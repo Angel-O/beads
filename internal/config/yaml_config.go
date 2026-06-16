@@ -81,6 +81,7 @@ var YamlOnlyKeys = map[string]bool{
 	"jira.api_token":             true,
 	"gitlab.token":               true,
 	"ado.pat":                    true,
+	"plane.api_key":              true,
 }
 
 // IsYamlOnlyKey returns true if the given key should be stored in config.yaml
@@ -132,6 +133,7 @@ var secretKeyEnvVarHints = map[string]string{ //nolint:gosec // Values are envir
 	"ai.api_key":     "ANTHROPIC_API_KEY",
 	"github.token":   "GITHUB_TOKEN",
 	"linear.api_key": "LINEAR_API_KEY",
+	"plane.api_key":  "PLANE_API_KEY",
 }
 
 // secretKeyEnvVarHint returns a suggested environment variable name for a
