@@ -1,7 +1,6 @@
 {
   "schema_version": 1,
   "bd_version": "1.0.5",
-  "bd_commit": "dev",
   "generated_by": "cmd/bd/protocol TestCorpusGolden",
   "canonicalized": true,
   "blobs": {

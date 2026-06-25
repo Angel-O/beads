@@ -94,9 +94,9 @@ func TestCorpusGolden(t *testing.T) {
 	}
 
 	dir := filepath.Join("testdata", "corpus")
-	bdVer, bdCommit := bdVersionInfo(t)
+	bdVer := bdVersionInfo(t)
 	schemaVersion := schemaVersionFromBlobs(t, blobs)
-	manifest := NewManifest(schemaVersion, bdVer, bdCommit, corpusGeneratedBy, CorpusPlan(), blobs)
+	manifest := NewManifest(schemaVersion, bdVer, corpusGeneratedBy, CorpusPlan(), blobs)
 	manifestBytes, err := MarshalManifest(manifest)
 	if err != nil {
 		t.Fatalf("marshal manifest: %v", err)
@@ -104,7 +104,7 @@ func TestCorpusGolden(t *testing.T) {
 
 	if *updateCorpus {
 		writeCorpus(t, dir, blobs, manifestBytes)
-		t.Logf("regenerated corpus under %s (bd %s, commit %s)", dir, bdVer, bdCommit)
+		t.Logf("regenerated corpus under %s (bd %s)", dir, bdVer)
 		return
 	}
 
@@ -169,11 +169,12 @@ func schemaVersionFromBlobs(t *testing.T, blobs map[string]map[string][]byte) in
 	return v.SchemaVersion
 }
 
-var bdVersionRE = regexp.MustCompile(`(?i)bd version\s+(\S+)\s*(?:\(([^)]*)\))?`)
+var bdVersionRE = regexp.MustCompile(`(?i)bd version\s+(\S+)`)
 
-// bdVersionInfo runs `bd version` (plain) and parses "bd version <ver> (<commit>)"
-// for the manifest provenance, e.g. "1.0.5" + "dev".
-func bdVersionInfo(t *testing.T) (version, commit string) {
+// bdVersionInfo runs `bd version` (plain) and parses the semantic version token
+// (e.g. "1.0.5") for the manifest's reproducible provenance. The build commit is
+// deliberately not recorded — it varies by build environment.
+func bdVersionInfo(t *testing.T) string {
 	t.Helper()
 	w := newWorkspace(t)
 	cmd := exec.Command(w.bd, "version")
@@ -187,9 +188,5 @@ func bdVersionInfo(t *testing.T) (version, commit string) {
 	if m == nil {
 		t.Fatalf("unrecognized bd version output: %q", out)
 	}
-	commit = m[2]
-	if commit == "" {
-		commit = "unknown"
-	}
-	return m[1], commit
+	return m[1]
 }

@@ -107,6 +107,13 @@ var timestampRE = regexp.MustCompile(
 // tsPlaceholder is the canonical stand-in for any timestamp value.
 const tsPlaceholder = "<TS>"
 
+// provenanceKeys are dropped during canonicalization: they are build-environment
+// metadata, not contract surface, and vary in both value AND presence across
+// builds. `bd version --json` embeds "commit" from Go's VCS stamping, which a
+// local worktree build may omit entirely while a CI clean-clone build includes —
+// so the value must be removed, not just normalized, to stay reproducible.
+var provenanceKeys = map[string]bool{"commit": true}
+
 // CanonicalizeJSON normalizes a bd JSON blob so that two independent runs
 // produce byte-identical output:
 //
@@ -143,6 +150,12 @@ func canonValue(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, child := range t {
+			// Drop build-provenance keys entirely so the canonical corpus does
+			// not depend on how (or where) bd was built.
+			if provenanceKeys[k] {
+				delete(t, k)
+				continue
+			}
 			t[k] = canonValue(child)
 		}
 		return t
@@ -221,9 +234,12 @@ type BlobMeta struct {
 // version/commit the corpus was generated from, plus a per-blob checksum so
 // consumers (Gas City) can detect tampering or partial vendoring.
 type Manifest struct {
-	SchemaVersion int                 `json:"schema_version"`
-	BDVersion     string              `json:"bd_version"`
-	BDCommit      string              `json:"bd_commit"`
+	SchemaVersion int    `json:"schema_version"`
+	BDVersion     string `json:"bd_version"`
+	// bd_commit is intentionally omitted: it varies by build environment and
+	// would make the committed manifest non-reproducible. bd_version plus the
+	// per-blob checksums are the reproducible provenance; the generating commit
+	// lives in the PR that updates the corpus.
 	GeneratedBy   string              `json:"generated_by"`
 	Canonicalized bool                `json:"canonicalized"`
 	Blobs         map[string]BlobMeta `json:"blobs"`
@@ -234,7 +250,7 @@ type Manifest struct {
 // "envelope/show") and cmd is the joined bd argument vector for that
 // capture. bytes are the already-canonicalized blob contents; the SHA is
 // computed over them so the manifest validates exactly what's on disk.
-func NewManifest(schemaVersion int, bdVersion, bdCommit, generatedBy string, plan []Capture, blobs map[string]map[string][]byte) Manifest {
+func NewManifest(schemaVersion int, bdVersion, generatedBy string, plan []Capture, blobs map[string]map[string][]byte) Manifest {
 	cmdByName := make(map[string]string, len(plan))
 	for _, c := range plan {
 		cmdByName[c.Name] = "bd " + joinArgs(c.Args)
@@ -254,7 +270,6 @@ func NewManifest(schemaVersion int, bdVersion, bdCommit, generatedBy string, pla
 	return Manifest{
 		SchemaVersion: schemaVersion,
 		BDVersion:     bdVersion,
-		BDCommit:      bdCommit,
 		GeneratedBy:   generatedBy,
 		Canonicalized: true,
 		Blobs:         out,
