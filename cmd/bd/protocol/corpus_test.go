@@ -7,8 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"strings"
 	"testing"
 )
 
@@ -94,9 +92,8 @@ func TestCorpusGolden(t *testing.T) {
 	}
 
 	dir := filepath.Join("testdata", "corpus")
-	bdVer := bdVersionInfo(t)
 	schemaVersion := schemaVersionFromBlobs(t, blobs)
-	manifest := NewManifest(schemaVersion, bdVer, corpusGeneratedBy, CorpusPlan(), blobs)
+	manifest := NewManifest(schemaVersion, corpusGeneratedBy, CorpusPlan(), blobs)
 	manifestBytes, err := MarshalManifest(manifest)
 	if err != nil {
 		t.Fatalf("marshal manifest: %v", err)
@@ -104,7 +101,7 @@ func TestCorpusGolden(t *testing.T) {
 
 	if *updateCorpus {
 		writeCorpus(t, dir, blobs, manifestBytes)
-		t.Logf("regenerated corpus under %s (bd %s)", dir, bdVer)
+		t.Logf("regenerated corpus under %s", dir)
 		return
 	}
 
@@ -167,26 +164,4 @@ func schemaVersionFromBlobs(t *testing.T, blobs map[string]map[string][]byte) in
 		t.Fatalf("version blob has no schema_version:\n%s", raw)
 	}
 	return v.SchemaVersion
-}
-
-var bdVersionRE = regexp.MustCompile(`(?i)bd version\s+(\S+)`)
-
-// bdVersionInfo runs `bd version` (plain) and parses the semantic version token
-// (e.g. "1.0.5") for the manifest's reproducible provenance. The build commit is
-// deliberately not recorded — it varies by build environment.
-func bdVersionInfo(t *testing.T) string {
-	t.Helper()
-	w := newWorkspace(t)
-	cmd := exec.Command(w.bd, "version")
-	cmd.Dir = w.dir
-	cmd.Env = w.env()
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("bd version: %v", err)
-	}
-	m := bdVersionRE.FindStringSubmatch(strings.TrimSpace(string(out)))
-	if m == nil {
-		t.Fatalf("unrecognized bd version output: %q", out)
-	}
-	return m[1]
 }

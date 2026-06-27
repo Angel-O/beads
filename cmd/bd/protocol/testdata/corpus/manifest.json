@@ -1,6 +1,5 @@
 {
   "schema_version": 1,
-  "bd_version": "1.0.5",
   "generated_by": "cmd/bd/protocol TestCorpusGolden",
   "canonicalized": true,
   "blobs": {
@@ -70,7 +69,7 @@
     },
     "envelope/version": {
       "cmd": "bd version --json",
-      "sha256": "b7caa91e287ed6a829bd4bb75dc1e9b3e666ce0ed38ae7222f2a00b9d21bd841"
+      "sha256": "756a704c64ab62286a355d17aa18ffc16cfb4e297e8b9520a218decb12c70939"
     },
     "flat/close": {
       "cmd": "bd close --force --json --reason \"corpus close reason exceeding twenty chars\" corpus-closed",
@@ -138,7 +137,7 @@
     },
     "flat/version": {
       "cmd": "bd version --json",
-      "sha256": "a215b7c9160b9fabd81524571bf248aafc871663a28d5e0f2112b1eff1c275e6"
+      "sha256": "63d2ab5c51cbdcc7d51588bef7d039dbfb857a432f42c6f13687a0100bd787e3"
     }
   }
 }

@@ -150,12 +150,24 @@ var timestampRE = regexp.MustCompile(
 // tsPlaceholder is the canonical stand-in for any timestamp value.
 const tsPlaceholder = "<TS>"
 
-// provenanceKeys are dropped during canonicalization: they are build-environment
-// metadata, not contract surface, and vary in both value AND presence across
-// builds. `bd version --json` embeds "commit" from Go's VCS stamping, which a
-// local worktree build may omit entirely while a CI clean-clone build includes —
-// so the value must be removed, not just normalized, to stay reproducible.
-var provenanceKeys = map[string]bool{"commit": true}
+// provenanceDropKeys are removed entirely during canonicalization: they vary in
+// both value AND presence across builds. `bd version --json` embeds "commit"
+// from Go's VCS stamping, which a local worktree build may omit while a CI
+// clean-clone build includes — so it must be dropped, not just normalized.
+var provenanceDropKeys = map[string]bool{"commit": true}
+
+// provenanceValueKeys have a stable presence but a release/build-specific value
+// (the bd version number, git branch, and build tag from `bd version --json`).
+// The corpus pins the SHAPE of the version command — that these fields exist and
+// schema_version is present — not the release identity, which changes every time
+// beads bumps its version. Their values are replaced with a placeholder so the
+// corpus stays reproducible across versions; gc's actual version parsing/gating
+// is covered by the cross-version matrix and bd_version_pin_test, not here.
+var provenanceValueKeys = map[string]string{
+	"version": "<VERSION>",
+	"branch":  "<BRANCH>",
+	"build":   "<BUILD>",
+}
 
 // CanonicalizeJSON normalizes a bd JSON blob so that two independent runs
 // produce byte-identical output:
@@ -195,9 +207,17 @@ func canonValue(v any) any {
 		for k, child := range t {
 			// Drop build-provenance keys entirely so the canonical corpus does
 			// not depend on how (or where) bd was built.
-			if provenanceKeys[k] {
+			if provenanceDropKeys[k] {
 				delete(t, k)
 				continue
+			}
+			// Replace release/build-specific values (version, branch, build) with
+			// a placeholder: pin the version command's shape, not its identity.
+			if ph, ok := provenanceValueKeys[k]; ok {
+				if _, isStr := child.(string); isStr {
+					t[k] = ph
+					continue
+				}
 			}
 			t[k] = canonValue(child)
 		}
@@ -277,12 +297,13 @@ type BlobMeta struct {
 // version/commit the corpus was generated from, plus a per-blob checksum so
 // consumers (Gas City) can detect tampering or partial vendoring.
 type Manifest struct {
-	SchemaVersion int    `json:"schema_version"`
-	BDVersion     string `json:"bd_version"`
-	// bd_commit is intentionally omitted: it varies by build environment and
-	// would make the committed manifest non-reproducible. bd_version plus the
-	// per-blob checksums are the reproducible provenance; the generating commit
-	// lives in the PR that updates the corpus.
+	SchemaVersion int `json:"schema_version"`
+	// bd_version and bd_commit are intentionally omitted: both vary by build
+	// environment / release and would make the committed manifest
+	// non-reproducible. The corpus is version-agnostic (it pins wire SHAPES, not
+	// a release identity); schema_version is the coordination canary and the
+	// per-blob checksums are the integrity anchor. The generating bd version/
+	// commit lives in the PR that updates the corpus.
 	GeneratedBy   string              `json:"generated_by"`
 	Canonicalized bool                `json:"canonicalized"`
 	Blobs         map[string]BlobMeta `json:"blobs"`
@@ -293,7 +314,7 @@ type Manifest struct {
 // "envelope/show") and cmd is the joined bd argument vector for that
 // capture. bytes are the already-canonicalized blob contents; the SHA is
 // computed over them so the manifest validates exactly what's on disk.
-func NewManifest(schemaVersion int, bdVersion, generatedBy string, plan []Capture, blobs map[string]map[string][]byte) Manifest {
+func NewManifest(schemaVersion int, generatedBy string, plan []Capture, blobs map[string]map[string][]byte) Manifest {
 	cmdByName := make(map[string]string, len(plan))
 	for _, c := range plan {
 		cmdByName[c.Name] = "bd " + joinArgs(c.Args)
@@ -312,7 +333,6 @@ func NewManifest(schemaVersion int, bdVersion, generatedBy string, plan []Captur
 
 	return Manifest{
 		SchemaVersion: schemaVersion,
-		BDVersion:     bdVersion,
 		GeneratedBy:   generatedBy,
 		Canonicalized: true,
 		Blobs:         out,
