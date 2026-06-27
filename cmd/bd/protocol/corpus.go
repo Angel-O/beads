@@ -37,8 +37,10 @@ type Capture struct {
 // of nondeterminism (generated hash IDs) so the only thing left to
 // canonicalize is timestamps.
 const (
-	CorpusRootID = "corpus-root"
-	CorpusDepID  = "corpus-dep"
+	CorpusRootID    = "corpus-root"
+	CorpusDepID     = "corpus-dep"
+	CorpusClosedID  = "corpus-closed"  // created, then closed + reopened
+	CorpusDeletedID = "corpus-deleted" // created, then deleted
 )
 
 // CorpusPlan returns the ordered, deterministic list of captures. The order
@@ -50,8 +52,11 @@ const (
 // capture deliberately targets a missing issue to pin the error envelope.
 func CorpusPlan() []Capture {
 	return []Capture{
-		// --force lets us pin custom IDs despite bd's per-database random ID
-		// prefix; pinned IDs make every downstream read deterministic.
+		// CREATE: --force lets us pin custom IDs despite bd's per-database random
+		// ID prefix; pinned IDs make every downstream read deterministic. Four
+		// beads: root + dep exercise reads/dependencies; closed + deleted are
+		// created here so the close/reopen and delete mutations below have stable
+		// subjects without disturbing root/dep.
 		{
 			Name: "create_root",
 			Args: []string{"create", "Corpus root issue", "--id", CorpusRootID, "--force", "--priority", "1", "--type", "feature", "--description", "deterministic corpus root", "--json"},
@@ -61,13 +66,55 @@ func CorpusPlan() []Capture {
 			Args: []string{"create", "Corpus dependency issue", "--id", CorpusDepID, "--force", "--priority", "2", "--type", "task", "--description", "deterministic corpus dependency", "--json"},
 		},
 		{
+			Name: "create_closed",
+			Args: []string{"create", "Corpus closeable issue", "--id", CorpusClosedID, "--force", "--priority", "3", "--type", "task", "--description", "deterministic corpus closeable", "--json"},
+		},
+		{
+			Name: "create_deleted",
+			Args: []string{"create", "Corpus deletable issue", "--id", CorpusDeletedID, "--force", "--priority", "3", "--type", "task", "--description", "deterministic corpus deletable", "--json"},
+		},
+		// dep_add pins the dual-key dependency-edge shape {issue_id, depends_on_id,
+		// type, status}.
+		{
 			Name: "dep_add",
 			Args: []string{"dep", "add", CorpusRootID, CorpusDepID, "--type", "blocks", "--json"},
 		},
+		// READS captured before the mutations below, so show/dep_list pin the
+		// pre-mutation root (the stable, long-standing blobs).
 		{
 			Name: "show",
 			Args: []string{"show", CorpusRootID, "--json"},
 		},
+		{
+			Name: "dep_list",
+			Args: []string{"dep", "list", CorpusRootID, "--json"},
+		},
+		// MUTATIONS: update/close/reopen return an array of the affected issue;
+		// update pins label + metadata coercion (phase=2 -> integer); close pins
+		// close_reason + closed_at; dep_remove/delete pin their confirmation shapes.
+		{
+			Name: "update",
+			Args: []string{"update", CorpusRootID, "--json", "--priority", "0", "--add-label", "corpus-label", "--set-metadata", "phase=2", "--description", "updated corpus root"},
+		},
+		{
+			Name: "close",
+			Args: []string{"close", "--force", "--json", "--reason", "corpus close reason exceeding twenty chars", CorpusClosedID},
+		},
+		{
+			Name: "reopen",
+			Args: []string{"reopen", "--json", CorpusClosedID},
+		},
+		{
+			Name: "dep_remove",
+			Args: []string{"dep", "remove", CorpusRootID, CorpusDepID, "--json"},
+		},
+		{
+			Name: "delete",
+			Args: []string{"delete", "--force", "--json", CorpusDeletedID},
+		},
+		// READS captured after the mutations, so list/ready/count reflect the
+		// full post-mutation state (updated root, reopened bead, removed edge,
+		// deleted bead gone).
 		{
 			Name: "list",
 			Args: []string{"list", "--all", "--json"},
@@ -75,10 +122,6 @@ func CorpusPlan() []Capture {
 		{
 			Name: "ready",
 			Args: []string{"ready", "--json"},
-		},
-		{
-			Name: "dep_list",
-			Args: []string{"dep", "list", CorpusRootID, "--json"},
 		},
 		{
 			Name: "count",
