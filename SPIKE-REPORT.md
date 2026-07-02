@@ -251,7 +251,7 @@ and new `cmd/bd/spike_uowstore_tx_integration_test.go` — so the default
 
 The `storage.DoltStorage` nil-interface embed is replaced by a **generated
 concrete shell** (`unsupported_gen.go`, from a stdlib-only `go/ast` generator in
-`gen/main.go`). Every method the spike does not really override returns a typed
+`gen/main.go`). Every unimplemented method with an error channel returns a typed
 `*storage.ErrUnsupported{Op, Backend}` wrapped with BD_SPIKE_UOWSTORE / #4547
 context — never a nil-pointer panic. The §6.4 crash class is retired: `store.Commit`
 (from `flushBatchCommitOnShutdown`), `CreateIssuesWithFullOptions` (molecules
@@ -259,23 +259,62 @@ loader), and every dual command that falls through under the flag (e.g. `bd dep
 add → AddDependency`) now exit nonzero with a clean message, verified by the CLI
 fixture (`bd dep add` output contains the typed text and no `panic:`/`goroutine`).
 
+**Two signatures have no error channel and are the sole exception to the
+"typed-error everywhere" rule: `GetInfraTypes` (returns `map[string]bool`) and
+`IsInfraTypeCtx` (returns bare `bool`).** The generator emits them as zero-value
+stubs (it comments the tradeoff inline: *"no error channel on this signature;
+returns the zero value"*), so a stub in their place returns `nil`/`false` — a
+*silent wrong answer*, not a loud typed one. Both are therefore **real overrides
+in `store.go`, never left to the shell**: each opens a UOW, calls the use-case,
+and swallows the use-case's error to fit the store signature. `IsInfraTypeCtx` in
+particular is reachable under the flag from `wisp.go:637/:682/:759`, where a silent
+`false` would misroute infra-type wisp handling; its override is pinned by
+`TestSpikeUOWStore_IsInfraTypeCtxRoutes` (seed `types.infra`, assert `agent`→true —
+verified RED when the override is removed, so the shell stub cannot masquerade for
+it). This is the concrete evidence the §4.0 clean-room seam cites for its
+error-channel-everywhere rule: the two methods that lack one are exactly the two
+the shell cannot make loud.
+
 Two design choices matter for the real adapter:
 
 - **Codegen, not a handwritten stub.** SPIKE-REPORT §6.6 mandated a *generated*
   shell, and Phase 4's compat wedge regenerates the same thing against the
-  ~107-method bridge core, so the generator is the reusable artifact. Two
-  compile-time completeness assertions (`var _ storage.DoltStorage = …{}`,
-  `var _ storage.Transaction = …{}`) live INSIDE the generated file: if either
-  interface grows a method the build breaks and forces `go generate`, so
-  interface drift can never silently grow a stub. The DO-NOT-EDIT header plus a
-  regen-idempotence CI gate guard against hand-edits dropping a method (the exact
-  way the molecules-loader gap would otherwise reappear as a quiet PreRun failure).
+  ~107-method bridge core, so the generator is the reusable artifact. The drift
+  guards are layered, and each covers a distinct class:
+  - **Interface growth / a hand-deleted stub** — two compile-time completeness
+    assertions (`var _ storage.DoltStorage = …{}`, `var _ storage.Transaction =
+    …{}`) live INSIDE the generated file. The shell type alone must satisfy the
+    full interface, so if either interface grows a method, or a stub is deleted by
+    hand, the build breaks and forces `go generate`. Interface drift can never
+    silently grow or drop a stub.
+  - **A hand-edited stub *body*** (a typo'd `Op` string, or a stub changed to
+    return `nil` instead of the typed error) — the compile assertions cannot see
+    this; it type-checks. `gen/gen_test.go::TestGeneratedShellIsUpToDate` closes
+    it: an ordinary (ungated) unit test that regenerates to a temp path and
+    byte-compares against the committed `unsupported_gen.go`, the same drift-check
+    idiom `scripts/check-cli-docs-drift.sh` uses for CLI docs. It is verified RED
+    against a corrupted committed file. To make this testable the generator's
+    `run()` was parameterized on `(srcDir, outFile)`; `main()` still writes the
+    canonical file. (A CI *workflow* gate is promotion-time work — no
+    `.github/workflows` step invokes the generator today — but the drift class the
+    §6.6 codegen mandate cares about is now pinned by the checked-in unit test, not
+    just asserted.)
+
+  The DO-NOT-EDIT header signals intent; the unit test enforces it (the exact way
+  the molecules-loader gap would otherwise reappear as a quiet PreRun failure).
 - **The silent-unsupported tradeoff is real and must be tripwired.** Converting a
   panic to a quiet typed error also means a typo'd override name compiles and
   silently routes to the stub. The mitigation is one integration assertion per real
   override (RoundTrip + T1–T5 collectively exercise all three tx overrides and the
-  store slice); a stub answering in a real method's place returns ErrUnsupported,
-  which those tests catch.
+  store slice); a stub answering in an *error-returning* method's place returns
+  ErrUnsupported, which those tests catch. **The two no-error-channel methods
+  (`GetInfraTypes`/`IsInfraTypeCtx`) cannot rely on that** — their stub returns a
+  benign zero value, not a catchable error — so they need a *value-equality*
+  tripwire instead: `TestSpikeUOWStore_IsInfraTypeCtxRoutes` seeds `types.infra`
+  and asserts `agent`→true, which the shell stub (always `false`) fails. This is
+  the general lesson for the real seam: an error-channel-everywhere signature is
+  what lets a single ErrUnsupported assertion cover every override; where the
+  signature refuses one, the tripwire must assert the *answer*, not the error.
 
 ### 8.2 Part A — `RunInTransaction` is ONE delegation to `uow.RunInTx`
 
@@ -320,6 +359,36 @@ explicitly, NOT papered over:
   dependency). Not runtime-tested (needs fault injection the proxied stack does not
   expose); correct by construction (single delegation) and covered by
   `run_in_tx_test.go`.
+
+**Open edge — a NON-transient commit-phase failure and the pooled session
+(corrected).** An earlier draft of this section overstated commit-phase safety as
+"correct by construction ... covered by `run_in_tx_test.go`". That is true for the
+*retry policy* (`RunInTxMsg` classifies a `Permanent` DOLT_COMMIT failure and does
+not replay), but it says nothing about the *pinned session's state* after the
+failure. On BASE, `doltServerTx.Commit` marked the tx `done` and released the conn
+unconditionally: when DOLT_COMMIT fails with a non-transient error (a commit-time
+constraint-verification or working-set error — NOT serialization/conn-loss), the
+session returned to the pool **still holding the open transaction with `fn`'s
+writes pending**. go-sql-driver v1.9.3's `ResetSession` only does a liveness check
+(no `COM_RESET_CONNECTION`), so the next borrower's `START TRANSACTION` implicitly
+commits those orphaned writes — a late/double-apply, the exact atomicity-violation
+class T1 is meant to preclude but never exercises (T1's rollback is the *fn-error*
+path, which does run `ROLLBACK` and is sound). This hardening once existed
+(commit `794ff0790`) and was reverted to BASE in `a59e75325`'s serverv2 triage,
+two weeks before this slice; slice 2 makes commit-phase failure a first-class
+adapter path via `RunInTransaction`, so the gap became load-bearing here.
+
+  **Fixed (re-landed).** `doltServerTx.Commit` now runs `ROLLBACK` on the same
+  session when DOLT_COMMIT fails, and poisons the conn (`driver.ErrBadConn`, so the
+  pool discards the session) if even the rollback fails; `Rollback` poisons on its
+  own failure; and `BeginTx` closes the pinned conn when `START TRANSACTION` fails
+  instead of leaking it. Pinned by `internal/storage/uow/doltserver_tx_test.go`
+  (sqlmock, asserting the ROLLBACK-then-release sequence and `db.Stats()` pool
+  discard) — verified RED against BASE. This is the same repair the reverted
+  `794ff0790` shipped; a live fixture that forces a real `dolt_constraint_violations`
+  commit failure and asserts the writes never appear on a second handle remains
+  feasible promotion-time work, but the unit-level pool-discard contract is now
+  enforced, not merely asserted.
 
 ### 8.3 What Slice 2 does NOT do
 
