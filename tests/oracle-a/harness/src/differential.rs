@@ -106,11 +106,27 @@ pub fn normalize(s: &str) -> String {
 pub fn run_scenario(bin: &Path, sc: &Scenario) -> std::io::Result<Trace> {
     let work = tempfile::tempdir()?;
     let run = |args: &[String]| -> std::io::Result<std::process::Output> {
-        Command::new(bin)
-            .args(args)
+        // Scrub the environment to an explicit whitelist. The upstream harness
+        // inherited the FULL host env, so any host BEADS_*/BD_* var
+        // (BEADS_DOLT_SERVER_MODE, BEADS_ACTOR, auto-export toggles) silently
+        // reshaped what BOTH binaries do — symmetric, so no divergence, but the
+        // gate then certifies a different configuration than users run. Passing a
+        // deliberate env makes each green attributable to the same config every
+        // run and on any host. (BEADS_TEST_MODE=1 is retained deliberately; its
+        // store-construction delta — auto-server decisions off, port rewiring —
+        // is a documented ungated gap: this rig does not cover mode/topology
+        // construction paths. See tests/oracle-a/README.md.)
+        let mut cmd = Command::new(bin);
+        cmd.args(args)
             .current_dir(work.path())
-            .env("BEADS_TEST_MODE", "1")
-            .output()
+            .env_clear()
+            .env("BEADS_TEST_MODE", "1");
+        for key in ["PATH", "HOME", "TMPDIR"] {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
+        }
+        cmd.output()
     };
 
     // init (output discarded; banners are not part of the contract)

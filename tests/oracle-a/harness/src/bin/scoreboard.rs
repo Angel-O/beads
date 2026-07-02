@@ -16,13 +16,15 @@ use std::path::PathBuf;
 /// gc-contract commands (everything else is out-of-scope bd surface).
 const IN_SCOPE_CMDS: &[&str] = &[
     "init", "create", "show", "list", "ready", "update", "close", "reopen", "delete", "purge",
-    "dep", "count", "query", "config", "version", "sql", "comment", "add", "remove", "set",
+    "dep", "count", "query", "config", "version", "sql", "comment", "comments", "add", "remove",
+    "set", "get",
 ];
 /// gc-contract flags (denominator §B + globals). A scenario is in-scope iff every
 /// command is in IN_SCOPE_CMDS and every flag is here.
 const IN_SCOPE_FLAGS: &[&str] = &[
     "--id", "--force", "-p", "--priority", "-t", "--type", "-d", "--description", "--json",
-    "-a", "--assignee", "--deps", "-l", "--labels", "--metadata", "--metadata-field", "--parent",
+    "-a", "--assignee", "--deps", "-l", "--labels", "--label", "--metadata", "--metadata-field",
+    "--parent",
     "--ephemeral", "--no-history", "--defer", "--graph", "--title", "--all", "-n", "--limit",
     "-s", "--status", "--created-before", "--include-infra", "--include-gates",
     "--include-templates", "--skip-labels", "--include-ephemeral", "-u", "--unassigned", "--claim",
@@ -36,7 +38,7 @@ const IN_SCOPE_FLAGS: &[&str] = &[
 /// excluded: gc calls those without `--json`.
 const JSON_OUTPUT_CMDS: &[&str] = &[
     "create", "show", "list", "ready", "count", "update", "close", "reopen", "delete", "purge",
-    "query", "version", "stats",
+    "query", "version", "stats", "comment", "comments",
 ];
 
 fn in_scope(sc: &bts_conformance::differential::Scenario) -> bool {

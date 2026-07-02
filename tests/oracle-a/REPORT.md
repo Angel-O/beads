@@ -36,11 +36,27 @@ branch and the working tree is never disturbed.
 
 ## Verification evidence
 
-### (a) main-vs-main = 100% in-scope pass
+> **Two corrections before reading the numbers below.**
+> 1. **Reference = merge base, not `origin/main` tip.** The rig now defaults
+>    `REF_REF` to `git merge-base HEAD origin/main` (env-overridable). The header
+>    and README previously said "merge base" while the code used the tip; today
+>    they coincide, but on a long-running effort `origin/main` advances and the tip
+>    would fold upstream commits into the diff as false in-scope FAILs. The verdict
+>    line prints both the resolved ref and its SHA so each green is attributable.
+> 2. **The captured evidence below is stale.** It was recorded when branch HEAD
+>    equalled `origin/main`, i.e. BEFORE the spike/oracle commits existed, and
+>    predates the scope fix (`--label`) and the added coverage scenarios, so the
+>    `39 scenarios` / `38 PASS` headline no longer matches the current rig. It also
+>    does NOT exercise the spike store: `BD_SPIKE_UOWSTORE` is unset during runs, so
+>    green says only that the flag-OFF wiring is inert — it says nothing about the
+>    uowStore adapter. Re-run `run-oracle-a.sh` at the branch tip and paste that
+>    output (with the printed REF/CAND SHAs) for a current, attributable gate record.
 
-At the time of writing, the branch HEAD equals `origin/main` (`7d8063d1d`), so a
-full `run-oracle-a.sh` builds the reference and candidate from the same source as
-**two independently-compiled binaries** and diffs them. This is the leak test:
+### (a) main-vs-main leak test (historical evidence, pre-dates the review fixes)
+
+At the time this was captured, the branch HEAD equalled `origin/main` (`7d8063d1d`),
+so a full `run-oracle-a.sh` builds the reference and candidate from the same source
+as **two independently-compiled binaries** and diffs them. This is the leak test:
 any divergence would be a harness/normalization bug, not a code change.
 
 Exact command and real output:
@@ -68,14 +84,22 @@ $ echo $?
 0
 ```
 
-Wall time end-to-end: **6 min 30 s** (cold reference build dominated). 38
-in-scope PASS / 0 FAIL / 100%. The 1 out-of-scope scenario is
-`config_set_protected_keys` (`config set` invoked without `--json`, which the
-in-scope predicate excludes by design); it passes too. **No harness or
-normalization gap surfaced** — the host git identity is `CI Bot`/`ci@beads.test`,
-exactly the tokens `normalize()` collapses, so identity and timestamps
-normalize cleanly and the two separately-built binaries agree byte-for-byte on
-every in-scope step.
+Wall time end-to-end: **6 min 30 s** (cold reference build dominated).
+**No harness or normalization gap surfaced** — the host git identity is
+`CI Bot`/`ci@beads.test`, exactly the tokens `normalize()` collapses, so identity
+and timestamps normalize cleanly and the two separately-built binaries agree
+byte-for-byte on every in-scope step.
+
+> **Correction (adversarial review).** The original report attributed the single
+> out-of-scope scenario to `config_set_protected_keys` "invoked without `--json`".
+> That was wrong twice: those steps DO pass `--json`, and `config` is not in
+> `JSON_OUTPUT_CMDS` anyway, so `config_set_protected_keys` is IN scope. The
+> genuinely out-of-scope scenario used to be `labels`, whose `list --all --label …`
+> step used `--label`, a flag absent from `IN_SCOPE_FLAGS` — so a regression in
+> label filtering silently did not gate. That is now fixed: `--label` was added to
+> `IN_SCOPE_FLAGS`, so `labels` is in scope, and label filtering is gated. Re-run
+> the rig for the current pass/fail headline; do not trust the stale `38/0` numbers
+> below, which pre-date the scope fix and the added coverage scenarios.
 
 An even tighter sanity was run during bring-up: scoring the reference binary
 against *its own* goldens (same binary both sides) also produced 38/0/100% — 0
@@ -117,15 +141,19 @@ in the working tree returns `0`. **The rig detects real user-visible changes.**
 
 `run-oracle-a.sh` is idempotent: it uses a unique per-run scratch dir
 (`oracle-a-<timestamp>-<pid>`), a unique binary path per binary (never `cp`s over
-an exec-mapped file), removes the reference `git worktree` and restores any
-`go.sum`/`go.mod` churn in an `EXIT` trap, and deletes `harness/testdata/golden`
-before re-capturing so goldens are always fresh from the current reference. After
-the full run above, verification confirmed: no leftover worktree
-(`git worktree list` clean), no scratch dirs, `git diff go.mod go.sum` empty, and
-`git status` shows only the intended new `tests/oracle-a/` plus the pre-existing
-untracked proposal docs. The injected-diff flow (a second, independent
-invocation of the same build/capture/score primitives) left the tree equally
-clean.
+an exec-mapped file), removes the reference `git worktree`, and deletes
+`harness/testdata/golden` before re-capturing so goldens are always fresh from the
+current reference.
+
+**go.mod/go.sum safety (adversarial-review fix).** The rig no longer runs
+`git checkout -- go.mod go.sum`, which restored to HEAD and so would have DESTROYED
+a pre-existing uncommitted edit (the working tree may legitimately carry one — e.g.
+a dep bump that is itself the candidate under test; the exact Phase-4 use case adds
+a Postgres driver dependency). It now snapshots the two files' bytes BEFORE any
+build and restores the pre-run snapshot only when the build actually changed them
+(content compare) — restore-to-pre-run, never restore-to-HEAD. `INT`/`TERM` are
+also trapped so a Ctrl-C during the multi-minute reference build still runs
+cleanup (no leaked `/tmp` worktree registration).
 
 ## Findings / friction discovered (feeds the design)
 
@@ -162,14 +190,18 @@ clean.
    already supports it. Left out deliberately to keep the rig's scope crisp and
    its runtime bounded.
 
-4. **`purge` and `config set` sit at the edge of the in-scope predicate and are
-   worth watching under the refactor.** `purge` has no uow dual (per the
-   proposal) and is where the bts-rs red team found re-seeding bugs; it is
-   covered (`purge_dry_run_zero_metrics`, in-scope). `config set` scenarios are
-   *out-of-scope* under the current predicate (no `--json`), so a regression in
-   plain `config set` output would not be gated by Oracle A — acceptable for a
-   gc-contract rig, but flagged so nobody mistakes green for full-`config`
-   coverage.
+4. **`purge`, `delete`, `comment`, and `config` success paths were coverage gaps —
+   now closed.** The original rig exercised `purge` only as `--dry-run` (which never
+   mutates), had ZERO `delete`/`comment` steps, and pinned `config set` only on its
+   reject path. Since `delete`/`purge` are §2.3's top-danger ops (must recompute
+   surviving neighbours' `is_blocked`), that was a real hole. Added scenarios:
+   `delete_unblocks_neighbour` (delete a blocker, assert the neighbour becomes
+   ready), `comment_add_list` (add two comments, list them), `config_set_get_success`
+   (custom-key round trip + missing-key read), and `purge_real_then_reseed` (a real
+   `purge --force` with `purged_count` and a post-purge create+list re-seed
+   assertion). And to correct the earlier note: `config set` IS in scope (`config`
+   is not a JSON-output command, so `--json` is not required for its scope), so the
+   reject-path scenario always gated — the earlier "out-of-scope" claim was wrong.
 
 ## Known gaps documented, not patched (per task instruction)
 
