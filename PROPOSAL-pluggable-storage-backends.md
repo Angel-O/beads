@@ -2,7 +2,7 @@
 
 **Status:** Draft for review (survived one adversarial review round; defects folded in)
 **Date:** 2026-07-02
-**Informed by:** the bts-rs Rust spike (`/data/projects/bts-rs` — a from-scratch reimplementation
+**Informed by:** the bts-rs Rust spike (a from-scratch Rust reimplementation
 of the gc-contract surface that validated a backend-agnostic storage seam at 299/299 byte-parity
 across two radically different backends), a five-dimension recon of this repo's storage
 architecture, and a two-reviewer adversarial verification pass. All file:line citations verified
