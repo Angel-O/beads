@@ -3,4 +3,6 @@
 # — the reference is the branch's own merge base, not a pinned snapshot).
 /target/
 /testdata/
-Cargo.lock
+# Cargo.lock IS committed (not ignored): this crate produces two [[bin]] targets,
+# so pinning the lockfile keeps the gate reproducible — serde/regex/tempfile do not
+# drift with upstream releases between CI runs.

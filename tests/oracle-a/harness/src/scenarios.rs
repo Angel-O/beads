@@ -565,5 +565,63 @@ pub fn all() -> Vec<Scenario> {
                 &["config", "set", "dolt.debug", "true", "--json"],
             ],
         ),
+        // COVERAGE: delete recomputes the surviving neighbour's is_blocked. del-b is
+        // blocked by del-a (omitted from ready); deleting del-a must make del-b ready.
+        // delete is §2.3's top-danger op (must recompute surviving neighbours); the
+        // rig had ZERO delete steps before this.
+        Scenario::new(
+            "delete_unblocks_neighbour",
+            "del",
+            &[
+                &["create", "Blocker", "--id", "del-a", "--force", "-t", "task", "--json"],
+                &["create", "Blocked", "--id", "del-b", "--force", "-t", "task", "--json"],
+                &["dep", "add", "del-b", "del-a", "--type", "blocks", "--json"],
+                &["ready", "--json"],
+                &["delete", "del-a", "--force", "--json"],
+                &["ready", "--json"],
+            ],
+        ),
+        // COVERAGE: comment add (bd comment <id> <text>) then list (bd comments <id>).
+        // Comment id (UUID) and created_at (TS) are normalized, so the trace is stable.
+        // The rig had ZERO comment steps before this.
+        Scenario::new(
+            "comment_add_list",
+            "cm",
+            &[
+                &["create", "Base", "--id", "cm-1", "--force", "-t", "task", "--json"],
+                &["comment", "cm-1", "first note", "--json"],
+                &["comment", "cm-1", "second note", "--json"],
+                &["comments", "cm-1", "--json"],
+            ],
+        ),
+        // COVERAGE: config set/get SUCCESS path (the protected-keys scenario only pins
+        // the reject path). custom.* keys are user-defined and warning-free. get echoes
+        // the value set; get of a missing key returns an empty value, not an error.
+        Scenario::new(
+            "config_set_get_success",
+            "cfs",
+            &[
+                &["config", "set", "custom.team", "core", "--json"],
+                &["config", "get", "custom.team", "--json"],
+                &["config", "get", "custom.absent", "--json"],
+            ],
+        ),
+        // COVERAGE: a REAL (non-dry-run) purge that mutates, plus the re-seed the
+        // proposal (§2.3) mandates. Two closed ephemerals are purged (purged_count=2),
+        // then a fresh create + list proves the workspace is usable after the purge.
+        // The rig previously exercised purge ONLY as --dry-run (never mutates).
+        Scenario::new(
+            "purge_real_then_reseed",
+            "prg",
+            &[
+                &["create", "E1", "--id", "prg-1", "--ephemeral", "-t", "task", "--json"],
+                &["create", "E2", "--id", "prg-2", "--ephemeral", "-t", "task", "--json"],
+                &["close", "prg-1", "--force", "--json"],
+                &["close", "prg-2", "--force", "--json"],
+                &["purge", "--force", "--json"],
+                &["create", "Fresh", "--id", "prg-3", "--force", "-t", "task", "--json"],
+                &["list", "--all", "--json"],
+            ],
+        ),
     ]
 }
