@@ -237,3 +237,95 @@ attempt lacked. Before committing to the full build, run the **command→store c
 census** described in §4 to get an accurate method count — the interface undercounts the work
 by ignoring the transitive read-surface, and overcounts it by including capability methods a
 core adapter never needs. This spike's 23 methods are a reusable substrate for that census.
+
+## 8. Slice 2 — `RunInTransaction` + typed-unsupported shell (follow-up)
+
+Slice 2 closes the two §6 hazards this spike's own recommendation flagged as
+must-not-survive: the **nil-embed panic minefield** (§6.4/§6.6) and the missing
+**`RunInTransaction` read-check-act atomicity** (§6.3). It touches only additive
+files — `internal/storage/errors_unsupported.go`, `internal/storage/uowstore/**`,
+and new `cmd/bd/spike_uowstore_tx_integration_test.go` — so the default
+(BD_SPIKE_UOWSTORE-unset) path stays byte-identical (Oracle A in-scope 100% pass).
+
+### 8.1 Part B — the nil embed is gone; gaps are now loud AND typed
+
+The `storage.DoltStorage` nil-interface embed is replaced by a **generated
+concrete shell** (`unsupported_gen.go`, from a stdlib-only `go/ast` generator in
+`gen/main.go`). Every method the spike does not really override returns a typed
+`*storage.ErrUnsupported{Op, Backend}` wrapped with BD_SPIKE_UOWSTORE / #4547
+context — never a nil-pointer panic. The §6.4 crash class is retired: `store.Commit`
+(from `flushBatchCommitOnShutdown`), `CreateIssuesWithFullOptions` (molecules
+loader), and every dual command that falls through under the flag (e.g. `bd dep
+add → AddDependency`) now exit nonzero with a clean message, verified by the CLI
+fixture (`bd dep add` output contains the typed text and no `panic:`/`goroutine`).
+
+Two design choices matter for the real adapter:
+
+- **Codegen, not a handwritten stub.** SPIKE-REPORT §6.6 mandated a *generated*
+  shell, and Phase 4's compat wedge regenerates the same thing against the
+  ~107-method bridge core, so the generator is the reusable artifact. Two
+  compile-time completeness assertions (`var _ storage.DoltStorage = …{}`,
+  `var _ storage.Transaction = …{}`) live INSIDE the generated file: if either
+  interface grows a method the build breaks and forces `go generate`, so
+  interface drift can never silently grow a stub. The DO-NOT-EDIT header plus a
+  regen-idempotence CI gate guard against hand-edits dropping a method (the exact
+  way the molecules-loader gap would otherwise reappear as a quiet PreRun failure).
+- **The silent-unsupported tradeoff is real and must be tripwired.** Converting a
+  panic to a quiet typed error also means a typo'd override name compiles and
+  silently routes to the stub. The mitigation is one integration assertion per real
+  override (RoundTrip + T1–T5 collectively exercise all three tx overrides and the
+  store slice); a stub answering in a real method's place returns ErrUnsupported,
+  which those tests catch.
+
+### 8.2 Part A — `RunInTransaction` is ONE delegation to `uow.RunInTx`
+
+`(*uowStore).RunInTransaction` opens ONE `uow.UnitOfWork` and runs `fn` against a
+`uowTransaction` view **constructed inside the retry closure**; the adapter adds
+zero retry/backoff/phase logic (grep gates: no `backoff` import anywhere in the
+package, no `NewUOW(` in `tx.go`). All of that is inherited from `uow.RunInTx` and
+remains owned/tested by `internal/storage/uow/run_in_tx_test.go`. The view is the
+minimal read-check-act set — `GetIssue` (read-your-writes + `storage.ErrNotFound`
+translation, via a helper now SHARED with the store method), `CloseIssue` (in-tx
+`is_blocked` recompute), `AddDependency` (wisp routing + in-tx cycle check) — which
+is enough to prove multi-statement atomicity across two tables (issues +
+dependencies). The other 21 Transaction methods stay generated-unsupported; because
+a stub error propagates out of `fn`, calling one also exercises the rollback path.
+
+Semantics inherited for free and pinned by the integration fixtures (a managed
+proxy + two independent in-process store handles):
+
+| Fixture | Contract proven |
+|---|---|
+| T1 rollback atomicity | `fn` error → BOTH mutations roll back; the second handle sees the issue still open and dep count 0; dolt_log head UNCHANGED. Read-your-writes + cross-handle isolation asserted mid-`fn`. |
+| T2 commit-once | success → EXACTLY ONE new dolt commit (DOLT_LOG walk between head hashes), message byte-equal to `commitMsg`. This is the assertion a stdout check structurally cannot make, and it is precisely the §6.3 "N commits instead of one" divergence class. |
+| T3 typed-unsupported in `fn` | a `Transaction` stub's `*storage.ErrUnsupported` is treated as a domain error — no retry, full rollback. |
+| T4 read-only `fn` | zero mutations → "nothing to commit" → success with NO new version commit. |
+| T5 CLI clean error | `bd dep add` on the spike path exits nonzero with the typed text and no crash output. |
+
+Three commit-semantics edges embedded mode handles differently were handled
+explicitly, NOT papered over:
+
+- **Blank commit message** — embedded means "SQL-commit, defer the version
+  commit", but the uow Tx only has `DOLT_COMMIT`, which rejects empty messages.
+  Passing it through yields a confusing dolt error; substituting a default silently
+  forks version history. `RunInTransaction` refuses a blank message with an explicit
+  guard (unit-tested: guard fires before any UOW opens, `fn` not called). This is
+  unreachable from the CLI on the spike path because `transactHonoringAutoCommit`
+  only blanks the message in embedded mode (`dolt_autocommit.go:31`).
+- **"Nothing to commit"** maps to success — owned by `RunInTxMsg`, not intercepted
+  in the adapter (T4).
+- **`ErrCommitIndeterminate`** (connection loss at/after COMMIT) is terminal and
+  surfaced via `errors.Is`, NEVER retried — a hoisted view or an adapter-level retry
+  around `uow.RunInTx` would risk a double-apply (second close event, duplicate
+  dependency). Not runtime-tested (needs fault injection the proxied stack does not
+  expose); correct by construction (single delegation) and covered by
+  `run_in_tx_test.go`.
+
+### 8.3 What Slice 2 does NOT do
+
+It does not lift the init gate, delete any `*_proxied_server.go` dual, or change
+the flag-gated factory wiring — those are the promotion-time must-not-survive
+changes §6.6 describes, not spike work. The Transaction view is still 3-of-24
+methods; the rest are typed-unsupported. And the shell's typed errors, while loud,
+are still a spike contract (`Backend == "uowstore spike"`, #4547 in the message) —
+the real seam's `ErrUnsupported{Op, Backend}` will name the actual backend.
