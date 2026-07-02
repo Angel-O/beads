@@ -15,7 +15,29 @@ import (
 	"github.com/steveyegge/beads/internal/storage/dbproxy/util"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
+	"github.com/steveyegge/beads/internal/storage/uowstore"
 )
+
+// spikeUOWStore reports whether the BD_SPIKE_UOWSTORE derisk spike is enabled
+// (issue gastownhall/beads#4547, Route A). When set, the proxied-server arms
+// below return a uowstore adapter (storage.DoltStorage over the uow stack)
+// instead of the "should be uow provider" error, and the CLI routes commands
+// through the normal store path rather than the *_proxied_server.go duals.
+// Default (unset) behavior is byte-identical to before.
+func spikeUOWStore() bool {
+	return os.Getenv("BD_SPIKE_UOWSTORE") == "1"
+}
+
+// newSpikeUOWStore builds the spike uowstore adapter over a proxied-server UOW
+// provider for beadsDir. Reused by every proxied factory arm so the spike store
+// is constructed exactly one way.
+func newSpikeUOWStore(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
+	provider, err := newProxiedServerUOWProvider(ctx, beadsDir)
+	if err != nil {
+		return nil, fmt.Errorf("spike uowstore: open uow provider: %w", err)
+	}
+	return uowstore.New(provider, getActor()), nil
+}
 
 func usesSQLServer() bool {
 	if shouldUseGlobals() {
@@ -37,6 +59,12 @@ func isEmbeddedMode() bool {
 }
 
 func usesProxiedServer() bool {
+	// BD_SPIKE_UOWSTORE (issue #4547 Route A derisk): route commands through the
+	// ordinary store path (backed by the uowstore adapter) instead of the
+	// *_proxied_server.go duals, so the spike store is what actually runs.
+	if spikeUOWStore() {
+		return false
+	}
 	if shouldUseGlobals() {
 		return proxiedServerMode
 	}
@@ -47,6 +75,9 @@ func usesProxiedServer() bool {
 // Used by bd init and PersistentPreRun.
 func newDoltStore(ctx context.Context, cfg *dolt.Config) (storage.DoltStorage, error) {
 	if cfg.ProxiedServer {
+		if spikeUOWStore() {
+			return newSpikeUOWStore(ctx, cfg.BeadsDir)
+		}
 		// TODO: this should not be a store
 		// it should be a uow provider
 		return nil, fmt.Errorf("proxy server store should be uow provider")
@@ -93,6 +124,9 @@ func acquireEmbeddedLock(beadsDir string, serverMode bool) (util.Unlocker, error
 func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
 	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
+		if spikeUOWStore() {
+			return newSpikeUOWStore(ctx, beadsDir)
+		}
 		// TODO: this needs to be uow provider
 		return nil, fmt.Errorf("proxy server store should be uow provider")
 		// 	return newProxiedServerStore(ctx, &dolt.Config{
@@ -166,6 +200,9 @@ func migrateHyphenatedDB(beadsDir string, cfg *configfile.Config, oldName, newNa
 func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
 	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
+		if spikeUOWStore() {
+			return newSpikeUOWStore(ctx, beadsDir)
+		}
 		// TODO: this needs to be uow provider
 		return nil, fmt.Errorf("proxy server store needs to be uow provider")
 		// return newProxiedServerStore(ctx, &dolt.Config{

@@ -1,0 +1,405 @@
+// Package uowstore is a DERISK SPIKE (issue gastownhall/beads#4547, Route A).
+//
+// It implements a tiny slice of storage.DoltStorage over the unit-of-work
+// stack (internal/storage/uow + internal/storage/domain), proving that the
+// full "uowStore adapter" sketched in PROPOSAL-uowstore-adapter.md §2 is
+// buildable: one adapter type presenting the old store interface, with each
+// call becoming one short UOW transaction (exactly the proxied-server design).
+//
+// SPIKE-LEGAL SHORTCUT: uowStore EMBEDS storage.DoltStorage as a nil interface
+// value. Only the methods overridden below are real; every other method of the
+// 144-method interface will PANIC with a nil-pointer dereference if called.
+// That is intentional for a vertical-slice spike — it lets us satisfy the
+// interface without stubbing ~136 methods, and any untouched path fails loudly
+// instead of silently. This type must NEVER be shipped as a general store.
+package uowstore
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/uow"
+	"github.com/steveyegge/beads/internal/types"
+)
+
+// uowStore adapts a uow.UnitOfWorkProvider to the storage.DoltStorage
+// interface. The embedded (nil) DoltStorage supplies the ~136 methods this
+// spike does not implement; calling any of them panics (see package doc).
+type uowStore struct {
+	storage.DoltStorage // embedded nil: unimplemented methods panic (spike-legal)
+
+	provider uow.UnitOfWorkProvider
+	actor    string
+}
+
+// New wraps a UnitOfWorkProvider as a spike storage.DoltStorage. actor is the
+// audit actor used for writes (the store interface's write methods that already
+// carry an actor argument use that argument; CreateIssue does not, so the
+// construction-time actor is used — matching how the CLI threads identity).
+func New(provider uow.UnitOfWorkProvider, actor string) storage.DoltStorage {
+	return &uowStore{provider: provider, actor: actor}
+}
+
+var _ storage.DoltStorage = (*uowStore)(nil)
+
+// ---- reads: open UOW, call use-case, Close (rollback). NEVER Commit("") ----
+
+// GetIssue mirrors issueops.GetIssueInTx: probe the issues table, then the
+// wisps table, and return storage.ErrNotFound (not sql.ErrNoRows) when neither
+// has the row. The use-case's GetIssue only probes issues and surfaces a
+// wrapped sql.ErrNoRows, so the adapter owns both the wisp fallback and the
+// error-code translation the store contract requires.
+func (s *uowStore) GetIssue(ctx context.Context, id string) (*types.Issue, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close(ctx)
+
+	issue, err := u.IssueUseCase().GetIssue(ctx, id)
+	if err == nil {
+		return issue, nil
+	}
+	if !isNotFound(err) {
+		return nil, err
+	}
+
+	wisp, werr := u.IssueUseCase().GetWisp(ctx, id)
+	if werr == nil {
+		return wisp, nil
+	}
+	if isNotFound(werr) {
+		return nil, fmt.Errorf("%w: issue %s", storage.ErrNotFound, id)
+	}
+	return nil, werr
+}
+
+// GetIssuesByIDs backs the molecule-ancestry resolution in the close path
+// (findParentMolecules -> GetIssuesByIDs, cmd/bd/mol_current.go:456). DIRECT.
+func (s *uowStore) GetIssuesByIDs(ctx context.Context, ids []string) ([]*types.Issue, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close(ctx)
+	return u.IssueUseCase().GetIssuesByIDs(ctx, ids)
+}
+
+func (s *uowStore) SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close(ctx)
+
+	page, err := u.IssueUseCase().SearchIssues(ctx, query, filter)
+	if err != nil {
+		return nil, err
+	}
+	return page.Items, nil
+}
+
+func (s *uowStore) SearchIssuesWithCounts(ctx context.Context, query string, filter types.IssueFilter) ([]*types.IssueWithCounts, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close(ctx)
+
+	page, err := u.IssueUseCase().SearchIssuesWithCounts(ctx, query, filter)
+	if err != nil {
+		return nil, err
+	}
+	return page.Items, nil
+}
+
+func (s *uowStore) GetReadyWork(ctx context.Context, filter types.WorkFilter) ([]*types.Issue, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close(ctx)
+
+	page, err := u.IssueUseCase().GetReadyWork(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	return page.Items, nil
+}
+
+func (s *uowStore) GetReadyWorkWithCounts(ctx context.Context, filter types.WorkFilter) ([]*types.IssueWithCounts, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close(ctx)
+
+	page, err := u.IssueUseCase().GetReadyWorkWithCounts(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	return page.Items, nil
+}
+
+// ---- writes: one short tx via uow.RunInTx with an outcome-derived message ----
+
+// CreateIssue mirrors EmbeddedDoltStore.CreateIssue: infra types route to the
+// wisps table, and the caller's *types.Issue is mutated in place with the
+// minted ID (the use-case operates on the same pointer via CreateIssueParams).
+func (s *uowStore) CreateIssue(ctx context.Context, issue *types.Issue, actor string) error {
+	if issue == nil {
+		return fmt.Errorf("issue must not be nil")
+	}
+	if err := s.applyInfraTypeRouting(ctx, issue); err != nil {
+		return err
+	}
+
+	params := domain.CreateIssueParams{Issue: issue}
+	return uow.RunInTxMsg(ctx, s.provider, func(u uow.UnitOfWork) (string, error) {
+		var (
+			res domain.CreateIssueResult
+			err error
+		)
+		if issue.Ephemeral {
+			res, err = u.IssueUseCase().CreateWisp(ctx, params, actor)
+		} else {
+			res, err = u.IssueUseCase().CreateIssue(ctx, params, actor)
+		}
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("bd: create %s", res.Issue.ID), nil
+	})
+}
+
+// CloseIssue mirrors EmbeddedDoltStore.CloseIssue: the raw close op only
+// (command-level validation — epic children, gate satisfaction, blocker checks
+// — lives above the store and is out of scope here). Probes issue-or-wisp so
+// the right table is closed, exactly as the proxied close command does.
+func (s *uowStore) CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error {
+	params := domain.CloseIssueParams{Reason: reason, Session: session}
+	return uow.RunInTxMsg(ctx, s.provider, func(u uow.UnitOfWork) (string, error) {
+		isWisp, err := s.isWisp(ctx, u, id)
+		if err != nil {
+			return "", err
+		}
+		if isWisp {
+			_, err = u.IssueUseCase().CloseWisp(ctx, id, params, actor)
+		} else {
+			_, err = u.IssueUseCase().CloseIssue(ctx, id, params, actor)
+		}
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("bd: close %s", id), nil
+	})
+}
+
+// ---- show-detail reads (labels / deps-with-metadata / counts) ----
+//
+// `bd show --json` (default output) fans out from GetIssue into these five
+// reads before rendering (cmd/bd/show.go:149-158), so the "get" leg of the
+// round-trip needs them. GetLabels and the counts are DIRECT; the
+// *WithMetadata pair is the doc's §4.2 COMPOSE (ListWithIssueMetadata with a
+// direction). NOTE: the store's counts sum the regular + wisp dependency
+// tables (embeddeddolt/counts.go); this spike counts only the regular table
+// via the use-case, which is correct for regular issues but is the documented
+// wisp-union gap for a full adapter.
+
+func (s *uowStore) GetLabels(ctx context.Context, issueID string) ([]string, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close(ctx)
+	return u.LabelUseCase().GetLabels(ctx, issueID)
+}
+
+func (s *uowStore) GetDependenciesWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close(ctx)
+	return u.DependencyUseCase().ListWithIssueMetadata(ctx, issueID, domain.DepListFilter{Direction: domain.DepDirectionOut})
+}
+
+func (s *uowStore) GetDependentsWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close(ctx)
+	return u.DependencyUseCase().ListWithIssueMetadata(ctx, issueID, domain.DepListFilter{Direction: domain.DepDirectionIn})
+}
+
+func (s *uowStore) CountDependencies(ctx context.Context, issueID string) (int64, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer u.Close(ctx)
+	return u.DependencyUseCase().CountByIssueID(ctx, issueID, domain.DepListFilter{Direction: domain.DepDirectionOut})
+}
+
+func (s *uowStore) CountDependents(ctx context.Context, issueID string) (int64, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer u.Close(ctx)
+	return u.DependencyUseCase().CountByIssueID(ctx, issueID, domain.DepListFilter{Direction: domain.DepDirectionIn})
+}
+
+func (s *uowStore) CountIssueComments(ctx context.Context, issueID string) (int64, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer u.Close(ctx)
+	return u.CommentUseCase().CountCommentsForIssue(ctx, issueID)
+}
+
+// ---- close-path reads (blocker check + molecule ancestry walk) ----
+//
+// `bd close` (store path) runs a pre-close blocker check (IsBlocked) and an
+// unconditional parent-molecule auto-close probe (findParentMolecules ->
+// GetDependencyRecordsForIssues, cmd/bd/mol_current.go:413). Both are DIRECT
+// maps onto DependencyUseCase.
+
+func (s *uowStore) IsBlocked(ctx context.Context, issueID string) (bool, []string, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return false, nil, err
+	}
+	defer u.Close(ctx)
+	return u.DependencyUseCase().IsBlocked(ctx, issueID)
+}
+
+func (s *uowStore) GetDependencyRecordsForIssues(ctx context.Context, issueIDs []string) (map[string][]*types.Dependency, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close(ctx)
+	return u.DependencyUseCase().GetForIssueIDs(ctx, issueIDs)
+}
+
+// ---- config-metadata reads (ConfigMetadataStore) ----
+//
+// These are NOT part of the original 5-8 core issue methods, but the core read
+// commands (list/create/show/ready) transitively require them: the CLI's list
+// filter loader calls GetCustomStatusesDetailed/GetCustomTypes/GetInfraTypes on
+// the store before it ever calls SearchIssues (cmd/bd/list_filter.go). So a
+// working vertical slice for those commands must implement them too. They are
+// all DIRECT 1:1 maps onto domain.ConfigUseCase — with two signature snags the
+// adapter absorbs: the store's GetInfraTypes/IsInfraTypeCtx drop the error the
+// use-case returns.
+
+func (s *uowStore) GetCustomStatusesDetailed(ctx context.Context) ([]types.CustomStatus, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close(ctx)
+	return u.ConfigUseCase().GetCustomStatuses(ctx)
+}
+
+func (s *uowStore) GetCustomTypes(ctx context.Context) ([]string, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close(ctx)
+	return u.ConfigUseCase().GetCustomTypes(ctx)
+}
+
+// GetInfraTypes drops the error to satisfy the store signature — a spike
+// simplification. A real adapter needs a signature-compatible surface here (the
+// store contract has no error channel), which is a documented §4 friction point.
+func (s *uowStore) GetInfraTypes(ctx context.Context) map[string]bool {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil
+	}
+	defer u.Close(ctx)
+	out, err := u.ConfigUseCase().GetInfraTypes(ctx)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+// GetConfig / GetAllConfig back the CLI's repo auto-routing preflight
+// (cmd/bd/routing_read.go), which every read command runs before touching
+// issues. Both are DIRECT maps onto domain.ConfigUseCase.
+func (s *uowStore) GetConfig(ctx context.Context, key string) (string, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer u.Close(ctx)
+	return u.ConfigUseCase().GetConfig(ctx, key)
+}
+
+func (s *uowStore) GetAllConfig(ctx context.Context) (map[string]string, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close(ctx)
+	return u.ConfigUseCase().GetAllConfig(ctx)
+}
+
+// ---- helpers ----
+
+// isWisp reports whether id lives in the wisps table, given an open UOW. It
+// distinguishes wisp from regular by probing GetIssue first (matching the
+// proxied command's proxiedResolveIssueOrWisp order).
+func (s *uowStore) isWisp(ctx context.Context, u uow.UnitOfWork, id string) (bool, error) {
+	if _, err := u.IssueUseCase().GetIssue(ctx, id); err == nil {
+		return false, nil
+	} else if !isNotFound(err) {
+		return false, err
+	}
+	if _, err := u.IssueUseCase().GetWisp(ctx, id); err == nil {
+		return true, nil
+	} else if !isNotFound(err) {
+		return false, err
+	}
+	// Not found in either table; let the close use-case surface the canonical
+	// not-found error rather than guessing a table here.
+	return false, nil
+}
+
+// applyInfraTypeRouting flips issue.Ephemeral for infra types, matching
+// EmbeddedDoltStore.CreateIssue. Runs in its own read-only UOW so the flag is
+// resolved before the write tx opens (RunInTxMsg may replay fn, so the routing
+// must be idempotent and pre-computed).
+func (s *uowStore) applyInfraTypeRouting(ctx context.Context, issue *types.Issue) error {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return err
+	}
+	defer u.Close(ctx)
+
+	isInfra, err := u.ConfigUseCase().IsInfraTypeCtx(ctx, issue.IssueType)
+	if err != nil {
+		return fmt.Errorf("infra-type routing: %w", err)
+	}
+	if isInfra {
+		issue.Ephemeral = true
+	}
+	return nil
+}
+
+// isNotFound covers both the storage-package sentinel and the raw sql.ErrNoRows
+// that the domain repositories wrap, so the adapter can translate the uow
+// path's not-found convention to the store contract's storage.ErrNotFound.
+func isNotFound(err error) bool {
+	return errors.Is(err, storage.ErrNotFound) || errors.Is(err, sql.ErrNoRows)
+}

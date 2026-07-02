@@ -1079,7 +1079,13 @@ var rootCmd = &cobra.Command{
 		// other helper paths stay in lockstep with the main command path.
 		dolt.ApplyCLIAutoStart(beadsDir, doltCfg)
 
-		if proxiedServerMode {
+		// BD_SPIKE_UOWSTORE (issue #4547 Route A derisk): in proxied mode the CLI
+		// normally short-circuits to the uowProvider path and dispatches through
+		// the *_proxied_server.go duals. With the spike flag set we instead fall
+		// through to newDoltStore, which returns a uowstore adapter, so commands
+		// travel the ordinary store path — exercising exactly the adapter this
+		// spike is proving. Default (unset) keeps the original short-circuit.
+		if proxiedServerMode && !spikeUOWStore() {
 			p, err := newProxiedServerUOWProvider(rootCtx, beadsDir)
 			if err != nil {
 				return HandleError("failed to open uow provider: %v", err)
