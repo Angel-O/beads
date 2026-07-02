@@ -279,6 +279,43 @@ func TestSpikeUOWStore_CLIUnsupportedIsCleanError(t *testing.T) {
 	}
 }
 
+// TestSpikeUOWStore_IsInfraTypeCtxRoutes is the tripwire for the IsInfraTypeCtx
+// override (#4547 slice-2 finding 2). IsInfraTypeCtx has no error channel, so the
+// generated shell can only return the zero value (false) — it CANNOT return a
+// typed ErrUnsupported. Left to the shell, an infra type would silently answer
+// false, the exact silent-divergence class the spike exists to surface, and it is
+// reachable under BD_SPIKE_UOWSTORE=1 from wisp.go's infra-type gating.
+//
+// The override must therefore route to the use-case. This test proves it: seed
+// types.infra directly in the config table, then a real override returns true for
+// a configured infra type while the shell stub would still return false. The
+// negative case (a non-configured type) guards against the override answering
+// true unconditionally.
+func TestSpikeUOWStore_IsInfraTypeCtxRoutes(t *testing.T) {
+	requireProxiedServerEnv(t)
+	bd := buildEmbeddedBD(t)
+	_, _, proj := setupSpikeProxiedWorkspace(t, bd, "spikeinfra")
+	st1, _ := spikeTxStores(t, proj)
+	ctx := context.Background()
+
+	// Seed types.infra in the config table via the proxied DB. GetInfraTypes
+	// returns an empty map when the key is unset (domain/db/config.go:287), so
+	// without this seed the override and the stub both return false and would be
+	// indistinguishable — the seed is what makes this a real tripwire.
+	db := openProxiedDB(t, proj)
+	if _, err := db.ExecContext(ctx,
+		"REPLACE INTO config (`key`, value) VALUES (?, ?)", "types.infra", "agent,role,message"); err != nil {
+		t.Fatalf("seed types.infra: %v", err)
+	}
+
+	if !st1.IsInfraTypeCtx(ctx, types.IssueType("agent")) {
+		t.Error("IsInfraTypeCtx(agent) = false; the generated stub answered instead of the use-case override")
+	}
+	if st1.IsInfraTypeCtx(ctx, types.IssueType("task")) {
+		t.Error("IsInfraTypeCtx(task) = true; want false for a non-infra type")
+	}
+}
+
 // mustTxStatus reads an issue's status through the transaction view.
 func spikeTxStatus(t *testing.T, tx storage.Transaction, id string) types.Status {
 	t.Helper()
