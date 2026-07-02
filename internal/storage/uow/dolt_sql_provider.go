@@ -65,6 +65,7 @@ func (p *doltSQLProvider) BeginTx(ctx context.Context) (Tx, error) {
 
 	_, err := conn.ExecContext(ctx, "START TRANSACTION;")
 	if err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("uow: failed to start transaction: %w", err)
 	}
 
