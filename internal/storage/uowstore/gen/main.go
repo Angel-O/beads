@@ -41,14 +41,16 @@ var targets = []target{
 }
 
 const (
-	srcDir      = ".." // go:generate CWD is internal/storage/uowstore
-	outFile     = "unsupported_gen.go"
-	storagePath = "github.com/steveyegge/beads/internal/storage"
+	// defaultSrcDir is the storage package dir relative to the go:generate CWD
+	// (internal/storage/uowstore); defaultOutFile is where the shell is written.
+	defaultSrcDir  = ".."
+	defaultOutFile = "unsupported_gen.go"
+	storagePath    = "github.com/steveyegge/beads/internal/storage"
 )
 
 func main() {
 	log.SetFlags(0)
-	if err := run(); err != nil {
+	if err := run(defaultSrcDir, defaultOutFile); err != nil {
 		log.Fatalf("gen: %v", err)
 	}
 }
@@ -60,7 +62,11 @@ type pkgInfo struct {
 	imports    map[string]string             // local name -> import path
 }
 
-func run() error {
+// run parses the storage package under srcDir and writes the typed-unsupported
+// shell to outFile. It is parameterized on both paths so a regen-idempotence
+// test can regenerate to a temp path and byte-compare against the committed file
+// without clobbering it.
+func run(srcDir, outFile string) error {
 	info, err := parsePackage(srcDir)
 	if err != nil {
 		return err
