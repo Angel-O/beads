@@ -39,6 +39,7 @@ type ConfigUseCase interface {
 	SetConfig(ctx context.Context, key, value string) error
 	DeleteConfig(ctx context.Context, key string) error
 	GetAllConfig(ctx context.Context) (map[string]string, error)
+	GetMetadata(ctx context.Context, key string) (string, error)
 }
 
 // CreateContext bundles the read-only config inputs that bd create needs
@@ -143,6 +144,14 @@ func (u *configUseCaseImpl) GetConfig(ctx context.Context, key string) (string, 
 	out, err := u.cfgRepo.GetConfig(ctx, key)
 	if err != nil {
 		return "", fmt.Errorf("GetConfig: %w", err)
+	}
+	return out, nil
+}
+
+func (u *configUseCaseImpl) GetMetadata(ctx context.Context, key string) (string, error) {
+	out, err := u.cfgRepo.GetMetadata(ctx, key)
+	if err != nil {
+		return "", fmt.Errorf("GetMetadata: %w", err)
 	}
 	return out, nil
 }

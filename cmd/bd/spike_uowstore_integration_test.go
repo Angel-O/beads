@@ -13,12 +13,13 @@
 // command that boots the managed proxy + child dolt sql-server and auto-creates
 // the schema (uow/dolt_sql_provider.go initSchema). issue_prefix — which normal
 // `bd init` seeds via SetConfig — is seeded here directly over the proxy, since
-// the spike store deliberately overrides only ~7 methods and SetConfig is not
-// among them.
+// the spike store overrides only a read/write vertical slice (23 methods) and
+// SetConfig is not among them.
 package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -340,4 +341,124 @@ func TestSpikeUOWStore_RoundTrip(t *testing.T) {
 	if arr := jsonSlice(t, spikeReady2); len(arr) != 0 {
 		t.Errorf("spike ready after close = %d issues, want 0", len(arr))
 	}
+
+	// labeled create: the adapter must thread issue.Labels into CreateIssueParams,
+	// or bd create silently drops every label on the store path (#4547 red-team).
+	// Assert the labels PERSIST by reading them back via bd show on BOTH backends.
+	assertLabeledCreateRoundTrips(t, bd, spikeDir, spikeEnv, embDir, embEnv)
+
+	// not-found read: exercises the adapter's bespoke wisp-fallback +
+	// sql.ErrNoRows→storage.ErrNotFound translation in GetIssue, which the
+	// happy-path round trip never reaches. Both backends must agree on exit code.
+	assertNotFoundShowParity(t, bd, spikeDir, spikeEnv, embDir, embEnv)
+}
+
+// assertLabeledCreateRoundTrips creates a labeled issue on both the spike and the
+// embedded backend and asserts bd show reports the SAME persisted label set. This
+// is the regression guard for the label-drop blocker: before the CreateIssueParams
+// mapping, the spike side returned zero labels while embedded returned the label.
+func assertLabeledCreateRoundTrips(t *testing.T, bd, spikeDir string, spikeEnv []string, embDir string, embEnv []string) {
+	t.Helper()
+	const label = "spikelabel"
+
+	spikeOut, se, err := spikeRun(t, bd, spikeDir, spikeEnv,
+		"create", "Labeled task", "--json", "-t", "task", "-l", label)
+	if err != nil {
+		t.Fatalf("spike labeled create failed: %v\n%s", err, se)
+	}
+	embOut, ee, err := spikeRun(t, bd, embDir, embEnv,
+		"create", "Labeled task", "--json", "-t", "task", "-l", label)
+	if err != nil {
+		t.Fatalf("embedded labeled create failed: %v\n%s", err, ee)
+	}
+	spikeID := fmt.Sprint(jsonObject(t, spikeOut)["id"])
+	embID := fmt.Sprint(jsonObject(t, embOut)["id"])
+
+	spikeLabels := showLabelsForEnv(t, bd, spikeDir, spikeEnv, spikeID)
+	embLabels := showLabelsForEnv(t, bd, embDir, embEnv, embID)
+	if len(spikeLabels) == 0 {
+		t.Fatalf("spike labeled create: bd show returned NO labels (label dropped) — want %q", label)
+	}
+	if !equalStringSets(spikeLabels, embLabels) {
+		t.Errorf("labeled create: label sets differ across backends: spike=%v embedded=%v", spikeLabels, embLabels)
+	}
+	if !containsString(spikeLabels, label) {
+		t.Errorf("spike labeled create: labels %v missing %q", spikeLabels, label)
+	}
+}
+
+// showLabels reads the labels array from `bd show <id> --json`.
+func showLabelsForEnv(t *testing.T, bd, dir string, env []string, id string) []string {
+	t.Helper()
+	out, se, err := spikeRun(t, bd, dir, env, "show", id, "--json")
+	if err != nil {
+		t.Fatalf("show %s failed: %v\n%s", id, err, se)
+	}
+	obj := jsonObject(t, out)
+	raw, ok := obj["labels"].([]any)
+	if !ok {
+		return nil
+	}
+	labels := make([]string, 0, len(raw))
+	for _, v := range raw {
+		labels = append(labels, fmt.Sprint(v))
+	}
+	return labels
+}
+
+// assertNotFoundShowParity runs `bd show <nonexistent> --json` on both backends
+// and asserts they agree on exit code (both nonzero). This drives the adapter's
+// ErrNotFound translation + wisp fallback, the riskiest hand-written path.
+func assertNotFoundShowParity(t *testing.T, bd, spikeDir string, spikeEnv []string, embDir string, embEnv []string) {
+	t.Helper()
+	const missing = "nope-does-not-exist"
+	_, _, spikeErr := spikeRun(t, bd, spikeDir, spikeEnv, "show", missing, "--json")
+	_, _, embErr := spikeRun(t, bd, embDir, embEnv, "show", missing, "--json")
+	spikeCode := exitCode(spikeErr)
+	embCode := exitCode(embErr)
+	if spikeCode == 0 {
+		t.Errorf("spike show <missing> exited 0, want nonzero (not-found)")
+	}
+	if spikeCode != embCode {
+		t.Errorf("show <missing> exit codes differ: spike=%d embedded=%d", spikeCode, embCode)
+	}
+}
+
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
+}
+
+func equalStringSets(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, s := range a {
+		seen[s]++
+	}
+	for _, s := range b {
+		seen[s]--
+	}
+	for _, n := range seen {
+		if n != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func containsString(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
 }

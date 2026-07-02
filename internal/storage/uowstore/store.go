@@ -10,8 +10,9 @@
 // value. Only the methods overridden below are real; every other method of the
 // 144-method interface will PANIC with a nil-pointer dereference if called.
 // That is intentional for a vertical-slice spike — it lets us satisfy the
-// interface without stubbing ~136 methods, and any untouched path fails loudly
-// instead of silently. This type must NEVER be shipped as a general store.
+// interface without stubbing the 121 unimplemented methods, and any untouched
+// path fails loudly instead of silently. This type must NEVER be shipped as a
+// general store.
 package uowstore
 
 import (
@@ -27,19 +28,22 @@ import (
 )
 
 // uowStore adapts a uow.UnitOfWorkProvider to the storage.DoltStorage
-// interface. The embedded (nil) DoltStorage supplies the ~136 methods this
+// interface. The embedded (nil) DoltStorage supplies the 121 methods this
 // spike does not implement; calling any of them panics (see package doc).
 type uowStore struct {
 	storage.DoltStorage // embedded nil: unimplemented methods panic (spike-legal)
 
 	provider uow.UnitOfWorkProvider
-	actor    string
+	actor    string // construction-time identity; unused in the spike slice (see New)
 }
 
 // New wraps a UnitOfWorkProvider as a spike storage.DoltStorage. actor is the
-// audit actor used for writes (the store interface's write methods that already
-// carry an actor argument use that argument; CreateIssue does not, so the
-// construction-time actor is used — matching how the CLI threads identity).
+// construction-time audit identity. NOTE: it is currently UNUSED — every store
+// method this spike overrides (CreateIssue, CloseIssue, …) carries its own actor
+// argument, so nothing reads s.actor. It is retained deliberately: §4.0's
+// Identity-on-the-seam rule means the full adapter will need a construction-time
+// actor for the methods that lack one, and threading getActor() here documents
+// that seam now. Drop it if the real adapter proves it is never needed.
 func New(provider uow.UnitOfWorkProvider, actor string) storage.DoltStorage {
 	return &uowStore{provider: provider, actor: actor}
 }
@@ -150,6 +154,15 @@ func (s *uowStore) GetReadyWorkWithCounts(ctx context.Context, filter types.Work
 // CreateIssue mirrors EmbeddedDoltStore.CreateIssue: infra types route to the
 // wisps table, and the caller's *types.Issue is mutated in place with the
 // minted ID (the use-case operates on the same pointer via CreateIssueParams).
+//
+// Label mapping is load-bearing: the embedded store persists issue.Labels (via
+// issueops.PersistLabels, which reads the *types.Issue), but the domain create
+// use-case reads only params.Labels — so the adapter must copy issue.Labels
+// across, or bd create silently drops every label on this path (#4547 red-team).
+// issue.Comments is NOT mapped: the create use-case has no comment path, and the
+// store-path bd create never populates Comments (comments arrive via bd comment
+// add). A full adapter that must round-trip imported comments needs a
+// comment-write gap unit — see SPIKE-REPORT §3.
 func (s *uowStore) CreateIssue(ctx context.Context, issue *types.Issue, actor string) error {
 	if issue == nil {
 		return fmt.Errorf("issue must not be nil")
@@ -158,7 +171,7 @@ func (s *uowStore) CreateIssue(ctx context.Context, issue *types.Issue, actor st
 		return err
 	}
 
-	params := domain.CreateIssueParams{Issue: issue}
+	params := domain.CreateIssueParams{Issue: issue, Labels: issue.Labels}
 	return uow.RunInTxMsg(ctx, s.provider, func(u uow.UnitOfWork) (string, error) {
 		var (
 			res domain.CreateIssueResult
@@ -353,6 +366,34 @@ func (s *uowStore) GetAllConfig(ctx context.Context) (map[string]string, error) 
 	}
 	defer u.Close(ctx)
 	return u.ConfigUseCase().GetAllConfig(ctx)
+}
+
+// ---- PreRun-surface reads (not command handlers, but on every write path) ----
+//
+// These are NOT reached by any of the five headline commands' RunE, but by the
+// PersistentPreRunE helpers that run BEFORE it: validateWorkspaceIdentity calls
+// GetMetadata (main.go:1441) for every write command, and maybeAutoImportJSONL
+// calls GetStatistics (auto_import_upgrade.go) on any workspace with a non-empty
+// issues.jsonl. Without them the spike store nil-panics before RunE on real
+// workspaces — the transitive census in §4 must cover PreRun, not just handlers.
+// Both are DIRECT 1:1 use-case maps.
+
+func (s *uowStore) GetMetadata(ctx context.Context, key string) (string, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer u.Close(ctx)
+	return u.ConfigUseCase().GetMetadata(ctx, key)
+}
+
+func (s *uowStore) GetStatistics(ctx context.Context) (*types.Statistics, error) {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close(ctx)
+	return u.IssueUseCase().GetStatistics(ctx)
 }
 
 // ---- helpers ----
