@@ -327,6 +327,28 @@ func (s *uowStore) GetInfraTypes(ctx context.Context) map[string]bool {
 	return out
 }
 
+// IsInfraTypeCtx is the other no-error-channel store method (same snag as
+// GetInfraTypes: the use-case returns (bool, error), the store contract returns
+// bare bool). It MUST be a real override, not left to the generated shell: the
+// shell's zero-value stub silently answers false, and this is reachable under
+// BD_SPIKE_UOWSTORE=1 from cmd/bd/wisp.go (store.IsInfraTypeCtx gates infra-type
+// wisp handling at :637/:682/:759). A silent false there is exactly the
+// silent-divergence class this spike exists to surface, so we swallow the error
+// to false — loud typed errors are impossible on this signature, but a real
+// override at least routes to the use-case instead of the stub.
+func (s *uowStore) IsInfraTypeCtx(ctx context.Context, t types.IssueType) bool {
+	u, err := s.provider.NewUOW(ctx)
+	if err != nil {
+		return false
+	}
+	defer u.Close(ctx)
+	isInfra, err := u.ConfigUseCase().IsInfraTypeCtx(ctx, t)
+	if err != nil {
+		return false
+	}
+	return isInfra
+}
+
 // GetConfig / GetAllConfig back the CLI's repo auto-routing preflight
 // (cmd/bd/routing_read.go), which every read command runs before touching
 // issues. Both are DIRECT maps onto domain.ConfigUseCase.
