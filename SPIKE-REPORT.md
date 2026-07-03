@@ -549,3 +549,89 @@ flag-gated factory wiring. The adapter is complete for the gc-16 call-set only (
 cross-plumbing run is a corpus differential, not an equivalence proof (§9.3), and 3
 of its divergences remain accepted-by-allowlist while 4 class-(a) findings (F-1, F-2,
 F-3, F-5) remain open.
+
+### 9.7 Slice 4 — equivalence-clean
+
+(Numbered 9.7, not 9.5: 9.5/9.6 above are already taken by the Slice-3 record.)
+
+Slice 4 closes the four class-(a) findings §9.5 left open (F-1, F-2, F-3, F-5;
+F-4 was already fixed in the Slice-3 lifecycle work) so the flag-off embedded ↔
+`BD_SPIKE_UOWSTORE` spike-proxied cross-plumbing differential is
+equivalence-clean: every remaining in-scope divergence is one of the 3
+allowlisted mode/unsupported/artifact differences (AX-1..AX-3), and no class-(a)
+finding diverges.
+
+The four fixes (embedded is the reference on every one):
+
+- **F-1 — dep-add error wording (`f4c20cfa8`).** `AddDependency` routes through
+  the domain use-case, which surfaced the three `bd dep add` rejections
+  differently from embedded. The use-case `add()` now checks self-dependency
+  before the cycle probe, emits the bare `"adding dependency would create a
+  cycle"` message, and passes the retype conflict through as a typed
+  `domain.DependencyTypeConflictError` whose `Error()` is byte-identical to the
+  embedded `issueops` string.
+- **F-2 — `--no-history` list visibility (`f9cebb9dd`).** `CreateIssue` only
+  routed `Ephemeral` beads to the wisps table, so a `--no-history` bead landed
+  in `issues` and showed up in `list --all` / `count`. Embedded's `useWispsTable`
+  is `Ephemeral || NoHistory || infra`; routing `issue.NoHistory` to `CreateWisp`
+  (ephemeral=0) hides it from `list --all` while `ready` still surfaces it.
+- **F-3 — `-t message` infra-type auto-ephemeral (`a0c5879f1`).** The domain
+  `ConfigUseCase.GetInfraTypes` returned only the (empty-by-default) `types.infra`
+  DB key, so `IsInfraTypeCtx("message")` answered false. Reproduced embedded's
+  config.yaml → hardcoded-defaults (`agent`/`role`/`message`) fallback in the
+  use-case layer so an unset `types.infra` classifies those types as infra on
+  both plumbings.
+- **F-5 — close-output label hydration (`f9cebb9dd`).** `close --json` re-fetches
+  via `GetIssue`, but the adapter returned the row without labels, so the close
+  object carried `labels=null` though labels persisted. `getIssueInUOW` now
+  hydrates labels (issues→labels, wisp→wisp_labels), mirroring
+  `issueops.GetIssueInTx`.
+
+Differential guards (`426dd0626`) — `TestSpikeUOWStore_CrossPlumbFindings` runs
+each remediated command on both plumbings with prefix-normalized IDs and asserts
+byte-identical observable output (gated behind `BEADS_TEST_PROXIED_SERVER=1`).
+The recorded run itself is `37f621752`.
+
+**Both oracle verdicts (verbatim):**
+
+- Oracle X: `[oracle-x] IN-SCOPE PASS=41 FAIL=3 / [oracle-x] attribution gate OK
+  — every divergence is attributed. (exit 0; the 3 divergences are exactly
+  allowlist AX-1 sql_unsupported_embedded, AX-2 config_set_protected_keys, AX-3
+  comment_add_list — all class b/c/d; ZERO class-(a) divergences)`
+- Oracle A: `[oracle-a] RESULT: IN-SCOPE PASS (44 scenarios, 0 divergences) —
+  refactor is behavior-preserving on the gc-contract surface. (exit 0)`
+
+**Review findings and dispositions.** An adversarial review of the slice raised
+one class-(a) finding; it was fixed (not refuted):
+
+- **fix2 (`ade2eba3b87e99cf404135e67d7594df950fca0d`) — spike create path skipped
+  validation.** The spike `CreateIssue` never ran `issue` validation, so it
+  diverged from `EmbeddedDoltStore` on two `create` inputs embedded rejects with
+  exit 1: custom-only types (`-t agent`/`-t role`/`-t totallybogus`) succeeded
+  and — after the F-3 classification fix — silently became ephemeral wisps; and
+  `-t message --no-history` persisted a bead with both `ephemeral=true` and
+  `no_history=true`, the mutually-exclusive state embedded's validator forbids
+  (GH#2619). `prepareForCreate` (renamed from `applyInfraTypeRouting`) now runs
+  `ValidateWithCustom` against the same custom status/type sets embedded reads,
+  wrapping the error byte-identically; the infra-type ephemeral flip stays
+  unconditional to match `EmbeddedDoltStore.CreateIssue`, so the
+  `message`+`--no-history` combo reaches the validator instead of slipping
+  through. `TestSpikeUOWStore_CrossPlumbFindings` gained a
+  `create_validation_parity` subtest pinning all four rejections to embedded's
+  message and exit code; full oracle-a stays 44/44 in-scope (the default embedded
+  path is untouched).
+
+Pre-existing unrelated failure left untouched per the same hard rule as §9.5:
+`internal/storage/issueops/config_yaml_fallback_test.go` (a deliberate untracked
+file) fails on custom-types/status-fallback in a lower layer these edits do not
+touch.
+
+**What equivalence-clean does and does NOT prove.** It proves that on the gc-16
+contract surface the spike plumbing (`BD_SPIKE_UOWSTORE`, the proxied UOW-store
+adapter) produces byte-identical observable behavior to the flag-off embedded
+store — for those two Dolt-backed plumbings, and only for the corpus/oracle
+scenarios exercised. It does **not** prove full equivalence beyond the exercised
+surface (24 of 144 methods; the other 118 stay typed-unsupported), it does **not**
+lift the init gate or touch any `*_proxied_server.go` dual, and — most
+importantly — it says **nothing about Postgres**: both sides of this differential
+run over Dolt, so PG is not involved and no PG-backend equivalence is implied.
