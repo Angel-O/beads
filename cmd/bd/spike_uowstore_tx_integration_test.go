@@ -262,14 +262,23 @@ func TestSpikeUOWStore_CLIUnsupportedIsCleanError(t *testing.T) {
 	x := spikeFirstJSONID(t, xOut)
 	y := spikeFirstJSONID(t, yOut)
 
-	// bd dep add falls through to store-level AddDependency (dep.go:378), which
-	// is a typed-unsupported store method on the spike path.
-	stdout, stderr, err := spikeRun(t, bd, spikeDir, spikeEnv, "dep", "add", x, y)
+	// Slice 3 implemented store-level AddDependency (dep.go:378 path), so bd dep
+	// add now SUCCEEDS through the spike store instead of returning the typed
+	// unsupported error it did in Slice 2.
+	if stdout, stderr, addErr := spikeRun(t, bd, spikeDir, spikeEnv, "dep", "add", x, y); addErr != nil {
+		t.Fatalf("bd dep add exited nonzero, want success (AddDependency implemented in Slice 3): %v\n%s%s", addErr, stdout, stderr)
+	}
+
+	// The clean-error contract now rides a method the census leaves genuinely
+	// unsupported: count --by-status -> store.CountIssuesByGroup (no domain
+	// cardinality-by-group seam). It must surface the typed ErrUnsupported text,
+	// exit nonzero, and never panic or dump a goroutine trace.
+	stdout, stderr, err := spikeRun(t, bd, spikeDir, spikeEnv, "count", "--by-status")
 	combined := stdout + stderr
 	if exitCode(err) == 0 {
-		t.Fatalf("bd dep add exited 0, want nonzero (unsupported)\noutput:\n%s", combined)
+		t.Fatalf("bd count --group-by exited 0, want nonzero (unsupported)\noutput:\n%s", combined)
 	}
-	if !strings.Contains(combined, `operation "AddDependency" not supported by the uowstore spike backend`) {
+	if !strings.Contains(combined, `operation "CountIssuesByGroup" not supported by the uowstore spike backend`) {
 		t.Errorf("output missing typed ErrUnsupported text:\n%s", combined)
 	}
 	for _, bad := range []string{"panic:", "goroutine ", "runtime error"} {
