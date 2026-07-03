@@ -398,3 +398,154 @@ changes §6.6 describes, not spike work. The Transaction view is still 3-of-24
 methods; the rest are typed-unsupported. And the shell's typed errors, while loud,
 are still a spike contract (`Backend == "uowstore spike"`, #4547 in the message) —
 the real seam's `ErrUnsupported{Op, Backend}` will name the actual backend.
+
+## 9. Slice 3 — gc-16 census, adapter completion, and the first cross-plumbing run
+
+Slice 3 turns §7's *"do the census first"* prerequisite into an artifact, completes
+the gc-16 adapter surface against that census, and stands up the first
+**cross-plumbing** differential (one binary, embedded vs spike-proxied) so the
+"faithful only where re-threaded" claim of §2 is measured rather than asserted. It
+touches additive spike files plus two domain-layer parity fixes; the default
+(`BD_SPIKE_UOWSTORE`-unset) embedded path is exercised as the *reference* of the new
+run, so its behavior is pinned by construction rather than merely left alone.
+
+### 9.1 The census artifact and its headline numbers
+
+`SPIKE-CENSUS-GC16.md` traces the EMBEDDED command path for each of the 16 gc
+commands (the 12 dual commands + `purge`, `count`, `version`, `stats`) down to the
+`storage.DoltStorage` calls it actually makes — direct (own `RunE`), transitive
+(PreRun molecules loader / routing preflight / id resolver / PostRun tip metadata),
+with explicit counting rules stated up front. The counts it establishes, and which
+the rest of the slice is scored against:
+
+- The generated shell (`unsupported_gen.go`) stubs **144** `DoltStorage` + **24**
+  `Transaction` methods. This corrects the looser interface-census figure §8/§6.6
+  worked from (~107); the census is the accurate denominator §7 asked for.
+- The adapter overrides **24** `DoltStorage` methods (+ `Close`, `RunInTransaction`)
+  and **3** `Transaction` methods (`GetIssue`, `CloseIssue`, `AddDependency`),
+  leaving **118** `DoltStorage` methods still typed-unsupported.
+- The 24 overridden are exactly the read/mutation set the gc-16 handlers + shared
+  surfaces reach on the embedded baseline (listed in the census "Coverage baseline"
+  block), so "complete for gc-16" means *complete for what those commands call*, not
+  complete for the interface.
+
+Honest limit: the baseline traced is the embedded path, and PostRun's write arm is
+*bypassed* on the spike path (it sits in the `else` of `proxiedServerMode`, which
+stays true under the flag — §4). PostRun-only methods are therefore latent on the
+spike path even though the embedded baseline reaches them; the census flags this
+per-row rather than hiding it.
+
+### 9.2 Adapter surface now covered (24 of the gc-16 call-set)
+
+Adapter completion landed in `fbb2bc332` (uowstore) with its coverage +
+error-mapping contract pinned by `53c72a602`. Every gc-16 command's embedded
+call-set is now overridden with a real UOW body sharing one error-mapping helper
+(`storage.ErrNotFound` translation etc.), so the surface a gc-16 command exercises
+no longer falls through to the shell. The 118 untouched methods remain
+typed-unsupported — this is *gc-16 completeness*, not interface completeness, and the
+distinction is the census's whole point.
+
+### 9.3 The cross-plumbing run — result, attribution, and what it does NOT prove
+
+`tests/oracle-a/run-oracle-x.sh` runs ONE working-tree binary through two plumbings:
+embedded (`BD_SPIKE_UOWSTORE` unset) as REFERENCE goldens, and proxied-server +
+uowstore adapter (`BD_SPIKE_UOWSTORE=1`) as CANDIDATE, over the gc-contract corpus.
+This is orthogonal to Oracle A (two binaries, one embedded plumbing — the
+refactor-safety net); Oracle X is one binary, two plumbings.
+
+Result (binary `spike/backend-seam-derisk@f41ece47`, 45 curated scenarios): **33
+in-scope PASS, 11 FAIL (75%)**, plus 1 out-of-scope informational pass. Every one of
+the 11 divergences is attributed by class in `tests/oracle-a/CROSSPLUMB-REPORT.md`:
+
+- **class (a)** — real uowstore-caused behavior difference; a finding, never
+  allowlisted. Seven of the 11: `cycle_reject` and `dep_retype` (F-1, error
+  wording), `tiers_ephemeral` (F-2, `--no-history` list visibility),
+  `ready_excludes_infra_and_coordination_types` + `list_excludes_gate_and_infra_types`
+  (both F-3, `-t message` infra-type not auto-marked ephemeral by the adapter —
+  `uowstore/store.go:495` `IsInfraTypeCtx('message')`), `output_parent_omitempty_boundary`
+  (F-4, `started_at` on the in_progress transition), `purge_dry_run_zero_metrics`
+  (F-5, close-output label hydration).
+- **class (b) mode difference** and **(c) unimplemented-out-of-scope** — allowlistable.
+  Four allowlisted at run time, now **3** after AX-4's withdrawal (see §9.5):
+  `sql_unsupported_embedded` (AX-1, raw-DB rejected on both, different surface),
+  `config_set_protected_keys` (AX-2, sql-server-only key + missing spike `config.yaml`),
+  `comment_add_list` (AX-3, `AddIssueComment` typed-unsupported — `comment` is outside
+  the gc-16 completion set, so NOT a census escape; the harness `IN_SCOPE_CMDS`
+  predates and is broader than gc-16).
+
+**What the run does NOT prove.** It is a differential over a *curated corpus*, not a
+proof of equivalence: (1) it only covers the ~45 scenarios in the rig, so unexercised
+code paths are silent; (2) the reference is the embedded path, so any behavior wrong
+in *both* plumbings passes undetected; (3) golden comparison is post-normalization,
+so anything the normalizer folds (timestamps, hashes) is invisible; (4) an
+allowlisted class-(b)/(c) divergence is an *accepted* difference, not an identical
+one — the allowlist records four such surfaces where the two plumbings deliberately
+differ. The run establishes *where* the proxied-uowstore path is and is not
+byte-equivalent to embedded over the corpus, with every gap attributed — nothing
+stronger.
+
+### 9.4 Two new corpus scenarios
+
+`4de3065a3` pins two PR #4560 review gaps in `tests/oracle-a` (Oracle A corpus):
+**force-close-of-pinned** and the **bd-note separator**. These are corpus additions
+(refactor-safety scenarios), distinct from the Oracle X cross-plumbing run above.
+
+### 9.5 Review findings and dispositions
+
+An adversarial review of the slice raised blocker/major findings; all
+blocker/major items were fixed (none refuted). The fixes:
+
+- **`fb385cd92` (uowstore delete cascade/force + update lifecycle parity)** closes
+  three blockers and two majors in the domain layer:
+  - *DeleteIssues cascade/force absorbed (data-loss blocker).* Added
+    `DeleteIssuesParams.EnforceCascadePolicy/Cascade/Force` +
+    `DeleteIssuesResult.OrphanedIssues`; new `deleteManyWithPolicy` mirrors
+    `issueops.DeleteIssuesInTx` (cascade-expand / refuse-if-external / orphan-under-force).
+    The legacy always-cascade path is preserved for `delete_proxied_server.go`
+    (untouched, per hard rule). Verified live: `delete a b --force` with external
+    `ext` → both plumbings `deleted_count=2`, `orphaned_issues=[ext]`, `ext` survives.
+  - *Batch-delete preview lost its refusal / "Would delete: 0" (blocker).* Same path:
+    refusal returns before the dry-run branch with the identical string, and dry-run
+    `DeletedCount` is now computed.
+  - *UpdateIssue skipped `ManageClosedAt` lifecycle (blocker — `closed_at` NULL / stale
+    on reopen).* `domain/db/issue.go` `Update` now reads the prior row on a status
+    change and applies `issueops.ManageClosedAt` + `ManageStartedAt` (this also fixes
+    the reported **F-4** `started_at`).
+  - *Domain repo always recorded `EventUpdated` (major).* `Update` now uses
+    `issueops.DetermineEventType` (`EventClosed`/`EventReopened`/`EventStatusChanged`).
+- **`c541dda57` (oracle-x attribution gate + ancestor-`.beads` block)** fixes two
+  majors in the harness itself: the `run-oracle-x.sh` exit contract is now enforced
+  (verdict parses allowlisted AX-N headers + attributed report-table names and exits
+  1 on any failing scenario in neither; scoreboard exit captured via `PIPESTATUS`),
+  and an `assert_no_ancestor_beads` preflight now walks `$SCENWORK`→`/` and dies if any
+  ancestor `.beads` exists (confirmed to trip on this host's real stale `/tmp/.beads`).
+- **`4d353d544` (docs)** withdraws AX-4 and records the self-dep divergence: AX-4's
+  `purge_real_then_reseed` `events:4 vs 0` was a mis-classification — a genuine
+  class-(a) counting bug smuggled in as class-(b). Fixed at source in `fb385cd92`
+  (`deleteManyWithPolicy` counts wisp aux rows for `cascadeWispIDs` only, not
+  directly-purged wisps), so the all-ephemeral purge reports `events:0` on both
+  plumbings; AX-4 is withdrawn from `CROSSPLUMB-ALLOWLIST.md` (total 4→3). The doc
+  fix also expands **F-1** to enumerate all three wording divergences including the
+  step-4 self-dependency (embedded "cannot add self-dependency" vs proxied "would
+  create a cycle"), left as an open error-wording finding rather than code-fixed this
+  slice.
+
+Remaining open class-(a) findings after this slice, all outside the blocker/major
+scope of the review: **F-1** (error wording), **F-2** (`--no-history` list
+visibility), **F-3** (`-t message` infra-type auto-ephemeral —
+`uowstore/store.go:495`), **F-5** (close-output label hydration). They are recorded,
+not resolved.
+
+Pre-existing unrelated failure left untouched per hard rule:
+`internal/storage/issueops/config_yaml_fallback_test.go` (a deliberate untracked
+file) fails on custom-types/status-fallback — `issueops` is a lower layer these edits
+do not touch, so it is orthogonal to Slice 3.
+
+### 9.6 What Slice 3 does NOT do
+
+It does not lift the init gate, touch any `*_proxied_server.go` dual, or change the
+flag-gated factory wiring. The adapter is complete for the gc-16 call-set only (24 of
+144 `DoltStorage` methods); the other 118 remain typed-unsupported. The
+cross-plumbing run is a corpus differential, not an equivalence proof (§9.3), and 3
+of its divergences remain accepted-by-allowlist while 4 class-(a) findings (F-1, F-2,
+F-3, F-5) remain open.
