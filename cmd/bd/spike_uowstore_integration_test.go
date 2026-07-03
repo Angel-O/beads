@@ -462,3 +462,235 @@ func containsString(xs []string, want string) bool {
 	}
 	return false
 }
+
+// TestSpikeUOWStore_CrossPlumbFindings pins the four open class-(a) divergences
+// from tests/oracle-a/CROSSPLUMB-REPORT.md (F-1 error wording, F-2 no_history
+// tier visibility, F-3 infra-type auto-ephemeral for `message`, F-5 close-output
+// label hydration) to embedded's behavior. EMBEDDED IS THE REFERENCE: every
+// assertion runs the SAME command on both plumbings with identical explicit IDs
+// and requires byte-identical observable output.
+// The two workspaces mint IDs under their own issue_prefix; explicit --id
+// values must therefore carry the matching prefix. Comparisons strip the
+// per-workspace prefix so a spike ID (spikef-<suffix>) and its embedded twin
+// (embf-<suffix>) compare equal on the stable suffix.
+const (
+	spikeFindPrefix = "spikef"
+	embFindPrefix   = "embf"
+)
+
+type plumbing struct {
+	dir    string
+	env    []string
+	prefix string
+}
+
+func (p plumbing) id(suffix string) string { return p.prefix + "-" + suffix }
+
+// stripPrefix removes a known "<prefix>-" from every whitespace/arrow-delimited
+// token in s, so error strings that embed workspace IDs compare across plumbings.
+func stripPrefix(s, prefix string) string {
+	return strings.ReplaceAll(s, prefix+"-", "")
+}
+
+func TestSpikeUOWStore_CrossPlumbFindings(t *testing.T) {
+	requireProxiedServerEnv(t)
+	bd := buildEmbeddedBD(t)
+
+	spikeDir, spikeEnv, _ := setupSpikeProxiedWorkspace(t, bd, spikeFindPrefix)
+	embDir, _, _ := bdInit(t, bd, "--prefix", embFindPrefix)
+	embEnv := spikeEmbeddedEnv(embDir)
+
+	spike := plumbing{dir: spikeDir, env: spikeEnv, prefix: spikeFindPrefix}
+	emb := plumbing{dir: embDir, env: embEnv, prefix: embFindPrefix}
+
+	t.Run("F1_dep_error_wording", func(t *testing.T) {
+		assertDepErrorParity(t, bd, spike, emb)
+	})
+	t.Run("F3_infra_message_ephemeral", func(t *testing.T) {
+		assertInfraMessageEphemeral(t, bd, spike, emb)
+	})
+	t.Run("F2_no_history_tier_visibility", func(t *testing.T) {
+		assertNoHistoryTierParity(t, bd, spike, emb)
+	})
+	t.Run("F5_close_label_hydration", func(t *testing.T) {
+		assertCloseLabelHydration(t, bd, spike, emb)
+	})
+}
+
+// depAddError runs `bd dep add from to [--type typ] --json`, requires a nonzero
+// exit, and returns the `.error` string the CLI emitted on stdout, with the
+// workspace prefix stripped so the two plumbings' messages compare equal.
+func depAddError(t *testing.T, bd string, p plumbing, fromSuffix, toSuffix, typ string) string {
+	t.Helper()
+	from, to := p.id(fromSuffix), p.id(toSuffix)
+	args := []string{"dep", "add", from, to, "--json"}
+	if typ != "" {
+		args = append(args, "--type", typ)
+	}
+	stdout, stderr, err := spikeRun(t, bd, p.dir, p.env, args...)
+	if err == nil {
+		t.Fatalf("dep add %s %s: expected error, got success\nstdout=%s", from, to, stdout)
+	}
+	obj := jsonObject(t, stdout)
+	msg, _ := obj["error"].(string)
+	if msg == "" {
+		t.Fatalf("dep add %s %s: no .error in stdout\nstdout=%s\nstderr=%s", from, to, stdout, stderr)
+	}
+	return stripPrefix(msg, p.prefix)
+}
+
+// assertDepErrorParity pins F-1: the cycle, self-dependency, and retype error
+// strings must be byte-identical across plumbings (prefix-normalized).
+func assertDepErrorParity(t *testing.T, bd string, spike, emb plumbing) {
+	t.Helper()
+	seed := func(p plumbing) {
+		for _, suf := range []string{"ca", "cb"} {
+			if _, se, err := spikeRun(t, bd, p.dir, p.env, "create", "Dep "+suf, "--id", p.id(suf), "--force", "-t", "task", "--json"); err != nil {
+				t.Fatalf("seed create %s: %v\n%s", p.id(suf), err, se)
+			}
+		}
+		// Forward blocking edge so reverse creates a cycle and a retype conflicts.
+		if _, se, err := spikeRun(t, bd, p.dir, p.env, "dep", "add", p.id("ca"), p.id("cb"), "--json"); err != nil {
+			t.Fatalf("seed dep add ca cb: %v\n%s", err, se)
+		}
+	}
+	seed(spike)
+	seed(emb)
+
+	cases := []struct {
+		name          string
+		from, to, typ string
+		wantContains  string
+	}{
+		{"cycle", "cb", "ca", "", "adding dependency would create a cycle"},
+		{"self", "ca", "ca", "", "cannot add self-dependency: ca cannot depend on itself"},
+		{"retype", "ca", "cb", "related", "already exists with type"},
+	}
+	for _, tc := range cases {
+		spikeMsg := depAddError(t, bd, spike, tc.from, tc.to, tc.typ)
+		embMsg := depAddError(t, bd, emb, tc.from, tc.to, tc.typ)
+		if spikeMsg != embMsg {
+			t.Errorf("F-1 %s: error strings differ\n spike=%q\n   emb=%q", tc.name, spikeMsg, embMsg)
+		}
+		if !strings.Contains(embMsg, tc.wantContains) {
+			t.Errorf("F-1 %s: embedded error %q missing expected substring %q", tc.name, embMsg, tc.wantContains)
+		}
+	}
+}
+
+// assertInfraMessageEphemeral pins F-3: `create -t message` must auto-mark the
+// issue ephemeral on both plumbings.
+func assertInfraMessageEphemeral(t *testing.T, bd string, spike, emb plumbing) {
+	t.Helper()
+	create := func(p plumbing) any {
+		out, se, err := spikeRun(t, bd, p.dir, p.env, "create", "Msg", "--id", p.id("msg1"), "--force", "-t", "message", "--json")
+		if err != nil {
+			t.Fatalf("create -t message (%s): %v\n%s", p.prefix, err, se)
+		}
+		return jsonObject(t, out)["ephemeral"]
+	}
+	embEph := create(emb)
+	spikeEph := create(spike)
+	if embEph != true {
+		t.Fatalf("F-3 precondition: embedded -t message ephemeral=%v, want true", embEph)
+	}
+	if spikeEph != embEph {
+		t.Errorf("F-3: -t message ephemeral differs: spike=%v embedded=%v", spikeEph, embEph)
+	}
+}
+
+// assertNoHistoryTierParity pins F-2: a --no-history issue is hidden from
+// `list --all` and `count` but visible in `ready` on BOTH plumbings.
+func assertNoHistoryTierParity(t *testing.T, bd string, spike, emb plumbing) {
+	t.Helper()
+	seed := func(p plumbing) {
+		if _, se, err := spikeRun(t, bd, p.dir, p.env, "create", "Normal", "--id", p.id("tn"), "--force", "-t", "task", "--json"); err != nil {
+			t.Fatalf("seed tn: %v\n%s", err, se)
+		}
+		if _, se, err := spikeRun(t, bd, p.dir, p.env, "create", "NoHist", "--id", p.id("th"), "--force", "-t", "task", "--no-history", "--json"); err != nil {
+			t.Fatalf("seed th: %v\n%s", err, se)
+		}
+	}
+	seed(spike)
+	seed(emb)
+
+	// idSuffixes returns the prefix-stripped IDs from a JSON-array command.
+	idSuffixes := func(p plumbing, args ...string) []string {
+		out, se, err := spikeRun(t, bd, p.dir, p.env, args...)
+		if err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, se)
+		}
+		ids := []string{}
+		for _, m := range jsonSlice(t, out) {
+			ids = append(ids, stripPrefix(fmt.Sprint(m["id"]), p.prefix))
+		}
+		return ids
+	}
+
+	spikeList := idSuffixes(spike, "list", "--all", "--json")
+	embList := idSuffixes(emb, "list", "--all", "--json")
+	if !equalStringSets(spikeList, embList) {
+		t.Errorf("F-2 list --all id sets differ: spike=%v embedded=%v", spikeList, embList)
+	}
+	if containsString(spikeList, "th") {
+		t.Errorf("F-2 list --all should hide no-history issue th, got %v", spikeList)
+	}
+
+	spikeReady := idSuffixes(spike, "ready", "--json")
+	embReady := idSuffixes(emb, "ready", "--json")
+	if !equalStringSets(spikeReady, embReady) {
+		t.Errorf("F-2 ready id sets differ: spike=%v embedded=%v", spikeReady, embReady)
+	}
+	if !containsString(spikeReady, "th") {
+		t.Errorf("F-2 ready should include no-history issue th, got %v", spikeReady)
+	}
+
+	count := func(p plumbing) string {
+		out, se, err := spikeRun(t, bd, p.dir, p.env, "count", "--json")
+		if err != nil {
+			t.Fatalf("count (%s): %v\n%s", p.prefix, err, se)
+		}
+		return fmt.Sprint(jsonObject(t, out)["count"])
+	}
+	if sc, ec := count(spike), count(emb); sc != ec {
+		t.Errorf("F-2 count differs: spike=%s embedded=%s", sc, ec)
+	}
+}
+
+// assertCloseLabelHydration pins F-5: `close --json` returns the closed issue
+// with its labels hydrated (not null) on both plumbings.
+func assertCloseLabelHydration(t *testing.T, bd string, spike, emb plumbing) {
+	t.Helper()
+	const label = "red"
+	closeLabels := func(p plumbing) []string {
+		if _, se, err := spikeRun(t, bd, p.dir, p.env, "create", "Closable", "--id", p.id("cl"), "--force", "-t", "task", "-l", label, "--json"); err != nil {
+			t.Fatalf("create cl: %v\n%s", err, se)
+		}
+		out, se, err := spikeRun(t, bd, p.dir, p.env, "close", p.id("cl"), "--json")
+		if err != nil {
+			t.Fatalf("close cl: %v\n%s", err, se)
+		}
+		obj := jsonObject(t, out)
+		// close --json may return the issue directly or under {"closed":[...]}.
+		if raw, ok := obj["closed"].([]any); ok && len(raw) > 0 {
+			if m, ok := raw[0].(map[string]any); ok {
+				obj = m
+			}
+		}
+		labels := []string{}
+		if raw, ok := obj["labels"].([]any); ok {
+			for _, v := range raw {
+				labels = append(labels, fmt.Sprint(v))
+			}
+		}
+		return labels
+	}
+	embLabels := closeLabels(emb)
+	spikeLabels := closeLabels(spike)
+	if !containsString(embLabels, label) {
+		t.Fatalf("F-5 precondition: embedded close labels %v missing %q", embLabels, label)
+	}
+	if !equalStringSets(spikeLabels, embLabels) {
+		t.Errorf("F-5 close label sets differ: spike=%v embedded=%v", spikeLabels, embLabels)
+	}
+}
