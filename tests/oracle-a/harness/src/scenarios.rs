@@ -623,5 +623,34 @@ pub fn all() -> Vec<Scenario> {
                 &["list", "--all", "--json"],
             ],
         ),
+        // DIVERGENCE PIN (PR #4560 review gap): `--force` close of a PINNED issue must
+        // actually close it. The close-guard treats pinned as "not active" for blockers,
+        // but the TARGET being pinned is a different axis — force must still transition
+        // the pinned bead itself to closed. The corpus pinned pinned-as-blocker
+        // (close_pinned_blocker_closes) but never force-closing a pinned target.
+        Scenario::new(
+            "close_pinned_force",
+            "cpf",
+            &[
+                &["create", "Pinned", "--id", "cpf-1", "--force", "-t", "task", "-p", "2", "--json"],
+                &["update", "cpf-1", "--status", "pinned", "--json"],
+                &["close", "cpf-1", "--force", "--json"],
+                &["show", "cpf-1", "--json"],
+            ],
+        ),
+        // OUT-OF-SCOPE for the gate (bd `note` is not in scoreboard IN_SCOPE_CMDS) but
+        // captured informationally (PR #4560 review gap): two `note` appends then `show`
+        // pins the stored notes bytes + the separator bd inserts between appended notes.
+        // The corpus pinned `comment`/`comments` but never the distinct `note` append path.
+        Scenario::new(
+            "note_append_two",
+            "nt",
+            &[
+                &["create", "Base", "--id", "nt-1", "--force", "-t", "task", "--json"],
+                &["note", "nt-1", "first note", "--json"],
+                &["note", "nt-1", "second note", "--json"],
+                &["show", "nt-1", "--json"],
+            ],
+        ),
     ]
 }
