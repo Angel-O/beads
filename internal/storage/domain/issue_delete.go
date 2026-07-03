@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"sort"
 
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 	"github.com/steveyegge/beads/internal/types"
@@ -49,7 +50,15 @@ func (u *issueUseCaseImpl) deleteMany(ctx context.Context, params DeleteIssuesPa
 	if len(params.IDs) == 0 {
 		return DeleteIssuesResult{}, nil
 	}
+	if params.EnforceCascadePolicy {
+		return u.deleteManyWithPolicy(ctx, params, actor)
+	}
+	return u.deleteManyCascade(ctx, params, actor)
+}
 
+// deleteManyCascade is the legacy always-cascade path (proxied-server delete
+// command). It unconditionally expands to transitive dependents.
+func (u *issueUseCaseImpl) deleteManyCascade(ctx context.Context, params DeleteIssuesParams, actor string) (DeleteIssuesResult, error) {
 	allIDs, err := u.issueRepo.FindAllDependents(ctx, params.IDs)
 	if err != nil {
 		return DeleteIssuesResult{}, fmt.Errorf("delete: cascade expansion: %w", err)
@@ -159,6 +168,203 @@ func (u *issueUseCaseImpl) deleteMany(ctx context.Context, params DeleteIssuesPa
 	}
 
 	return result, nil
+}
+
+// deleteManyWithPolicy reproduces issueops.DeleteIssuesInTx (the embedded batch
+// delete) over the domain repositories: it honors Cascade/Force, refuses when a
+// non-cascade delete would strip a dependent not in the deletion set, orphans
+// those dependents under --force, and matches embedded's child-row counting
+// (wisp aux rows counted only for cascade-discovered wisps, not directly
+// requested ones). This is the store-path parity contract the cross-plumbing
+// oracle pins (cmd/bd/delete.go, cmd/bd/purge.go → store.DeleteIssues).
+func (u *issueUseCaseImpl) deleteManyWithPolicy(ctx context.Context, params DeleteIssuesParams, actor string) (DeleteIssuesResult, error) {
+	initialWispIDs, regularIDs, err := u.issueRepo.PartitionWispIDs(ctx, params.IDs)
+	if err != nil {
+		return DeleteIssuesResult{}, fmt.Errorf("delete: partition: %w", err)
+	}
+
+	idSet := make(map[string]bool, len(params.IDs))
+	for _, id := range params.IDs {
+		idSet[id] = true
+	}
+
+	result := DeleteIssuesResult{}
+
+	// Decide the effective regular deletion set + any orphaned external dependents.
+	expandedRegularIDs := regularIDs
+	if params.Cascade {
+		all, err := u.issueRepo.FindAllDependents(ctx, regularIDs)
+		if err != nil {
+			return DeleteIssuesResult{}, fmt.Errorf("delete: cascade expansion: %w", err)
+		}
+		expandedRegularIDs = all
+	} else {
+		externalBySource, err := u.externalDependents(ctx, regularIDs, idSet)
+		if err != nil {
+			return DeleteIssuesResult{}, err
+		}
+		if len(externalBySource) > 0 {
+			if !params.Force {
+				// Refuse: name the first requested id (in argv order) that has a
+				// dependent outside the deletion set, matching embedded.
+				for _, id := range regularIDs {
+					if deps := externalBySource[id]; len(deps) > 0 {
+						result.OrphanedIssues = deps
+						return result, fmt.Errorf("issue %s has dependents not in deletion set; use --cascade to delete them or --force to orphan them", id)
+					}
+				}
+			}
+			// Force: orphan every external dependent (deduped, deterministic).
+			orphanSet := make(map[string]bool)
+			for _, deps := range externalBySource {
+				for _, d := range deps {
+					orphanSet[d] = true
+				}
+			}
+			orphans := make([]string, 0, len(orphanSet))
+			for id := range orphanSet {
+				orphans = append(orphans, id)
+			}
+			sort.Strings(orphans)
+			result.OrphanedIssues = orphans
+		}
+	}
+
+	cascadeWispIDs, finalRegularIDs, err := u.issueRepo.PartitionWispIDs(ctx, expandedRegularIDs)
+	if err != nil {
+		return DeleteIssuesResult{}, fmt.Errorf("delete: partition expanded: %w", err)
+	}
+	allWispIDs := append(append([]string{}, initialWispIDs...), cascadeWispIDs...)
+
+	// Child-row counts. Embedded counts wisp aux rows for cascade-discovered
+	// wisps only (CROSSPLUMB finding on AX-4): the directly-requested wisps
+	// (initialWispIDs) are excluded, so an all-ephemeral purge reports 0 events.
+	depReg, err := u.depRepo.CountAllForIDs(ctx, finalRegularIDs, DepCountsOpts{})
+	if err != nil {
+		return DeleteIssuesResult{}, fmt.Errorf("delete: count deps: %w", err)
+	}
+	depWisp, err := u.depRepo.CountAllForIDs(ctx, cascadeWispIDs, DepCountsOpts{UseWispsTable: true})
+	if err != nil {
+		return DeleteIssuesResult{}, fmt.Errorf("delete: count wisp deps: %w", err)
+	}
+	result.DependenciesCount = depReg + depWisp
+
+	labelReg, err := u.labelRepo.CountAllForIDs(ctx, finalRegularIDs, LabelOpts{})
+	if err != nil {
+		return DeleteIssuesResult{}, fmt.Errorf("delete: count labels: %w", err)
+	}
+	labelWisp, err := u.labelRepo.CountAllForIDs(ctx, cascadeWispIDs, LabelOpts{UseWispsTable: true})
+	if err != nil {
+		return DeleteIssuesResult{}, fmt.Errorf("delete: count wisp labels: %w", err)
+	}
+	result.LabelsCount = labelReg + labelWisp
+
+	evReg, err := u.eventsRepo.CountAllForIDs(ctx, finalRegularIDs, RecordEventOpts{})
+	if err != nil {
+		return DeleteIssuesResult{}, fmt.Errorf("delete: count events: %w", err)
+	}
+	evWisp, err := u.eventsRepo.CountAllForIDs(ctx, cascadeWispIDs, RecordEventOpts{UseWispsTable: true})
+	if err != nil {
+		return DeleteIssuesResult{}, fmt.Errorf("delete: count wisp events: %w", err)
+	}
+	result.EventsCount = evReg + evWisp
+
+	result.DeletedCount = len(finalRegularIDs) + len(allWispIDs)
+
+	if params.DryRun {
+		return result, nil
+	}
+
+	var connected map[string]*types.Issue
+	var connectedIsWisp map[string]bool
+	deletedAll := append(append([]string{}, finalRegularIDs...), allWispIDs...)
+	if params.UpdateTextReferences {
+		deletedSet := make(map[string]bool, len(deletedAll))
+		for _, id := range deletedAll {
+			deletedSet[id] = true
+		}
+		connected, connectedIsWisp, err = u.collectConnectedIssues(ctx, deletedAll, deletedSet)
+		if err != nil {
+			return result, err
+		}
+	}
+
+	affectedIssues, affectedWisps, err := u.issueRepo.AffectedByDeletion(ctx, finalRegularIDs, allWispIDs)
+	if err != nil {
+		return result, fmt.Errorf("delete: affected by deletion: %w", err)
+	}
+
+	if _, err := u.depRepo.DeleteAllForIDs(ctx, finalRegularIDs, DepInsertOpts{}); err != nil {
+		return result, fmt.Errorf("delete: drop deps: %w", err)
+	}
+	if _, err := u.depRepo.DeleteAllForIDs(ctx, allWispIDs, DepInsertOpts{UseWispsTable: true}); err != nil {
+		return result, fmt.Errorf("delete: drop wisp deps: %w", err)
+	}
+	if _, err := u.labelRepo.DeleteAllForIDs(ctx, finalRegularIDs, LabelOpts{}); err != nil {
+		return result, fmt.Errorf("delete: drop labels: %w", err)
+	}
+	if _, err := u.labelRepo.DeleteAllForIDs(ctx, allWispIDs, LabelOpts{UseWispsTable: true}); err != nil {
+		return result, fmt.Errorf("delete: drop wisp labels: %w", err)
+	}
+	if _, err := u.eventsRepo.DeleteAllForIDs(ctx, finalRegularIDs, RecordEventOpts{}); err != nil {
+		return result, fmt.Errorf("delete: drop events: %w", err)
+	}
+	if _, err := u.eventsRepo.DeleteAllForIDs(ctx, allWispIDs, RecordEventOpts{UseWispsTable: true}); err != nil {
+		return result, fmt.Errorf("delete: drop wisp events: %w", err)
+	}
+
+	issuesDeleted, err := u.issueRepo.DeleteByIDs(ctx, finalRegularIDs, IssueTableOpts{})
+	if err != nil {
+		return result, fmt.Errorf("delete: drop issue rows: %w", err)
+	}
+	wispsDeleted, err := u.issueRepo.DeleteByIDs(ctx, allWispIDs, IssueTableOpts{UseWispsTable: true})
+	if err != nil {
+		return result, fmt.Errorf("delete: drop wisp rows: %w", err)
+	}
+	result.DeletedCount = issuesDeleted + wispsDeleted
+
+	if params.UpdateTextReferences && len(connected) > 0 {
+		refs, err := u.rewriteTextReferences(ctx, deletedAll, connected, connectedIsWisp, actor)
+		if err != nil {
+			return result, fmt.Errorf("delete: rewrite text references: %w", err)
+		}
+		result.ReferencesUpdated = refs
+	}
+
+	if err := u.issueRepo.RecomputeIsBlocked(ctx, affectedIssues, affectedWisps); err != nil {
+		return result, fmt.Errorf("delete: recompute is_blocked: %w", err)
+	}
+
+	return result, nil
+}
+
+// externalDependents returns, keyed by requested source id, the issues that
+// depend on that source but are NOT themselves in idSet — the direct dependents
+// that a non-cascade delete would orphan. It spans both the regular and wisp
+// dependency tables, mirroring embedded's findExternalDependents.
+func (u *issueUseCaseImpl) externalDependents(ctx context.Context, ids []string, idSet map[string]bool) (map[string][]string, error) {
+	bySource := make(map[string][]string)
+	if len(ids) == 0 {
+		return bySource, nil
+	}
+	for _, useWisp := range []bool{false, true} {
+		res, err := u.depRepo.ListByIssueIDs(ctx, ids, DepListOpts{Direction: DepDirectionIn, UseWispsTable: useWisp})
+		if err != nil {
+			if useWisp && dberrors.IsTableNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("delete: external dependents: %w", err)
+		}
+		for _, deps := range res.Incoming {
+			for _, d := range deps {
+				if d.IssueID == "" || idSet[d.IssueID] {
+					continue
+				}
+				bySource[d.DependsOnID] = append(bySource[d.DependsOnID], d.IssueID)
+			}
+		}
+	}
+	return bySource, nil
 }
 
 func (u *issueUseCaseImpl) previewDelete(ctx context.Context, ids []string) (DeletePreview, error) {

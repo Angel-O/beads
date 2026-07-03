@@ -162,14 +162,24 @@ func (s *uowStore) DeleteIssue(ctx context.Context, id string) error {
 }
 
 // DeleteIssues backs both purge paths: --dry-run (dryRun=true, purge.go:176) and
-// --force (dryRun=false, purge.go:225), plus batch delete. The domain deleteMany
-// always cascades to dependents (FindAllDependents) and always rewrites text
-// references, so the store's cascade/force flags are absorbed rather than
-// threaded — a documented spike simplification (the census flags purge as a
-// gap unit with no uow dual). dry-run runs on a read-only UOW (no commit); a
-// real delete opens a write tx.
+// --force (dryRun=false, purge.go:225), plus batch delete. cascade/force are
+// threaded into the domain use-case's embedded-parity policy path
+// (EnforceCascadePolicy): a non-cascade delete refuses when a dependent outside
+// the deletion set would be stripped (force=false) or orphans it (force=true),
+// matching issueops.DeleteIssuesInTx so the store contract can't silently
+// cascade-delete durable dependents. UpdateTextReferences is left OFF: the
+// embedded store's DeleteIssues does not rewrite references (cmd/bd/delete.go
+// does that itself), so the store's ReferencesUpdated stays 0 on both plumbings.
+// dry-run runs on a read-only UOW (no commit); a real delete opens a write tx.
 func (s *uowStore) DeleteIssues(ctx context.Context, ids []string, cascade bool, force bool, dryRun bool) (*types.DeleteIssuesResult, error) {
-	params := domain.DeleteIssuesParams{IDs: ids, DryRun: dryRun, UpdateTextReferences: true}
+	params := domain.DeleteIssuesParams{
+		IDs:                  ids,
+		DryRun:               dryRun,
+		UpdateTextReferences: false,
+		EnforceCascadePolicy: true,
+		Cascade:              cascade,
+		Force:                force,
+	}
 	if dryRun {
 		u, err := s.provider.NewUOW(ctx)
 		if err != nil {
@@ -278,13 +288,14 @@ func deleteIssueInUOW(ctx context.Context, u uow.UnitOfWork, id, actor string) e
 }
 
 // toStoreDeleteResult maps the domain delete tallies onto the store contract's
-// result type. OrphanedIssues has no domain equivalent (the domain cascades
-// rather than orphaning), so it is left nil.
+// result type, including the orphaned-dependent set the policy path reports
+// under --force.
 func toStoreDeleteResult(r domain.DeleteIssuesResult) *types.DeleteIssuesResult {
 	return &types.DeleteIssuesResult{
 		DeletedCount:      r.DeletedCount,
 		DependenciesCount: r.DependenciesCount,
 		LabelsCount:       r.LabelsCount,
 		EventsCount:       r.EventsCount,
+		OrphanedIssues:    r.OrphanedIssues,
 	}
 }
