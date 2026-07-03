@@ -159,7 +159,7 @@ func (s *uowStore) CreateIssue(ctx context.Context, issue *types.Issue, actor st
 	if issue == nil {
 		return fmt.Errorf("issue must not be nil")
 	}
-	if err := s.applyInfraTypeRouting(ctx, issue); err != nil {
+	if err := s.prepareForCreate(ctx, issue); err != nil {
 		return err
 	}
 
@@ -511,11 +511,32 @@ func closeIssueInUOW(ctx context.Context, u uow.UnitOfWork, id, reason, actor, s
 	return err
 }
 
-// applyInfraTypeRouting flips issue.Ephemeral for infra types, matching
-// EmbeddedDoltStore.CreateIssue. Runs in its own read-only UOW so the flag is
-// resolved before the write tx opens (RunInTxMsg may replay fn, so the routing
-// must be idempotent and pre-computed).
-func (s *uowStore) applyInfraTypeRouting(ctx context.Context, issue *types.Issue) error {
+// prepareForCreate reproduces the pre-write state EmbeddedDoltStore.CreateIssue
+// computes before it opens its write tx, so the spike and the default embedded
+// store accept and reject exactly the same `bd create` inputs:
+//
+//   - Infra-type ephemeral flip. EmbeddedDoltStore.CreateIssue marks every infra
+//     type ephemeral UNCONDITIONALLY (create_issue.go:19-21 — note it has no
+//     `!issue.NoHistory` guard; that guard lives only on the legacy DoltStore /
+//     batch paths). Mirroring that unconditional flip is load-bearing: an infra
+//     type created with --no-history must land in the ephemeral+no_history state
+//     the validator then declares impossible, so the spike rejects it just like
+//     embedded. Guarding the flip here would instead let that combo through as a
+//     silent no_history wisp — the opposite of parity.
+//   - Issue validation. Embedded validates via issueops.PrepareIssueForInsert ->
+//     Issue.ValidateWithCustom (create.go:433); the domain create use-case never
+//     does, so without this the spike silently accepts custom-only types like
+//     agent/role (types.go custom-only set) and the ephemeral+no_history combo
+//     that embedded refuses with exit 1 (#4547 Slice-4 red-team). Custom statuses
+//     and types are resolved through the same ConfigUseCase the embedded path
+//     reads (custom_types table -> types.custom config -> YAML union), so a
+//     genuinely configured custom type still validates on both plumbings.
+//
+// Runs in one read-only UOW so the flag and the custom status/type sets are
+// resolved before the write tx opens (RunInTxMsg may replay fn, so this must stay
+// idempotent and pre-computed). The validation error is wrapped exactly as
+// PrepareIssueForInsert wraps it so the CLI-visible message is byte-identical.
+func (s *uowStore) prepareForCreate(ctx context.Context, issue *types.Issue) error {
 	u, err := s.provider.NewUOW(ctx)
 	if err != nil {
 		return err
@@ -528,6 +549,22 @@ func (s *uowStore) applyInfraTypeRouting(ctx context.Context, issue *types.Issue
 	}
 	if isInfra {
 		issue.Ephemeral = true
+	}
+
+	customStatuses, err := u.ConfigUseCase().GetCustomStatuses(ctx)
+	if err != nil {
+		return mapUowError(err)
+	}
+	customTypes, err := u.ConfigUseCase().GetCustomTypes(ctx)
+	if err != nil {
+		return mapUowError(err)
+	}
+	statusNames := make([]string, 0, len(customStatuses))
+	for _, st := range customStatuses {
+		statusNames = append(statusNames, st.Name)
+	}
+	if err := issue.ValidateWithCustom(statusNames, customTypes); err != nil {
+		return fmt.Errorf("validation failed for issue %s: %w", issue.ID, err)
 	}
 	return nil
 }

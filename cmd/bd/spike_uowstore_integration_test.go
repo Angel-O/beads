@@ -515,6 +515,75 @@ func TestSpikeUOWStore_CrossPlumbFindings(t *testing.T) {
 	t.Run("F5_close_label_hydration", func(t *testing.T) {
 		assertCloseLabelHydration(t, bd, spike, emb)
 	})
+	t.Run("create_validation_parity", func(t *testing.T) {
+		assertCreateValidationParity(t, bd, spike, emb)
+	})
+}
+
+// createExpectingError runs `bd create ... --json` requiring a nonzero exit and
+// returns the prefix-normalized stderr message. On a validation failure `bd
+// create --json` prints NOTHING to stdout and `Error: <msg>` to stderr, so the
+// stderr message (not a JSON .error field) is the observable pinned across
+// plumbings.
+func createExpectingError(t *testing.T, bd string, p plumbing, idSuffix string, extraArgs ...string) string {
+	t.Helper()
+	args := append([]string{"create", "V " + idSuffix, "--id", p.id(idSuffix), "--force", "--json"}, extraArgs...)
+	stdout, stderr, err := spikeRun(t, bd, p.dir, p.env, args...)
+	if err == nil {
+		t.Fatalf("create %v (%s): expected validation error, got success\nstdout=%s", extraArgs, p.prefix, stdout)
+	}
+	// The spike workspace prints boot-time warnings (dir perms, beads.role) to
+	// stderr that the embedded workspace does not; pin the `Error:` line alone.
+	line := errorLine(stderr)
+	if line == "" {
+		t.Fatalf("create %v (%s): no 'Error:' line in stderr\nstderr=%s", extraArgs, p.prefix, stderr)
+	}
+	return stripPrefix(line, p.prefix)
+}
+
+// errorLine returns the last stderr line beginning with "Error:", trimmed.
+func errorLine(stderr string) string {
+	var out string
+	for _, ln := range strings.Split(stderr, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(ln), "Error:") {
+			out = strings.TrimSpace(ln)
+		}
+	}
+	return out
+}
+
+// assertCreateValidationParity pins the Slice-4 create-validation findings: the
+// spike CreateIssue path must run the SAME issue validation embedded runs via
+// issueops.PrepareIssueForInsert -> Issue.ValidateWithCustom. Without it the
+// spike silently accepted custom-only issue types (agent/role/bogus) and the
+// ephemeral+no_history combo an infra type + --no-history produces — states the
+// default embedded store (EmbeddedDoltStore) rejects with exit 1. Every case
+// must fail with a byte-identical (prefix-normalized) message on both plumbings.
+func assertCreateValidationParity(t *testing.T, bd string, spike, emb plumbing) {
+	t.Helper()
+	cases := []struct {
+		name     string
+		idSuffix string
+		args     []string
+		want     string
+	}{
+		{"type_agent", "vagent", []string{"-t", "agent"}, "invalid issue type: agent"},
+		{"type_role", "vrole", []string{"-t", "role"}, "invalid issue type: role"},
+		{"type_bogus", "vbogus", []string{"-t", "totallybogus"}, "invalid issue type: totallybogus"},
+		{"infra_message_no_history", "vmnh", []string{"-t", "message", "--no-history"}, "ephemeral and no_history are mutually exclusive"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			embMsg := createExpectingError(t, bd, emb, tc.idSuffix, tc.args...)
+			spikeMsg := createExpectingError(t, bd, spike, tc.idSuffix, tc.args...)
+			if !strings.Contains(embMsg, tc.want) {
+				t.Fatalf("precondition: embedded message %q missing %q", embMsg, tc.want)
+			}
+			if spikeMsg != embMsg {
+				t.Errorf("create validation message differs\n spike=%q\n   emb=%q", spikeMsg, embMsg)
+			}
+		})
+	}
 }
 
 // depAddError runs `bd dep add from to [--type typ] --json`, requires a nonzero
