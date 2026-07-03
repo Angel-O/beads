@@ -85,30 +85,25 @@ flagged for follow-up).
   in-scope-per-harness / out-of-scope-per-census seam, and it is not a census
   escape: no gc-16 method answered `unsupported`.
 
-## AX-4 — `purge_real_then_reseed` · audit-event materialization count
+## ~~AX-4~~ — `purge_real_then_reseed` · WITHDRAWN (was mis-classified, now FIXED)
 
-- **class:** (b) mode difference
-- **pair:** embedded ↔ spike-proxied
-- **field:** step 4 `purge --force --json` → `.events`
-- **tag:** known
-- **evidence:**
-  ```
-  reference (embedded):  {"dependencies":0,"events":0,"labels":0,"purged_count":2,"schema_version":1}
-  candidate (proxied):   {"dependencies":0,"events":4,"labels":0,"purged_count":2,"schema_version":1}
-  ```
-- **why allowed:** the primary result — `purged_count` — is **identical** (2).
-  The plumbings disagree only on the `events` child-row sub-metric: the proxied
-  dolt-server path materializes 4 audit-event rows (create+close for the two
-  purged ephemerals) that purge then deletes and counts, while the embedded path
-  reports 0 for the same all-ephemeral candidate set. This is an
-  audit-event-materialization shape difference between the two storage
-  plumbings, not a difference in what was purged. **Flagged `known`:** worth a
-  follow-up to decide whether the uowstore should suppress audit rows for
-  ephemeral issues to match embedded, but it does not change purge's contract
-  outcome (count + reseed-usable workspace, which the scenario's later steps
-  confirm pass).
+AX-4 previously allowlisted the `purge --force` `.events` divergence (embedded
+`events:0` vs proxied `events:4`) as a "(b) audit-row materialization" mode
+difference. That story was **false**: direct table inspection showed BOTH
+plumbings hold identical rows (wisps=1, wisp_events=2, issues=0, events=0) — no
+extra rows are materialized by server mode. The `4 vs 0` was a genuine class-(a)
+**adapter counting bug**: the uowstore delete path counted `wisp_events` for the
+directly-purged wisps, whereas embedded (`issueops.DeleteIssuesInTx`) counts wisp
+child-rows only for *cascade-discovered* wisps, so an all-ephemeral purge reports
+0. Per this allowlist's own rule (class-(a) is NOT allowlistable) AX-4 never
+belonged here.
+
+It is now **fixed at source**: `deleteManyWithPolicy`
+(`internal/storage/domain/issue_delete.go`) counts wisp aux rows for
+`cascadeWispIDs` only, so `purge_real_then_reseed` reports `events:0` on both
+plumbings and no longer diverges. Nothing to allowlist.
 
 ---
 
-**Allowlisted total: 4** (AX-1..AX-4). All remaining divergences are class-(a)
+**Allowlisted total: 3** (AX-1..AX-3). All remaining divergences are class-(a)
 findings — see `CROSSPLUMB-REPORT.md` §Findings.

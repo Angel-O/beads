@@ -63,7 +63,16 @@ OUT-OF-SCOPE pass: 1  fail: 0    (note_append_two, informational)
 
 > The scoreboard records the **first** divergence per scenario. For #5/#6 the
 > shared `IsInfraTypeCtx` root cause also perturbs the later `ready`/`list`/`count`
-> steps of those scenarios; they are one finding (F-3), not three.
+> steps of those scenarios; they are one finding (F-3), not three. **First-only
+> also masked a second divergence inside `cycle_reject` (row 1): step 4's
+> self-dependency case emits a semantically distinct error on the two plumbings —
+> now folded into F-1.**
+>
+> **Slice-3 remediation:** rows **7** (F-4 `started_at`) and **11** (AX-4 purge
+> `.events`) are FIXED — see the remediation addendum below — and the two delete
+> data-loss blockers that the corpus *masked* (batch `delete --force` cascade,
+> lost `!force` refusal) are fixed at the same seam. Rows 1–3, 5, 6, 8 (F-1, F-2,
+> F-3, F-5) remain open. The headline PASS/FAIL counts above predate these fixes.
 
 ## Findings (class-(a), NOT allowlistable)
 
@@ -74,8 +83,22 @@ oracle — the cross-plumbing equivalence gaps in the spike adapter.
   (cosmetic).* The rejection semantics and exit codes match; the uow/dolt_sql
   provider surfaces a differently-worded (more internal) error string than the
   embedded store's user-facing message. gc code that string-matches these errors
-  would break. Fix: have the adapter map these two errors to the embedded
-  user-facing strings.
+  would break. **Three distinct wording divergences live in this family — the
+  scoreboard records only the FIRST per scenario, so two were initially masked:**
+  1. `cycle_reject` step 3 `dep add` (reverse edge): proxied "add dep: adding
+     c-b → c-a would create a cycle" vs embedded "adding dependency would create
+     a cycle".
+  2. `cycle_reject` step 4 `dep add c-a c-a` (**SELF-dependency**): embedded
+     emits its dedicated "cannot add self-dependency: c-a cannot depend on
+     itself"; the adapter mis-routes it through the generic cycle check and emits
+     "add dep: adding c-a -> c-a would create a cycle". Both exit 1. This step is
+     a *semantically distinct* divergence (self-dep vs cycle), not just a
+     re-wording — mapping only the two cycle strings leaves it failing.
+  3. `dep_retype` step 3 `dep add` (retype): proxied "add dep: insert: db:
+     DependencySQLRepository.Insert: …" vs embedded "…remove it first with 'bd
+     dep remove'…".
+  Fix: have the adapter reproduce embedded's self-dependency guard AND map the
+  cycle/retype strings to the embedded user-facing messages.
 - **F-2 — `no_history` tier visibility (tiers_ephemeral).** *Severity: medium.*
   `list --all` includes a `--no-history` issue on proxied but excludes it on
   embedded. A tier/data-visibility divergence — the adapter's list path does not
@@ -87,11 +110,14 @@ oracle — the cross-plumbing equivalence gaps in the spike adapter.
   a different classification, so proxied leaves `message` non-ephemeral. This
   changes downstream ready/list/count filtering for the coordination types.
 - **F-4 — `started_at` on `update --status in_progress`
-  (output_parent_omitempty_boundary).** *Severity: medium.* Embedded auto-sets
-  `started_at` (GH#2796, `issueops/update.go:81` `ManageStartedAt`); the
-  adapter's non-claim `UpdateIssue` path does not. (The `--claim` path *does* set
-  it — `claim_preassigned_open` passes — so this is specifically the
-  `UpdateIssue`/`ManageStartedAt` seam.)
+  (output_parent_omitempty_boundary).** *Severity: medium.* **FIXED (Slice-3).**
+  Embedded auto-sets `started_at` (GH#2796, `issueops/update.go:81`
+  `ManageStartedAt`); the adapter's non-claim `UpdateIssue` path did not. The
+  domain repo `Update` (`internal/storage/domain/db/issue.go`) now applies
+  `issueops.ManageStartedAt` **and** `ManageClosedAt` on a status change, so
+  `started_at`/`closed_at` track the transition on both plumbings. The same fix
+  closes the broader (corpus-masked) sibling: `update --status closed` left
+  `closed_at` NULL and reopening left stale `closed_at`/`close_reason`.
 - **F-5 — label hydration in `close` output (purge_dry_run_zero_metrics).**
   *Severity: low/medium.* Labels *persist* (the round-trip test proves `bd show`
   returns them on both), but the adapter's `close` **return object** omits the
@@ -185,3 +211,52 @@ the plumbings are **not yet fully equivalent** — the adapter has real gaps in
 infra-type classification, `started_at` management, no-history list filtering,
 close-time label hydration, and error-message wording. These are the concrete
 completion items the oracle exists to surface.
+
+> The headline numbers in this section describe the **recorded pre-remediation
+> run**. See the addendum for what the Slice-3 fixes change.
+
+## Slice-3 remediation addendum (post-run fixes)
+
+A Slice-3 red-team pass surfaced findings the recorded run's counts did not
+reflect (some corpus-masked). The following are now fixed at source; the numbers
+above are **not** re-derived here — re-run `run-oracle-x.sh` for fresh counts.
+
+**Data-loss blockers (corpus-masked — no failing scenario caught them):**
+
+- **B-DEL-1 — batch `delete --force` cascaded durable dependents.** The store's
+  `DeleteIssues` absorbed `cascade`/`force` into an unconditional cascade
+  (`FindAllDependents`), so `bd delete a b --force` / `bd purge --force` silently
+  deleted durable issues that merely *depended on* the deleted set. Fixed:
+  `writes.go` now threads `cascade`/`force` into
+  `deleteManyWithPolicy`, which refuses (force=false) or orphans (force=true)
+  external dependents, mirroring `issueops.DeleteIssuesInTx`. Verified
+  embedded↔spike: `delete a b --force` with external `ext` → both report
+  `deleted_count=2, orphaned_issues=[ext]` and `ext` survives.
+- **B-DEL-2 — `!force` batch preview lost the refusal.** `bd delete a b` (no
+  `--force`) with an external dependent reported "Would delete: 0 issues" instead
+  of embedded's "…has dependents not in deletion set…". Fixed by the same path
+  (refusal returned pre-dry-run, and the dry-run `DeletedCount` is now computed).
+  Verified: both plumbings emit the identical refusal string.
+- **B-UPD-3 — `update --status` skipped the close/reopen lifecycle.** The domain
+  repo `Update` never ran `ManageClosedAt`, so `update --status closed` left
+  `closed_at` NULL and reopening left stale `closed_at`/`close_reason`. Fixed (see
+  F-4) and verified embedded↔spike.
+
+**Attribution corrections:**
+
+- **AX-4 withdrawn / fixed.** The purge `.events` `4 vs 0` was a class-(a)
+  counting bug (adapter counted `wisp_events` for directly-purged wisps; embedded
+  counts them only for cascade-discovered wisps), not the "(b) audit-row
+  materialization" story AX-4 claimed. `deleteManyWithPolicy` now matches
+  embedded, so `purge_real_then_reseed` reports `events:0` on both plumbings.
+  AX-4 removed from the allowlist.
+- **F-1 completed.** The `cycle_reject` self-dependency step (step 4) is a
+  distinct divergence the first-divergence-only scoreboard masked; it is now
+  documented under F-1. Still open (error-wording family).
+- **Event-type parity (new).** The domain repo `Update` recorded `EventUpdated`
+  for every status change where embedded records
+  `EventClosed`/`EventReopened`/`EventStatusChanged`; now uses
+  `issueops.DetermineEventType`. Corpus-masked (events surface only as counts).
+
+**Still open:** F-1 (wording), F-2 (`no_history` list visibility), F-3
+(infra-type auto-ephemeral for `message`), F-5 (close-output label hydration).
