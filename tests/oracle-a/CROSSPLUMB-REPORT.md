@@ -5,8 +5,14 @@ plumbings, over the gc-contract corpus. This is the Slice-3 headline: it proves
 where the spike's proxied-uowstore path IS and IS NOT behaviorally equivalent to
 the ordinary embedded path, with **every divergence attributed**.
 
-Run: `tests/oracle-a/run-oracle-x.sh` · binary
-`spike/backend-seam-derisk@f41ece47` · 45 curated scenarios.
+Run: `tests/oracle-a/run-oracle-x.sh` · 2026-07-03 · binary built from the
+`spike/backend-seam-derisk@426dd0626` working tree · 45 curated scenarios.
+
+> **Binary-provenance caveat.** The candidate is built from the *working tree*
+> at `426dd0626`, which carries an intentional uncommitted `go.mod` edit
+> (`charmbracelet/x/ansi`). The exact binary is therefore **not** reproducible
+> from a clean checkout of that commit; the counts below describe this
+> working-tree build.
 
 ## What this oracle is (vs Oracle A)
 
@@ -31,21 +37,35 @@ and passes every other argv through to `bd` untouched with
 
 ```
 total scenarios: 45   (in-scope: 44, out-of-scope: 1)
-IN-SCOPE   PASS: 33   FAIL: 11   (75%)
+IN-SCOPE   PASS: 41   FAIL: 3   (93%)
 OUT-OF-SCOPE pass: 1  fail: 0    (note_append_two, informational)
 ```
 
-- **33 in-scope scenarios are byte-identical** (post-normalization) across the
-  two plumbings — the close→ready `is_blocked` loop, transitive/parent-child
-  blocking, cycle *detection* (semantics, not message — see F-1), claim
-  lifecycle, tiers set algebra (except no_history — F-3), metadata filtering,
-  labels round-trip, delete-unblocks-neighbour, real purge + reseed count,
-  config custom-key set/get, and the omitempty output boundaries.
-- **11 in-scope divergences**, every one attributed below:
-  **4 allowlisted** (class b/c/d — `CROSSPLUMB-ALLOWLIST.md`) +
-  **7 class-(a) findings** (real uowstore-caused differences — §Findings).
+**This is the Slice-4 equivalence-clean run.** Every class-(a) finding the
+recorded Slice-3 run surfaced (F-1..F-5) is now fixed at source (see §Findings
+and the remediation addendum), so **zero class-(a) divergences remain**. The
+only 3 in-scope divergences left are the 3 allowlisted mode/unsupported/artifact
+differences (`CROSSPLUMB-ALLOWLIST.md`, AX-1..AX-3):
 
-### Attribution table (all 11)
+- **41 in-scope scenarios are byte-identical** (post-normalization) across the
+  two plumbings — the close→ready `is_blocked` loop, transitive/parent-child
+  blocking, cycle *detection and message*, self-dependency guard, dep-retype
+  refusal, claim lifecycle, tiers set algebra **including no_history**, metadata
+  filtering, labels round-trip (incl. close-output hydration), infra-type
+  auto-ephemeral for `message`, `started_at`/`closed_at` on status transitions,
+  delete-unblocks-neighbour, real purge + reseed count (incl. `.events`), config
+  custom-key set/get, and the omitempty output boundaries.
+- **3 in-scope divergences**, every one **allowlisted** (class b/c/d —
+  `CROSSPLUMB-ALLOWLIST.md`): AX-1 `sql_unsupported_embedded`,
+  AX-2 `config_set_protected_keys`, AX-3 `comment_add_list`. **No class-(a)
+  finding diverged this run.**
+
+The attribution table below is retained as the **historical Slice-3 record** of
+all 11 divergences the first recorded run found and how each was dispositioned;
+rows 1–3, 5–8, 11 (the class-(a) findings + withdrawn AX-4) no longer diverge in
+the Slice-4 run above.
+
+### Attribution table (historical — Slice-3 recorded run, all 11)
 
 | # | scenario | step | field | class | attribution |
 |---|---|---|---|---|---|
@@ -203,17 +223,16 @@ is the gate, not a bare FAIL count.
 
 ## Verdict
 
-The cross-plumbing differential **completed**. The spike-proxied uowstore path is
-byte-equivalent to embedded on **33/44 in-scope scenarios** and on the 1:1:1
-commit shape. **4 divergences are allowlisted** mode/unsupported/artifact
-differences (`CROSSPLUMB-ALLOWLIST.md`). **7 are class-(a) findings** (F-1..F-5):
-the plumbings are **not yet fully equivalent** — the adapter has real gaps in
-infra-type classification, `started_at` management, no-history list filtering,
-close-time label hydration, and error-message wording. These are the concrete
-completion items the oracle exists to surface.
-
-> The headline numbers in this section describe the **recorded pre-remediation
-> run**. See the addendum for what the Slice-3 fixes change.
+The cross-plumbing differential **completed clean** in the Slice-4 run. The
+spike-proxied uowstore path is now byte-equivalent to embedded on **41/44
+in-scope scenarios** and on the 1:1:1 commit shape, with the run exiting 0 under
+its machine-checked attribution gate. **The only 3 remaining divergences are the
+3 allowlisted** mode/unsupported/artifact differences (`CROSSPLUMB-ALLOWLIST.md`,
+AX-1..AX-3); **zero class-(a) findings diverge** — every Slice-3 adapter gap
+(infra-type classification, `started_at`/`closed_at` management, no-history list
+filtering, close-time label hydration, cycle/self-dep/retype error wording) is
+fixed at source. The Slice-3 findings and the attribution table are retained
+below as the historical record of what the oracle surfaced and how it was closed.
 
 ## Slice-3 remediation addendum (post-run fixes)
 
@@ -258,5 +277,9 @@ above are **not** re-derived here — re-run `run-oracle-x.sh` for fresh counts.
   `EventClosed`/`EventReopened`/`EventStatusChanged`; now uses
   `issueops.DetermineEventType`. Corpus-masked (events surface only as counts).
 
-**Still open:** F-1 (wording), F-2 (`no_history` list visibility), F-3
-(infra-type auto-ephemeral for `message`), F-5 (close-output label hydration).
+**Slice-4 status: all closed.** The Slice-4 run (§Results) shows F-1 (wording +
+self-dep), F-2 (`no_history` list visibility), F-3 (infra-type auto-ephemeral for
+`message`), and F-5 (close-output label hydration) **no longer diverge** — they
+join F-4 as fixed at source. The cross-plumbing differential is now
+equivalence-clean: only the 3 allowlisted (AX-1..AX-3) mode/unsupported/artifact
+differences remain.
