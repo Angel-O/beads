@@ -16,15 +16,20 @@ import (
 // so callers must not retain it (same hazard as the embedded *sql.Tx view).
 //
 // The embedded unsupportedTransaction shell returns typed *storage.ErrUnsupported
-// for the 21 Transaction methods this spike does not implement; the three
-// overridden below (GetIssue, CloseIssue, AddDependency) are the minimal
-// read-check-act set that proves multi-statement atomicity across two tables
-// (issues + dependencies). Because a stubbed method's error propagates out of
-// fn, calling one also exercises the rollback-on-domain-error path.
+// for the Transaction methods this spike does not implement; the ones overridden
+// below (GetIssue, CloseIssue, AddDependency plus the delete-command trio
+// UpdateIssue, RemoveDependency, DeleteIssue) are the read-check-act set that
+// proves multi-statement atomicity across the issue + dependency tables. Because
+// a stubbed method's error propagates out of fn, calling one also exercises the
+// rollback-on-domain-error path.
 type uowTransaction struct {
-	unsupportedTransaction // generated: the 21 non-slice methods return typed ErrUnsupported
+	unsupportedTransaction // generated: the non-overridden methods return typed ErrUnsupported
 
 	u uow.UnitOfWork
+	// storeActor is the enclosing store's construction-time audit identity,
+	// threaded here so the actor-less tx methods (DeleteIssue) have a §4.0
+	// identity on the seam. Set in RunInTransaction — never leave it empty.
+	storeActor string
 }
 
 var _ storage.Transaction = (*uowTransaction)(nil)
@@ -33,30 +38,58 @@ var _ storage.Transaction = (*uowTransaction)(nil)
 // read-your-writes inside the transaction and the storage.ErrNotFound
 // translation behave identically to the non-transactional path.
 func (t *uowTransaction) GetIssue(ctx context.Context, id string) (*types.Issue, error) {
-	return getIssueInUOW(ctx, t.u, id)
+	issue, err := getIssueInUOW(ctx, t.u, id)
+	return issue, mapUowError(err)
 }
 
 // CloseIssue mutates through the shared close helper (issue-vs-wisp probe →
 // CloseIssue/CloseWisp). The is_blocked recompute fires inside this same tx.
 func (t *uowTransaction) CloseIssue(ctx context.Context, id, reason, actor, session string) error {
-	return closeIssueInUOW(ctx, t.u, id, reason, actor, session)
+	return mapUowError(closeIssueInUOW(ctx, t.u, id, reason, actor, session))
 }
 
-// AddDependency mirrors embeddedTransaction's IsActiveWispInTx routing: a wisp
-// source uses the wisp-dependency table, otherwise the regular table. The
-// use-case runs its blocking-cycle check (depRepo.HasCycle) in the same tx.
+// AddDependency routes wisp-vs-issue via the shared addDependencyInUOW helper
+// (same body as the store-level AddDependency); the use-case runs its
+// blocking-cycle check in the same tx.
 func (t *uowTransaction) AddDependency(ctx context.Context, dep *types.Dependency, actor string) error {
-	if dep == nil {
-		return fmt.Errorf("dependency must not be nil")
-	}
-	isWisp, err := isWispInUOW(ctx, t.u, dep.IssueID)
+	return mapUowError(addDependencyInUOW(ctx, t.u, dep, actor))
+}
+
+// UpdateIssue rewrites text references on a surviving neighbor inside the
+// delete tx (cmd/bd/delete.go). Same whitelisted-column semantics as the
+// store-level UpdateIssue, routed issue-vs-wisp.
+func (t *uowTransaction) UpdateIssue(ctx context.Context, id string, updates map[string]interface{}, actor string) error {
+	isWisp, err := isWispInUOW(ctx, t.u, id)
 	if err != nil {
-		return err
+		return mapUowError(err)
 	}
 	if isWisp {
-		return t.u.DependencyUseCase().AddWispDependency(ctx, dep, actor)
+		err = t.u.IssueUseCase().UpdateWisp(ctx, id, updates, actor)
+	} else {
+		err = t.u.IssueUseCase().UpdateIssue(ctx, id, updates, actor)
 	}
-	return t.u.DependencyUseCase().AddDependency(ctx, dep, actor)
+	return mapUowError(err)
+}
+
+// RemoveDependency tears down an edge inside the delete tx; the domain Delete
+// recomputes is_blocked for the surviving neighbors in the same tx (the `del`
+// scenario's blocked -> ready assertion rides this recompute).
+func (t *uowTransaction) RemoveDependency(ctx context.Context, issueID, dependsOnID, actor string) error {
+	return mapUowError(removeDependencyInUOW(ctx, t.u, issueID, dependsOnID, actor))
+}
+
+// DeleteIssue removes the issue row inside the delete tx. delete.go tears down
+// every edge touching id via RemoveDependency BEFORE this runs, so the cascade
+// delete's FindAllDependents resolves to {id} alone — no unintended cascade.
+func (t *uowTransaction) DeleteIssue(ctx context.Context, id string) error {
+	return mapUowError(deleteIssueInUOW(ctx, t.u, id, t.actor()))
+}
+
+// actor resolves the audit identity for the tx-view's actor-less store methods
+// (Transaction.DeleteIssue). It reads the enclosing store's construction-time
+// actor, threaded onto the view at construction (RunInTransaction below).
+func (t *uowTransaction) actor() string {
+	return t.storeActor
 }
 
 // RunInTransaction implements storage.Storage.RunInTransaction over ONE
@@ -94,6 +127,6 @@ func (s *uowStore) RunInTransaction(ctx context.Context, commitMsg string, fn fu
 		return fmt.Errorf("uowstore spike: RunInTransaction requires a non-empty commit message; deferred (blank-message) version commits are embedded-only (gastownhall/beads#4547)")
 	}
 	return uow.RunInTx(ctx, s.provider, commitMsg, func(u uow.UnitOfWork) error {
-		return fn(&uowTransaction{u: u}) // view constructed INSIDE the retry closure — never hoist
+		return fn(&uowTransaction{u: u, storeActor: s.actor}) // view constructed INSIDE the retry closure — never hoist
 	})
 }

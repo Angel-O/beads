@@ -69,7 +69,8 @@ func (s *uowStore) GetIssue(ctx context.Context, id string) (*types.Issue, error
 		return nil, err
 	}
 	defer u.Close(ctx)
-	return getIssueInUOW(ctx, u, id)
+	issue, err := getIssueInUOW(ctx, u, id)
+	return issue, mapUowError(err)
 }
 
 // GetIssuesByIDs backs the molecule-ancestry resolution in the close path
@@ -80,7 +81,8 @@ func (s *uowStore) GetIssuesByIDs(ctx context.Context, ids []string) ([]*types.I
 		return nil, err
 	}
 	defer u.Close(ctx)
-	return u.IssueUseCase().GetIssuesByIDs(ctx, ids)
+	out, err := u.IssueUseCase().GetIssuesByIDs(ctx, ids)
+	return out, mapUowError(err)
 }
 
 func (s *uowStore) SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error) {
@@ -92,7 +94,7 @@ func (s *uowStore) SearchIssues(ctx context.Context, query string, filter types.
 
 	page, err := u.IssueUseCase().SearchIssues(ctx, query, filter)
 	if err != nil {
-		return nil, err
+		return nil, mapUowError(err)
 	}
 	return page.Items, nil
 }
@@ -106,7 +108,7 @@ func (s *uowStore) SearchIssuesWithCounts(ctx context.Context, query string, fil
 
 	page, err := u.IssueUseCase().SearchIssuesWithCounts(ctx, query, filter)
 	if err != nil {
-		return nil, err
+		return nil, mapUowError(err)
 	}
 	return page.Items, nil
 }
@@ -120,7 +122,7 @@ func (s *uowStore) GetReadyWork(ctx context.Context, filter types.WorkFilter) ([
 
 	page, err := u.IssueUseCase().GetReadyWork(ctx, filter)
 	if err != nil {
-		return nil, err
+		return nil, mapUowError(err)
 	}
 	return page.Items, nil
 }
@@ -134,7 +136,7 @@ func (s *uowStore) GetReadyWorkWithCounts(ctx context.Context, filter types.Work
 
 	page, err := u.IssueUseCase().GetReadyWorkWithCounts(ctx, filter)
 	if err != nil {
-		return nil, err
+		return nil, mapUowError(err)
 	}
 	return page.Items, nil
 }
@@ -184,12 +186,12 @@ func (s *uowStore) CreateIssue(ctx context.Context, issue *types.Issue, actor st
 // — lives above the store and is out of scope here). Probes issue-or-wisp so
 // the right table is closed, exactly as the proxied close command does.
 func (s *uowStore) CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error {
-	return uow.RunInTxMsg(ctx, s.provider, func(u uow.UnitOfWork) (string, error) {
+	return mapUowError(uow.RunInTxMsg(ctx, s.provider, func(u uow.UnitOfWork) (string, error) {
 		if err := closeIssueInUOW(ctx, u, id, reason, actor, session); err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("bd: close %s", id), nil
-	})
+	}))
 }
 
 // ---- show-detail reads (labels / deps-with-metadata / counts) ----
@@ -209,7 +211,8 @@ func (s *uowStore) GetLabels(ctx context.Context, issueID string) ([]string, err
 		return nil, err
 	}
 	defer u.Close(ctx)
-	return u.LabelUseCase().GetLabels(ctx, issueID)
+	out, err := u.LabelUseCase().GetLabels(ctx, issueID)
+	return out, mapUowError(err)
 }
 
 func (s *uowStore) GetDependenciesWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error) {
@@ -218,7 +221,8 @@ func (s *uowStore) GetDependenciesWithMetadata(ctx context.Context, issueID stri
 		return nil, err
 	}
 	defer u.Close(ctx)
-	return u.DependencyUseCase().ListWithIssueMetadata(ctx, issueID, domain.DepListFilter{Direction: domain.DepDirectionOut})
+	out, err := u.DependencyUseCase().ListWithIssueMetadata(ctx, issueID, domain.DepListFilter{Direction: domain.DepDirectionOut})
+	return out, mapUowError(err)
 }
 
 func (s *uowStore) GetDependentsWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error) {
@@ -227,7 +231,8 @@ func (s *uowStore) GetDependentsWithMetadata(ctx context.Context, issueID string
 		return nil, err
 	}
 	defer u.Close(ctx)
-	return u.DependencyUseCase().ListWithIssueMetadata(ctx, issueID, domain.DepListFilter{Direction: domain.DepDirectionIn})
+	out, err := u.DependencyUseCase().ListWithIssueMetadata(ctx, issueID, domain.DepListFilter{Direction: domain.DepDirectionIn})
+	return out, mapUowError(err)
 }
 
 func (s *uowStore) CountDependencies(ctx context.Context, issueID string) (int64, error) {
@@ -236,7 +241,8 @@ func (s *uowStore) CountDependencies(ctx context.Context, issueID string) (int64
 		return 0, err
 	}
 	defer u.Close(ctx)
-	return u.DependencyUseCase().CountByIssueID(ctx, issueID, domain.DepListFilter{Direction: domain.DepDirectionOut})
+	n, err := u.DependencyUseCase().CountByIssueID(ctx, issueID, domain.DepListFilter{Direction: domain.DepDirectionOut})
+	return n, mapUowError(err)
 }
 
 func (s *uowStore) CountDependents(ctx context.Context, issueID string) (int64, error) {
@@ -245,7 +251,8 @@ func (s *uowStore) CountDependents(ctx context.Context, issueID string) (int64, 
 		return 0, err
 	}
 	defer u.Close(ctx)
-	return u.DependencyUseCase().CountByIssueID(ctx, issueID, domain.DepListFilter{Direction: domain.DepDirectionIn})
+	n, err := u.DependencyUseCase().CountByIssueID(ctx, issueID, domain.DepListFilter{Direction: domain.DepDirectionIn})
+	return n, mapUowError(err)
 }
 
 func (s *uowStore) CountIssueComments(ctx context.Context, issueID string) (int64, error) {
@@ -254,7 +261,8 @@ func (s *uowStore) CountIssueComments(ctx context.Context, issueID string) (int6
 		return 0, err
 	}
 	defer u.Close(ctx)
-	return u.CommentUseCase().CountCommentsForIssue(ctx, issueID)
+	n, err := u.CommentUseCase().CountCommentsForIssue(ctx, issueID)
+	return n, mapUowError(err)
 }
 
 // ---- close-path reads (blocker check + molecule ancestry walk) ----
@@ -270,7 +278,8 @@ func (s *uowStore) IsBlocked(ctx context.Context, issueID string) (bool, []strin
 		return false, nil, err
 	}
 	defer u.Close(ctx)
-	return u.DependencyUseCase().IsBlocked(ctx, issueID)
+	blocked, blockers, err := u.DependencyUseCase().IsBlocked(ctx, issueID)
+	return blocked, blockers, mapUowError(err)
 }
 
 func (s *uowStore) GetDependencyRecordsForIssues(ctx context.Context, issueIDs []string) (map[string][]*types.Dependency, error) {
@@ -279,7 +288,8 @@ func (s *uowStore) GetDependencyRecordsForIssues(ctx context.Context, issueIDs [
 		return nil, err
 	}
 	defer u.Close(ctx)
-	return u.DependencyUseCase().GetForIssueIDs(ctx, issueIDs)
+	out, err := u.DependencyUseCase().GetForIssueIDs(ctx, issueIDs)
+	return out, mapUowError(err)
 }
 
 // ---- config-metadata reads (ConfigMetadataStore) ----
@@ -299,7 +309,8 @@ func (s *uowStore) GetCustomStatusesDetailed(ctx context.Context) ([]types.Custo
 		return nil, err
 	}
 	defer u.Close(ctx)
-	return u.ConfigUseCase().GetCustomStatuses(ctx)
+	out, err := u.ConfigUseCase().GetCustomStatuses(ctx)
+	return out, mapUowError(err)
 }
 
 func (s *uowStore) GetCustomTypes(ctx context.Context) ([]string, error) {
@@ -308,7 +319,8 @@ func (s *uowStore) GetCustomTypes(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	defer u.Close(ctx)
-	return u.ConfigUseCase().GetCustomTypes(ctx)
+	out, err := u.ConfigUseCase().GetCustomTypes(ctx)
+	return out, mapUowError(err)
 }
 
 // GetInfraTypes drops the error to satisfy the store signature — a spike
@@ -358,7 +370,8 @@ func (s *uowStore) GetConfig(ctx context.Context, key string) (string, error) {
 		return "", err
 	}
 	defer u.Close(ctx)
-	return u.ConfigUseCase().GetConfig(ctx, key)
+	out, err := u.ConfigUseCase().GetConfig(ctx, key)
+	return out, mapUowError(err)
 }
 
 func (s *uowStore) GetAllConfig(ctx context.Context) (map[string]string, error) {
@@ -367,7 +380,8 @@ func (s *uowStore) GetAllConfig(ctx context.Context) (map[string]string, error) 
 		return nil, err
 	}
 	defer u.Close(ctx)
-	return u.ConfigUseCase().GetAllConfig(ctx)
+	out, err := u.ConfigUseCase().GetAllConfig(ctx)
+	return out, mapUowError(err)
 }
 
 // ---- PreRun-surface reads (not command handlers, but on every write path) ----
@@ -386,7 +400,8 @@ func (s *uowStore) GetMetadata(ctx context.Context, key string) (string, error) 
 		return "", err
 	}
 	defer u.Close(ctx)
-	return u.ConfigUseCase().GetMetadata(ctx, key)
+	out, err := u.ConfigUseCase().GetMetadata(ctx, key)
+	return out, mapUowError(err)
 }
 
 func (s *uowStore) GetStatistics(ctx context.Context) (*types.Statistics, error) {
@@ -395,7 +410,8 @@ func (s *uowStore) GetStatistics(ctx context.Context) (*types.Statistics, error)
 		return nil, err
 	}
 	defer u.Close(ctx)
-	return u.IssueUseCase().GetStatistics(ctx)
+	out, err := u.IssueUseCase().GetStatistics(ctx)
+	return out, mapUowError(err)
 }
 
 // ---- lifecycle ----
