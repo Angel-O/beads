@@ -34,9 +34,17 @@
 # (for the commit-count observer). 43+ scenarios each boot a proxy + child dolt
 # sql-server; the full capture+score can exceed 30 minutes.
 #
-# Exit status: 0 = run completed and ZERO unallowlisted class-(a) divergences;
-#              1 = at least one divergence not covered by the allowlist;
+# Exit status: 0 = run completed and every divergence is ATTRIBUTED — either an
+#                  allowlist entry (`CROSSPLUMB-ALLOWLIST.md`, class b/c/d) or a
+#                  named class-(a) finding row in `CROSSPLUMB-REPORT.md`;
+#              1 = at least one UNATTRIBUTED divergence (a failing scenario named
+#                  in neither doc), or the scoreboard itself crashed;
 #              2 = setup/build error.
+#
+# The verdict section (step 7) machine-checks this: it parses the allowlisted
+# scenario names from CROSSPLUMB-ALLOWLIST.md's `## AX-N — `name`` headers and the
+# attributed scenario names from CROSSPLUMB-REPORT.md's attribution table, then
+# refuses (exit 1) if any failing scenario is in neither. Nothing is trust-based.
 
 set -euo pipefail
 
@@ -116,6 +124,23 @@ command -v gcc   >/dev/null 2>&1 || command -v cc >/dev/null 2>&1 || die "no C c
 command -v dolt  >/dev/null 2>&1 || die "dolt not found in PATH (the proxied child server needs it)"
 command -v jq    >/dev/null 2>&1 || die "jq not found"
 command -v mysql >/dev/null 2>&1 || warn "mysql client not found — the commit-count observer will be skipped"
+
+# bd's workspace discovery walks UP from each scenario workspace looking for a
+# .beads dir; a stale .beads on ANY ancestor of $SCENWORK silently hijacks every
+# scenario (foreign DB, schema skew) and both the harness and wrapper swallow the
+# init failure. The default scratch root is ${TMPDIR:-/tmp}, so on a host with a
+# stale /tmp/.beads the whole run is invalid. Refuse to start if one exists.
+assert_no_ancestor_beads() {
+  local dir; dir="$(cd "$1" && pwd -P)"
+  while :; do
+    if [ -e "$dir/.beads" ]; then
+      die "ancestor .beads hijack: $dir/.beads exists and bd would bind every scenario workspace under $SCENWORK to it. Remove it, or set TMPDIR to a directory with no .beads on any ancestor, then re-run."
+    fi
+    [ "$dir" = "/" ] && break
+    dir="$(dirname "$dir")"
+  done
+}
+assert_no_ancestor_beads "$SCENWORK"
 
 # --- 1. the ONE binary: working-tree bd ----------------------------------------------
 BD="${BD_BIN:-}"
@@ -257,8 +282,12 @@ log "scoring CANDIDATE (spike-proxied) — booting a proxy+child per scenario, t
 SCORE_OUT="$SCRATCH/scoreboard.out"
 set +e
 TMPDIR="$SCENWORK" BTS_CANDIDATE="$WRAPPER" "$SCOREBOARD" | tee "$SCORE_OUT"
+score_rc=${PIPESTATUS[0]}
 set -e
 reap_servers
+# A scoreboard crash must not masquerade as a clean run (the `| tee` used to hide
+# it). Surface it in the verdict rather than swallowing it here.
+[ "$score_rc" -ne 0 ] && warn "scoreboard exited non-zero ($score_rc) — verdict will fail the run."
 
 # preserve the per-failure detail this run produced (scoreboard writes a fixed path).
 FAIL_DETAIL="$SCRATCH/crossplumb-failures.txt"
@@ -317,9 +346,55 @@ log "IN-SCOPE PASS=$IN_PASS FAIL=$IN_FAIL"
 log "scoreboard : $SCORE_OUT"
 log "failures   : $FAIL_DETAIL"
 log "observer   : $OBS_OUT"
-if [ -n "${IN_FAIL:-}" ] && [ "$IN_FAIL" -gt 0 ]; then
-  warn "cross-plumbing divergences present — attribute each in CROSSPLUMB-ALLOWLIST.md (class-(a) adapter bugs are findings, not allowlistable)."
+
+# --- machine-checked attribution gate ------------------------------------------------
+# Every FAILING scenario must be ATTRIBUTED: named either in an allowlist header
+# (`## AX-N — `name``) or in the report's attribution table (`| N | name | …`). A
+# failing scenario named in neither is an UNATTRIBUTED divergence and fails the run.
+ALLOWLIST_MD="$SCRIPT_DIR/CROSSPLUMB-ALLOWLIST.md"
+REPORT_MD="$SCRIPT_DIR/CROSSPLUMB-REPORT.md"
+
+attributed="$(
+  { grep -oE '^## AX-[0-9]+ — `[^`]+`' "$ALLOWLIST_MD" 2>/dev/null \
+      | sed -E 's/.*`([^`]+)`.*/\1/'
+    grep -oE '^\| *[0-9]+ *\| *[a-zA-Z0-9_]+ *\|' "$REPORT_MD" 2>/dev/null \
+      | sed -E 's/^\| *[0-9]+ *\| *([a-zA-Z0-9_]+).*/\1/'
+  } | sort -u
+)"
+
+failing=""
+if [ -s "$FAIL_DETAIL" ]; then
+  failing="$(sed -E 's/ +— .*//; s/[[:space:]]+$//' "$FAIL_DETAIL" | grep -v '^$' | sort -u)"
 fi
-# The gate is attribution-based, enforced by the committed allowlist + report,
-# not by a bare FAIL count (mode differences are expected and allowlisted).
-exit 0
+
+# Stale attribution: an allowlisted/attributed scenario that did NOT diverge.
+# Informational only (a fixed adapter gap) — never fails the run.
+while IFS= read -r scen; do
+  [ -z "$scen" ] && continue
+  printf '%s\n' "$failing" | grep -qxF "$scen" || \
+    warn "attributed scenario '$scen' did not diverge this run (fixed? prune it from the allowlist/report)."
+done <<ATTR
+$attributed
+ATTR
+
+unattributed=""
+while IFS= read -r scen; do
+  [ -z "$scen" ] && continue
+  printf '%s\n' "$attributed" | grep -qxF "$scen" || unattributed="$unattributed $scen"
+done <<FAILS
+$failing
+FAILS
+
+rc=0
+if [ -n "${unattributed// /}" ]; then
+  warn "UNATTRIBUTED cross-plumbing divergence(s) — in neither CROSSPLUMB-ALLOWLIST.md nor CROSSPLUMB-REPORT.md:"
+  for s in $unattributed; do warn "  - $s"; done
+  warn "attribute each as an allowlist entry (class b/c/d) or a report finding row (class a), then re-run."
+  rc=1
+fi
+if [ "${score_rc:-0}" -ne 0 ]; then
+  warn "scoreboard crashed (exit $score_rc) — run invalid."
+  rc=1
+fi
+[ "$rc" -eq 0 ] && log "attribution gate OK — every divergence is attributed."
+exit "$rc"
