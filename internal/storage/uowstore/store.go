@@ -169,7 +169,13 @@ func (s *uowStore) CreateIssue(ctx context.Context, issue *types.Issue, actor st
 			res domain.CreateIssueResult
 			err error
 		)
-		if issue.Ephemeral {
+		// Route ephemeral AND no-history beads to the wisps table, mirroring
+		// EmbeddedDoltStore.CreateIssue's `useWispsTable := Ephemeral || NoHistory
+		// || infra`. no_history beads live in wisps with ephemeral=0, so
+		// `list --all` (SkipWisps) hides them while `ready` (issues∪wisps union)
+		// still surfaces them — the tier set-algebra embedded produces (#4547 F-2).
+		// NoHistory does NOT set issue.Ephemeral, so the create JSON is unchanged.
+		if issue.Ephemeral || issue.NoHistory {
 			res, err = u.IssueUseCase().CreateWisp(ctx, params, actor)
 		} else {
 			res, err = u.IssueUseCase().CreateIssue(ctx, params, actor)
@@ -435,6 +441,16 @@ func (s *uowStore) Close() error {
 func getIssueInUOW(ctx context.Context, u uow.UnitOfWork, id string) (*types.Issue, error) {
 	issue, err := u.IssueUseCase().GetIssue(ctx, id)
 	if err == nil {
+		// Hydrate labels from the issues-side label table, matching embedded's
+		// issueops.GetIssueInTx (it always populates issue.Labels). The domain
+		// use-case GetIssue returns only the row, so without this the close/show
+		// return objects carry labels=null even though the labels persist —
+		// #4547 F-5. GetLabels routes to `labels` for a regular issue.
+		labels, lerr := u.LabelUseCase().GetLabels(ctx, id)
+		if lerr != nil {
+			return nil, lerr
+		}
+		issue.Labels = labels
 		return issue, nil
 	}
 	if !isNotFound(err) {
@@ -443,6 +459,13 @@ func getIssueInUOW(ctx context.Context, u uow.UnitOfWork, id string) (*types.Iss
 
 	wisp, werr := u.IssueUseCase().GetWisp(ctx, id)
 	if werr == nil {
+		// Wisp-side hydration reads wisp_labels, mirroring GetIssueInTx's
+		// issues→wisps table fallback (labels→wisp_labels).
+		labels, lerr := u.LabelUseCase().GetWispLabels(ctx, id)
+		if lerr != nil {
+			return nil, lerr
+		}
+		wisp.Labels = labels
 		return wisp, nil
 	}
 	if isNotFound(werr) {
