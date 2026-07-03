@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -128,6 +129,22 @@ func (u *configUseCaseImpl) GetInfraTypes(ctx context.Context) (map[string]bool,
 	out, err := u.cfgRepo.GetInfraTypes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("GetInfraTypes: %w", err)
+	}
+	// The repo returns only the DB `types.infra` config; an unset/empty value
+	// yields an empty map. Embedded resolves the same way but then falls back to
+	// config.yaml and finally the hardcoded defaults (["agent","role","message"])
+	// via issueops.ResolveInfraTypesInTx / DoltStore.GetInfraTypes. Reproduce that
+	// fallback here so `-t message` auto-routes to ephemeral on this seam exactly
+	// as on the embedded store, instead of being treated as a plain type (#4547 F-3).
+	if len(out) == 0 {
+		typeList := config.GetInfraTypesFromYAML()
+		if len(typeList) == 0 {
+			typeList = DefaultInfraTypes()
+		}
+		out = make(map[string]bool, len(typeList))
+		for _, t := range typeList {
+			out[t] = true
+		}
 	}
 	return out, nil
 }
