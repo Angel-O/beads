@@ -106,6 +106,17 @@ var Profiles = []BackendProfile{
 			"update-no-history-demote": "deferred: durable→wisp demote guard",
 		},
 	},
+	{
+		Name:      "sqlite",
+		Available: func() bool { return true }, // embedded (pure-Go modernc); always runs
+		// File-based: the default beads.db inside each workspace's .beads dir isolates
+		// it; the temp workspace dir cleanup removes the file. No handle/env/teardown.
+		InitArgs: func(*Workspace) []string { return []string{"--backend=sqlite"} },
+		XFail: map[string]string{
+			"stats":                    "deferred: GetStatistics (bd stats/status)",
+			"update-no-history-demote": "deferred: durable→wisp demote guard",
+		},
+	},
 }
 
 // Reference returns the single reference profile.

@@ -48,6 +48,9 @@ type Config struct {
 	MySQLDSN      string `json:"mysql_dsn,omitempty"`      // e.g. user@tcp(host:3306)/ (no password)
 	MySQLDatabase string `json:"mysql_database,omitempty"` // per-workspace database (MySQL's isolation unit)
 
+	// SQLite backend (backend="sqlite"). File-based, embedded; no credentials.
+	SQLitePath string `json:"sqlite_path,omitempty"` // database file, relative to the beads dir (default beads.db)
+
 	// Project identity — unique ID generated at bd init time.
 	// Used to detect cross-project data leakage when a client connects
 	// to the wrong Dolt server (GH#2372).
@@ -184,6 +187,7 @@ const (
 	BackendDolt     = "dolt"
 	BackendPostgres = "postgres"
 	BackendMySQL    = "mysql"
+	BackendSQLite   = "sqlite"
 )
 
 // BackendCapabilities describes behavioral constraints for a storage backend.
@@ -229,9 +233,20 @@ func (c *Config) GetBackend() string {
 			return BackendPostgres
 		case BackendMySQL:
 			return BackendMySQL
+		case BackendSQLite:
+			return BackendSQLite
 		}
 	}
 	return BackendDolt
+}
+
+// GetSQLitePath returns the SQLite database file path (relative to the beads dir, or
+// absolute). Empty means the default (beads.db).
+func (c *Config) GetSQLitePath() string {
+	if c == nil {
+		return ""
+	}
+	return c.SQLitePath
 }
 
 // GetPostgresDSN returns the Postgres connection string. Precedence:

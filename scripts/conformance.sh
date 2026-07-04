@@ -39,6 +39,10 @@ CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/pgdialect/
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/mysql/ \
   -run 'TestInterfaceCompleteness|TestSeedOnlyOnFirstProvision'
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/mysqldialect/
+# SQLite is embedded (pure-Go), always runs.
+CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/sqlite/ \
+  -run 'TestInterfaceCompleteness|TestSeedOnlyOnFirstProvision'
+CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/sqlitedialect/
 
 echo "==> Tier 2: end-to-end 'bd init' + CLI conformance (differential vs Dolt)"
 CGO_ENABLED=1 go test -tags "$TAGS e2e" ./test/conformance/

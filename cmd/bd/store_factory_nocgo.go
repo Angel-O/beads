@@ -13,6 +13,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	beadsmysql "github.com/steveyegge/beads/internal/storage/mysql"
 	"github.com/steveyegge/beads/internal/storage/postgres"
+	beadssqlite "github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/storage/uowstore"
 )
 
@@ -82,6 +83,10 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltS
 		// MySQL (go-sql-driver) needs no CGO either.
 		return beadsmysql.NewFromConfig(ctx, beadsDir)
 	}
+	if err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendSQLite {
+		// SQLite (modernc.org/sqlite) is pure-Go; no CGO.
+		return beadssqlite.NewFromConfig(ctx, beadsDir)
+	}
 	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
 		if spikeUOWStore() {
 			return newSpikeUOWStore(ctx, beadsDir)
@@ -108,6 +113,9 @@ func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.D
 	}
 	if err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendMySQL {
 		return beadsmysql.NewFromConfig(ctx, beadsDir)
+	}
+	if err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendSQLite {
+		return beadssqlite.NewFromConfig(ctx, beadsDir)
 	}
 	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
 		if spikeUOWStore() {
