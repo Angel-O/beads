@@ -84,6 +84,28 @@ var Profiles = []BackendProfile{
 			"update-no-history-demote": "deferred: durable→wisp demote guard",
 		},
 	},
+	{
+		Name:      "mysql",
+		Available: func() bool { return os.Getenv("BEADS_MYSQL_TEST_URL") != "" },
+		NewHandle: freshSchemaName, // a valid MySQL database name
+		InitArgs: func(ws *Workspace) []string {
+			return []string{
+				"--backend=mysql",
+				"--mysql-url=" + os.Getenv("BEADS_MYSQL_TEST_URL"),
+				"--mysql-database=" + ws.Handle,
+			}
+		},
+		Env: func(*Workspace) []string {
+			// The server DSN (with password) is used for every command; the
+			// per-workspace database comes from metadata.json / --mysql-database.
+			return []string{"BEADS_MYSQL_URL=" + os.Getenv("BEADS_MYSQL_TEST_URL")}
+		},
+		Teardown: dropMySQLDatabase,
+		XFail: map[string]string{
+			"stats":                    "deferred: GetStatistics (bd stats/status)",
+			"update-no-history-demote": "deferred: durable→wisp demote guard",
+		},
+	},
 }
 
 // Reference returns the single reference profile.

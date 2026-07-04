@@ -30,6 +30,7 @@ import (
 	"github.com/steveyegge/beads/internal/molecules"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	mysqlstore "github.com/steveyegge/beads/internal/storage/mysql"
 	pgstore "github.com/steveyegge/beads/internal/storage/postgres"
 	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/storage/uow"
@@ -916,8 +917,8 @@ var rootCmd = &cobra.Command{
 
 		if dbPath == "" {
 			if bd := beads.FindBeadsDir(); bd != "" {
-				if cfg, _ := configfile.Load(bd); cfg != nil && (cfg.IsDoltProxiedServerMode() || cfg.GetBackend() == configfile.BackendPostgres) {
-					// A postgres (or proxied-server) workspace has no local Dolt
+				if cfg, _ := configfile.Load(bd); cfg != nil && (cfg.IsDoltProxiedServerMode() || cfg.GetBackend() == configfile.BackendPostgres || cfg.GetBackend() == configfile.BackendMySQL) {
+					// A non-Dolt SQL (or proxied-server) workspace has no local Dolt
 					// database file; the .beads dir with metadata.json IS the workspace.
 					dbPath = bd
 				}
@@ -1145,6 +1146,9 @@ var rootCmd = &cobra.Command{
 			// Postgres backend: open via the SQL-family bundle, bypassing the
 			// Dolt open path (the doltCfg above is built but unused here).
 			store, err = pgstore.NewFromConfig(rootCtx, beadsDir)
+		} else if cfg != nil && cfg.GetBackend() == configfile.BackendMySQL {
+			// MySQL backend: same SQL-family bundle, isolation by database.
+			store, err = mysqlstore.NewFromConfig(rootCtx, beadsDir)
 		} else {
 			store, err = newDoltStore(rootCtx, doltCfg)
 		}

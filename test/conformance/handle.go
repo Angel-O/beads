@@ -2,10 +2,12 @@ package conformance
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"sync/atomic"
 
+	gomysql "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/beads/internal/storage/pgdialect"
 )
 
@@ -34,4 +36,26 @@ func dropPostgresSchema(ws *Workspace) {
 	}
 	defer raw.Close()
 	_, _ = raw.ExecContext(context.Background(), fmt.Sprintf(`DROP SCHEMA IF EXISTS %q CASCADE`, ws.Handle))
+}
+
+// dropMySQLDatabase tears down a workspace's database. Best effort.
+func dropMySQLDatabase(ws *Workspace) {
+	if ws.Handle == "" {
+		return
+	}
+	url := os.Getenv("BEADS_MYSQL_TEST_URL")
+	if url == "" {
+		return
+	}
+	cfg, err := gomysql.ParseDSN(url)
+	if err != nil {
+		return
+	}
+	cfg.DBName = ""
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		return
+	}
+	defer db.Close()
+	_, _ = db.ExecContext(context.Background(), "DROP DATABASE IF EXISTS `"+ws.Handle+"`")
 }

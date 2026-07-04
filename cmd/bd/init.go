@@ -27,6 +27,7 @@ import (
 	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	beadsmysql "github.com/steveyegge/beads/internal/storage/mysql"
 	"github.com/steveyegge/beads/internal/storage/pgdialect"
 	"github.com/steveyegge/beads/internal/storage/postgres"
 	"github.com/steveyegge/beads/internal/storage/schema"
@@ -104,6 +105,8 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// Postgres backend flags (backend="postgres")
 		pgURL, _ := cmd.Flags().GetString("pg-url")
 		pgSchema, _ := cmd.Flags().GetString("pg-schema")
+		mysqlURL, _ := cmd.Flags().GetString("mysql-url")
+		mysqlDatabase, _ := cmd.Flags().GetString("mysql-database")
 
 		// --force is a deprecated alias for --reinit-local. They share
 		// semantics for the local data-safety guard; both refuse remote
@@ -233,17 +236,20 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			return fmt.Errorf("--backend=sqlite is no longer supported")
 		}
 		isPostgres := backendFlag == configfile.BackendPostgres
-		if backendFlag != "" && backendFlag != configfile.BackendDolt && !isPostgres {
-			return fmt.Errorf("unknown backend %q: supported backends are \"dolt\" (default) and \"postgres\"", backendFlag)
+		isMySQL := backendFlag == configfile.BackendMySQL
+		if backendFlag != "" && backendFlag != configfile.BackendDolt && !isPostgres && !isMySQL {
+			return fmt.Errorf("unknown backend %q: supported backends are \"dolt\" (default), \"postgres\", and \"mysql\"", backendFlag)
 		}
-		if isPostgres {
-			// The Postgres proof-wedge is a plain local workspace: only a small set of
+		if isPostgres || isMySQL {
+			// A non-Dolt SQL backend is a plain local workspace: only a small set of
 			// init-local flags apply. Reject any other init-local flag by ALLOWLIST — a
 			// denylist silently ignores Dolt-only flags added later, the exact footgun
 			// this block exists to prevent. Inherited/global flags (--json, --dir, …)
 			// are not init-local and are left untouched.
 			pgAllowedFlags := map[string]bool{
-				"backend": true, "pg-url": true, "pg-schema": true,
+				"backend": true,
+				"pg-url":  true, "pg-schema": true,
+				"mysql-url": true, "mysql-database": true,
 				"prefix": true, "quiet": true,
 				"skip-hooks": true, "skip-agents": true,
 				"reinit-local": true, "force": true, "init-if-missing": true,
@@ -263,7 +269,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			})
 			if len(rejected) > 0 {
 				sort.Strings(rejected)
-				return fmt.Errorf("bd init --backend=postgres does not support %s (the Postgres proof-wedge is a plain local workspace: no Dolt server, sync, remote, or wizard)", strings.Join(rejected, ", "))
+				return fmt.Errorf("bd init --backend=%s does not support %s (a non-Dolt SQL backend is a plain local workspace: no Dolt server, sync, remote, or wizard)", backendFlag, strings.Join(rejected, ", "))
 			}
 		}
 
@@ -809,6 +815,16 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				pgSchema:   pgSchema,
 				quiet:      quiet,
 				jsonOutput: jsonOutput,
+			})
+		}
+		if isMySQL {
+			return runInitMySQL(ctx, initMySQLInput{
+				beadsDir:      beadsDir,
+				prefix:        prefix,
+				mysqlURL:      mysqlURL,
+				mysqlDatabase: mysqlDatabase,
+				quiet:         quiet,
+				jsonOutput:    jsonOutput,
 			})
 		}
 
@@ -1890,6 +1906,102 @@ func runInitPostgres(ctx context.Context, in initPostgresInput) error {
 	return nil
 }
 
+// initMySQLInput carries the resolved inputs the MySQL init arm needs.
+type initMySQLInput struct {
+	beadsDir      string
+	prefix        string
+	mysqlURL      string
+	mysqlDatabase string
+	quiet         bool
+	jsonOutput    bool
+}
+
+// runInitMySQL finalizes a MySQL-backed workspace: it creates the per-workspace
+// database, applies the schema (config seeds on first provision), seeds the issue
+// prefix and project identity, and writes metadata.json with the password-stripped
+// DSN. The password is supplied at open time via BEADS_MYSQL_PASSWORD and never lands
+// on disk. MySQL isolates by database where Postgres isolates by schema.
+func runInitMySQL(ctx context.Context, in initMySQLInput) error {
+	dsn := in.mysqlURL
+	if dsn == "" {
+		dsn = os.Getenv("BEADS_MYSQL_URL")
+	}
+	if dsn == "" {
+		return fmt.Errorf("bd init --backend=mysql requires --mysql-url=<dsn> (or BEADS_MYSQL_URL), e.g. user:pass@tcp(host:3306)/ ; a password may be included for init but is never persisted — set BEADS_MYSQL_PASSWORD for later commands")
+	}
+	database := in.mysqlDatabase
+	if database == "" {
+		return fmt.Errorf("bd init --backend=mysql requires --mysql-database=<name> (the per-workspace database)")
+	}
+
+	// Redact BEFORE provisioning so a DSN we cannot safely persist fails before any
+	// side effect, and the password is guaranteed never to reach metadata.json.
+	persistDSN, err := beadsmysql.RedactPassword(dsn)
+	if err != nil {
+		return fmt.Errorf("cannot safely persist the MySQL connection: %w", err)
+	}
+
+	store, err := beadsmysql.Provision(ctx, dsn, database)
+	if err != nil {
+		return fmt.Errorf("failed to initialize MySQL workspace: %w", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	cfg, _ := configfile.Load(in.beadsDir)
+	if cfg == nil {
+		cfg = configfile.DefaultConfig()
+	}
+
+	if in.prefix != "" {
+		if existing, _ := store.GetConfig(ctx, "issue_prefix"); existing == "" {
+			issuePrefix := strings.ReplaceAll(in.prefix, ".", "_")
+			if err := store.SetConfig(ctx, "issue_prefix", issuePrefix); err != nil {
+				return fmt.Errorf("failed to set issue prefix: %w", err)
+			}
+		}
+	}
+
+	projectID, _ := store.GetMetadata(ctx, "_project_id")
+	if projectID == "" {
+		if cfg.ProjectID != "" {
+			projectID = cfg.ProjectID
+		} else {
+			projectID = configfile.GenerateProjectID()
+		}
+		if err := store.SetMetadata(ctx, "_project_id", projectID); err != nil {
+			return fmt.Errorf("failed to write project ID: %w", err)
+		}
+	}
+
+	cfg.Backend = configfile.BackendMySQL
+	cfg.MySQLDSN = persistDSN
+	cfg.MySQLDatabase = database
+	cfg.ProjectID = projectID
+	if err := cfg.Save(in.beadsDir); err != nil {
+		return fmt.Errorf("failed to write metadata.json: %w", err)
+	}
+
+	switch {
+	case in.jsonOutput:
+		out := map[string]any{
+			"status":   "initialized",
+			"backend":  configfile.BackendMySQL,
+			"database": database,
+			"prefix":   in.prefix,
+		}
+		b, _ := json.MarshalIndent(out, "", "  ")
+		fmt.Println(string(b))
+	case !in.quiet:
+		fmt.Printf("%s bd initialized with the MySQL backend\n", ui.RenderPass("✓"))
+		fmt.Printf("  Database: %s\n", database)
+		if in.prefix != "" {
+			fmt.Printf("  Prefix:   %s\n", in.prefix)
+		}
+		fmt.Println("  History:  not tracked (MySQL backend has no version control; use Dolt for history)")
+	}
+	return nil
+}
+
 func init() {
 	initCmd.Flags().StringP("prefix", "p", "", "Issue prefix (default: current directory name)")
 	initCmd.Flags().BoolP("quiet", "q", false, "Suppress output (quiet mode)")
@@ -1918,6 +2030,8 @@ func init() {
 	initCmd.Flags().String("backend", "", "Storage backend: dolt (default) or postgres. --backend=sqlite prints deprecation notice.")
 	initCmd.Flags().String("pg-url", "", "Postgres connection URL (with --backend=postgres). A password may be included for init but is never persisted; set BEADS_PG_PASSWORD for later commands. Falls back to BEADS_POSTGRES_URL.")
 	initCmd.Flags().String("pg-schema", "", "Postgres schema for this workspace's tables (with --backend=postgres; provides search_path isolation)")
+	initCmd.Flags().String("mysql-url", "", "MySQL server DSN (with --backend=mysql), e.g. user:pass@tcp(host:3306)/ . A password may be included for init but is never persisted; set BEADS_MYSQL_PASSWORD for later commands. Falls back to BEADS_MYSQL_URL.")
+	initCmd.Flags().String("mysql-database", "", "MySQL database for this workspace (with --backend=mysql; MySQL's isolation unit)")
 
 	// Dolt server connection flags
 	initCmd.Flags().Bool("server", false, "Use external dolt sql-server instead of embedded engine")
@@ -2054,6 +2168,19 @@ To re-initialize (Postgres provisioning is idempotent):
   bd init --backend=postgres --reinit-local ...
 
 Aborting.`, ui.RenderWarn("⚠"), cfg.GetPostgresSchema(), ui.RenderAccent("bd list"))
+	}
+
+	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendMySQL {
+		return alreadyInitialized(`
+%s This workspace is already initialized with the MySQL backend (database %q).
+
+To use it:
+  Just run bd commands normally (e.g., %s)
+
+To re-initialize (MySQL provisioning is idempotent):
+  bd init --backend=mysql --reinit-local ...
+
+Aborting.`, ui.RenderWarn("⚠"), cfg.GetMySQLDatabase(), ui.RenderAccent("bd list"))
 	}
 
 	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendDolt {

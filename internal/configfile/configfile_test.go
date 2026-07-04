@@ -655,6 +655,13 @@ func TestGetBackendAllowlist(t *testing.T) {
 			t.Errorf("GetBackend() = %q, want %q", got, BackendPostgres)
 		}
 	})
+
+	t.Run("mysql honored", func(t *testing.T) {
+		cfg := &Config{Backend: BackendMySQL}
+		if got := cfg.GetBackend(); got != BackendMySQL {
+			t.Errorf("GetBackend() = %q, want %q", got, BackendMySQL)
+		}
+	})
 }
 
 // TestDatabasePathAlwaysDolt tests that DatabasePath always returns the dolt path.

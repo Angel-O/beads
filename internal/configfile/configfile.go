@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	gomysql "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/beads/internal/config"
 )
 
@@ -41,6 +42,11 @@ type Config struct {
 	// comes from BEADS_PG_PASSWORD or BEADS_POSTGRES_URL.
 	PostgresDSN    string `json:"postgres_dsn,omitempty"`    // e.g. postgres://user@host:5432/db (no password)
 	PostgresSchema string `json:"postgres_schema,omitempty"` // per-workspace schema (search_path)
+
+	// MySQL backend (backend="mysql"). Password is NEVER persisted; it comes from
+	// BEADS_MYSQL_PASSWORD or BEADS_MYSQL_URL.
+	MySQLDSN      string `json:"mysql_dsn,omitempty"`      // e.g. user@tcp(host:3306)/ (no password)
+	MySQLDatabase string `json:"mysql_database,omitempty"` // per-workspace database (MySQL's isolation unit)
 
 	// Project identity — unique ID generated at bd init time.
 	// Used to detect cross-project data leakage when a client connects
@@ -177,6 +183,7 @@ func (c *Config) GetStaleClosedIssuesDays() int {
 const (
 	BackendDolt     = "dolt"
 	BackendPostgres = "postgres"
+	BackendMySQL    = "mysql"
 )
 
 // BackendCapabilities describes behavioral constraints for a storage backend.
@@ -211,12 +218,18 @@ func (c *Config) GetCapabilities() BackendCapabilities {
 	return CapabilitiesForBackend(backend)
 }
 
-// GetBackend returns the configured storage backend. Only "postgres" is honored
-// as a non-default; "", "dolt", and any legacy value resolve to dolt so the
-// default path stays byte-identical.
+// GetBackend returns the configured storage backend. Only the explicitly-allowlisted
+// non-default backends ("postgres", "mysql") are honored; "", "dolt", and any legacy
+// or unknown value resolve to dolt so the default path stays byte-identical and a
+// typo fails safe to Dolt.
 func (c *Config) GetBackend() string {
-	if c != nil && c.Backend == BackendPostgres {
-		return BackendPostgres
+	if c != nil {
+		switch c.Backend {
+		case BackendPostgres:
+			return BackendPostgres
+		case BackendMySQL:
+			return BackendMySQL
+		}
 	}
 	return BackendDolt
 }
@@ -247,6 +260,34 @@ func (c *Config) GetPostgresSchema() string {
 		return ""
 	}
 	return c.PostgresSchema
+}
+
+// GetMySQLDSN returns the MySQL server DSN. Precedence: BEADS_MYSQL_URL (may carry a
+// password) > metadata mysql_dsn with the password from BEADS_MYSQL_PASSWORD merged
+// in via the go-sql-driver parser. The password is never persisted.
+func (c *Config) GetMySQLDSN() string {
+	if u := os.Getenv("BEADS_MYSQL_URL"); u != "" {
+		return u
+	}
+	if c == nil {
+		return ""
+	}
+	dsn := c.MySQLDSN
+	if pw := os.Getenv("BEADS_MYSQL_PASSWORD"); pw != "" && dsn != "" {
+		if parsed, err := gomysql.ParseDSN(dsn); err == nil {
+			parsed.Passwd = pw
+			return parsed.FormatDSN()
+		}
+	}
+	return dsn
+}
+
+// GetMySQLDatabase returns the per-workspace MySQL database (isolation unit).
+func (c *Config) GetMySQLDatabase() string {
+	if c == nil {
+		return ""
+	}
+	return c.MySQLDatabase
 }
 
 // Password redaction for persistence lives in pgdialect.RedactPassword, not here:

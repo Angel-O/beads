@@ -34,6 +34,11 @@ CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/embeddeddolt/ -run TestCo
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/postgres/ \
   -run 'TestPGSmoke|TestInterfaceCompleteness|TestSeedOnlyOnFirstProvision'
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/pgdialect/
+# MySQL wedge gates (self-skip without BEADS_MYSQL_TEST_URL); the dialect rewrite test
+# (the is_blocked 1093 workaround) always runs.
+CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/mysql/ \
+  -run 'TestInterfaceCompleteness|TestSeedOnlyOnFirstProvision'
+CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/mysqldialect/
 
 echo "==> Tier 2: end-to-end 'bd init' + CLI conformance (differential vs Dolt)"
 CGO_ENABLED=1 go test -tags "$TAGS e2e" ./test/conformance/

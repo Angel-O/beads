@@ -11,6 +11,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/util"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	beadsmysql "github.com/steveyegge/beads/internal/storage/mysql"
 	"github.com/steveyegge/beads/internal/storage/postgres"
 	"github.com/steveyegge/beads/internal/storage/uowstore"
 )
@@ -77,6 +78,10 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltS
 		// Postgres needs no CGO (pure-Go pgx), so it works in the nocgo build too.
 		return postgres.NewFromConfig(ctx, beadsDir)
 	}
+	if err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendMySQL {
+		// MySQL (go-sql-driver) needs no CGO either.
+		return beadsmysql.NewFromConfig(ctx, beadsDir)
+	}
 	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
 		if spikeUOWStore() {
 			return newSpikeUOWStore(ctx, beadsDir)
@@ -100,6 +105,9 @@ func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.D
 	cfg, err := configfile.Load(beadsDir)
 	if err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendPostgres {
 		return postgres.NewFromConfig(ctx, beadsDir)
+	}
+	if err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendMySQL {
+		return beadsmysql.NewFromConfig(ctx, beadsDir)
 	}
 	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
 		if spikeUOWStore() {
