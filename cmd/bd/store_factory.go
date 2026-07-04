@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/dbproxy/util"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
+	"github.com/steveyegge/beads/internal/storage/postgres"
 	"github.com/steveyegge/beads/internal/storage/uowstore"
 )
 
@@ -130,6 +131,9 @@ func acquireEmbeddedLock(beadsDir string, serverMode bool) (util.Unlocker, error
 // auto-sanitized to underscores and the fix is persisted to metadata.json.
 func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
+	if err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendPostgres {
+		return postgres.NewFromConfig(ctx, beadsDir)
+	}
 	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
 		if spikeUOWStore() {
 			return newSpikeUOWStore(ctx, beadsDir)
@@ -206,6 +210,11 @@ func migrateHyphenatedDB(beadsDir string, cfg *configfile.Config, oldName, newNa
 // hydration from mutating foreign projects (GH#3231).
 func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
+	if err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendPostgres {
+		// Postgres has no read-only open mode in the wedge; a normal open is fine
+		// (reads don't mutate, and search_path is per-workspace).
+		return postgres.NewFromConfig(ctx, beadsDir)
+	}
 	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
 		if spikeUOWStore() {
 			return newSpikeUOWStore(ctx, beadsDir)

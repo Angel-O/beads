@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,6 +36,11 @@ type Config struct {
 	DoltDataDir        string `json:"dolt_data_dir,omitempty"`        // Custom dolt data directory (absolute path; default: .beads/dolt)
 	DoltRemotesAPIPort int    `json:"dolt_remotesapi_port,omitempty"` // Dolt remotesapi port for federation (default: 8080)
 	// Note: Password should be set via BEADS_DOLT_PASSWORD env var for security
+
+	// Postgres backend (backend="postgres"). Password is NEVER persisted; it
+	// comes from BEADS_PG_PASSWORD or BEADS_POSTGRES_URL.
+	PostgresDSN    string `json:"postgres_dsn,omitempty"`    // e.g. postgres://user@host:5432/db (no password)
+	PostgresSchema string `json:"postgres_schema,omitempty"` // per-workspace schema (search_path)
 
 	// Project identity — unique ID generated at bd init time.
 	// Used to detect cross-project data leakage when a client connects
@@ -169,7 +175,8 @@ func (c *Config) GetStaleClosedIssuesDays() int {
 
 // Backend constants
 const (
-	BackendDolt = "dolt"
+	BackendDolt     = "dolt"
+	BackendPostgres = "postgres"
 )
 
 // BackendCapabilities describes behavioral constraints for a storage backend.
@@ -204,9 +211,42 @@ func (c *Config) GetCapabilities() BackendCapabilities {
 	return CapabilitiesForBackend(backend)
 }
 
-// GetBackend returns the backend type. Always returns "dolt".
+// GetBackend returns the configured storage backend. Only "postgres" is honored
+// as a non-default; "", "dolt", and any legacy value resolve to dolt so the
+// default path stays byte-identical.
 func (c *Config) GetBackend() string {
+	if c != nil && c.Backend == BackendPostgres {
+		return BackendPostgres
+	}
 	return BackendDolt
+}
+
+// GetPostgresDSN returns the Postgres connection string. Precedence:
+// BEADS_POSTGRES_URL (may carry a password) > metadata postgres_dsn with the
+// password from BEADS_PG_PASSWORD merged in. The password is never persisted.
+func (c *Config) GetPostgresDSN() string {
+	if u := os.Getenv("BEADS_POSTGRES_URL"); u != "" {
+		return u
+	}
+	if c == nil {
+		return ""
+	}
+	dsn := c.PostgresDSN
+	if pw := os.Getenv("BEADS_PG_PASSWORD"); pw != "" && dsn != "" {
+		if parsed, err := url.Parse(dsn); err == nil {
+			parsed.User = url.UserPassword(parsed.User.Username(), pw)
+			return parsed.String()
+		}
+	}
+	return dsn
+}
+
+// GetPostgresSchema returns the per-workspace Postgres schema (search_path).
+func (c *Config) GetPostgresSchema() string {
+	if c == nil {
+		return ""
+	}
+	return c.PostgresSchema
 }
 
 // Dolt mode constants

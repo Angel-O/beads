@@ -61,6 +61,15 @@ func (s *Store) CommitPending(_ context.Context, _ string) (bool, error) {
 	return false, nil
 }
 
+// Commit and its variants are no-ops on Postgres, NOT unsupported: a Dolt
+// "commit" flushes the working set to history, but every sqlkit write already
+// committed its own SQL transaction, so the data is durable. Command paths call
+// store.Commit() opportunistically after writes; returning nil lets those writes
+// stand instead of erroring on a history operation that has no PG meaning.
+func (s *Store) Commit(_ context.Context, _ string) error                { return nil }
+func (s *Store) CommitWithConfig(_ context.Context, _ string) error      { return nil }
+func (s *Store) CommitMergeResolution(_ context.Context, _ string) error { return nil }
+
 // Compile-time proof the Postgres backend satisfies the full storage seam
 // (core methods via *sqlkit.Store, the rest via the generated shell) and the
 // negative maintenance marker.

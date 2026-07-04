@@ -94,21 +94,6 @@ func (unsupportedDoltStorage) ListBranches(_ context.Context) (_ []string, err e
 	return
 }
 
-func (unsupportedDoltStorage) Commit(_ context.Context, _ string) (err error) {
-	err = errUnsupported("Commit")
-	return
-}
-
-func (unsupportedDoltStorage) CommitWithConfig(_ context.Context, _ string) (err error) {
-	err = errUnsupported("CommitWithConfig")
-	return
-}
-
-func (unsupportedDoltStorage) CommitMergeResolution(_ context.Context, _ string) (err error) {
-	err = errUnsupported("CommitMergeResolution")
-	return
-}
-
 func (unsupportedDoltStorage) CommitExists(_ context.Context, _ string) (_ bool, err error) {
 	err = errUnsupported("CommitExists")
 	return
@@ -364,4 +349,4 @@ func (unsupportedDoltStorage) GetStaleIssues(_ context.Context, _ types.StaleFil
 	return
 }
 
-// NOTE: partial shell (74 methods skipped); the embedding composite must assert storage.DoltStorage itself.
+// NOTE: partial shell (77 methods skipped); the embedding composite must assert storage.DoltStorage itself.

@@ -30,6 +30,7 @@ import (
 	"github.com/steveyegge/beads/internal/molecules"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	pgstore "github.com/steveyegge/beads/internal/storage/postgres"
 	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/storage/uow"
 	"github.com/steveyegge/beads/internal/telemetry"
@@ -915,7 +916,9 @@ var rootCmd = &cobra.Command{
 
 		if dbPath == "" {
 			if bd := beads.FindBeadsDir(); bd != "" {
-				if cfg, _ := configfile.Load(bd); cfg != nil && cfg.IsDoltProxiedServerMode() {
+				if cfg, _ := configfile.Load(bd); cfg != nil && (cfg.IsDoltProxiedServerMode() || cfg.GetBackend() == configfile.BackendPostgres) {
+					// A postgres (or proxied-server) workspace has no local Dolt
+					// database file; the .beads dir with metadata.json IS the workspace.
 					dbPath = bd
 				}
 			}
@@ -1138,7 +1141,13 @@ var rootCmd = &cobra.Command{
 		// Removing them WILL cause unrecoverable data corruption and data loss.
 		// Dolt manages these files itself; external interference is never safe.
 
-		store, err = newDoltStore(rootCtx, doltCfg)
+		if cfg != nil && cfg.GetBackend() == configfile.BackendPostgres {
+			// Postgres backend: open via the SQL-family bundle, bypassing the
+			// Dolt open path (the doltCfg above is built but unused here).
+			store, err = pgstore.NewFromConfig(rootCtx, beadsDir)
+		} else {
+			store, err = newDoltStore(rootCtx, doltCfg)
+		}
 
 		// Track final read-only state for staleness checks (GH#1089)
 		storeIsReadOnly = doltCfg.ReadOnly

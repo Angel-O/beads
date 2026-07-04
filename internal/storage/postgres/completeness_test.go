@@ -23,7 +23,8 @@ var legitimatelyUnsupported = map[string]string{
 	// "bd on Postgres, history/version-control simply absent".
 	"Branch": "VC: Dolt branch", "Checkout": "VC: Dolt checkout",
 	"CurrentBranch": "VC", "DeleteBranch": "VC", "ListBranches": "VC",
-	"Commit": "VC: DOLT_COMMIT", "CommitWithConfig": "VC", "CommitMergeResolution": "VC",
+	// Commit/CommitWithConfig/CommitMergeResolution are NO-OPS on Postgres (data
+	// is already durable per-tx), not unsupported — implemented on postgres.Store.
 	"CommitExists": "VC", "GetCurrentCommit": "VC: Dolt hash", "Status": "VC",
 	"Log": "VC: dolt_log", "Merge": "VC", "GetConflicts": "VC", "ResolveConflicts": "VC",
 
