@@ -480,7 +480,43 @@ func InitSchema(ctx context.Context, db *sql.DB, schema string) error {
 			return fmt.Errorf("postgres: exec DDL statement: %w\n-- statement:\n%s", err, stmt)
 		}
 	}
+	if err := seedDefaultConfig(ctx, conn); err != nil {
+		return err
+	}
 	return stampSchemaVersion(ctx, conn)
+}
+
+// defaultConfigSeeds mirrors internal/storage/schema/migrations/0016_default_config.up.sql
+// exactly — the config rows a fresh Dolt workspace materializes on init. Seeding the
+// identical set (and no more) keeps `bd config list` byte-identical to the Dolt oracle;
+// on Dolt these land via a migration, which the wedge does not run, so InitSchema seeds
+// them directly. issue_prefix is intentionally absent: it is workspace-specific and the
+// caller (bd init) seeds it via store.SetConfig, matching the Dolt path.
+var defaultConfigSeeds = [][2]string{
+	{"compaction_enabled", "false"},
+	{"compact_tier1_days", "30"},
+	{"compact_tier1_dep_levels", "2"},
+	{"compact_tier2_days", "90"},
+	{"compact_tier2_dep_levels", "5"},
+	{"compact_tier2_commits", "100"},
+	{"compact_batch_size", "50"},
+	{"compact_parallel_workers", "5"},
+	{"auto_compact_enabled", "false"},
+}
+
+// seedDefaultConfig inserts the migration-0016 default config rows using
+// ON CONFLICT DO NOTHING — the Postgres equivalent of the migration's INSERT IGNORE,
+// so re-init and concurrent opens are idempotent. Runs on the search_path-pinned
+// connection so it targets the workspace config table.
+func seedDefaultConfig(ctx context.Context, conn *sql.Conn) error {
+	for _, kv := range defaultConfigSeeds {
+		if _, err := conn.ExecContext(ctx,
+			`INSERT INTO config (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`,
+			kv[0], kv[1]); err != nil {
+			return fmt.Errorf("postgres: seed default config %q: %w", kv[0], err)
+		}
+	}
+	return nil
 }
 
 // stampSchemaVersion records schemaVersion in the metadata table on first init

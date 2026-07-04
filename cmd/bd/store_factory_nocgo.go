@@ -11,6 +11,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/util"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/postgres"
 	"github.com/steveyegge/beads/internal/storage/uowstore"
 )
 
@@ -72,6 +73,10 @@ func acquireEmbeddedLock(_ string, _ bool) (util.Unlocker, error) {
 // newDoltStoreFromConfig creates a SQL-server-backed storage backend from config.
 func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
+	if err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendPostgres {
+		// Postgres needs no CGO (pure-Go pgx), so it works in the nocgo build too.
+		return postgres.NewFromConfig(ctx, beadsDir)
+	}
 	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
 		if spikeUOWStore() {
 			return newSpikeUOWStore(ctx, beadsDir)
@@ -93,6 +98,9 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltS
 // newReadOnlyStoreFromConfig creates a read-only SQL-server-backed storage backend.
 func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
+	if err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendPostgres {
+		return postgres.NewFromConfig(ctx, beadsDir)
+	}
 	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
 		if spikeUOWStore() {
 			return newSpikeUOWStore(ctx, beadsDir)

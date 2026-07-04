@@ -3,17 +3,20 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/steveyegge/beads/cmd/bd/doctor"
 	"github.com/steveyegge/beads/cmd/bd/setup"
 	"github.com/steveyegge/beads/internal/beads"
@@ -24,6 +27,8 @@ import (
 	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/pgdialect"
+	"github.com/steveyegge/beads/internal/storage/postgres"
 	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/templates/agents"
 	"github.com/steveyegge/beads/internal/ui"
@@ -96,6 +101,9 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		serverUser, _ := cmd.Flags().GetString("server-user")
 		database, _ := cmd.Flags().GetString("database")
 		destroyToken, _ := cmd.Flags().GetString("destroy-token")
+		// Postgres backend flags (backend="postgres")
+		pgURL, _ := cmd.Flags().GetString("pg-url")
+		pgSchema, _ := cmd.Flags().GetString("pg-schema")
 
 		// --force is a deprecated alias for --reinit-local. They share
 		// semantics for the local data-safety guard; both refuse remote
@@ -223,8 +231,40 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			fmt.Fprintf(os.Stderr, "  bd init --from-jsonl\n\n")
 			fmt.Fprintf(os.Stderr, "See: https://github.com/gastownhall/beads/blob/main/docs/DOLT.md\n")
 			return fmt.Errorf("--backend=sqlite is no longer supported")
-		} else if backendFlag != "" && backendFlag != "dolt" {
-			return fmt.Errorf("unknown backend %q: only \"dolt\" is supported", backendFlag)
+		}
+		isPostgres := backendFlag == configfile.BackendPostgres
+		if backendFlag != "" && backendFlag != configfile.BackendDolt && !isPostgres {
+			return fmt.Errorf("unknown backend %q: supported backends are \"dolt\" (default) and \"postgres\"", backendFlag)
+		}
+		if isPostgres {
+			// The Postgres proof-wedge is a plain local workspace: only a small set of
+			// init-local flags apply. Reject any other init-local flag by ALLOWLIST — a
+			// denylist silently ignores Dolt-only flags added later, the exact footgun
+			// this block exists to prevent. Inherited/global flags (--json, --dir, …)
+			// are not init-local and are left untouched.
+			pgAllowedFlags := map[string]bool{
+				"backend": true, "pg-url": true, "pg-schema": true,
+				"prefix": true, "quiet": true,
+				"skip-hooks": true, "skip-agents": true,
+				"reinit-local": true, "force": true, "init-if-missing": true,
+				"non-interactive": true,
+			}
+			var rejected []string
+			cmd.Flags().Visit(func(f *pflag.Flag) {
+				// Only police init's own flags; inherited/global flags (--json, …)
+				// are not this command's concern. cmd.Flags() is the authoritative
+				// parsed set that carries the Changed state.
+				if cmd.InheritedFlags().Lookup(f.Name) != nil {
+					return
+				}
+				if !pgAllowedFlags[f.Name] {
+					rejected = append(rejected, "--"+f.Name)
+				}
+			})
+			if len(rejected) > 0 {
+				sort.Strings(rejected)
+				return fmt.Errorf("bd init --backend=postgres does not support %s (the Postgres proof-wedge is a plain local workspace: no Dolt server, sync, remote, or wizard)", strings.Join(rejected, ", "))
+			}
 		}
 
 		// Validate --database format early, before any side effects.
@@ -755,6 +795,22 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		}
 
 		ctx := rootCtx
+
+		// Postgres proof-wedge: finalize a plain local workspace backed by Postgres.
+		// Everything below provisions Dolt (embedded/server DB dir, migrations, remote
+		// gate, sync, remotes) — none of which Postgres has an analog for — so the PG
+		// path provisions the schema + seeds + metadata.json here and returns. The
+		// shared setup above (.beads/, .gitignore, git init) already ran.
+		if isPostgres {
+			return runInitPostgres(ctx, initPostgresInput{
+				beadsDir:   beadsDir,
+				prefix:     prefix,
+				pgURL:      pgURL,
+				pgSchema:   pgSchema,
+				quiet:      quiet,
+				jsonOutput: jsonOutput,
+			})
+		}
 
 		// Create Dolt storage backend
 		storagePath := doltserver.ResolveDoltDir(beadsDir)
@@ -1726,6 +1782,114 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 	},
 }
 
+// initPostgresInput carries the resolved inputs the Postgres init arm needs from
+// the shared prologue of the init command.
+type initPostgresInput struct {
+	beadsDir   string
+	prefix     string
+	pgURL      string
+	pgSchema   string
+	quiet      bool
+	jsonOutput bool
+}
+
+// runInitPostgres finalizes a Postgres-backed workspace. It is the Postgres analog
+// of the Dolt store-open + config-seed + metadata block (init.go), minus every
+// version-control / server / sync step Postgres has no analog for: it provisions the
+// schema (DDL + config-default seeds, idempotent), seeds the issue prefix and project
+// identity, and writes metadata.json with the password-stripped DSN. The password is
+// supplied at open time via BEADS_PG_PASSWORD and never lands on disk.
+func runInitPostgres(ctx context.Context, in initPostgresInput) error {
+	dsn := in.pgURL
+	if dsn == "" {
+		dsn = os.Getenv("BEADS_POSTGRES_URL")
+	}
+	if dsn == "" {
+		return fmt.Errorf("bd init --backend=postgres requires --pg-url=<dsn> (or BEADS_POSTGRES_URL); a password may be included for init but is never persisted — set BEADS_PG_PASSWORD for later commands")
+	}
+	schema := in.pgSchema
+	if schema == "" {
+		return fmt.Errorf("bd init --backend=postgres requires --pg-schema=<name> (the per-workspace schema for search_path isolation)")
+	}
+
+	// Redact BEFORE provisioning: a connection string whose password we cannot safely
+	// strip fails the whole init before any schema is created, and the password is
+	// guaranteed never to reach metadata.json (RedactPassword verifies with pgx that
+	// no password survives, failing closed).
+	persistDSN, err := pgdialect.RedactPassword(dsn)
+	if err != nil {
+		return fmt.Errorf("cannot safely persist the Postgres connection: %w", err)
+	}
+
+	store, err := postgres.Provision(ctx, dsn, schema)
+	if err != nil {
+		return fmt.Errorf("failed to initialize Postgres workspace: %w", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	// Load any existing metadata.json up front so we can adopt its project identity.
+	cfg, _ := configfile.Load(in.beadsDir)
+	if cfg == nil {
+		cfg = configfile.DefaultConfig()
+	}
+
+	// Seed the issue prefix, only if unset — a shared schema may already carry one.
+	// Matches the Dolt init path (dots normalized to underscores for valid IDs).
+	if in.prefix != "" {
+		if existing, _ := store.GetConfig(ctx, "issue_prefix"); existing == "" {
+			issuePrefix := strings.ReplaceAll(in.prefix, ".", "_")
+			if err := store.SetConfig(ctx, "issue_prefix", issuePrefix); err != nil {
+				return fmt.Errorf("failed to set issue prefix: %w", err)
+			}
+		}
+	}
+
+	// Project identity: the DB is authoritative when it already carries one; otherwise
+	// adopt the metadata.json id (a re-init or committed clone) or mint a fresh UUID.
+	// Write it to BOTH the DB and metadata.json so the two can never diverge (GH#2372) —
+	// the Dolt path keeps them in lockstep the same way.
+	projectID, _ := store.GetMetadata(ctx, "_project_id")
+	if projectID == "" {
+		if cfg.ProjectID != "" {
+			projectID = cfg.ProjectID
+		} else {
+			projectID = configfile.GenerateProjectID()
+		}
+		if err := store.SetMetadata(ctx, "_project_id", projectID); err != nil {
+			return fmt.Errorf("failed to write project ID: %w", err)
+		}
+	}
+
+	// Persist metadata.json: backend + password-free DSN + schema + the DB's identity.
+	cfg.Backend = configfile.BackendPostgres
+	cfg.PostgresDSN = persistDSN
+	cfg.PostgresSchema = schema
+	cfg.ProjectID = projectID
+	if err := cfg.Save(in.beadsDir); err != nil {
+		return fmt.Errorf("failed to write metadata.json: %w", err)
+	}
+
+	switch {
+	case in.jsonOutput:
+		out := map[string]any{
+			"status":  "initialized",
+			"backend": configfile.BackendPostgres,
+			"schema":  schema,
+			"prefix":  in.prefix,
+		}
+		b, _ := json.MarshalIndent(out, "", "  ")
+		fmt.Println(string(b))
+	case !in.quiet:
+		fmt.Printf("%s bd initialized with the Postgres backend\n", ui.RenderPass("✓"))
+		fmt.Printf("  Schema:  %s\n", schema)
+		if in.prefix != "" {
+			fmt.Printf("  Prefix:  %s\n", in.prefix)
+		}
+		fmt.Println("  History: not tracked (Postgres backend has no version control; use Dolt for history)")
+	}
+	return nil
+}
+
 func init() {
 	initCmd.Flags().StringP("prefix", "p", "", "Issue prefix (default: current directory name)")
 	initCmd.Flags().BoolP("quiet", "q", false, "Suppress output (quiet mode)")
@@ -1751,7 +1915,9 @@ func init() {
 	initCmd.Flags().String("role", "", "Set beads role without prompting: \"maintainer\" or \"contributor\"")
 
 	// Backend selection (dolt is the only supported backend; sqlite accepted for deprecation notice)
-	initCmd.Flags().String("backend", "", "Storage backend (default: dolt). --backend=sqlite prints deprecation notice.")
+	initCmd.Flags().String("backend", "", "Storage backend: dolt (default) or postgres. --backend=sqlite prints deprecation notice.")
+	initCmd.Flags().String("pg-url", "", "Postgres connection URL (with --backend=postgres). A password may be included for init but is never persisted; set BEADS_PG_PASSWORD for later commands. Falls back to BEADS_POSTGRES_URL.")
+	initCmd.Flags().String("pg-schema", "", "Postgres schema for this workspace's tables (with --backend=postgres; provides search_path isolation)")
 
 	// Dolt server connection flags
 	initCmd.Flags().Bool("server", false, "Use external dolt sql-server instead of embedded engine")
@@ -1871,6 +2037,23 @@ func checkExistingBeadsDataAt(beadsDir string, prefix string) error {
 	// Check if .beads directory exists
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
 		return nil // No .beads directory, safe to init
+	}
+
+	// A Postgres workspace is marked by metadata.json alone (there is no local DB
+	// directory to inspect). Without this guard a plain `bd init` — which defaults to
+	// Dolt — silently repoints a live Postgres workspace to a new embedded Dolt DB and
+	// orphans its issues. --reinit-local/--force bypass this (handled by the caller).
+	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendPostgres {
+		return alreadyInitialized(`
+%s This workspace is already initialized with the Postgres backend (schema %q).
+
+To use it:
+  Just run bd commands normally (e.g., %s)
+
+To re-initialize (Postgres provisioning is idempotent):
+  bd init --backend=postgres --reinit-local ...
+
+Aborting.`, ui.RenderWarn("⚠"), cfg.GetPostgresSchema(), ui.RenderAccent("bd list"))
 	}
 
 	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendDolt {

@@ -249,6 +249,10 @@ func (c *Config) GetPostgresSchema() string {
 	return c.PostgresSchema
 }
 
+// Password redaction for persistence lives in pgdialect.RedactPassword, not here:
+// it must fail closed (verify with pgx that no password survives) and therefore
+// depends on the pgx parser, which this low-level config package must not import.
+
 // Dolt mode constants
 const (
 	DoltModeEmbedded      = "embedded"

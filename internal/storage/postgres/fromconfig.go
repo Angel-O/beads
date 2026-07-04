@@ -27,9 +27,24 @@ func NewFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, e
 	if schema == "" {
 		return nil, fmt.Errorf("postgres: no schema (set postgres_schema in metadata.json)")
 	}
+	return Provision(ctx, dsn, schema)
+}
 
-	// DDL runs over a raw connection: the translating driver would mangle the
-	// $$-quoted function bodies and treat DDL as workload SQL.
+// Provision opens the Postgres backend from an explicit DSN and schema: it applies
+// the schema (InitSchema — create-schema, DDL, config seeds, version stamp; all
+// idempotent) over a raw non-translating connection, then returns the store over the
+// translating driver. dsn may carry a password; it is used only to connect and is
+// never persisted. `bd init` calls this directly (before metadata.json exists, using
+// the flag-provided DSN); NewFromConfig calls it after resolving DSN/schema from
+// metadata. DDL runs raw because the translating driver would mangle the $$-quoted
+// function bodies and treat DDL as workload SQL.
+func Provision(ctx context.Context, dsn, schema string) (storage.DoltStorage, error) {
+	if dsn == "" {
+		return nil, fmt.Errorf("postgres: empty DSN")
+	}
+	if schema == "" {
+		return nil, fmt.Errorf("postgres: empty schema")
+	}
 	raw, err := pgdialect.OpenRaw(dsn, schema)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: open (raw): %w", err)
@@ -40,9 +55,5 @@ func NewFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, e
 	}
 	_ = raw.Close()
 
-	st, err := New(ctx, Config{DSN: dsn, Schema: schema})
-	if err != nil {
-		return nil, err
-	}
-	return st, nil
+	return New(ctx, Config{DSN: dsn, Schema: schema})
 }

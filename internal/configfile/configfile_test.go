@@ -626,9 +626,12 @@ func TestProxiedServerClientInfo_ResolvedPaths(t *testing.T) {
 	})
 }
 
-// TestGetBackendAlwaysDolt tests that GetBackend always returns "dolt".
-func TestGetBackendAlwaysDolt(t *testing.T) {
-	tests := []struct {
+// TestGetBackendAllowlist verifies the allowlist semantics: only "postgres" is
+// honored; every other value (empty, legacy, stale sqlite, genuinely unknown) falls
+// back to Dolt. This is the guard behind the Postgres backend selection — a typo in
+// metadata.json must fail safe to Dolt, never to an unintended backend.
+func TestGetBackendAllowlist(t *testing.T) {
+	fallsBackToDolt := []struct {
 		name string
 		cfg  *Config
 	}{
@@ -636,16 +639,22 @@ func TestGetBackendAlwaysDolt(t *testing.T) {
 		{name: "empty backend", cfg: &Config{Backend: ""}},
 		{name: "legacy config", cfg: &Config{}},
 		{name: "stale sqlite value", cfg: &Config{Backend: "sqlite"}},
-		{name: "unknown backend", cfg: &Config{Backend: "postgres"}},
+		{name: "unknown backend", cfg: &Config{Backend: "mystery"}},
 	}
-
-	for _, tt := range tests {
+	for _, tt := range fallsBackToDolt {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := tt.cfg.GetBackend(); got != BackendDolt {
 				t.Errorf("GetBackend() = %q, want %q", got, BackendDolt)
 			}
 		})
 	}
+
+	t.Run("postgres honored", func(t *testing.T) {
+		cfg := &Config{Backend: BackendPostgres}
+		if got := cfg.GetBackend(); got != BackendPostgres {
+			t.Errorf("GetBackend() = %q, want %q", got, BackendPostgres)
+		}
+	})
 }
 
 // TestDatabasePathAlwaysDolt tests that DatabasePath always returns the dolt path.
