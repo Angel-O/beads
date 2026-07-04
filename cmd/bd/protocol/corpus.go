@@ -18,7 +18,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"sort"
 	"strings"
@@ -42,6 +44,14 @@ const (
 	CorpusClosedID  = "corpus-closed"  // created, then closed + reopened
 	CorpusDeletedID = "corpus-deleted" // created, then deleted
 )
+
+// errorCaptureName is the single PLAN capture that deliberately targets a
+// missing issue, so it is the one capture expected to exit non-zero. It pins the
+// exit-codes-and-errors half of the contract — a non-zero exit plus the
+// {error, schema_version} stdout envelope (see CATALOG.md) — while every other
+// capture must exit 0. The generator special-cases this name in both the
+// exit-status check and the error-envelope guard.
+const errorCaptureName = "error"
 
 // CorpusPlan returns the ordered, deterministic list of captures. The order
 // matters: create steps must run before the read steps that observe them,
@@ -131,10 +141,11 @@ func CorpusPlan() []Capture {
 			Name: "version",
 			Args: []string{"version", "--json"},
 		},
-		// "error" pins the {error, schema_version} envelope bd emits on stdout
-		// for a missing issue — gascity's isBdNotFound classifier depends on it.
+		// The error capture pins the {error, schema_version} envelope bd emits on
+		// stdout for a missing issue — gascity's isBdNotFound classifier depends on
+		// it — plus the non-zero exit status bd returns (see checkCaptureExit).
 		{
-			Name: "error",
+			Name: errorCaptureName,
 			Args: []string{"show", "nonexistent-xyz-corpus", "--json"},
 		},
 	}
@@ -190,6 +201,18 @@ func CanonicalizeJSON(raw []byte) ([]byte, error) {
 	if err := dec.Decode(&v); err != nil {
 		return nil, fmt.Errorf("canonicalize: decode: %w", err)
 	}
+	// A corpus capture must be exactly one JSON document. bd could print a
+	// warning line (or, on a bug, a second JSON value) after the payload; that
+	// trailing stdout would otherwise be silently dropped here and canonicalized
+	// as if the command emitted clean JSON, while a real consumer decoding the
+	// whole stream would choke on it. Require the stream to end after the first
+	// value; only trailing whitespace, which the decoder skips, is allowed.
+	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, fmt.Errorf("canonicalize: unexpected second JSON value after the first")
+		}
+		return nil, fmt.Errorf("canonicalize: unexpected trailing data after JSON value: %w", err)
+	}
 
 	canon := canonValue(v)
 
@@ -205,6 +228,18 @@ func canonValue(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, child := range t {
+			// NOTE ON SCOPE: the provenance transforms below match by bare key
+			// name at every nesting depth of every blob, not just the version
+			// capture. That is safe only because these keys (commit/version/
+			// branch/build) currently appear solely in the version blob
+			// (`grep -rl '"version"' testdata/corpus` lists version blobs only).
+			// If a future command ever emits a field named commit/version/branch/
+			// build, this would silently drop or placeholder it and the corpus
+			// would stop guarding that command's wire shape. Before adding such a
+			// field, scope these transforms to the version capture (thread the
+			// Capture.Name through generation) — note it cannot be done by "top
+			// level only" because envelope mode nests these under "data".
+			//
 			// Drop build-provenance keys entirely so the canonical corpus does
 			// not depend on how (or where) bd was built.
 			if provenanceDropKeys[k] {
@@ -293,9 +328,11 @@ type BlobMeta struct {
 	SHA256 string `json:"sha256"`
 }
 
-// Manifest is the corpus index. It pins the schema version and the live bd
-// version/commit the corpus was generated from, plus a per-blob checksum so
-// consumers (Gas City) can detect tampering or partial vendoring.
+// Manifest is the corpus index. It pins the schema version (the coordination
+// canary), the generator identity, and a per-blob SHA-256 checksum so consumers
+// (Gas City) can detect tampering or partial vendoring. It deliberately does not
+// pin the live bd version/commit — see the field comment below for why the
+// corpus stays version-agnostic.
 type Manifest struct {
 	SchemaVersion int `json:"schema_version"`
 	// bd_version and bd_commit are intentionally omitted: both vary by build

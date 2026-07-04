@@ -33,11 +33,16 @@ migration off.
 
 | Blob (flat + envelope) | bd command | Contract domain |
 | ---------------------- | ---------- | --------------- |
-| `create_root`, `create_dep` | `bd create … --json` | json-output-shapes (object) |
+| `create_root`, `create_dep`, `create_closed`, `create_deleted` | `bd create … --json` | json-output-shapes (object) |
 | `show` | `bd show <id> --json` | json-output-shapes (array-of-one), dependency shape |
+| `update` | `bd update … --json` | json-output-shapes (mutation array), label add + metadata coercion (`phase` → integer) |
+| `close` | `bd close --reason … --json` | close semantics (`close_reason`, `closed_at`) |
+| `reopen` | `bd reopen … --json` | reopen semantics (status back to open) |
 | `list` | `bd list --all --json` | json-output-shapes (array / list envelope) |
 | `ready` | `bd ready --json` | ready-projection-semantics |
 | `dep_add`, `dep_list` | `bd dep add/list --json` | json-output-shapes (dependency) |
+| `dep_remove` | `bd dep remove … --json` | dependency-edge removal confirmation |
+| `delete` | `bd delete --force … --json` | delete confirmation shape |
 | `count` | `bd count --json` | json-output-shapes (scalar) |
 | `version` | `bd version --json` | version-compat, the `schema_version` canary |
 | `error` | `bd show <missing> --json` | exit-codes-and-errors (`{error, schema_version}`) |

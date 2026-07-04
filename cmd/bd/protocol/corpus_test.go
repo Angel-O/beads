@@ -3,7 +3,9 @@ package protocol
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,15 +37,25 @@ func generateCorpus(t *testing.T, envelope bool) map[string][]byte {
 		cmd.Env = env
 		var stdout bytes.Buffer
 		cmd.Stdout = &stdout // stdout only: bd writes human error banners to stderr
-		_ = cmd.Run()        // the "error" capture exits non-zero by design; read stdout regardless
+		runErr := cmd.Run()  // keep the exit status: it is itself part of the pinned contract
+
+		// Validate the exit status BEFORE canonicalizing: every capture but the
+		// error capture must succeed, and the error capture must fail with bd's
+		// not-found exit code. Discarding this let a "successful" command exit
+		// non-zero (or the error capture stop failing) slip through, leaving the
+		// exit-codes-and-errors contract the error blob claims (CATALOG.md)
+		// unpinned even though its stdout still looked right.
+		if err := checkCaptureExit(c.Name, runErr); err != nil {
+			t.Fatalf("capture %q (envelope=%v): %v", c.Name, envelope, err)
+		}
 
 		canon, err := CanonicalizeJSON(stdout.Bytes())
 		if err != nil {
 			t.Fatalf("canonicalize %s (envelope=%v): %v\nraw stdout:\n%s", c.Name, envelope, err, stdout.Bytes())
 		}
 		// Guard against silently baking a failure into the corpus: only the
-		// dedicated "error" capture may be an error envelope.
-		if c.Name != "error" && isErrorEnvelope(canon, envelope) {
+		// dedicated error capture may be an error envelope.
+		if c.Name != errorCaptureName && isErrorEnvelope(canon, envelope) {
 			t.Fatalf("capture %q (envelope=%v) produced an error envelope, not real output:\n%s\n(check the bd command in CorpusPlan)", c.Name, envelope, canon)
 		}
 		out[c.Name] = canon
@@ -73,10 +85,86 @@ func isErrorEnvelope(blob []byte, envelope bool) bool {
 	return false
 }
 
-func TestCorpusGolden(t *testing.T) {
-	if testDoltPort == 0 {
-		t.Skip("dolt container unavailable; corpus generation needs a live store")
+// errorCaptureExitCode is the exit status bd returns for the error capture
+// (`bd show <missing> --json`). bd's RunE error handlers return
+// exitError{Code: 1} (cmd/bd/errors.go: HandleErrorRespectJSON / SilentExit),
+// which main() maps to os.Exit(1) — the not-found path exits 1 while still
+// printing the {error, schema_version} envelope to stdout. Pinning the exact
+// code makes the corpus catch a regression in bd's not-found exit status, which
+// Gas City's error classifier keys off of.
+const errorCaptureExitCode = 1
+
+// checkCaptureExit validates a capture's subprocess exit status against the
+// corpus contract, so the exit-codes-and-errors coverage CATALOG.md claims is
+// actually enforced instead of silently discarded. runErr is cmd.Run()'s
+// result. Every capture except errorCaptureName must exit 0 (success); the error
+// capture must exit non-zero with errorCaptureExitCode (bd's not-found path). It
+// returns a descriptive error instead of failing the test directly, so the rule
+// is unit-testable without a live bd (TestCheckCaptureExit) and lives in one
+// place the generation loop runs for every capture — a new capture cannot bypass
+// exit-status validation.
+func checkCaptureExit(name string, runErr error) error {
+	if name == errorCaptureName {
+		var exitErr *exec.ExitError
+		if !errors.As(runErr, &exitErr) {
+			return fmt.Errorf("error capture must exit non-zero via *exec.ExitError, got %T: %v", runErr, runErr)
+		}
+		if got := exitErr.ExitCode(); got != errorCaptureExitCode {
+			return fmt.Errorf("error capture exit code = %d, want %d (bd not-found contract)", got, errorCaptureExitCode)
+		}
+		return nil
 	}
+	if runErr != nil {
+		return fmt.Errorf("capture must exit 0 (success), but the command failed: %v", runErr)
+	}
+	return nil
+}
+
+func TestCheckCaptureExit(t *testing.T) {
+	// Genuine *exec.ExitError values can only come from a real process (their
+	// fields are unexported). CI is ubuntu-latest and the protocol harness already
+	// shells out to git/go, so a POSIX shell is present; skip if it somehow is not
+	// rather than fail spuriously.
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skipf("sh not available: %v", err)
+	}
+	exitErr := func(code int) error {
+		err := exec.Command("sh", "-c", fmt.Sprintf("exit %d", code)).Run()
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("sh -c 'exit %d': want *exec.ExitError, got %T: %v", code, err, err)
+		}
+		return err
+	}
+
+	tests := []struct {
+		desc    string
+		capture string
+		runErr  error
+		wantErr bool
+	}{
+		{"success capture, exit 0", "show", nil, false},
+		{"success capture, non-zero exit", "show", exitErr(1), true},
+		{"error capture, expected exit code", errorCaptureName, exitErr(errorCaptureExitCode), false},
+		{"error capture, exit 0", errorCaptureName, nil, true},
+		{"error capture, wrong non-zero code", errorCaptureName, exitErr(errorCaptureExitCode + 1), true},
+		{"error capture, never started (not an ExitError)", errorCaptureName, errors.New("exec: not started"), true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			err := checkCaptureExit(tc.capture, tc.runErr)
+			if tc.wantErr && err == nil {
+				t.Fatalf("checkCaptureExit(%q, %v) = nil, want error", tc.capture, tc.runErr)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("checkCaptureExit(%q, %v) = %v, want nil", tc.capture, tc.runErr, err)
+			}
+		})
+	}
+}
+
+func TestCorpusGolden(t *testing.T) {
+	requireDoltStore(t, "corpus golden test")
 
 	modes := []struct {
 		name     string
@@ -125,12 +213,60 @@ func TestCorpusGolden(t *testing.T) {
 	if !bytes.Equal(manifestBytes, wantManifest) {
 		t.Fatalf("manifest drift\n--- committed ---\n%s\n--- live ---\n%s\nrun `make corpus-regen`", wantManifest, manifestBytes)
 	}
+
+	// The per-blob loop above only proves every generated blob is committed and
+	// matches. It cannot catch a *stale* committed blob left behind when a
+	// capture is removed or renamed from CorpusPlan — that file simply stops
+	// being generated but stays on disk, and the release job ships the whole
+	// testdata/corpus directory. Assert the committed file set is exactly the
+	// generated blobs plus manifest.json so a deleted capture is a hard failure.
+	assertNoStaleCorpusFiles(t, dir, blobs)
+}
+
+// assertNoStaleCorpusFiles fails if the committed corpus tree holds any .json
+// file that the current PLAN did not generate. Without it, removing a capture
+// leaves its stale blob committed (and shipped in the release archive) while
+// still passing the per-blob golden comparison, which only checks generated
+// files.
+func assertNoStaleCorpusFiles(t *testing.T, dir string, blobs map[string]map[string][]byte) {
+	t.Helper()
+	want := map[string]bool{"manifest.json": true}
+	for mode, byName := range blobs {
+		for name := range byName {
+			want[filepath.ToSlash(filepath.Join(mode, name+".json"))] = true
+		}
+	}
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if !want[rel] {
+			t.Errorf("stale corpus file committed but not generated by CorpusPlan: %s\nremove it (or run `make corpus-regen`) after deleting a capture", rel)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk corpus dir %s: %v", dir, err)
+	}
 }
 
 func writeCorpus(t *testing.T, dir string, blobs map[string]map[string][]byte, manifest []byte) {
 	t.Helper()
 	for mode, byName := range blobs {
 		modeDir := filepath.Join(dir, mode)
+		// Recreate the mode directory from scratch so a capture removed or
+		// renamed in CorpusPlan does not leave a stale blob behind on regen.
+		if err := os.RemoveAll(modeDir); err != nil {
+			t.Fatalf("clean %s: %v", modeDir, err)
+		}
 		if err := os.MkdirAll(modeDir, 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", modeDir, err)
 		}

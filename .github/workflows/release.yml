@@ -200,8 +200,16 @@ jobs:
           shasum -a 256 "$archive" | tee corpus-checksum.txt
           gh release upload "$tag" "$archive" --clobber
           gh release download "$tag" --pattern checksums.txt --dir /tmp/corpus-sums
-          cat corpus-checksum.txt >> /tmp/corpus-sums/checksums.txt
-          gh release upload "$tag" /tmp/corpus-sums/checksums.txt --clobber
+          sums=/tmp/corpus-sums/checksums.txt
+          # Idempotent on a job re-run (manual retry or flake): drop any prior
+          # entry for this archive before appending the fresh checksum, so the
+          # re-download+append never leaves a duplicate (or stale) corpus row.
+          if [ -f "$sums" ]; then
+            grep -vF "$archive" "$sums" > "$sums.tmp" || true
+            mv "$sums.tmp" "$sums"
+          fi
+          cat corpus-checksum.txt >> "$sums"
+          gh release upload "$tag" "$sums" --clobber
 
   goreleaser-macos:
     # Build macOS binaries with CGO_ENABLED=1 for embedded Dolt support.

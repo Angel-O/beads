@@ -506,7 +506,12 @@ jobs:
         run: docker pull dolthub/dolt-sql-server:2.1.0
 
       - name: Corpus golden + determinism
-        run: go test -tags gms_pure_go -count=1 -run 'TestCorpusGolden|TestCanonicalize|TestCorpusDoubleRunByteIdentical' ./cmd/bd/protocol
+        # Require a live Dolt store here: this is the gate that must exercise the
+        # golden + double-run checks, so a failed container is a hard failure,
+        # not a silent skip (see requireDoltStore in cmd/bd/protocol tests).
+        env:
+          BEADS_PROTOCOL_REQUIRE_DOLT: "1"
+        run: go test -tags gms_pure_go -count=1 -run 'TestCorpusGolden|TestCanonicalize|TestCorpusDoubleRunByteIdentical|TestCheckCaptureExit' ./cmd/bd/protocol
 
   fmt-check:
     name: Check formatting
