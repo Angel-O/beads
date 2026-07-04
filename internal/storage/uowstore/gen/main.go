@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -50,9 +51,75 @@ const (
 
 func main() {
 	log.SetFlags(0)
-	if err := run(defaultSrcDir, defaultOutFile); err != nil {
+	cfg, err := parseFlags(os.Args[1:])
+	if err != nil {
 		log.Fatalf("gen: %v", err)
 	}
+	if err := runConfig(cfg); err != nil {
+		log.Fatalf("gen: %v", err)
+	}
+}
+
+// genConfig is the parameterized generation request. Its zero-flag defaults
+// (see defaultConfig) reproduce the committed uowstore shell byte-for-byte; the
+// flags exist so the same generator can emit a partial shell for another
+// package (e.g. postgres) that embeds a real store alongside the generated one.
+type genConfig struct {
+	pkg   string          // -pkg  : package clause of the generated file
+	src   string          // -src  : dir of the storage package to parse
+	out   string          // -out  : output file path
+	types []string        // -type : which target interfaces to emit (table order, not flag order)
+	skip  map[string]bool // -skip : Op strings (opPrefix+Method) to omit
+}
+
+func defaultConfig() genConfig {
+	return genConfig{
+		pkg:   "uowstore",
+		src:   defaultSrcDir,
+		out:   defaultOutFile,
+		types: nil, // nil => all targets, in var targets order
+		skip:  nil, // nil => skip nothing
+	}
+}
+
+// parseFlags builds a genConfig from CLI args. Every flag defaults to the
+// byte-identity-preserving value, so `go run ./gen` with no flags is exactly
+// the historical invocation.
+func parseFlags(args []string) (genConfig, error) {
+	def := defaultConfig()
+	fs := flag.NewFlagSet("gen", flag.ContinueOnError)
+	pkg := fs.String("pkg", def.pkg, "package clause of the generated file")
+	src := fs.String("src", def.src, "directory of the storage package to parse")
+	out := fs.String("out", def.out, "output file path")
+	typeList := fs.String("type", "", "comma-separated target interface names to emit (empty = all)")
+	skipList := fs.String("skip", "", "comma-separated Op strings (opPrefix+Method) to omit")
+	if err := fs.Parse(args); err != nil {
+		return genConfig{}, err
+	}
+	cfg := def
+	cfg.pkg = *pkg
+	cfg.src = *src
+	cfg.out = *out
+	cfg.types = splitList(*typeList)
+	if entries := splitList(*skipList); len(entries) > 0 {
+		cfg.skip = make(map[string]bool, len(entries))
+		for _, e := range entries {
+			cfg.skip[e] = true
+		}
+	}
+	return cfg, nil
+}
+
+// splitList splits a comma-separated flag value, trimming blanks. An empty or
+// all-whitespace value yields a nil slice (the "unset" sentinel).
+func splitList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 type pkgInfo struct {
@@ -62,12 +129,30 @@ type pkgInfo struct {
 	imports    map[string]string             // local name -> import path
 }
 
-// run parses the storage package under srcDir and writes the typed-unsupported
-// shell to outFile. It is parameterized on both paths so a regen-idempotence
-// test can regenerate to a temp path and byte-compare against the committed file
-// without clobbering it.
+// run parses the storage package under srcDir and writes the default (full,
+// uowstore) typed-unsupported shell to outFile. It is retained as the pinned
+// entry point for the byte-identity gate (gen_test.go), which regenerates to a
+// temp path and byte-compares against the committed file without clobbering it.
+// run == runConfig at defaultConfig() with only the two paths overridden, so
+// its output is byte-identical to the historical generator.
 func run(srcDir, outFile string) error {
-	info, err := parsePackage(srcDir)
+	cfg := defaultConfig()
+	cfg.src = srcDir
+	cfg.out = outFile
+	return runConfig(cfg)
+}
+
+// runConfig is the parameterized generator. At defaultConfig() values it emits
+// the committed uowstore shell byte-for-byte; -pkg/-type/-skip let it emit a
+// partial shell for another package (e.g. postgres) that embeds a real store
+// alongside the generated one.
+func runConfig(cfg genConfig) error {
+	info, err := parsePackage(cfg.src)
+	if err != nil {
+		return err
+	}
+
+	selected, err := selectTargets(cfg.types)
 	if err != nil {
 		return err
 	}
@@ -76,8 +161,11 @@ func run(srcDir, outFile string) error {
 	// Track selector qualifiers actually used across all emitted signatures so
 	// we can emit exactly the imports needed.
 	usedQualifiers := map[string]bool{}
+	// Track which -skip entries actually matched an emitted method, for strict
+	// post-emission validation.
+	skipMatched := map[string]bool{}
 
-	for _, tg := range targets {
+	for _, tg := range selected {
 		iface, ok := info.interfaces[tg.iface]
 		if !ok {
 			return fmt.Errorf("interface %q not found in package storage", tg.iface)
@@ -86,14 +174,20 @@ func run(srcDir, outFile string) error {
 		if err != nil {
 			return err
 		}
-		if err := emitTarget(&body, info, tg, methods, usedQualifiers); err != nil {
+		if err := emitTarget(&body, info, tg, methods, usedQualifiers, cfg.skip, skipMatched); err != nil {
 			return err
 		}
 	}
 
+	// Strict skip validation: a -skip entry that matched no emitted method is a
+	// typo or a drift tripwire (method removed from the interface). Fail loudly.
+	if unmatched := unmatchedSkips(cfg.skip, skipMatched); len(unmatched) > 0 {
+		return fmt.Errorf("skip entries matched no emitted method: %s", strings.Join(unmatched, ", "))
+	}
+
 	var out bytes.Buffer
-	out.WriteString("// Code generated by gen (uowstore typed-unsupported shell); DO NOT EDIT.\n\n")
-	out.WriteString("package uowstore\n\n")
+	fmt.Fprintf(&out, "// Code generated by gen (%s typed-unsupported shell); DO NOT EDIT.\n\n", cfg.pkg)
+	fmt.Fprintf(&out, "package %s\n\n", cfg.pkg)
 	writeImports(&out, info, usedQualifiers)
 	out.Write(body.Bytes())
 
@@ -102,10 +196,59 @@ func run(srcDir, outFile string) error {
 		return fmt.Errorf("gofmt generated source: %w\n----\n%s", err, out.String())
 	}
 	// #nosec G306 -- generated Go source must be world-readable like the rest of the tree
-	if err := os.WriteFile(outFile, formatted, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", outFile, err)
+	if err := os.WriteFile(cfg.out, formatted, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", cfg.out, err)
 	}
 	return nil
+}
+
+// selectTargets returns the targets to emit. An empty names slice selects all
+// targets; otherwise each name is validated against the targets table and the
+// result is filtered in table order (not flag order) so output is deterministic
+// regardless of -type ordering. An unknown name is a fatal error.
+func selectTargets(names []string) ([]target, error) {
+	if len(names) == 0 {
+		return targets, nil
+	}
+	known := map[string]bool{}
+	for _, tg := range targets {
+		known[tg.iface] = true
+	}
+	want := map[string]bool{}
+	for _, n := range names {
+		if !known[n] {
+			return nil, fmt.Errorf("unknown -type %q (known: %s)", n, knownTargetNames())
+		}
+		want[n] = true
+	}
+	var selected []target
+	for _, tg := range targets {
+		if want[tg.iface] {
+			selected = append(selected, tg)
+		}
+	}
+	return selected, nil
+}
+
+func knownTargetNames() string {
+	names := make([]string, 0, len(targets))
+	for _, tg := range targets {
+		names = append(names, tg.iface)
+	}
+	return strings.Join(names, ", ")
+}
+
+// unmatchedSkips returns the sorted -skip entries that never matched an emitted
+// method (a nil skip set yields a nil result).
+func unmatchedSkips(skip, matched map[string]bool) []string {
+	var unmatched []string
+	for k := range skip {
+		if !matched[k] {
+			unmatched = append(unmatched, k)
+		}
+	}
+	sort.Strings(unmatched)
+	return unmatched
 }
 
 func parsePackage(dir string) (*pkgInfo, error) {
@@ -224,13 +367,23 @@ func flatten(info *pkgInfo, iface *ast.InterfaceType, ifaceName string) ([]metho
 	return out, nil
 }
 
-func emitTarget(buf *bytes.Buffer, info *pkgInfo, tg target, methods []method, usedQualifiers map[string]bool) error {
+func emitTarget(buf *bytes.Buffer, info *pkgInfo, tg target, methods []method, usedQualifiers, skip, skipMatched map[string]bool) error {
 	fmt.Fprintf(buf, "// %s is the generated typed-unsupported shell for storage.%s.\n", tg.typeName, tg.iface)
 	fmt.Fprintf(buf, "// Every method returns *storage.ErrUnsupported; embed it and override the\n")
 	fmt.Fprintf(buf, "// real slice. DO NOT hand-edit — regenerate with `go generate ./...`.\n")
 	fmt.Fprintf(buf, "type %s struct{}\n\n", tg.typeName)
 
+	skipped := 0
 	for _, m := range methods {
+		op := tg.opPrefix + m.name
+		// A skipped method is simply not emitted (the embedding concrete store
+		// implements it itself); no placeholder. Skipping happens before rewrite
+		// so its qualifiers never enter the import set.
+		if skip[op] {
+			skipMatched[op] = true
+			skipped++
+			continue
+		}
 		rewritten, err := rewriteFuncType(info, m.typ, usedQualifiers)
 		if err != nil {
 			return fmt.Errorf("%s.%s: %w", tg.iface, m.name, err)
@@ -252,7 +405,7 @@ func emitTarget(buf *bytes.Buffer, info *pkgInfo, tg target, methods []method, u
 		}
 		buf.WriteString(" {\n")
 		if hasErr {
-			fmt.Fprintf(buf, "\terr = errUnsupported(%q)\n", tg.opPrefix+m.name)
+			fmt.Fprintf(buf, "\terr = errUnsupported(%q)\n", op)
 			buf.WriteString("\treturn\n")
 		} else {
 			buf.WriteString("\t// NOTE: no error channel on this signature; returns the zero value.\n")
@@ -261,7 +414,15 @@ func emitTarget(buf *bytes.Buffer, info *pkgInfo, tg target, methods []method, u
 		buf.WriteString("}\n\n")
 	}
 
-	fmt.Fprintf(buf, "var _ storage.%s = %s{}\n\n", tg.iface, tg.typeName)
+	if skipped == 0 {
+		// Full shell: the compile-time completeness assertion, exactly as before.
+		fmt.Fprintf(buf, "var _ storage.%s = %s{}\n\n", tg.iface, tg.typeName)
+	} else {
+		// Partial shell: it cannot satisfy the interface alone, so the assertion
+		// moves to the embedding composite's `var _ storage.<iface> = (*Store)(nil)`,
+		// which proves union coverage (real methods + these stubs = full interface).
+		fmt.Fprintf(buf, "// NOTE: partial shell (%d methods skipped); the embedding composite must assert storage.%s itself.\n\n", skipped, tg.iface)
+	}
 	return nil
 }
 
