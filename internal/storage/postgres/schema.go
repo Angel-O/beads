@@ -480,10 +480,20 @@ func InitSchema(ctx context.Context, db *sql.DB, schema string) error {
 			return fmt.Errorf("postgres: exec DDL statement: %w\n-- statement:\n%s", err, stmt)
 		}
 	}
-	if err := seedDefaultConfig(ctx, conn); err != nil {
+	fresh, err := stampSchemaVersion(ctx, conn)
+	if err != nil {
 		return err
 	}
-	return stampSchemaVersion(ctx, conn)
+	// Seed the default config rows ONLY on first provision — exactly like Dolt's
+	// migration 0016, which runs once. InitSchema runs on EVERY open (NewFromConfig →
+	// Provision → InitSchema) for idempotency, so seeding unconditionally would
+	// resurrect any config key a user has `config unset`, diverging from Dolt.
+	if fresh {
+		if err := seedDefaultConfig(ctx, conn); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // defaultConfigSeeds mirrors internal/storage/schema/migrations/0016_default_config.up.sql
@@ -505,8 +515,9 @@ var defaultConfigSeeds = [][2]string{
 }
 
 // seedDefaultConfig inserts the migration-0016 default config rows using
-// ON CONFLICT DO NOTHING — the Postgres equivalent of the migration's INSERT IGNORE,
-// so re-init and concurrent opens are idempotent. Runs on the search_path-pinned
+// ON CONFLICT DO NOTHING (the Postgres equivalent of the migration's INSERT IGNORE).
+// InitSchema calls it only on first provision; the ON CONFLICT guard additionally
+// makes it safe against a concurrent first init. Runs on the search_path-pinned
 // connection so it targets the workspace config table.
 func seedDefaultConfig(ctx context.Context, conn *sql.Conn) error {
 	for _, kv := range defaultConfigSeeds {
@@ -521,23 +532,25 @@ func seedDefaultConfig(ctx context.Context, conn *sql.Conn) error {
 
 // stampSchemaVersion records schemaVersion in the metadata table on first init
 // and refuses to open a workspace written by a binary with a different schema
-// version (the proof-wedge has no migrator). Runs on the search_path-pinned
-// connection so it resolves the workspace metadata table.
-func stampSchemaVersion(ctx context.Context, conn *sql.Conn) error {
+// version (the proof-wedge has no migrator). It returns fresh=true only when it
+// stamped a brand-new schema (no version row yet) — the signal InitSchema uses to
+// seed one-time data exactly once. Runs on the search_path-pinned connection so it
+// resolves the workspace metadata table.
+func stampSchemaVersion(ctx context.Context, conn *sql.Conn) (fresh bool, err error) {
 	var stored string
-	err := conn.QueryRowContext(ctx, `SELECT value FROM metadata WHERE key = $1`, schemaVersionKey).Scan(&stored)
+	err = conn.QueryRowContext(ctx, `SELECT value FROM metadata WHERE key = $1`, schemaVersionKey).Scan(&stored)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		if _, err := conn.ExecContext(ctx, `INSERT INTO metadata (key, value) VALUES ($1, $2)`, schemaVersionKey, schemaVersion); err != nil {
-			return fmt.Errorf("postgres: stamp schema version: %w", err)
+			return false, fmt.Errorf("postgres: stamp schema version: %w", err)
 		}
-		return nil
+		return true, nil
 	case err != nil:
-		return fmt.Errorf("postgres: read schema version: %w", err)
+		return false, fmt.Errorf("postgres: read schema version: %w", err)
 	case stored != schemaVersion:
-		return fmt.Errorf("postgres: workspace schema version %s, this binary requires %s — no migrator in the proof-wedge, recreate the workspace or use a matching binary", stored, schemaVersion)
+		return false, fmt.Errorf("postgres: workspace schema version %s, this binary requires %s — no migrator in the proof-wedge, recreate the workspace or use a matching binary", stored, schemaVersion)
 	default:
-		return nil
+		return false, nil
 	}
 }
 
