@@ -134,7 +134,7 @@ test-migration: build
 # Gas City vendors this corpus to detect cross-version drift. Needs Docker (Dolt).
 corpus-regen:
 	@echo "Regenerating contract corpus..."
-	go test ./cmd/bd/protocol -run TestCorpusGolden -corpus.update -count=1
+	go test -tags "$(BUILD_TAGS)" ./cmd/bd/protocol -run TestCorpusGolden -corpus.update -count=1
 
 
 # Run performance benchmarks against Dolt storage backend

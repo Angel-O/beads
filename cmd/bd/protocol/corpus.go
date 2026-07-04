@@ -178,7 +178,7 @@ var provenanceValueKeys = map[string]string{
 //     element's "id" field (falling back to the element's canonical-JSON
 //     form when "id" is absent or equal), so list/ready/sql ordering is
 //     deterministic regardless of storage iteration order.
-//  3. The result is re-marshalled with 2-space indentation and sorted keys
+//  3. The result is re-marshaled with 2-space indentation and sorted keys
 //     (Go's encoding/json sorts map keys), yielding a minimal, byte-stable
 //     diff.
 //
