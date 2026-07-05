@@ -41,6 +41,12 @@ func (t *sqlkitTx) CreateIssueImport(ctx context.Context, issue *types.Issue, ac
 	return t.CreateIssue(ctx, issue, actor)
 }
 
+// SearchIssueIDs is the narrow-projection variant of SearchIssues over the tx
+// (ids only), mirroring the Dolt transaction implementations.
+func (t *sqlkitTx) SearchIssueIDs(ctx context.Context, query string, filter types.IssueFilter) ([]string, error) {
+	return issueops.SearchIssueIDsInTx(ctx, t.tx, query, filter)
+}
+
 // CreateIssue creates a single issue; TableRouting inside issueops routes
 // wisps, so no store-level split is needed.
 func (t *sqlkitTx) CreateIssue(ctx context.Context, issue *types.Issue, actor string) error {

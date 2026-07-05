@@ -53,6 +53,9 @@ CREATE TABLE IF NOT EXISTS `issues` (
   `no_history` tinyint(1) DEFAULT '0',
   `started_at` datetime,
   `is_blocked` tinyint(1) NOT NULL DEFAULT '0',
+  `lease_expires_at` datetime,
+  `heartbeat_at` datetime,
+  `row_lock` bigint NOT NULL DEFAULT 0,
   PRIMARY KEY (`id`),
   KEY `idx_issues_assignee` (`assignee`),
   KEY `idx_issues_created_at` (`created_at`),
@@ -62,7 +65,8 @@ CREATE TABLE IF NOT EXISTS `issues` (
   KEY `idx_issues_issue_type` (`issue_type`),
   KEY `idx_issues_priority` (`priority`),
   KEY `idx_issues_spec_id` (`spec_id`(191)),
-  KEY `idx_issues_status_updated_at` (`status`,`updated_at`)
+  KEY `idx_issues_status_updated_at` (`status`,`updated_at`),
+  KEY `idx_issues_lease` (`status`,`lease_expires_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;
 
 
@@ -121,6 +125,9 @@ CREATE TABLE IF NOT EXISTS `wisps` (
   `no_history` tinyint(1) DEFAULT '0',
   `started_at` datetime,
   `is_blocked` tinyint(1) NOT NULL DEFAULT '0',
+  `lease_expires_at` datetime,
+  `heartbeat_at` datetime,
+  `row_lock` bigint NOT NULL DEFAULT 0,
   PRIMARY KEY (`id`),
   KEY `idx_wisps_assignee` (`assignee`),
   KEY `idx_wisps_created_at` (`created_at`),

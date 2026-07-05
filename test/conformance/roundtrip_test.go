@@ -3,6 +3,7 @@
 package conformance
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -85,7 +86,7 @@ func TestExportImportRoundTripE2E(t *testing.T) {
 				}
 			}
 			reexp := restoreAndReexport(t, bin, p, exp)
-			if a, b := sortJSONLines(exp), sortJSONLines(reexp); a != b {
+			if a, b := canonicalRecords(exp), canonicalRecords(reexp); a != b {
 				t.Errorf("[%s] export->import->export is not lossless:\n%s", p.Name, firstRecordDiff(a, b))
 			}
 		})
@@ -156,15 +157,39 @@ func runSteps(t *testing.T, bin, dir string, env []string, backend string, steps
 	}
 }
 
-// sortJSONLines sorts the non-empty lines of a JSONL export. Record order is not part of
-// the backup contract, so sorting lets a reordered re-export still compare equal; every
-// field value within a record is still compared byte-for-byte.
-func sortJSONLines(s string) string {
+// ephemeralExportKeys are runtime claim/lease fields that `bd export` serializes but
+// `bd import` deliberately does not restore: a restored backup must not carry a dead
+// worker's stale lease. They are not part of the durable backup contract, so the
+// round-trip legitimately drops them on EVERY backend (the Dolt reference included), and
+// canonicalRecords strips them before the fidelity comparison.
+var ephemeralExportKeys = []string{"lease_expires_at", "heartbeat_at", "row_lock"}
+
+// canonicalRecords normalizes a JSONL export for the round-trip fidelity comparison:
+// it drops the ephemeral lease keys from each record and sorts the lines. Record order
+// is not part of the backup contract, and each record's durable fields are still
+// compared value-for-value (nested arrays are left byte-identical, which holds because
+// both sides are the same backend's own export).
+func canonicalRecords(s string) string {
 	var lines []string
 	for _, l := range strings.Split(strings.TrimSpace(s), "\n") {
-		if strings.TrimSpace(l) != "" {
-			lines = append(lines, l)
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
 		}
+		var rec map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(l), &rec); err != nil {
+			lines = append(lines, l) // non-object line: compare verbatim
+			continue
+		}
+		for _, k := range ephemeralExportKeys {
+			delete(rec, k)
+		}
+		b, err := json.Marshal(rec) // map marshal emits keys in sorted order
+		if err != nil {
+			lines = append(lines, l)
+			continue
+		}
+		lines = append(lines, string(b))
 	}
 	sort.Strings(lines)
 	return strings.Join(lines, "\n")

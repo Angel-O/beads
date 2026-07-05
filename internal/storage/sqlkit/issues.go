@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
@@ -160,6 +161,32 @@ func (s *Store) DeleteIssue(ctx context.Context, id string) error {
 	return s.withMutationTx(ctx, func(tx *sql.Tx) error {
 		return issueops.DeleteIssueInTx(ctx, tx, id)
 	})
+}
+
+// HeartbeatIssue renews the lease on a claimed issue. Mirrors embeddeddolt:
+// wisps are ephemeral and never leased, so heartbeating one is ErrNotClaimable;
+// otherwise delegate to issueops.HeartbeatIssueInTx.
+func (s *Store) HeartbeatIssue(ctx context.Context, id, actor string) error {
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		if issueops.IsActiveWispInTx(ctx, tx, id) {
+			return fmt.Errorf("%w: %s is ephemeral", storage.ErrNotClaimable, id)
+		}
+		return issueops.HeartbeatIssueInTx(ctx, tx, id, actor)
+	})
+}
+
+// ReclaimExpiredLeases reverts in_progress issues whose lease expired more than
+// olderThan ago back to ready, recovering work stranded by dead workers. Mirrors
+// embeddeddolt (issueops.ReclaimExpiredLeasesInTx does the shared SQL).
+func (s *Store) ReclaimExpiredLeases(ctx context.Context, olderThan time.Duration, actor string) ([]types.ReclaimedLease, error) {
+	cutoff := time.Now().UTC().Add(-olderThan)
+	var reclaimed []types.ReclaimedLease
+	err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		reclaimed, err = issueops.ReclaimExpiredLeasesInTx(ctx, tx, cutoff, actor)
+		return err
+	})
+	return reclaimed, err
 }
 
 // --- metadata schema helpers (config-only; copied from dolt/metadata_schema.go) ---

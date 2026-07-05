@@ -74,6 +74,11 @@ func (unsupportedDoltStorage) SearchIssuesWithCounts(_ context.Context, _ string
 	return
 }
 
+func (unsupportedDoltStorage) SearchIssueIDs(_ context.Context, _ string, _ types.IssueFilter) (_ []string, err error) {
+	err = errUnsupported("SearchIssueIDs")
+	return
+}
+
 func (unsupportedDoltStorage) AddDependency(_ context.Context, _ *types.Dependency, _ string) (err error) {
 	err = errUnsupported("AddDependency")
 	return
@@ -539,6 +544,16 @@ func (unsupportedDoltStorage) ClaimReadyIssue(_ context.Context, _ types.WorkFil
 	return
 }
 
+func (unsupportedDoltStorage) HeartbeatIssue(_ context.Context, _ string, _ string) (err error) {
+	err = errUnsupported("HeartbeatIssue")
+	return
+}
+
+func (unsupportedDoltStorage) ReclaimExpiredLeases(_ context.Context, _ time.Duration, _ string) (_ []types.ReclaimedLease, err error) {
+	err = errUnsupported("ReclaimExpiredLeases")
+	return
+}
+
 func (unsupportedDoltStorage) PromoteFromEphemeral(_ context.Context, _ string, _ string) (err error) {
 	err = errUnsupported("PromoteFromEphemeral")
 	return
@@ -773,6 +788,11 @@ func (unsupportedTransaction) GetIssue(_ context.Context, _ string) (_ *types.Is
 
 func (unsupportedTransaction) SearchIssues(_ context.Context, _ string, _ types.IssueFilter) (_ []*types.Issue, err error) {
 	err = errUnsupported("Transaction.SearchIssues")
+	return
+}
+
+func (unsupportedTransaction) SearchIssueIDs(_ context.Context, _ string, _ types.IssueFilter) (_ []string, err error) {
+	err = errUnsupported("Transaction.SearchIssueIDs")
 	return
 }
 
