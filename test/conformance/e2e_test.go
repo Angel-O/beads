@@ -452,15 +452,34 @@ func runBd(bin, dir string, env []string, args ...string) (stdout, stderr string
 var (
 	buildOnce sync.Once
 	bdBin     string
+	bdBinDir  string
 	bdErr     error
 )
+
+// TestMain removes the shared bd binary after the whole package runs. buildBD is
+// process-wide (sync.Once) and shared by every test, so its binary must outlive any
+// single test — hence a package-scoped temp dir cleaned here rather than a per-test
+// t.TempDir, which Go deletes when its owning test returns.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if bdBinDir != "" {
+		_ = os.RemoveAll(bdBinDir)
+	}
+	os.Exit(code)
+}
 
 // buildBD builds the bd binary once per test process (matching the gms_pure_go tag
 // used everywhere else) and returns its absolute path.
 func buildBD(t *testing.T) string {
 	t.Helper()
 	buildOnce.Do(func() {
-		bin := filepath.Join(t.TempDir(), "bd-e2e")
+		dir, err := os.MkdirTemp("", "bd-e2e")
+		if err != nil {
+			bdErr = fmt.Errorf("mkdir temp for bd binary: %v", err)
+			return
+		}
+		bdBinDir = dir
+		bin := filepath.Join(dir, "bd-e2e")
 		cmd := exec.Command("go", "build", "-tags", "gms_pure_go", "-o", bin, "./cmd/bd")
 		cmd.Dir = repoRoot()
 		if out, err := cmd.CombinedOutput(); err != nil {
