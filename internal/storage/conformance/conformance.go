@@ -162,6 +162,9 @@ func RunAll(t *testing.T, factory Factory) {
 	// Portable non-VC methods (molecule/repo-mtime/streams/counts/comment/rekey/batch)
 	t.Run("Portable", func(t *testing.T) { RunPortableMethods(t, factory) })
 
+	// Audit — exhaustive strange-behavior cases derived from the Dolt reference impl.
+	t.Run("Audit", func(t *testing.T) { RunAudit(t, factory) })
+
 	// Iterators
 	t.Run("IterIssues", func(t *testing.T) { testIterIssues(t, factory) })
 	t.Run("IterComments", func(t *testing.T) { testIterComments(t, factory) })
