@@ -18,6 +18,11 @@ import (
 func Translate(sql string) string {
 	out := sql
 	out = rewriteFuncCalls(out, "CONCAT", concatArgs) // CONCAT(a,b) -> (a || b)
+	// SQLite has no LOCATE; INSTR(haystack, needle) is the equivalent but with the
+	// arguments REVERSED vs MySQL LOCATE(needle, haystack). Run after CONCAT so a nested
+	// LOCATE(CONCAT(...), path) already has its inner CONCAT rewritten. Without this the
+	// recursive parent-descendant CTE (ready/blocked --parent) errors and returns nothing.
+	out = rewriteFuncCalls(out, "LOCATE", locateArgs) // LOCATE(n,h) -> INSTR(h,n)
 	// SQLite json_extract already returns an unquoted scalar, so MySQL's explicit
 	// JSON_UNQUOTE wrapper is dropped; the inner JSON_EXTRACT is native SQLite.
 	out = rewriteFuncCalls(out, "JSON_UNQUOTE", jsonUnquoteArgs)
@@ -174,6 +179,15 @@ func concatArgs(args []string) string {
 		args[i] = strings.TrimSpace(args[i])
 	}
 	return "(" + strings.Join(args, " || ") + ")"
+}
+
+// locateArgs rewrites MySQL LOCATE(needle, haystack) -> SQLite INSTR(haystack, needle):
+// SQLite's INSTR takes the string first and the substring second, reversed from LOCATE.
+func locateArgs(args []string) string {
+	if len(args) != 2 {
+		return "LOCATE(" + strings.Join(args, ", ") + ")" // 3-arg form is not on bd's path; leave loud
+	}
+	return "INSTR(" + strings.TrimSpace(args[1]) + ", " + strings.TrimSpace(args[0]) + ")"
 }
 
 func ifArgs(args []string) string {
