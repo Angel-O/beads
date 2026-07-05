@@ -53,9 +53,6 @@ var legitimatelyUnsupported = map[string]string{
 	// MergeSlot — the Dolt merge-serialization primitive.
 	"MergeSlotCreate": "merge-slot", "MergeSlotCheck": "merge-slot",
 	"MergeSlotAcquire": "merge-slot", "MergeSlotRelease": "merge-slot",
-
-	// Slot — gt per-issue metadata slots; not on the bd core surface.
-	"SlotSet": "slot", "SlotGet": "slot", "SlotClear": "slot",
 }
 
 var shellMethodRe = regexp.MustCompile(`func \(unsupportedDoltStorage\) ([A-Za-z0-9]+)\(`)

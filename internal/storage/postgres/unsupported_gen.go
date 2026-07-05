@@ -33,21 +33,6 @@ func (unsupportedDoltStorage) MergeSlotRelease(_ context.Context, _ string, _ st
 	return
 }
 
-func (unsupportedDoltStorage) SlotSet(_ context.Context, _ string, _ string, _ string, _ string) (err error) {
-	err = errUnsupported("SlotSet")
-	return
-}
-
-func (unsupportedDoltStorage) SlotGet(_ context.Context, _ string, _ string) (_ string, err error) {
-	err = errUnsupported("SlotGet")
-	return
-}
-
-func (unsupportedDoltStorage) SlotClear(_ context.Context, _ string, _ string, _ string) (err error) {
-	err = errUnsupported("SlotClear")
-	return
-}
-
 func (unsupportedDoltStorage) Branch(_ context.Context, _ string) (err error) {
 	err = errUnsupported("Branch")
 	return
@@ -248,4 +233,4 @@ func (unsupportedDoltStorage) RestoreFromSnapshot(_ context.Context, _ string) (
 	return
 }
 
-// NOTE: partial shell (97 methods skipped); the embedding composite must assert storage.DoltStorage itself.
+// NOTE: partial shell (100 methods skipped); the embedding composite must assert storage.DoltStorage itself.

@@ -41,6 +41,7 @@ func RunPortableMethods(t *testing.T, factory Factory) {
 	t.Run("UpdateIssueID", func(t *testing.T) { testUpdateIssueID(t, factory) })
 	t.Run("DeleteIssuesBySourceRepo", func(t *testing.T) { testDeleteIssuesBySourceRepo(t, factory) })
 	t.Run("CreateIssuesWithFullOptions", func(t *testing.T) { testCreateIssuesWithFullOptions(t, factory) })
+	t.Run("Slots", func(t *testing.T) { testSlots(t, factory) })
 }
 
 // --- helpers (file-private) ---
@@ -616,6 +617,48 @@ func testCreateIssuesWithFullOptions(t *testing.T, f Factory) {
 		"a", storage.BatchCreateOptions{OrphanHandling: storage.OrphanAllow, SkipPrefixValidation: true, ConflictSkip: true}))
 	if got, _ := s.GetIssue(c, "test-keep"); got.Title != "Original" {
 		t.Errorf("ConflictSkip overwrote title to %q, want Original", got.Title)
+	}
+}
+
+// --- Metadata slots (gt per-issue KV over the issue metadata JSON) ---
+
+func testSlots(t *testing.T, f Factory) {
+	s := f(t)
+	c := ctx()
+	must(t, s.CreateIssue(c, withDefaults(&types.Issue{ID: "test-sl", Title: "T"}), "a"))
+
+	// Get before set is an error (no such slot).
+	if _, err := s.SlotGet(c, "test-sl", "k"); err == nil {
+		t.Error("SlotGet on an unset key: want error, got nil")
+	}
+
+	// Set then get round-trips; a second key is independent.
+	must(t, s.SlotSet(c, "test-sl", "k", "v1", "a"))
+	must(t, s.SlotSet(c, "test-sl", "k2", "other", "a"))
+	if v, err := s.SlotGet(c, "test-sl", "k"); err != nil || v != "v1" {
+		t.Fatalf("SlotGet after set = (%q,%v), want (v1,nil)", v, err)
+	}
+
+	// Overwrite: last write wins.
+	must(t, s.SlotSet(c, "test-sl", "k", "v2", "a"))
+	if v, _ := s.SlotGet(c, "test-sl", "k"); v != "v2" {
+		t.Errorf("SlotGet after overwrite = %q, want v2", v)
+	}
+
+	// Clear removes only the named key; a missing/repeat clear is a silent no-op.
+	must(t, s.SlotClear(c, "test-sl", "k", "a"))
+	if _, err := s.SlotGet(c, "test-sl", "k"); err == nil {
+		t.Error("SlotGet after clear: want error, got nil")
+	}
+	if v, _ := s.SlotGet(c, "test-sl", "k2"); v != "other" {
+		t.Errorf("k2 wrongly affected by clearing k: %q", v)
+	}
+	must(t, s.SlotClear(c, "test-sl", "k", "a"))     // idempotent
+	must(t, s.SlotClear(c, "test-sl", "never", "a")) // never-set key
+
+	// Operating on a non-existent issue is an error (GetIssue fails).
+	if err := s.SlotSet(c, "test-missing", "k", "v", "a"); err == nil {
+		t.Error("SlotSet on a missing issue: want error, got nil")
 	}
 }
 
