@@ -115,15 +115,11 @@ func (s *Store) UpdateIssue(ctx context.Context, id string, updates map[string]i
 		}
 	}
 
-	// Demoting a regular issue to a wisp is a table migration in dolt; it is out
-	// of scope for the wedge. An in-place column write would silently diverge.
-	if _, ok := updates["no_history"]; ok {
-		return fmt.Errorf("sqlkit: demoting an issue to a wisp via update is not supported")
-	}
-	if _, ok := updates["wisp"]; ok {
-		return fmt.Errorf("sqlkit: demoting an issue to a wisp via update is not supported")
-	}
-
+	// Setting no_history/wisp on a durable issue is an IN-PLACE column write on the
+	// embedded-Dolt reference (the default backend + our oracle): updateIssueInTx routes
+	// by IsActiveWispInTx and, for a durable id, updates the issues row in place — the row
+	// is NOT migrated to the wisps table (only the server-Dolt store's DemoteToWisp does
+	// that). Delegating to the same shared helper matches the reference exactly.
 	return s.withMutationTx(ctx, func(tx *sql.Tx) error {
 		_, err := issueops.UpdateIssueInTx(ctx, tx, id, updates, actor)
 		return err

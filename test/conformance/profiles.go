@@ -74,12 +74,6 @@ var Profiles = []BackendProfile{
 			return nil
 		},
 		Teardown: dropPostgresSchema,
-		XFail: map[string]string{
-			// Deferred: durable→wisp demotion is a Dolt table migration; the wedge
-			// guards it loudly rather than diverge silently (sqlkit/issues.go).
-			// (GetStatistics is now implemented in shared issueops — no longer XFail.)
-			"update-no-history-demote": "deferred: durable→wisp demote guard",
-		},
 	},
 	{
 		Name:      "mysql",
@@ -98,9 +92,6 @@ var Profiles = []BackendProfile{
 			return []string{"BEADS_MYSQL_URL=" + os.Getenv("BEADS_MYSQL_TEST_URL")}
 		},
 		Teardown: dropMySQLDatabase,
-		XFail: map[string]string{
-			"update-no-history-demote": "deferred: durable→wisp demote guard",
-		},
 	},
 	{
 		Name:      "sqlite",
@@ -108,9 +99,6 @@ var Profiles = []BackendProfile{
 		// File-based: the default beads.db inside each workspace's .beads dir isolates
 		// it; the temp workspace dir cleanup removes the file. No handle/env/teardown.
 		InitArgs: func(*Workspace) []string { return []string{"--backend=sqlite"} },
-		XFail: map[string]string{
-			"update-no-history-demote": "deferred: durable→wisp demote guard",
-		},
 	},
 }
 
