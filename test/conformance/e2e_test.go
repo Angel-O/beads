@@ -81,6 +81,14 @@ var corpus = []scenario{
 		{"create", "s", "--id", "cf-s1", "-t", "task"},
 		{"stats", "--json"},
 	}},
+	// A fresh issue is never stale, so this exercises the GetStaleIssues query +
+	// dialect translation and asserts the empty result matches the reference on every
+	// backend. The found path (aged updated_at) is covered at the store level by the
+	// conformance RunDeferredReads gate, which the CLI can't reach deterministically.
+	{name: "stale", steps: [][]string{
+		{"create", "st", "--id", "cf-st1", "-t", "task"},
+		{"stale", "--days", "1", "--json"},
+	}},
 	{name: "update-no-history-demote", steps: [][]string{
 		{"create", "d", "--id", "cf-d1", "-t", "task"},
 		{"update", "cf-d1", "--no-history", "--json"},

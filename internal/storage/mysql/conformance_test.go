@@ -22,10 +22,28 @@ func TestConformance(t *testing.T) {
 	if url == "" {
 		t.Skip("BEADS_MYSQL_TEST_URL not set")
 	}
+	conformance.RunAll(t, mysqlConformanceFactory(url))
+}
+
+// TestDeferredReads runs the shared deferred non-version-control reads (statistics,
+// external-ref, stale) that the backend now implements through issueops, as a GREEN
+// gate. RunAll stays the fail-loud measurement (red on genuinely Dolt-only methods
+// like slots), so this focused gate is what conformance.sh runs. Gated on
+// BEADS_MYSQL_TEST_URL.
+func TestDeferredReads(t *testing.T) {
+	url := os.Getenv("BEADS_MYSQL_TEST_URL")
+	if url == "" {
+		t.Skip("BEADS_MYSQL_TEST_URL not set")
+	}
+	conformance.RunDeferredReads(t, mysqlConformanceFactory(url))
+}
+
+// mysqlConformanceFactory provisions a fresh, isolated database per sub-test against
+// the MySQL server at url, seeded with issue_prefix as `bd init` leaves it.
+func mysqlConformanceFactory(url string) conformance.Factory {
 	base := time.Now().UnixNano()
 	var seq int64
-
-	conformance.RunAll(t, func(t *testing.T) storage.DoltStorage {
+	return func(t *testing.T) storage.DoltStorage {
 		ctx := context.Background()
 		database := fmt.Sprintf("conf_%d_%d", base, atomic.AddInt64(&seq, 1))
 
@@ -48,5 +66,5 @@ func TestConformance(t *testing.T) {
 			_ = st.Close()
 		})
 		return st
-	})
+	}
 }

@@ -29,19 +29,20 @@ CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/embeddeddolt/ -run TestCo
 # (GetStatistics, external-ref, slots — audited in completeness_test.go). Tier 1 here
 # runs the wedge's green gates: live smoke, the interface-completeness audit (the shell
 # must equal the deferral allowlist — no SILENT unsupported), the seed-once regression,
-# and the dialect corpus-PREPARE + password-redaction gates. All self-skip without
+# the deferred non-VC reads (statistics/external-ref/stale, now implemented), and the
+# dialect corpus-PREPARE + password-redaction gates. All self-skip without
 # BEADS_PG_TEST_URL.
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/postgres/ \
-  -run 'TestPGSmoke|TestInterfaceCompleteness|TestSeedOnlyOnFirstProvision'
+  -run 'TestPGSmoke|TestInterfaceCompleteness|TestSeedOnlyOnFirstProvision|TestDeferredReads'
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/pgdialect/
 # MySQL wedge gates (self-skip without BEADS_MYSQL_TEST_URL); the dialect rewrite test
 # (the is_blocked 1093 workaround) always runs.
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/mysql/ \
-  -run 'TestInterfaceCompleteness|TestSeedOnlyOnFirstProvision'
+  -run 'TestInterfaceCompleteness|TestSeedOnlyOnFirstProvision|TestDeferredReads'
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/mysqldialect/
 # SQLite is embedded (pure-Go), always runs.
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/sqlite/ \
-  -run 'TestInterfaceCompleteness|TestSeedOnlyOnFirstProvision'
+  -run 'TestInterfaceCompleteness|TestSeedOnlyOnFirstProvision|TestDeferredReads'
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/sqlitedialect/
 
 echo "==> Tier 2: end-to-end 'bd init' + CLI conformance (differential vs Dolt)"

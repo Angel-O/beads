@@ -12,6 +12,7 @@ package conformance
 import (
 	"context"
 	"errors"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -86,12 +87,28 @@ func RunAll(t *testing.T, factory Factory) {
 	// Statistics
 	t.Run("Statistics", func(t *testing.T) { testStatistics(t, factory) })
 
+	// Stale
+	t.Run("StaleIssues", func(t *testing.T) { testStaleIssues(t, factory) })
+
 	// Iterators
 	t.Run("IterIssues", func(t *testing.T) { testIterIssues(t, factory) })
 	t.Run("IterComments", func(t *testing.T) { testIterComments(t, factory) })
 
 	// Transaction
 	t.Run("Transaction", func(t *testing.T) { testTransaction(t, factory) })
+}
+
+// RunDeferredReads runs the subset of the suite covering the shared "deferred"
+// non-version-control reads — statistics, external-ref lookup, and staleness — that
+// the SQL-family backends (postgres/mysql/sqlite) implement through issueops. RunAll
+// is the full fail-loud measurement (and stays red on genuinely Dolt-only methods
+// like slots), so these backends run this focused GREEN gate instead. The Dolt
+// reference covers the same cases via RunAll.
+func RunDeferredReads(t *testing.T, factory Factory) {
+	t.Helper()
+	t.Run("Statistics", func(t *testing.T) { testStatistics(t, factory) })
+	t.Run("GetByExternalRef", func(t *testing.T) { testGetByExternalRef(t, factory) })
+	t.Run("StaleIssues", func(t *testing.T) { testStaleIssues(t, factory) })
 }
 
 // --- helpers ---
@@ -136,6 +153,16 @@ func issueIDs(issues []*types.Issue) []string {
 		ids[i] = iss.ID
 	}
 	sort.Strings(ids)
+	return ids
+}
+
+// orderedIDs is issueIDs without the sort — for asserting a contractual result
+// order (e.g. GetStaleIssues' updated_at ASC) rather than set membership.
+func orderedIDs(issues []*types.Issue) []string {
+	ids := make([]string, len(issues))
+	for i, iss := range issues {
+		ids[i] = iss.ID
+	}
 	return ids
 }
 
@@ -620,6 +647,56 @@ func testStatistics(t *testing.T, f Factory) {
 	}
 	if stats.ClosedIssues != 1 {
 		t.Errorf("ClosedIssues = %d", stats.ClosedIssues)
+	}
+}
+
+// --- Stale ---
+
+func testStaleIssues(t *testing.T, f Factory) {
+	s := f(t)
+	c := ctx()
+
+	// Two issues last touched years ago (stalest first by updated_at), one fresh,
+	// and one aged-but-closed. Staleness is decided on updated_at, which CreateIssue
+	// honors when preset (issueops/create.go), so no clock manipulation is needed —
+	// and a year between the aged timestamps keeps the order unambiguous across
+	// backends (no whole-second tie).
+	y2020 := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	y2021 := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
+	must(t, s.CreateIssue(c, withDefaults(&types.Issue{ID: "sl-old1", Title: "oldest open", Status: types.StatusOpen, CreatedAt: y2020, UpdatedAt: y2020}), "actor"))
+	must(t, s.CreateIssue(c, withDefaults(&types.Issue{ID: "sl-old2", Title: "aged in-progress", Status: types.StatusInProgress, CreatedAt: y2021, UpdatedAt: y2021}), "actor"))
+	must(t, s.CreateIssue(c, withDefaults(&types.Issue{ID: "sl-fresh", Title: "fresh open", Status: types.StatusOpen}), "actor"))
+	must(t, s.CreateIssue(c, withDefaults(&types.Issue{ID: "sl-closed", Title: "aged but closed", Status: types.StatusClosed, CreatedAt: y2020, UpdatedAt: y2020}), "actor"))
+
+	// Default (open + in_progress): the two aged issues, stalest first; the fresh one
+	// and the closed one are excluded. Order is contractual (updated_at ASC).
+	got, err := s.GetStaleIssues(c, types.StaleFilter{Days: 30})
+	if err != nil {
+		t.Fatalf("GetStaleIssues: %v", err)
+	}
+	if seq := orderedIDs(got); !slices.Equal(seq, []string{"sl-old1", "sl-old2"}) {
+		t.Fatalf("GetStaleIssues(Days=30) = %v, want [sl-old1 sl-old2]", seq)
+	}
+
+	// Status filter narrows to open only.
+	openOnly, err := s.GetStaleIssues(c, types.StaleFilter{Days: 30, Status: "open"})
+	must(t, err)
+	if seq := orderedIDs(openOnly); !slices.Equal(seq, []string{"sl-old1"}) {
+		t.Fatalf("GetStaleIssues(status=open) = %v, want [sl-old1]", seq)
+	}
+
+	// Limit caps the result set.
+	limited, err := s.GetStaleIssues(c, types.StaleFilter{Days: 30, Limit: 1})
+	must(t, err)
+	if len(limited) != 1 {
+		t.Fatalf("GetStaleIssues(limit=1) returned %d, want 1", len(limited))
+	}
+
+	// Nothing is stale on a century horizon.
+	none, err := s.GetStaleIssues(c, types.StaleFilter{Days: 36500})
+	must(t, err)
+	if len(none) != 0 {
+		t.Fatalf("GetStaleIssues(Days=36500) = %v, want none", orderedIDs(none))
 	}
 }
 
