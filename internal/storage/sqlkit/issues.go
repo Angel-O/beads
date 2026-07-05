@@ -136,10 +136,22 @@ func (s *Store) UpdateIssueType(ctx context.Context, id string, issueType string
 // defer_until, records EventReopened, adds the reason comment when non-empty,
 // and recomputes is_blocked for affected IDs — all in one tx.
 func (s *Store) ReopenIssue(ctx context.Context, id string, reason string, actor string) error {
-	return s.withMutationTx(ctx, func(tx *sql.Tx) error {
-		_, err := issueops.ReopenIssueInTx(ctx, tx, id, reason, actor)
+	// Mirror the embedded-Dolt reference exactly: reopen via UpdateIssue (which always
+	// records a status event, bumps updated_at, and returns a wrapped storage.ErrNotFound
+	// for a missing id — even when the issue is already open), then attach the reason as a
+	// comment. The old issueops.ReopenIssueInTx path used WHERE status='closed', which made
+	// reopening an already-open issue a silent no-op and returned a plain not-found error.
+	updates := map[string]interface{}{
+		"status":      string(types.StatusOpen),
+		"defer_until": nil,
+	}
+	if err := s.UpdateIssue(ctx, id, updates, actor); err != nil {
 		return err
-	})
+	}
+	if reason != "" {
+		return s.AddComment(ctx, id, actor, reason)
+	}
+	return nil
 }
 
 // DeleteIssue permanently removes an issue. issueops routes wisps internally and
