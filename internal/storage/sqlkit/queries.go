@@ -54,6 +54,28 @@ func (s *Store) GetBlockedIssues(ctx context.Context, filter types.WorkFilter) (
 	return result, err
 }
 
+// GetStatistics returns summary statistics (counts, blocked, ready) for the workspace.
+func (s *Store) GetStatistics(ctx context.Context) (*types.Statistics, error) {
+	var stats *types.Statistics
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		stats, err = issueops.GetStatisticsInTx(ctx, tx)
+		return err
+	})
+	return stats, err
+}
+
+// GetStaleIssues returns non-ephemeral issues not updated within the filter window.
+func (s *Store) GetStaleIssues(ctx context.Context, filter types.StaleFilter) ([]*types.Issue, error) {
+	var result []*types.Issue
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetStaleIssuesInTx(ctx, tx, filter)
+		return err
+	})
+	return result, err
+}
+
 // GetEpicsEligibleForClosure returns epics whose children are all closed.
 func (s *Store) GetEpicsEligibleForClosure(ctx context.Context) ([]*types.EpicStatus, error) {
 	var result []*types.EpicStatus

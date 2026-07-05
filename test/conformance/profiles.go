@@ -75,12 +75,9 @@ var Profiles = []BackendProfile{
 		},
 		Teardown: dropPostgresSchema,
 		XFail: map[string]string{
-			// Deferred: GetStatistics is on the audited unsupported allowlist
-			// (internal/storage/postgres/completeness_test.go). Kept failing and
-			// triaged, per the operator: not masked.
-			"stats": "deferred: GetStatistics (bd stats/status)",
 			// Deferred: durable→wisp demotion is a Dolt table migration; the wedge
 			// guards it loudly rather than diverge silently (sqlkit/issues.go).
+			// (GetStatistics is now implemented in shared issueops — no longer XFail.)
 			"update-no-history-demote": "deferred: durable→wisp demote guard",
 		},
 	},
@@ -102,7 +99,6 @@ var Profiles = []BackendProfile{
 		},
 		Teardown: dropMySQLDatabase,
 		XFail: map[string]string{
-			"stats":                    "deferred: GetStatistics (bd stats/status)",
 			"update-no-history-demote": "deferred: durable→wisp demote guard",
 		},
 	},
@@ -113,7 +109,6 @@ var Profiles = []BackendProfile{
 		// it; the temp workspace dir cleanup removes the file. No handle/env/teardown.
 		InitArgs: func(*Workspace) []string { return []string{"--backend=sqlite"} },
 		XFail: map[string]string{
-			"stats":                    "deferred: GetStatistics (bd stats/status)",
 			"update-no-history-demote": "deferred: durable→wisp demote guard",
 		},
 	},

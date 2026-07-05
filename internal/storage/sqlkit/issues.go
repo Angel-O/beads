@@ -69,6 +69,23 @@ func (s *Store) GetIssue(ctx context.Context, id string) (*types.Issue, error) {
 	return issue, err
 }
 
+// GetIssueByExternalRef retrieves an issue by its external reference, spanning both
+// the issues and wisps tiers. Returns a wrapped storage.ErrNotFound when none matches.
+// Resolves the ID in a read tx (issueops), then reuses GetIssue so wisp-tier hydration
+// and not-found semantics are identical to a normal fetch.
+func (s *Store) GetIssueByExternalRef(ctx context.Context, externalRef string) (*types.Issue, error) {
+	var id string
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var e error
+		id, e = issueops.GetIssueByExternalRefInTx(ctx, tx, externalRef)
+		return e
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s.GetIssue(ctx, id)
+}
+
 // GetIssuesByIDs retrieves multiple issues by ID, spanning both the issues and
 // wisps tiers.
 func (s *Store) GetIssuesByIDs(ctx context.Context, ids []string) ([]*types.Issue, error) {

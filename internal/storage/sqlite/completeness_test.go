@@ -59,15 +59,12 @@ var legitimatelyUnsupported = map[string]string{
 	// molecule/export/import), NOT on the gc-16 demo path. Cheap issueops
 	// delegations; a later slice implements them. Tracked here so they can never
 	// regress into a SILENT unsupported.
-	"GetStatistics":               "deferred: bd stats",
-	"GetIssueByExternalRef":       "deferred: external-ref lookup",
 	"GetAllEventsSince":           "deferred: full event stream",
 	"IterAllEventsSince":          "deferred: full event stream",
 	"GetAllDependencyRecords":     "deferred: full-graph export",
 	"IterAllDependencyRecords":    "deferred: full-graph export",
 	"CountDependentsByStatus":     "deferred",
 	"FindWispDependentsRecursive": "deferred: wisp gc",
-	"GetStaleIssues":              "deferred: bd stale",
 	"GetMoleculeProgress":         "deferred: molecule progress",
 	"GetMoleculeLastActivity":     "deferred: molecule activity",
 	"GetRepoMtime":                "deferred: repo-mtime cache",
