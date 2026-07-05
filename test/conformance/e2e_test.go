@@ -89,6 +89,29 @@ var corpus = []scenario{
 		{"create", "st", "--id", "cf-st1", "-t", "task"},
 		{"stale", "--days", "1", "--json"},
 	}},
+	// Promote a wisp to a durable issue (PromoteFromEphemeral) — CLI-level differential
+	// for one of the backfilled writes.
+	{name: "promote", steps: [][]string{
+		{"create", "w", "--id", "cf-pw1", "-t", "task", "--ephemeral"},
+		{"promote", "cf-pw1"},
+		{"show", "cf-pw1", "--json"},
+	}},
+	// Rekey an issue id (UpdateIssueID); dependents follow.
+	{name: "rename", steps: [][]string{
+		{"create", "r1", "--id", "cf-rn1", "-t", "task"},
+		{"create", "r2", "--id", "cf-rn2", "-t", "task"},
+		{"dep", "add", "cf-rn2", "cf-rn1"},
+		{"rename", "cf-rn1", "cf-rn9"},
+		{"show", "cf-rn9", "--json"},
+	}},
+	// Molecule rollup over parent-child children (GetMoleculeProgress): one closed, one open.
+	{name: "mol-progress", steps: [][]string{
+		{"create", "epic", "--id", "cf-mo1", "-t", "epic"},
+		{"create", "a", "--id", "cf-mo1a", "-t", "task", "--parent", "cf-mo1"},
+		{"create", "b", "--id", "cf-mo1b", "-t", "task", "--parent", "cf-mo1"},
+		{"close", "cf-mo1a"},
+		{"mol", "progress", "cf-mo1", "--json"},
+	}},
 	{name: "update-no-history-demote", steps: [][]string{
 		{"create", "d", "--id", "cf-d1", "-t", "task"},
 		{"update", "cf-d1", "--no-history", "--json"},
