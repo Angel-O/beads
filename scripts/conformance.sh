@@ -24,26 +24,25 @@ TAGS="gms_pure_go"
 echo "==> Tier 1: in-process store conformance + wedge gates"
 # Dolt runs the full backend-agnostic suite (conformance.RunAll).
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/embeddeddolt/ -run TestConformance
-# The postgres wedge's behavioral parity is covered differentially in Tier 2 and by
-# the deep oracle; its full in-process RunAll still fails the genuinely-Dolt-only methods
-# (version-control/remote/sync/slots — audited in completeness_test.go). Tier 1 here runs
-# the wedge's green gates: live smoke, the interface-completeness audit (the shell must
-# equal the deferral allowlist — no SILENT unsupported) plus its behavioral complement
-# (every allowlisted method returns typed ErrUnsupported), the seed-once regression, the
-# portable non-VC reads+writes (statistics/external-ref/stale + molecule/repo-mtime/
-# streams/counts/comment/rekey/promote/purge/batch), and the dialect corpus-PREPARE +
-# password-redaction gates. All self-skip without BEADS_PG_TEST_URL.
+# Each SQL backend now passes the FULL in-process store conformance suite (TestConformance
+# = conformance.RunAll, the same ~40 behavior subtests the Dolt reference runs) — the only
+# methods it does NOT implement are the genuinely-Dolt-only ones (version-control/remote/
+# sync/…), which RunAll does not exercise. Alongside RunAll: live smoke, the
+# interface-completeness audit (shell == deferral allowlist — no SILENT unsupported) plus
+# its behavioral complement (every allowlisted method returns typed ErrUnsupported), the
+# seed-once regression, and the dialect corpus-PREPARE + password-redaction gates. All
+# self-skip without BEADS_PG_TEST_URL.
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/postgres/ \
-  -run 'TestPGSmoke|TestInterfaceCompleteness|TestUnsupportedContract|TestSeedOnlyOnFirstProvision|TestDeferredReads|TestPortableMethods'
+  -run 'TestPGSmoke|TestInterfaceCompleteness|TestUnsupportedContract|TestConformance|TestSeedOnlyOnFirstProvision'
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/pgdialect/
 # MySQL wedge gates (self-skip without BEADS_MYSQL_TEST_URL); the dialect rewrite test
 # (the is_blocked 1093 workaround) always runs.
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/mysql/ \
-  -run 'TestInterfaceCompleteness|TestUnsupportedContract|TestSeedOnlyOnFirstProvision|TestDeferredReads|TestPortableMethods'
+  -run 'TestInterfaceCompleteness|TestUnsupportedContract|TestConformance|TestSeedOnlyOnFirstProvision'
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/mysqldialect/
 # SQLite is embedded (pure-Go), always runs.
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/sqlite/ \
-  -run 'TestInterfaceCompleteness|TestUnsupportedContract|TestSeedOnlyOnFirstProvision|TestDeferredReads|TestPortableMethods'
+  -run 'TestInterfaceCompleteness|TestUnsupportedContract|TestConformance|TestSeedOnlyOnFirstProvision'
 CGO_ENABLED=1 go test -tags "$TAGS" ./internal/storage/sqlitedialect/
 
 echo "==> Tier 2: end-to-end 'bd init' + CLI conformance (differential vs Dolt)"
