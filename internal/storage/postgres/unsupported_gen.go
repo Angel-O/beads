@@ -6,23 +6,12 @@ import (
 	"context"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
-	"time"
 )
 
 // unsupportedDoltStorage is the generated typed-unsupported shell for storage.DoltStorage.
 // Every method returns *storage.ErrUnsupported; embed it and override the
 // real slice. DO NOT hand-edit — regenerate with `go generate ./...`.
 type unsupportedDoltStorage struct{}
-
-func (unsupportedDoltStorage) GetAllEventsSince(_ context.Context, _ time.Time) (_ []*types.Event, err error) {
-	err = errUnsupported("GetAllEventsSince")
-	return
-}
-
-func (unsupportedDoltStorage) IterAllEventsSince(_ context.Context, _ time.Time) (_ storage.Iter[types.Event], err error) {
-	err = errUnsupported("IterAllEventsSince")
-	return
-}
 
 func (unsupportedDoltStorage) MergeSlotCreate(_ context.Context, _ string) (_ *types.Issue, err error) {
 	err = errUnsupported("MergeSlotCreate")
@@ -224,56 +213,6 @@ func (unsupportedDoltStorage) RemoveFederationPeer(_ context.Context, _ string) 
 	return
 }
 
-func (unsupportedDoltStorage) CreateIssuesWithFullOptions(_ context.Context, _ []*types.Issue, _ string, _ storage.BatchCreateOptions) (err error) {
-	err = errUnsupported("CreateIssuesWithFullOptions")
-	return
-}
-
-func (unsupportedDoltStorage) DeleteIssuesBySourceRepo(_ context.Context, _ string) (_ int, err error) {
-	err = errUnsupported("DeleteIssuesBySourceRepo")
-	return
-}
-
-func (unsupportedDoltStorage) UpdateIssueID(_ context.Context, _ string, _ string, _ *types.Issue, _ string) (err error) {
-	err = errUnsupported("UpdateIssueID")
-	return
-}
-
-func (unsupportedDoltStorage) PromoteFromEphemeral(_ context.Context, _ string, _ string) (err error) {
-	err = errUnsupported("PromoteFromEphemeral")
-	return
-}
-
-func (unsupportedDoltStorage) GetAllDependencyRecords(_ context.Context) (_ map[string][]*types.Dependency, err error) {
-	err = errUnsupported("GetAllDependencyRecords")
-	return
-}
-
-func (unsupportedDoltStorage) FindWispDependentsRecursive(_ context.Context, _ []string) (_ map[string]bool, err error) {
-	err = errUnsupported("FindWispDependentsRecursive")
-	return
-}
-
-func (unsupportedDoltStorage) IterAllDependencyRecords(_ context.Context) (_ storage.Iter[types.Dependency], err error) {
-	err = errUnsupported("IterAllDependencyRecords")
-	return
-}
-
-func (unsupportedDoltStorage) CountDependentsByStatus(_ context.Context, _ string, _ types.Status) (_ int64, err error) {
-	err = errUnsupported("CountDependentsByStatus")
-	return
-}
-
-func (unsupportedDoltStorage) AddComment(_ context.Context, _ string, _ string, _ string) (err error) {
-	err = errUnsupported("AddComment")
-	return
-}
-
-func (unsupportedDoltStorage) ImportIssueComment(_ context.Context, _ string, _ string, _ string, _ time.Time) (_ *types.Comment, err error) {
-	err = errUnsupported("ImportIssueComment")
-	return
-}
-
 func (unsupportedDoltStorage) CheckEligibility(_ context.Context, _ string, _ int) (_ bool, _ string, err error) {
 	err = errUnsupported("CheckEligibility")
 	return
@@ -309,29 +248,4 @@ func (unsupportedDoltStorage) RestoreFromSnapshot(_ context.Context, _ string) (
 	return
 }
 
-func (unsupportedDoltStorage) GetRepoMtime(_ context.Context, _ string) (_ int64, err error) {
-	err = errUnsupported("GetRepoMtime")
-	return
-}
-
-func (unsupportedDoltStorage) SetRepoMtime(_ context.Context, _ string, _ string, _ int64) (err error) {
-	err = errUnsupported("SetRepoMtime")
-	return
-}
-
-func (unsupportedDoltStorage) ClearRepoMtime(_ context.Context, _ string) (err error) {
-	err = errUnsupported("ClearRepoMtime")
-	return
-}
-
-func (unsupportedDoltStorage) GetMoleculeProgress(_ context.Context, _ string) (_ *types.MoleculeProgressStats, err error) {
-	err = errUnsupported("GetMoleculeProgress")
-	return
-}
-
-func (unsupportedDoltStorage) GetMoleculeLastActivity(_ context.Context, _ string) (_ *types.MoleculeLastActivity, err error) {
-	err = errUnsupported("GetMoleculeLastActivity")
-	return
-}
-
-// NOTE: partial shell (80 methods skipped); the embedding composite must assert storage.DoltStorage itself.
+// NOTE: partial shell (97 methods skipped); the embedding composite must assert storage.DoltStorage itself.

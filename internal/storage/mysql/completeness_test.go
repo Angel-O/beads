@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"sort"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/storage/conformance"
 )
 
 // legitimatelyUnsupported is the EXPLICIT denominator of every storage.DoltStorage
@@ -54,28 +56,6 @@ var legitimatelyUnsupported = map[string]string{
 
 	// Slot — gt per-issue metadata slots; not on the bd core surface.
 	"SlotSet": "slot", "SlotGet": "slot", "SlotClear": "slot",
-
-	// Deferred core/adjacent — reachable by non-core commands (bd stats/stale/
-	// molecule/export/import), NOT on the gc-16 demo path. Cheap issueops
-	// delegations; a later slice implements them. Tracked here so they can never
-	// regress into a SILENT unsupported.
-	"GetAllEventsSince":           "deferred: full event stream",
-	"IterAllEventsSince":          "deferred: full event stream",
-	"GetAllDependencyRecords":     "deferred: full-graph export",
-	"IterAllDependencyRecords":    "deferred: full-graph export",
-	"CountDependentsByStatus":     "deferred",
-	"FindWispDependentsRecursive": "deferred: wisp gc",
-	"GetMoleculeProgress":         "deferred: molecule progress",
-	"GetMoleculeLastActivity":     "deferred: molecule activity",
-	"GetRepoMtime":                "deferred: repo-mtime cache",
-	"SetRepoMtime":                "deferred: repo-mtime cache",
-	"ClearRepoMtime":              "deferred: repo-mtime cache",
-	"CreateIssuesWithFullOptions": "deferred: batch import options",
-	"DeleteIssuesBySourceRepo":    "deferred: per-repo purge",
-	"UpdateIssueID":               "deferred: id rekey",
-	"PromoteFromEphemeral":        "deferred: wisp promote",
-	"ImportIssueComment":          "deferred: import",
-	"AddComment":                  "deferred: superseded by AddIssueComment on the core path",
 }
 
 var shellMethodRe = regexp.MustCompile(`func \(unsupportedDoltStorage\) ([A-Za-z0-9]+)\(`)
@@ -119,4 +99,12 @@ func TestInterfaceCompleteness(t *testing.T) {
 	for _, m := range stale {
 		t.Errorf("method %q is in legitimatelyUnsupported but no longer in the shell (implemented?): remove the allowlist entry", m)
 	}
+}
+
+// TestUnsupportedContract is the behavioral complement to TestInterfaceCompleteness:
+// every allowlisted method must actually return a typed storage.ErrUnsupported when
+// called, not panic or return a different error. DB-free — the generated stubs ignore
+// their receiver, so a zero-value store answers them.
+func TestUnsupportedContract(t *testing.T) {
+	conformance.RunUnsupportedContract(t, &Store{}, legitimatelyUnsupported)
 }

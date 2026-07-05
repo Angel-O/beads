@@ -40,6 +40,17 @@ func TestDeferredReads(t *testing.T) {
 	conformance.RunDeferredReads(t, pgConformanceFactory(url))
 }
 
+// TestPortableMethods runs the full portable-method behavior contract (molecule/
+// repo-mtime/streams/counts/comment/rekey/batch). Red until the methods are wired into
+// sqlkit; green after. Gated on BEADS_PG_TEST_URL.
+func TestPortableMethods(t *testing.T) {
+	url := os.Getenv("BEADS_PG_TEST_URL")
+	if url == "" {
+		t.Skip("BEADS_PG_TEST_URL not set")
+	}
+	conformance.RunPortableMethods(t, pgConformanceFactory(url))
+}
+
 // pgConformanceFactory provisions a fresh, isolated schema per sub-test against the
 // Postgres server at url, seeded with issue_prefix as `bd init` leaves it.
 func pgConformanceFactory(url string) conformance.Factory {

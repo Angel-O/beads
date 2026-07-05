@@ -38,6 +38,16 @@ func TestDeferredReads(t *testing.T) {
 	conformance.RunDeferredReads(t, mysqlConformanceFactory(url))
 }
 
+// TestPortableMethods runs the full portable-method behavior contract. Red until the
+// methods are wired into sqlkit; green after. Gated on BEADS_MYSQL_TEST_URL.
+func TestPortableMethods(t *testing.T) {
+	url := os.Getenv("BEADS_MYSQL_TEST_URL")
+	if url == "" {
+		t.Skip("BEADS_MYSQL_TEST_URL not set")
+	}
+	conformance.RunPortableMethods(t, mysqlConformanceFactory(url))
+}
+
 // mysqlConformanceFactory provisions a fresh, isolated database per sub-test against
 // the MySQL server at url, seeded with issue_prefix as `bd init` leaves it.
 func mysqlConformanceFactory(url string) conformance.Factory {

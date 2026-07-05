@@ -25,6 +25,12 @@ func TestDeferredReads(t *testing.T) {
 	conformance.RunDeferredReads(t, sqliteConformanceFactory())
 }
 
+// TestPortableMethods runs the full portable-method behavior contract. Red until the
+// methods are wired into sqlkit; green after.
+func TestPortableMethods(t *testing.T) {
+	conformance.RunPortableMethods(t, sqliteConformanceFactory())
+}
+
 // sqliteConformanceFactory returns a fresh, file-isolated store per sub-test, seeded
 // with issue_prefix as `bd init` leaves it.
 func sqliteConformanceFactory() conformance.Factory {

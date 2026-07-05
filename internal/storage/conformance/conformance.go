@@ -12,6 +12,7 @@ package conformance
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"sort"
 	"testing"
@@ -20,6 +21,74 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+var (
+	ctxIface = reflect.TypeOf((*context.Context)(nil)).Elem()
+	errIface = reflect.TypeOf((*error)(nil)).Elem()
+)
+
+// RunUnsupportedContract is the BEHAVIORAL half of a backend's capability contract: it
+// calls every method the backend lists as legitimately unsupported and asserts each
+// returns a typed storage.ErrUnsupported. completeness_test.go asserts the STRUCTURAL
+// half (the generated shell equals this same allowlist); together they close the loop so
+// an unsupported method can neither silently resolve to something else (structural) nor
+// return the wrong error/panic (behavioral). Driven by the allowlist itself, so it stays
+// exhaustive and shrinks automatically as methods graduate off the list.
+//
+// No live database: the generated stubs ignore their receiver and arguments, so a
+// zero-value store answers them. Pass the backend's concrete store value (e.g. &Store{}).
+func RunUnsupportedContract(t *testing.T, store any, unsupported map[string]string) {
+	t.Helper()
+	rv := reflect.ValueOf(store)
+	names := make([]string, 0, len(unsupported))
+	for name := range unsupported {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			m := rv.MethodByName(name)
+			if !m.IsValid() {
+				t.Fatalf("%q is on the unsupported allowlist but is not a method on the store (shell drift)", name)
+			}
+			mt := m.Type()
+			in := make([]reflect.Value, mt.NumIn())
+			for i := 0; i < mt.NumIn(); i++ {
+				if mt.In(i) == ctxIface {
+					in[i] = reflect.ValueOf(ctx())
+				} else {
+					in[i] = reflect.Zero(mt.In(i))
+				}
+			}
+			var out []reflect.Value
+			if mt.IsVariadic() {
+				out = m.CallSlice(in)
+			} else {
+				out = m.Call(in)
+			}
+			var err error
+			hasErr := false
+			for _, o := range out {
+				if o.Type() == errIface {
+					hasErr = true
+					if !o.IsNil() {
+						err = o.Interface().(error)
+					}
+				}
+			}
+			if !hasErr {
+				t.Fatalf("%q has no error return; cannot assert the unsupported contract", name)
+			}
+			var unsup *storage.ErrUnsupported
+			if !errors.As(err, &unsup) {
+				t.Fatalf("%q returned %v, want *storage.ErrUnsupported", name, err)
+			}
+			if unsup.Op != name {
+				t.Errorf("%q returned unsupported error for Op %q — wrong method wired?", name, unsup.Op)
+			}
+		})
+	}
+}
 
 // Factory creates a fresh, empty store for each test.
 //
@@ -89,6 +158,9 @@ func RunAll(t *testing.T, factory Factory) {
 
 	// Stale
 	t.Run("StaleIssues", func(t *testing.T) { testStaleIssues(t, factory) })
+
+	// Portable non-VC methods (molecule/repo-mtime/streams/counts/comment/rekey/batch)
+	t.Run("Portable", func(t *testing.T) { RunPortableMethods(t, factory) })
 
 	// Iterators
 	t.Run("IterIssues", func(t *testing.T) { testIterIssues(t, factory) })
