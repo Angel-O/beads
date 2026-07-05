@@ -120,7 +120,24 @@ func (s *Store) withMutationTx(ctx context.Context, fn func(tx *sql.Tx) error) e
 // SetConfig persists a config key/value.
 func (s *Store) SetConfig(ctx context.Context, key, value string) error {
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
-		return issueops.SetConfigInTx(ctx, tx, key, value)
+		if err := issueops.SetConfigInTx(ctx, tx, key, value); err != nil {
+			return err
+		}
+		// Sync the normalized custom-status/type tables, matching the embedded-Dolt
+		// reference. The sync parses+validates the value (a malformed one errors and
+		// rolls back the whole write tx) and is what GetCustomStatuses/GetCustomTypes
+		// read back ORDER BY name.
+		switch key {
+		case "status.custom":
+			if err := issueops.SyncCustomStatusesTable(ctx, tx, value); err != nil {
+				return fmt.Errorf("syncing custom_statuses table: %w", err)
+			}
+		case "types.custom":
+			if err := issueops.SyncCustomTypesTable(ctx, tx, value); err != nil {
+				return fmt.Errorf("syncing custom_types table: %w", err)
+			}
+		}
+		return nil
 	})
 }
 

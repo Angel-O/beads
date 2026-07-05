@@ -110,13 +110,22 @@ func (s *Store) GetNextChildID(ctx context.Context, parentID string) (string, er
 // GetCustomStatusesDetailed returns the configured custom statuses with their
 // full definitions.
 func (s *Store) GetCustomStatusesDetailed(ctx context.Context) ([]types.CustomStatus, error) {
-	var statuses []types.CustomStatus
+	// Read the normalized custom_statuses table (ORDER BY name), matching the
+	// embedded-Dolt reference — SetConfig("status.custom") keeps it in sync. On a tx
+	// error fall back to config.yaml exactly as dolt does.
+	var result []types.CustomStatus
 	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
 		var e error
-		statuses, _, e = issueops.ResolveCustomConfigInTx(ctx, tx)
+		result, e = issueops.ResolveCustomStatusesDetailedInTx(ctx, tx)
 		return e
 	})
-	return statuses, err
+	if err != nil {
+		if yamlStatuses := config.GetCustomStatusesFromYAML(); len(yamlStatuses) > 0 {
+			return issueops.ParseStatusFallback(yamlStatuses), nil
+		}
+		return nil, nil
+	}
+	return result, nil
 }
 
 // GetCustomStatuses returns the configured custom status names.
@@ -130,13 +139,22 @@ func (s *Store) GetCustomStatuses(ctx context.Context) ([]string, error) {
 
 // GetCustomTypes returns the configured custom issue-type values.
 func (s *Store) GetCustomTypes(ctx context.Context) ([]string, error) {
-	var customTypes []string
+	// Read the normalized custom_types table (ORDER BY name), matching the embedded-Dolt
+	// reference; SetConfig("types.custom") keeps it in sync. Fall back to config.yaml on a
+	// tx error, as dolt does.
+	var result []string
 	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
 		var e error
-		_, customTypes, e = issueops.ResolveCustomConfigInTx(ctx, tx)
+		result, e = issueops.ResolveCustomTypesInTx(ctx, tx)
 		return e
 	})
-	return customTypes, err
+	if err != nil {
+		if yamlTypes := config.GetCustomTypesFromYAML(); len(yamlTypes) > 0 {
+			return yamlTypes, nil
+		}
+		return nil, err
+	}
+	return result, nil
 }
 
 // --- infra types ---
