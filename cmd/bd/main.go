@@ -1053,7 +1053,20 @@ var rootCmd = &cobra.Command{
 			// config.yaml). Port 0 is fine here — auto-start will resolve it.
 			doltCfg.ServerPort = doltserver.DefaultConfig(beadsDir).Port
 			doltCfg.ServerSocket = cfg.GetDoltServerSocket()
-			doltCfg.ServerUser = cfg.GetDoltServerUser()
+			// A configured credential command targets an authenticating gateway server:
+			// run it for a short-lived token used as the connection username. Fail closed
+			// — never fall back to the static/root user when a command was configured but
+			// failed. Mirrors applyResolvedConfig, which this hand-built doltCfg path
+			// bypasses. Server mode only: embedded stores never present a username, so the
+			// command must not run (or fail) embedded opens even when the env var is set.
+			if doltCfg.ServerMode {
+				if _, credErr := dolt.ApplyGatewayCredential(rootCtx, cfg, doltCfg); credErr != nil {
+					return HandleError("resolving dolt credential command: %v", credErr)
+				}
+			}
+			if doltCfg.ServerUser == "" {
+				doltCfg.ServerUser = cfg.GetDoltServerUser()
+			}
 			// Use the resolved port for credential lookup — metadata.json port
 			// and runtime port can diverge (e.g., tunnel on 3308 vs local on 3307).
 			doltCfg.ServerPassword = cfg.GetDoltServerPasswordForPort(doltCfg.ServerPort)

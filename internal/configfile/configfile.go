@@ -453,6 +453,18 @@ func (c *Config) GetDoltServerUser() string {
 	return DefaultDoltServerUser
 }
 
+// GetDoltCredentialCommand returns the server credential command:
+// BEADS_DOLT_CREDENTIAL_COMMAND. Empty means no command — the static
+// BEADS_DOLT_SERVER_USER / dolt_server_user path applies. The command's stdout is a
+// short-lived token (bare, or a {token,expirationTimestamp} / {access_token,expires_in}
+// envelope) presented as the connection username to an authenticating gateway server,
+// which verifies it and routes to the database. It is deliberately read from the
+// environment only, NOT metadata.json: a metadata-sourced command is arbitrary code run
+// on open, so persisting it waits on a workspace-trust gate.
+func (c *Config) GetDoltCredentialCommand() string {
+	return os.Getenv("BEADS_DOLT_CREDENTIAL_COMMAND")
+}
+
 // GetDoltDatabase returns the Dolt SQL database name.
 // Checks BEADS_DOLT_SERVER_DATABASE env var first, then config, then default.
 func (c *Config) GetDoltDatabase() string {
