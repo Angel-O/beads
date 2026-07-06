@@ -137,6 +137,17 @@ func RunAll(t *testing.T, factory Factory) {
 	t.Run("BlockedIssues", func(t *testing.T) { testBlockedIssues(t, factory) })
 	t.Run("EpicsEligibleForClosure", func(t *testing.T) { testEpicsEligible(t, factory) })
 
+	// Claim / lease (Gas Station v1.1 dead-worker recovery)
+	t.Run("Claim", func(t *testing.T) { testClaim(t, factory) })
+	t.Run("ClaimIdempotent", func(t *testing.T) { testClaimIdempotent(t, factory) })
+	t.Run("ClaimAlreadyClaimed", func(t *testing.T) { testClaimAlreadyClaimed(t, factory) })
+	t.Run("ClaimNotClaimable", func(t *testing.T) { testClaimNotClaimable(t, factory) })
+	t.Run("ClaimReadyIssue", func(t *testing.T) { testClaimReadyIssue(t, factory) })
+	t.Run("HeartbeatRenewsLease", func(t *testing.T) { testHeartbeatRenewsLease(t, factory) })
+	t.Run("HeartbeatWisp", func(t *testing.T) { testHeartbeatWisp(t, factory) })
+	t.Run("ReclaimExpiredLease", func(t *testing.T) { testReclaimExpiredLease(t, factory) })
+	t.Run("ReclaimSkipsFreshLease", func(t *testing.T) { testReclaimSkipsFreshLease(t, factory) })
+
 	// Labels
 	t.Run("Labels", func(t *testing.T) { testLabels(t, factory) })
 	t.Run("LabelIdempotent", func(t *testing.T) { testLabelIdempotent(t, factory) })
