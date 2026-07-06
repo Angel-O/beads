@@ -9,8 +9,8 @@ import (
 // RedactPassword returns dsn with the password removed, or an error if it cannot be
 // stripped. It uses go-sql-driver's own parser (never hand-rolled string surgery) and
 // verifies with a re-parse that no password survives, failing closed. bd init persists
-// the returned string to metadata.json; the password is re-supplied at open time from
-// BEADS_MYSQL_PASSWORD (see configfile.GetMySQLDSN).
+// the returned string to metadata.json; the password is re-supplied at open time by
+// the credential ladder (see resolveDSNCredential in credential.go).
 func RedactPassword(dsn string) (string, error) {
 	cfg, err := gomysql.ParseDSN(dsn)
 	if err != nil {
@@ -32,6 +32,14 @@ func withDatabase(dsn, database string) (string, error) {
 	cfg, err := gomysql.ParseDSN(dsn)
 	if err != nil {
 		return "", err
+	}
+	// The go-sql-driver grammar cannot carry a password without a username —
+	// FormatDSN would silently drop it. Refuse loudly rather than reformat this DSN
+	// into a passwordless one and connect (the same invariant mysqldialect.WithPassword
+	// enforces; this covers the path where a userless password-bearing DSN reaches us
+	// directly, e.g. an inline ":secret@tcp(host)/" URL that skips the credential ladder).
+	if cfg.User == "" && cfg.Passwd != "" {
+		return "", fmt.Errorf("connection string carries a password but no username; the MySQL DSN grammar cannot carry a password without a user (it would be silently dropped) — add a user to the DSN")
 	}
 	cfg.DBName = database
 	cfg.ParseTime = true

@@ -8,10 +8,11 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 )
 
-// NewFromConfig opens the MySQL backend for a workspace, reading the server DSN and
-// per-workspace database from .beads/metadata.json (password merged from
-// BEADS_MYSQL_PASSWORD, never persisted). It is the factory arm cmd/bd dispatches to
-// when metadata.json has backend="mysql".
+// NewFromConfig opens the MySQL backend for a workspace. It reads the base server DSN
+// and per-workspace database from .beads/metadata.json, resolves the password through
+// the credential ladder (command > env, fail-closed) and places it into the DSN —
+// never persisting it — then provisions and returns the store. It is the factory arm
+// cmd/bd dispatches to when metadata.json has backend="mysql".
 func NewFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
 	if err != nil {
@@ -20,6 +21,10 @@ func NewFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, e
 	dsn := cfg.GetMySQLDSN()
 	if dsn == "" {
 		return nil, fmt.Errorf("mysql: no DSN (set mysql_dsn in metadata.json, or BEADS_MYSQL_URL)")
+	}
+	dsn, err = resolveDSNCredential(ctx, cfg, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: resolve credential: %w", err)
 	}
 	database := cfg.GetMySQLDatabase()
 	if database == "" {

@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	gomysql "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/beads/internal/config"
 )
 
@@ -284,9 +283,12 @@ func (c *Config) GetPostgresSchema() string {
 	return c.PostgresSchema
 }
 
-// GetMySQLDSN returns the MySQL server DSN. Precedence: BEADS_MYSQL_URL (may carry a
-// password) > metadata mysql_dsn with the password from BEADS_MYSQL_PASSWORD merged
-// in via the go-sql-driver parser. The password is never persisted.
+// GetMySQLDSN returns the base MySQL server DSN: BEADS_MYSQL_URL (a full override
+// that may carry a password) if set, else the persisted, password-free metadata
+// mysql_dsn. It never merges a password — password resolution
+// (BEADS_MYSQL_PASSWORD_COMMAND, BEADS_MYSQL_PASSWORD, the credentials file) and
+// placement happen at open time in the mysql backend, which owns the go-sql-driver
+// parser this low-level package must not import (see the note at RedactPassword).
 func (c *Config) GetMySQLDSN() string {
 	if u := os.Getenv("BEADS_MYSQL_URL"); u != "" {
 		return u
@@ -294,14 +296,19 @@ func (c *Config) GetMySQLDSN() string {
 	if c == nil {
 		return ""
 	}
-	dsn := c.MySQLDSN
-	if pw := os.Getenv("BEADS_MYSQL_PASSWORD"); pw != "" && dsn != "" {
-		if parsed, err := gomysql.ParseDSN(dsn); err == nil {
-			parsed.Passwd = pw
-			return parsed.FormatDSN()
-		}
-	}
-	return dsn
+	return c.MySQLDSN
+}
+
+// GetMySQLPasswordCommand returns the credential command that resolves the MySQL
+// password: BEADS_MYSQL_PASSWORD_COMMAND. Empty means no command — the static
+// BEADS_MYSQL_PASSWORD / credentials-file path applies. The command's stdout is a
+// password (a bare token or a {token,expires_in} envelope); it is run at open time,
+// out-ranking the static password so a rotating secret is never shadowed by a stale
+// env value. It is deliberately read from the environment only, NOT metadata.json:
+// a metadata-sourced command is arbitrary code run on open, so persisting it waits
+// on a workspace-trust gate.
+func (c *Config) GetMySQLPasswordCommand() string {
+	return os.Getenv("BEADS_MYSQL_PASSWORD_COMMAND")
 }
 
 // GetMySQLDatabase returns the per-workspace MySQL database (isolation unit).
