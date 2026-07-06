@@ -626,10 +626,10 @@ func TestProxiedServerClientInfo_ResolvedPaths(t *testing.T) {
 	})
 }
 
-// TestGetBackendAllowlist verifies the allowlist semantics: only "postgres" is
-// honored; every other value (empty, legacy, stale sqlite, genuinely unknown) falls
-// back to Dolt. This is the guard behind the Postgres backend selection — a typo in
-// metadata.json must fail safe to Dolt, never to an unintended backend.
+// TestGetBackendAllowlist verifies the allowlist semantics: the SQL backends
+// (postgres, mysql, sqlite) are honored; every other value (empty, legacy,
+// genuinely unknown) falls back to Dolt. This is the guard behind backend selection
+// — a typo in metadata.json must fail safe to Dolt, never to an unintended backend.
 func TestGetBackendAllowlist(t *testing.T) {
 	fallsBackToDolt := []struct {
 		name string
@@ -638,7 +638,6 @@ func TestGetBackendAllowlist(t *testing.T) {
 		{name: "explicit dolt", cfg: &Config{Backend: BackendDolt}},
 		{name: "empty backend", cfg: &Config{Backend: ""}},
 		{name: "legacy config", cfg: &Config{}},
-		{name: "stale sqlite value", cfg: &Config{Backend: "sqlite"}},
 		{name: "unknown backend", cfg: &Config{Backend: "mystery"}},
 	}
 	for _, tt := range fallsBackToDolt {
@@ -649,19 +648,15 @@ func TestGetBackendAllowlist(t *testing.T) {
 		})
 	}
 
-	t.Run("postgres honored", func(t *testing.T) {
-		cfg := &Config{Backend: BackendPostgres}
-		if got := cfg.GetBackend(); got != BackendPostgres {
-			t.Errorf("GetBackend() = %q, want %q", got, BackendPostgres)
-		}
-	})
-
-	t.Run("mysql honored", func(t *testing.T) {
-		cfg := &Config{Backend: BackendMySQL}
-		if got := cfg.GetBackend(); got != BackendMySQL {
-			t.Errorf("GetBackend() = %q, want %q", got, BackendMySQL)
-		}
-	})
+	honored := []string{BackendPostgres, BackendMySQL, BackendSQLite}
+	for _, backend := range honored {
+		t.Run(backend+" honored", func(t *testing.T) {
+			cfg := &Config{Backend: backend}
+			if got := cfg.GetBackend(); got != backend {
+				t.Errorf("GetBackend() = %q, want %q", got, backend)
+			}
+		})
+	}
 }
 
 // TestDatabasePathAlwaysDolt tests that DatabasePath always returns the dolt path.
