@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -249,9 +248,12 @@ func (c *Config) GetSQLitePath() string {
 	return c.SQLitePath
 }
 
-// GetPostgresDSN returns the Postgres connection string. Precedence:
-// BEADS_POSTGRES_URL (may carry a password) > metadata postgres_dsn with the
-// password from BEADS_PG_PASSWORD merged in. The password is never persisted.
+// GetPostgresDSN returns the base Postgres connection string: BEADS_POSTGRES_URL (a
+// full override that may carry a password) if set, else the persisted,
+// password-free metadata postgres_dsn. It never merges a password — password
+// resolution (BEADS_PG_PASSWORD_COMMAND, BEADS_PG_PASSWORD, the credentials file)
+// and placement happen at open time in the postgres backend, which owns the pgx
+// parser this low-level package must not import (see the note at RedactPassword).
 func (c *Config) GetPostgresDSN() string {
 	if u := os.Getenv("BEADS_POSTGRES_URL"); u != "" {
 		return u
@@ -259,14 +261,19 @@ func (c *Config) GetPostgresDSN() string {
 	if c == nil {
 		return ""
 	}
-	dsn := c.PostgresDSN
-	if pw := os.Getenv("BEADS_PG_PASSWORD"); pw != "" && dsn != "" {
-		if parsed, err := url.Parse(dsn); err == nil {
-			parsed.User = url.UserPassword(parsed.User.Username(), pw)
-			return parsed.String()
-		}
-	}
-	return dsn
+	return c.PostgresDSN
+}
+
+// GetPostgresPasswordCommand returns the credential command that resolves the
+// Postgres password: BEADS_PG_PASSWORD_COMMAND. Empty means no command — the static
+// BEADS_PG_PASSWORD / credentials-file path applies. The command's stdout is a
+// password (a bare token or a {token,expires_in} envelope); it is run at open time,
+// out-ranking the static password so a rotating secret is never shadowed by a stale
+// env value. It is deliberately read from the environment only, NOT metadata.json:
+// a metadata-sourced command is arbitrary code run on open, so persisting it waits
+// on a workspace-trust gate.
+func (c *Config) GetPostgresPasswordCommand() string {
+	return os.Getenv("BEADS_PG_PASSWORD_COMMAND")
 }
 
 // GetPostgresSchema returns the per-workspace Postgres schema (search_path).
