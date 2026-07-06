@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -12,6 +14,23 @@ import (
 
 const baseDSN = "postgres://bts@127.0.0.1:5432/db"
 
+// TestMain neutralizes every ambient credential source the rungs could read, so tests
+// are hermetic: the beads credentials file, plus pgx's own PGPASSWORD/~/.pgpass (which
+// pgx.ParseConfig folds into a connection at parse/connect time). Tests that exercise
+// the file rung override BEADS_CREDENTIALS_FILE per-test with t.Setenv.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "beads-pg-cred-test")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("BEADS_CREDENTIALS_FILE", filepath.Join(dir, "none"))
+	os.Unsetenv("PGPASSWORD")
+	os.Setenv("PGPASSFILE", filepath.Join(dir, "no-pgpass"))
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
 // password parses out and returns the password pgx sees, failing the test on a parse error.
 func password(t *testing.T, dsn string) string {
 	t.Helper()
@@ -20,6 +39,26 @@ func password(t *testing.T, dsn string) string {
 		t.Fatalf("pgx.ParseConfig(%q): %v", dsn, err)
 	}
 	return cfg.Password
+}
+
+// user parses out and returns the username pgx sees.
+func user(t *testing.T, dsn string) string {
+	t.Helper()
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("pgx.ParseConfig(%q): %v", dsn, err)
+	}
+	return cfg.User
+}
+
+// writeCredsFile writes an INI credentials file and returns its path.
+func writeCredsFile(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "credentials")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
 
 func TestResolveDSNCredentialCommand(t *testing.T) {
@@ -98,8 +137,71 @@ func TestResolveDSNCredentialExistingPasswordWins(t *testing.T) {
 	}
 }
 
-// staticSource is a test Source with a fixed credential, used to exercise the
-// identity-refusal guard (no env-driven rung yields KindIdentity today).
+// The credentials file resolves the password when no command or env is set.
+func TestResolveDSNCredentialFile(t *testing.T) {
+	t.Setenv("BEADS_PG_PASSWORD_COMMAND", "")
+	t.Setenv("BEADS_PG_PASSWORD", "")
+	t.Setenv("BEADS_CREDENTIALS_FILE", writeCredsFile(t, "[127.0.0.1:5432]\npassword=file-pw\n"))
+	got, err := resolveDSNCredential(context.Background(), &configfile.Config{}, baseDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pw := password(t, got); pw != "file-pw" {
+		t.Fatalf("password = %q, want file-pw", pw)
+	}
+}
+
+// The env password out-ranks the credentials file.
+func TestResolveDSNCredentialEnvBeatsFile(t *testing.T) {
+	t.Setenv("BEADS_PG_PASSWORD_COMMAND", "")
+	t.Setenv("BEADS_PG_PASSWORD", "env-pw")
+	t.Setenv("BEADS_CREDENTIALS_FILE", writeCredsFile(t, "[127.0.0.1:5432]\npassword=file-pw\n"))
+	got, err := resolveDSNCredential(context.Background(), &configfile.Config{}, baseDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pw := password(t, got); pw != "env-pw" {
+		t.Fatalf("password = %q, want env-pw (env out-ranks file)", pw)
+	}
+}
+
+// A file section for a different endpoint does not match: the DSN is untouched.
+func TestResolveDSNCredentialFileWrongSectionMisses(t *testing.T) {
+	t.Setenv("BEADS_PG_PASSWORD_COMMAND", "")
+	t.Setenv("BEADS_PG_PASSWORD", "")
+	t.Setenv("BEADS_CREDENTIALS_FILE", writeCredsFile(t, "[127.0.0.1:9999]\npassword=file-pw\n"))
+	got, err := resolveDSNCredential(context.Background(), &configfile.Config{}, baseDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != baseDSN {
+		t.Fatalf("dsn = %q, want it unchanged (wrong section must not match)", got)
+	}
+}
+
+// A broken command fails closed even when the file could supply a valid password.
+func TestResolveDSNCredentialBrokenCommandNotRescuedByFile(t *testing.T) {
+	t.Setenv("BEADS_PG_PASSWORD_COMMAND", "false")
+	t.Setenv("BEADS_PG_PASSWORD", "")
+	t.Setenv("BEADS_CREDENTIALS_FILE", writeCredsFile(t, "[127.0.0.1:5432]\npassword=file-pw\n"))
+	if _, err := resolveDSNCredential(context.Background(), &configfile.Config{}, baseDSN); err == nil {
+		t.Fatal("expected fail-closed; the credentials file must not rescue a broken command")
+	}
+}
+
+// A set BEADS_PG_CREDENTIAL_COMMAND is a hard error, pre-empting even a
+// password-bearing DSN and any lower rung.
+func TestResolveDSNCredentialRejectsReservedIdentityVar(t *testing.T) {
+	t.Setenv("BEADS_PG_CREDENTIAL_COMMAND", "gasworks getToken beads")
+	t.Setenv("BEADS_PG_PASSWORD", "would-otherwise-work")
+	_, err := resolveDSNCredential(context.Background(), &configfile.Config{}, "postgres://bts:has-pw@127.0.0.1:5432/db")
+	if err == nil || !strings.Contains(err.Error(), "BEADS_PG_CREDENTIAL_COMMAND") {
+		t.Fatalf("expected a reserved-var rejection naming BEADS_PG_CREDENTIAL_COMMAND, got %v", err)
+	}
+}
+
+// staticSource is a test Source with a fixed credential, used to exercise placement
+// and the identity-refusal guard directly.
 type staticSource struct{ cred creds.Credential }
 
 func (s staticSource) Name() string { return "test" }
@@ -114,5 +216,45 @@ func TestResolveDSNCredentialRefusesIdentity(t *testing.T) {
 	_, err := resolveDSNWithSources(context.Background(), baseDSN, src)
 	if err == nil || !strings.Contains(err.Error(), "identity") {
 		t.Fatalf("expected an identity-refusal error, got %v", err)
+	}
+}
+
+// A credential carrying a username (a Vault dynamic user/password pair) places both.
+func TestResolveDSNCredentialPlacesUsername(t *testing.T) {
+	src := staticSource{cred: creds.Credential{Value: "pw", Username: "dyn", Kind: creds.KindSecret}}
+	got, err := resolveDSNWithSources(context.Background(), baseDSN, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := user(t, got); u != "dyn" {
+		t.Fatalf("user = %q, want dyn", u)
+	}
+	if pw := password(t, got); pw != "pw" {
+		t.Fatalf("password = %q, want pw", pw)
+	}
+}
+
+// An empty username leaves the DSN's user untouched.
+func TestResolveDSNCredentialEmptyUsernameKeepsDSNUser(t *testing.T) {
+	src := staticSource{cred: creds.Credential{Value: "pw", Username: "", Kind: creds.KindSecret}}
+	got, err := resolveDSNWithSources(context.Background(), baseDSN, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := user(t, got); u != "bts" {
+		t.Fatalf("user = %q, want bts (DSN user preserved)", u)
+	}
+}
+
+// End-to-end: a JSON envelope carrying a username places both user and password.
+func TestResolveDSNCredentialEnvelopeUsernameEndToEnd(t *testing.T) {
+	t.Setenv("BEADS_PG_PASSWORD_COMMAND", `printf '{"token":"pw","username":"dyn"}'`)
+	t.Setenv("BEADS_PG_PASSWORD", "")
+	got, err := resolveDSNCredential(context.Background(), &configfile.Config{}, baseDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u, pw := user(t, got), password(t, got); u != "dyn" || pw != "pw" {
+		t.Fatalf("(user,password) = (%q,%q), want (dyn,pw)", u, pw)
 	}
 }

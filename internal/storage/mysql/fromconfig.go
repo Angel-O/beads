@@ -10,7 +10,7 @@ import (
 
 // NewFromConfig opens the MySQL backend for a workspace. It reads the base server DSN
 // and per-workspace database from .beads/metadata.json, resolves the password through
-// the credential ladder (command > env, fail-closed) and places it into the DSN —
+// the credential ladder (command > env > credentials file, fail-closed) and places it into the DSN —
 // never persisting it — then provisions and returns the store. It is the factory arm
 // cmd/bd dispatches to when metadata.json has backend="mysql".
 func NewFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {

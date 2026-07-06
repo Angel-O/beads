@@ -16,21 +16,22 @@ var kvPasswordRe = regexp.MustCompile(`(?i)(^|\s)(?:password|sslpassword)\s*=\s*
 // RedactPassword returns dsn with the password removed, or an error if a password
 // cannot be safely removed. It strips every known password location — URL userinfo,
 // URL query params (password, sslpassword), and libpq keyword/value tokens — then
-// VERIFIES with the same parser pgx itself uses that no password survives, failing
-// closed rather than persisting a secret in a DSN shape we did not anticipate.
+// VERIFIES that no EMBEDDED password survives, failing closed rather than persisting a
+// secret in a DSN shape we did not anticipate. The check is embedded-only (HasPassword,
+// not pgx.ParseConfig.Password) so an ambient PGPASSWORD/~/.pgpass — which pgx would
+// fold in but which is never written to disk — does not falsely block init.
 //
 // Callers persist the returned string (e.g. to metadata.json) and re-supply the
-// password at open time from BEADS_PG_PASSWORD (see configfile.GetPostgresDSN), so
-// nothing operational is lost by never writing the password to disk. The hard
+// password at open time via the credential ladder (see the backend's resolveDSNCredential),
+// so nothing operational is lost by never writing the password to disk. The hard
 // invariant — a password must never be persisted — is enforced here, not assumed.
 func RedactPassword(dsn string) (string, error) {
 	stripped := stripPasswordBestEffort(dsn)
-	cfg, err := pgx.ParseConfig(stripped)
-	if err != nil {
-		// If it will not parse, we cannot prove it is password-free. Refuse.
+	// It must still parse, or we cannot reason about it — refuse a shape we mangled.
+	if _, err := pgx.ParseConfig(stripped); err != nil {
 		return "", fmt.Errorf("cannot verify the connection string is free of a password (unparseable after redaction): %w", err)
 	}
-	if cfg.Password != "" {
+	if HasPassword(stripped) {
 		return "", fmt.Errorf("refusing to persist a connection string that still carries a password; supply it via BEADS_PG_PASSWORD instead of embedding it in --pg-url")
 	}
 	return stripped, nil
