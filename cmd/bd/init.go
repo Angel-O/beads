@@ -45,10 +45,11 @@ var initCmd = &cobra.Command{
 	SilenceErrors: true,
 	Short:         "Initialize bd in the current directory",
 	Long: `Initialize bd in the current directory by creating a .beads/ directory
-and Dolt database. Optionally specify a custom issue prefix.
+and its storage (a Dolt database by default). Optionally specify a custom issue prefix.
 
-Dolt is the default (and only supported) storage backend. The legacy SQLite
-backend has been removed. Use --backend=sqlite to see migration instructions.
+Dolt is the default backend and the only one with version control (history,
+branching, sync). Select an alternative with --backend=<postgres|mysql|sqlite>;
+see docs/STORAGE-BACKENDS.md for the trade-offs and setup.
 
 Use --database to specify an existing server database name, overriding the
 default prefix-based naming. This is useful when an external tool (e.g. an orchestrator)
@@ -296,7 +297,8 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			return fmt.Errorf("--team requires interactive prompts and cannot be used with --non-interactive")
 		}
 
-		// Dolt is the only supported backend
+		// Non-Dolt backends (postgres/mysql/sqlite) were dispatched and returned
+		// earlier; this is the Dolt init path.
 		backend := configfile.BackendDolt
 
 		// Also treat BEADS_DOLT_SERVER_MODE=1 env var as --server.
@@ -2112,8 +2114,8 @@ func init() {
 	initCmd.Flags().Bool("non-interactive", false, "Skip all interactive prompts (auto-detected in CI or non-TTY environments)")
 	initCmd.Flags().String("role", "", "Set beads role without prompting: \"maintainer\" or \"contributor\"")
 
-	// Backend selection (dolt is the only supported backend; sqlite accepted for deprecation notice)
-	initCmd.Flags().String("backend", "", "Storage backend: dolt (default) or postgres. --backend=sqlite prints deprecation notice.")
+	// Backend selection: dolt (default) plus the SQL-family backends (postgres/mysql/sqlite).
+	initCmd.Flags().String("backend", "", "Storage backend: dolt (default), postgres, mysql, or sqlite. See docs/STORAGE-BACKENDS.md.")
 	initCmd.Flags().String("pg-url", "", "Postgres connection URL (with --backend=postgres). A password may be included for init but is never persisted; set BEADS_PG_PASSWORD for later commands. Falls back to BEADS_POSTGRES_URL.")
 	initCmd.Flags().String("pg-schema", "", "Postgres schema for this workspace's tables (with --backend=postgres; provides search_path isolation)")
 	initCmd.Flags().String("mysql-url", "", "MySQL server DSN (with --backend=mysql), e.g. user:pass@tcp(host:3306)/ . A password may be included for init but is never persisted; set BEADS_MYSQL_PASSWORD for later commands. Falls back to BEADS_MYSQL_URL.")
