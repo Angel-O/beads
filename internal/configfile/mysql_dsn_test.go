@@ -30,8 +30,8 @@ func TestGetMySQLPasswordCommand(t *testing.T) {
 	if got := c.GetMySQLPasswordCommand(); got != "" {
 		t.Fatalf("GetMySQLPasswordCommand() = %q, want empty when unset", got)
 	}
-	t.Setenv("BEADS_MYSQL_PASSWORD_COMMAND", "gasworks getToken beads")
-	if got, want := c.GetMySQLPasswordCommand(), "gasworks getToken beads"; got != want {
+	t.Setenv("BEADS_MYSQL_PASSWORD_COMMAND", "get-credential")
+	if got, want := c.GetMySQLPasswordCommand(), "get-credential"; got != want {
 		t.Fatalf("GetMySQLPasswordCommand() = %q, want %q", got, want)
 	}
 }

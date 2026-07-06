@@ -13,11 +13,11 @@ import (
 
 // CommandSource runs a configured command and reads a credential from its stdout —
 // the external credential-process idiom (kubectl ExecCredential / AWS
-// credential_process / git credential helper). bd knows nothing of the issuer: a
-// hosted deployment points Command at e.g. `gasworks getToken beads --org <org>`
-// (an identity), and a Vault/RDS/GCP user points it at `vault read ...` or
-// `aws rds generate-db-auth-token ...` (a secret). Kind is fixed at construction
-// from the config slot, so the resolved value's role is never ambiguous.
+// credential_process / git credential helper). bd knows nothing of the issuer: the
+// operator points Command at whatever mints the credential — a token-issuing CLI for
+// an identity, or `vault read ...` / `aws rds generate-db-auth-token ...` for a secret.
+// Kind is fixed at construction from the config slot, so the resolved value's role is
+// never ambiguous.
 //
 // The result is cached per-command until near expiry so repeated opens don't
 // re-spawn the helper; the cache lives for the process and dies with it.
@@ -56,12 +56,12 @@ const (
 )
 
 // execCredential is the union of stdout envelopes accepted: the kubectl
-// ExecCredential subset {token, expirationTimestamp}, the gasworks getToken shape
-// {access_token, expires_in}, and an optional username for dynamic user/password
+// ExecCredential subset {token, expirationTimestamp}, the OAuth-style
+// {access_token, expires_in} shape, and an optional username for dynamic user/password
 // pairs (e.g. Vault). A helper may instead print a bare token — see parseCredential.
 type execCredential struct {
-	Token               string `json:"token"`        //nolint:gosec // G117: ExecCredential/getToken envelope field name (wire format), not an embedded secret
-	AccessToken         string `json:"access_token"` //nolint:gosec // G117: ExecCredential/getToken envelope field name (wire format), not an embedded secret
+	Token               string `json:"token"`        //nolint:gosec // G117: ExecCredential/OAuth envelope field name (wire format), not an embedded secret
+	AccessToken         string `json:"access_token"` //nolint:gosec // G117: ExecCredential/OAuth envelope field name (wire format), not an embedded secret
 	Username            string `json:"username"`
 	ExpirationTimestamp string `json:"expirationTimestamp"`
 	ExpiresIn           int64  `json:"expires_in"`

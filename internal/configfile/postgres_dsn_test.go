@@ -29,8 +29,8 @@ func TestGetPostgresPasswordCommand(t *testing.T) {
 	if got := c.GetPostgresPasswordCommand(); got != "" {
 		t.Fatalf("GetPostgresPasswordCommand() = %q, want empty when unset", got)
 	}
-	t.Setenv("BEADS_PG_PASSWORD_COMMAND", "gasworks getToken beads")
-	if got, want := c.GetPostgresPasswordCommand(), "gasworks getToken beads"; got != want {
+	t.Setenv("BEADS_PG_PASSWORD_COMMAND", "get-credential")
+	if got, want := c.GetPostgresPasswordCommand(), "get-credential"; got != want {
 		t.Fatalf("GetPostgresPasswordCommand() = %q, want %q", got, want)
 	}
 }

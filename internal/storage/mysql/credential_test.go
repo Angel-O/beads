@@ -236,7 +236,7 @@ func TestResolveDSNCredentialFileUnixSocketDegrades(t *testing.T) {
 // A set BEADS_MYSQL_CREDENTIAL_COMMAND is a hard error, pre-empting even a
 // password-bearing DSN and any lower rung.
 func TestResolveDSNCredentialRejectsReservedIdentityVar(t *testing.T) {
-	t.Setenv("BEADS_MYSQL_CREDENTIAL_COMMAND", "gasworks getToken beads")
+	t.Setenv("BEADS_MYSQL_CREDENTIAL_COMMAND", "get-credential")
 	t.Setenv("BEADS_MYSQL_PASSWORD", "would-otherwise-work")
 	_, err := resolveDSNCredential(context.Background(), &configfile.Config{}, "bts:has-pw@tcp(127.0.0.1:55441)/")
 	if err == nil || !strings.Contains(err.Error(), "BEADS_MYSQL_CREDENTIAL_COMMAND") {
@@ -254,7 +254,7 @@ func (s staticSource) Resolve(context.Context) (creds.Credential, bool, error) {
 }
 
 func TestResolveDSNCredentialRefusesIdentity(t *testing.T) {
-	src := staticSource{cred: creds.Credential{Value: "an-eia-token", Kind: creds.KindIdentity, Source: "test"}}
+	src := staticSource{cred: creds.Credential{Value: "an-identity-token", Kind: creds.KindIdentity, Source: "test"}}
 	_, err := resolveDSNWithSources(context.Background(), baseDSN, src)
 	if err == nil || !strings.Contains(err.Error(), "identity") {
 		t.Fatalf("expected an identity-refusal error, got %v", err)

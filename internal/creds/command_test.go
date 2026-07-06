@@ -16,9 +16,9 @@ func TestParseCredential(t *testing.T) {
 		wantExp  bool // expect a non-zero expiry
 		wantErr  bool
 	}{
-		{"bare token (EIA-shaped)", "eyJhbGciOiJSUzI1NiJ9.eyJvIjoib18xIn0.sig\n", "eyJhbGciOiJSUzI1NiJ9.eyJvIjoib18xIn0.sig", "", false, false},
+		{"bare token (JWT-shaped)", "eyJhbGciOiJSUzI1NiJ9.eyJvIjoib18xIn0.sig\n", "eyJhbGciOiJSUzI1NiJ9.eyJvIjoib18xIn0.sig", "", false, false},
 		{"execcredential token+exp", `{"token":"abc","expirationTimestamp":"2099-01-02T15:04:05Z"}`, "abc", "", true, false},
-		{"gasworks access_token+expires_in", `{"access_token":"xyz","expires_in":90,"token_type":"DPoP"}`, "xyz", "", true, false},
+		{"OAuth access_token+expires_in", `{"access_token":"xyz","expires_in":90,"token_type":"Bearer"}`, "xyz", "", true, false},
 		{"vault dynamic user+pass pair", `{"username":"v-app-beads-xyz","password":"s3cr3t","expires_in":3600}`, "", "", true, true}, // token/access_token absent -> error
 		{"pair via access_token+username", `{"access_token":"pw","username":"dynuser","expires_in":900}`, "pw", "dynuser", true, false},
 		{"json without token", `{"foo":"bar"}`, "", "", false, true},

@@ -17,8 +17,8 @@ import (
 //     presented as a username to a gateway, and this backend connects directly;
 //   - the DSN already carries a password (a full BEADS_MYSQL_URL, or an explicit
 //     --mysql-url) — it wins outright, no ladder is applied;
-//   - BEADS_MYSQL_PASSWORD_COMMAND — a credential command (Vault / RDS-IAM / GCP-IAM /
-//     `gasworks getToken`); run at open time, cached until near expiry;
+//   - BEADS_MYSQL_PASSWORD_COMMAND — a credential command (e.g. Vault / RDS-IAM / GCP-IAM);
+//     run at open time, cached until near expiry;
 //   - BEADS_MYSQL_PASSWORD — a static password;
 //   - the credentials file [host:port] ($BEADS_CREDENTIALS_FILE or
 //     ~/.config/beads/credentials);
