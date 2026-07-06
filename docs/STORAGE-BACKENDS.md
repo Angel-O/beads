@@ -2,63 +2,59 @@
 
 Beads uses Dolt as its default storage backend, and Dolt remains the reference implementation. You can also point `bd` at Postgres, MySQL, or SQLite — every backend implements the full issue-tracking core, and the only thing you give up off Dolt is version control.
 
-One seam, two halves: the shared core is implemented once and reaches each engine through a thin dialect; Dolt-only capabilities are real on Dolt and return one clean, typed error everywhere else.
+One seam, one shared core: the issue-tracking semantics are written once (in `issueops`) and shared by *every* backend — Dolt runs them natively, the SQL family runs them through one thin per-engine dialect. Each backend is a store adapter over that shared core. Version control lives only in the Dolt store; on the SQL backends it returns one clean, typed error.
 
 ```mermaid
 flowchart TD
     CLI["bd CLI"] --> SEAM["Storage interface<br/>one seam — every backend satisfies all of it"]
 
-    SEAM --> CORE["CORE — every backend<br/>CRUD · search · deps · ready/claim · labels · comments"]
-    SEAM --> CAPS["CAPABILITIES — Dolt-only<br/>version control · history · remotes · sync"]
+    SEAM --> CORE["CORE — issueops<br/>CRUD · search · deps · ready/claim · ordering · id-mint<br/>written once, shared by EVERY backend"]
+    SEAM --> CAPS["CAPABILITIES — version control<br/>history · branch · remotes · sync"]
 
-    CORE --> DOLT[("Dolt, embedded<br/>native core impl — the conformance oracle")]
-    CORE --> KIT["sqlkit.Store<br/>ONE shared implementation of all core semantics"]
+    CORE --> DS["Dolt store<br/>runs the core natively"]
+    CORE --> KIT["sqlkit.Store<br/>SQL-family adapter · Dialect / Readiness / Claim"]
 
+    DS --> DOLT[("Dolt — embedded / server<br/>the conformance ORACLE")]
     KIT --> PGD["pgdialect"] --> PG[("Postgres")]
     KIT --> MYD["mysqldialect"] --> MY[("MySQL")]
     KIT --> LTD["sqlitedialect"] --> LT[("SQLite")]
 
-    CAPS -->|"implemented"| DOLT
-    CAPS -->|"every call returns a typed error:<br/>operation X not supported by the backend"| SHELL["generated unsupported shell<br/>Postgres / MySQL / SQLite"]
+    CAPS -->|"implemented in the Dolt store"| DS
+    CAPS -->|"generated typed-unsupported shell"| SHELL["Postgres / MySQL / SQLite<br/>operation X not supported"]
 
-    DOLT -. "oracle: SQL family conformance-tested<br/>to match Dolt byte-for-byte" .-> KIT
+    DOLT -. "conformance-tested: SQL family matches Dolt byte-for-byte" .-> KIT
 ```
 
 <details>
 <summary>Plain-text version of the diagram</summary>
 
 ```
-                                +--------+
-                                | bd CLI |
-                                +---+----+
-                                    |
-              +---------------------v----------------------+
-              |            Storage interface               |
-              |  (one seam; every backend satisfies it)    |
-              +----------+---------------------+-----------+
-                         |                     |
-                         v                     v
-+--------------------------------------+  +--------------------------------------+
-| CORE  (every backend)                |  | CAPABILITIES  (Dolt-only)            |
-| CRUD, search, deps, ready/claim,     |  | version control, history,            |
-| labels, comments, config             |  | remotes, sync                        |
-|                                      |  |                                      |
-|        +--------------------+        |  |  Dolt: fully implemented             |
-|        |    sqlkit.Store    |        |  |  (branch, log, diff, push/pull)      |
-|        | ONE shared impl of |        |  |                                      |
-|        | all core semantics |        |  |  Postgres / MySQL / SQLite:          |
-|        +---------+----------+        |  |  generated typed-unsupported shell   |
-|                  |                   |  |  -- every call returns a clean       |
-|    one thin dialect per engine:      |  |  typed error, never a panic:         |
-|      pgdialect     -> Postgres       |  |                                      |
-|      mysqldialect  -> MySQL          |  |    operation "X" not supported       |
-|      sqlitedialect -> SQLite         |  |    by the <backend> backend          |
-|                                      |  |                                      |
-|  Dolt serves core natively (its own  |  +--------------------------------------+
-|  impl, not sqlkit) and is the        |
-|  conformance ORACLE the SQL family   |
-|  must match byte-for-byte            |
-+--------------------------------------+
+                              bd CLI
+                                |
+                       Storage interface
+                                |
+      +-------------------------+--------------------------+
+      |                                                    |
+  CORE  (every backend)                        CAPABILITIES  (Dolt-only)
+  issueops -- CRUD, search, deps,              version control:
+  ready/claim, ordering, id-mint,              history, branch, remotes, sync
+  cycle checks: written ONCE                     |
+      |                                          +-> Dolt store: implemented
+      +--------------------+                     +-> Postgres/MySQL/SQLite:
+      |                    |                          generated typed-"unsupported"
+  Dolt store         sqlkit.Store                     (operation "X" not supported)
+  runs the core      SQL-family adapter
+  natively           (Dialect/Readiness/Claim)
+      |                    |
+ [Dolt engine]      +------+------+---------+
+ embedded/server    pgdialect mysqldialect sqlitedialect
+ = conformance          |         |            |
+    ORACLE          Postgres    MySQL       SQLite
+
+  issueops is shared by EVERY backend (Dolt included); each backend is a store
+  adapter over it. Dolt runs the core's SQL natively and adds version control;
+  the SQL family runs it through one thin dialect per engine, and is
+  conformance-tested to match the Dolt oracle byte-for-byte.
 ```
 
 </details>
