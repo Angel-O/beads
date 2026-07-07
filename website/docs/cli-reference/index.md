@@ -9,7 +9,7 @@ sidebar_position: 0
 <!-- AUTO-GENERATED: do not edit manually -->
 Reference for bd Latest. Generated from `bd help --docs-root`.
 
-This reference covers all 111 live top-level `bd` commands. Regenerate it with:
+This reference covers all 112 live top-level `bd` commands. Regenerate it with:
 
 ```bash
 ./scripts/generate-cli-docs.sh
@@ -86,6 +86,7 @@ This reference covers all 111 live top-level `bd` commands. Regenerate it with:
 - [`bd onboard`](./onboard.md)
 - [`bd orphans`](./orphans.md)
 - [`bd ping`](./ping.md)
+- [`bd plane`](./plane.md)
 - [`bd preflight`](./preflight.md)
 - [`bd prime`](./prime.md)
 - [`bd priority`](./priority.md)

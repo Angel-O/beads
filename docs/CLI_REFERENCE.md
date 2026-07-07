@@ -216,6 +216,9 @@ Reference for bd Latest. Generated from `bd help --all`.
   - [bd linear status](#bd-linear-status) — Show Linear sync status
   - [bd linear sync](#bd-linear-sync) — Synchronize issues with Linear
   - [bd linear teams](#bd-linear-teams) — List available Linear teams
+- [bd plane](#bd-plane) — Plane integration commands
+  - [bd plane status](#bd-plane-status) — Show Plane sync status
+  - [bd plane sync](#bd-plane-sync) — Synchronize issues with Plane
 - [bd repo](#bd-repo) — Manage multiple repository configuration
   - [bd repo add](#bd-repo-add) — Add an additional repository to sync
   - [bd repo list](#bd-repo-list) — List all configured repositories
@@ -3448,10 +3451,11 @@ bd info [flags]
 ### bd init
 
 Initialize bd in the current directory by creating a .beads/ directory
-and Dolt database. Optionally specify a custom issue prefix.
+and its storage (a Dolt database by default). Optionally specify a custom issue prefix.
 
-Dolt is the default (and only supported) storage backend. The legacy SQLite
-backend has been removed. Use --backend=sqlite to see migration instructions.
+Dolt is the default backend and the only one with version control (history,
+branching, sync). Select an alternative with --backend=&lt;postgres|mysql|sqlite&gt;;
+see docs/STORAGE-BACKENDS.md for the trade-offs and setup.
 
 Use --database to specify an existing server database name, overriding the
 default prefix-based naming. This is useful when an external tool (e.g. an orchestrator)
@@ -3491,7 +3495,7 @@ bd init [flags]
       --agents-file string                             Custom filename for agent instructions (default: AGENTS.md)
       --agents-profile string                          AGENTS.md profile: 'minimal' (default, pointer to bd prime) or 'full' (complete command reference)
       --agents-template string                         Path to custom AGENTS.md template (overrides embedded default)
-      --backend string                                 Storage backend (default: dolt). --backend=sqlite prints deprecation notice.
+      --backend string                                 Storage backend: dolt (default), postgres, mysql, or sqlite. See docs/STORAGE-BACKENDS.md.
       --contributor                                    Run OSS contributor setup wizard
       --database string                                Use existing server database name (overrides prefix-based naming)
       --debug                                          Run the managed Dolt sql-server with --loglevel=debug and CPU profiling (--prof cpu). Persisted to config.yaml as dolt.debug. No effect on externally-managed servers.
@@ -3501,7 +3505,11 @@ bd init [flags]
       --force                                          Deprecated alias for --reinit-local. Bypasses only the LOCAL data-safety guard; does NOT authorize remote divergence (see 'bd help init-safety').
       --from-jsonl                                     Import issues from configured import.path; refuses remote history unless --discard-remote authorizes replacement
       --init-if-missing                                If the workspace is already initialized, skip init and exit 0 instead of failing (idempotent init for scaffolds)
+      --mysql-database string                          MySQL database for this workspace (with --backend=mysql; MySQL's isolation unit)
+      --mysql-url string                               MySQL server DSN (with --backend=mysql), e.g. user:pass@tcp(host:3306)/ . A password may be included for init but is never persisted; set BEADS_MYSQL_PASSWORD for later commands. Falls back to BEADS_MYSQL_URL.
       --non-interactive                                Skip all interactive prompts (auto-detected in CI or non-TTY environments)
+      --pg-schema string                               Postgres schema for this workspace's tables (with --backend=postgres; provides search_path isolation)
+      --pg-url string                                  Postgres connection URL (with --backend=postgres). A password may be included for init but is never persisted; set BEADS_PG_PASSWORD for later commands. Falls back to BEADS_POSTGRES_URL.
   -p, --prefix string                                  Issue prefix (default: current directory name)
       --proxied-server                                 [EXPERIMENTAL] Use a per-workspace proxied dolt sql-server (proxy + child dolt) rooted at .beads/proxieddb
       --proxied-server-config-path string              [EXPERIMENTAL] Absolute path to an existing dolt sql-server YAML config (proxied-server mode only). When set, bd uses this file instead of auto-generating one. Relative paths are rejected.
@@ -3528,6 +3536,7 @@ bd init [flags]
       --shared-server                                  Enable shared Dolt server mode (all projects share one server at ~/.beads/shared-server/)
       --skip-agents                                    Skip AGENTS.md and Claude/Codex setup generation
       --skip-hooks                                     Skip git hooks installation
+      --sqlite-path string                             SQLite database file (with --backend=sqlite; relative to the beads dir, default beads.db)
       --stealth                                        Enable stealth mode: global gitattributes and gitignore, no local repo tracking
       --team                                           Run team workflow setup wizard
 ```
@@ -5167,6 +5176,101 @@ Example:
 
 ```
 bd linear teams
+```
+
+### bd plane
+
+Synchronize issues between beads and Plane (https://github.com/makeplane/plane).
+
+Targets self-hosted Plane Community Edition via the /api/v1 REST API.
+Work items are linked by Plane's native external_id/external_source fields
+(external_id = bead ID), making creation idempotent and duplicate-safe.
+
+Configuration:
+  bd config set plane.api_key "YOUR_API_KEY"   # personal token from Plane profile settings
+  bd config set plane.base_url "https://plane.example.com"
+  bd config set plane.workspace "myworkspace"  # workspace slug
+  bd config set plane.project_id "UUID"        # target project UUID
+
+Environment variables (alternative to config):
+  PLANE_API_KEY     - Plane personal API token
+  PLANE_BASE_URL    - Instance root URL
+  PLANE_WORKSPACE   - Workspace slug
+  PLANE_PROJECT_ID  - Project UUID
+
+Field mapping notes:
+  - Plane CE has no work item types and no blocked state: beads issue
+    types and blocked status round-trip via beads:type:* and
+    beads:blocked labels on the Plane side.
+  - Status maps through Plane state groups rather than state names, so
+    custom project workflow states work out of the box.
+  - Descriptions convert between Markdown (beads) and HTML (Plane).
+
+Examples:
+  bd plane sync --pull         # Import issues from Plane
+  bd plane sync --push         # Export issues to Plane
+  bd plane sync                # Bidirectional sync (pull then push)
+  bd plane sync --dry-run      # Preview sync without changes
+  bd plane status              # Show sync status
+
+```
+bd plane
+```
+
+#### bd plane status
+
+Show the current Plane sync status, including:
+  - Last sync timestamp
+  - Configuration status
+  - Number of issues with Plane links
+  - Issues pending push (no external_ref)
+
+```
+bd plane status
+```
+
+#### bd plane sync
+
+Synchronize issues between beads and Plane.
+
+Modes:
+  --pull         Import issues from Plane into beads
+  --push         Export issues from beads to Plane
+  (no flags)     Bidirectional sync: pull then push, with conflict resolution
+
+Filtering:
+  --state open|closed|all   Restrict sync to open or closed issues
+  --include-ephemeral       Include ephemeral issues (wisps, etc.) when
+                            pushing; default is to keep them local
+
+Conflict Resolution:
+  By default, newer timestamp wins. Override with:
+  --prefer-local   Always prefer local beads version
+  --prefer-plane   Always prefer Plane version
+
+Examples:
+  bd plane sync --pull                # Import from Plane
+  bd plane sync --push --create-only  # Push new issues only
+  bd plane sync --dry-run             # Preview without changes
+  bd plane sync --prefer-local        # Bidirectional, local wins
+
+```
+bd plane sync [flags]
+```
+
+**Flags:**
+
+```
+      --create-only         Only create new issues, don't update existing
+      --dry-run             Preview sync without making changes
+      --include-ephemeral   Include ephemeral issues (wisps, etc.) when pushing to Plane
+      --issues string       Comma-separated bead IDs to sync selectively (e.g., bd-abc,bd-def). Mutually exclusive with --parent.
+      --parent string       Limit push to this bead and its descendants (push only). Mutually exclusive with --issues.
+      --prefer-local        Prefer local version on conflicts
+      --prefer-plane        Prefer Plane version on conflicts
+      --pull                Pull issues from Plane
+      --push                Push issues to Plane
+      --state string        Issue state to sync: open, closed, all (default "all")
 ```
 
 ### bd repo
