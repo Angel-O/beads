@@ -1376,12 +1376,29 @@ func TestEmbeddedInit(t *testing.T) {
 		requireFile(t, filepath.Join(embeddedDir, "bdolt", ".dolt"))
 	})
 
-	t.Run("rejected_backends", func(t *testing.T) {
+	t.Run("backend_sqlite", func(t *testing.T) {
+		// SQLite is a first-class local backend on this line: init succeeds
+		// into a plain local workspace (no Dolt server/sync) with a beads.db file.
+		_, beadsDir, _ := bdInit(t, bd, "--prefix", "bsqlite", "--backend", "sqlite")
+		requireFile(t, filepath.Join(beadsDir, "beads.db"))
+		cfg, err := configfile.Load(beadsDir)
+		if err != nil {
+			t.Fatalf("failed to load metadata.json: %v", err)
+		}
+		if cfg.Backend != configfile.BackendSQLite {
+			t.Errorf("Backend: got %q, want %q", cfg.Backend, configfile.BackendSQLite)
+		}
+	})
+
+	t.Run("backend_flag_errors", func(t *testing.T) {
+		// postgres/mysql are first-class but need their connection flag; an
+		// unrecognized backend is the only genuine "unknown backend" case.
 		for _, tc := range []struct {
 			backend, wantErr string
 		}{
-			{"sqlite", "DEPRECATED"},
-			{"postgres", "unknown backend"},
+			{"postgres", "requires --pg-url"},
+			{"mysql", "requires --mysql-url"},
+			{"cockroach", "unknown backend"},
 		} {
 			out := bdInitFail(t, bd, "--backend", tc.backend)
 			if !strings.Contains(out, tc.wantErr) {

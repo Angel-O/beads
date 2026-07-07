@@ -2353,36 +2353,38 @@ func TestBareParentWorktreeCoreCommandsWithoutRedirect(t *testing.T) {
 func TestInitBackendFlag(t *testing.T) {
 	bd := buildBDForInitTests(t)
 
-	t.Run("sqlite_shows_deprecation", func(t *testing.T) {
+	t.Run("sqlite_backend_succeeds", func(t *testing.T) {
+		// SQLite is a first-class local backend on this line: init succeeds into
+		// a plain local workspace and records backend=sqlite in metadata.json.
 		tmpDir := t.TempDir()
 
 		cmd := exec.Command(bd, "init", "--backend", "sqlite", "--quiet")
 		cmd.Dir = tmpDir
 		cmd.Env = os.Environ()
 		out, err := cmd.CombinedOutput()
-		if err == nil {
-			t.Fatal("Expected non-zero exit for --backend=sqlite, but command succeeded")
+		if err != nil {
+			t.Fatalf("bd init --backend=sqlite should succeed: %v\n%s", err, out)
 		}
 
-		outStr := string(out)
-		if !strings.Contains(outStr, "DEPRECATED") {
-			t.Errorf("Expected deprecation notice, got: %s", outStr)
-		}
-		if !strings.Contains(outStr, "SQLite backend has been removed") {
-			t.Errorf("Expected 'SQLite backend has been removed' message, got: %s", outStr)
-		}
-		if !strings.Contains(outStr, "bd init --from-jsonl") {
-			t.Errorf("Expected migration instructions, got: %s", outStr)
-		}
-
-		// Verify no .beads directory was created
 		beadsDir := filepath.Join(tmpDir, ".beads")
-		if _, err := os.Stat(beadsDir); err == nil {
-			t.Error(".beads directory should not be created when --backend=sqlite is used")
+		if _, err := os.Stat(beadsDir); err != nil {
+			t.Errorf(".beads directory should be created for --backend=sqlite: %v", err)
+		}
+		cfg, err := configfile.Load(beadsDir)
+		if err != nil {
+			t.Fatalf("Failed to load metadata.json: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("metadata.json not found")
+		}
+		if cfg.Backend != configfile.BackendSQLite {
+			t.Errorf("Expected backend %q, got %q", configfile.BackendSQLite, cfg.Backend)
 		}
 	})
 
-	t.Run("unknown_backend_errors", func(t *testing.T) {
+	t.Run("postgres_requires_pg_url", func(t *testing.T) {
+		// postgres is first-class but needs a connection flag; without --pg-url
+		// it fails with a specific required-flag error (not "unknown backend").
 		tmpDir := t.TempDir()
 
 		cmd := exec.Command(bd, "init", "--backend", "postgres", "--quiet")
@@ -2390,7 +2392,25 @@ func TestInitBackendFlag(t *testing.T) {
 		cmd.Env = os.Environ()
 		out, err := cmd.CombinedOutput()
 		if err == nil {
-			t.Fatal("Expected non-zero exit for --backend=postgres, but command succeeded")
+			t.Fatal("Expected non-zero exit for --backend=postgres without --pg-url, but command succeeded")
+		}
+
+		outStr := string(out)
+		if !strings.Contains(outStr, "requires --pg-url") {
+			t.Errorf("Expected '--backend=postgres requires --pg-url' error, got: %s", outStr)
+		}
+	})
+
+	t.Run("unknown_backend_errors", func(t *testing.T) {
+		// Only a genuinely unrecognized backend produces "unknown backend".
+		tmpDir := t.TempDir()
+
+		cmd := exec.Command(bd, "init", "--backend", "cockroach", "--quiet")
+		cmd.Dir = tmpDir
+		cmd.Env = os.Environ()
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatal("Expected non-zero exit for --backend=cockroach, but command succeeded")
 		}
 
 		outStr := string(out)
