@@ -1,0 +1,140 @@
+# Comment moderation — REPORT-ONLY malware-attachment detector.
+#
+# WHY THIS EXISTS
+#   An automated spam campaign posts LLM-written "here's a fix" comments on fresh
+#   issues with a malware archive (e.g. bd_fix_v1.zip) attached through GitHub's
+#   own comment uploader (github.com/user-attachments/files/...). This workflow
+#   scores each new comment / body and records the moderation tier it WOULD
+#   assign. See the ops wiki "GitHub comment moderation" pages for the policy.
+#
+# REPORT-ONLY — READ BEFORE CHANGING
+#   This workflow takes NO moderation action: it never minimizes, deletes,
+#   labels, locks, or blocks. It only writes its verdict to the run log and the
+#   job summary. Its purpose is to measure the false-positive rate against real
+#   traffic before anyone wires up enforcement. Graduating to minimize-only (and
+#   later human-gated delete/block) is a deliberate, separate change documented
+#   in .github/scripts/README-comment-moderation.md. Because of that, the token
+#   here is read-only (contents: read) and no write scopes are requested.
+#
+# SAFETY
+#   - Triggered by untrusted comment/body content; the body is passed to the
+#     detector ONLY through the step `env:` block (never interpolated into a
+#     shell command), matching the repo's injection-safe script pattern.
+#   - Uses `pull_request_target` so fork-PR *bodies* can be scored, but it checks
+#     out the trusted DEFAULT branch only and never runs any PR code.
+#   - Skips bot/app authors to avoid noise and self-triggering.
+
+name: comment-moderation (report-only)
+
+on:
+  issue_comment:
+    types: [created, edited]
+  issues:
+    types: [opened, edited]
+  pull_request_target:
+    types: [opened, edited]
+  pull_request_review:
+    types: [submitted, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+  discussion:
+    types: [created, edited]
+  discussion_comment:
+    types: [created, edited]
+  commit_comment:
+    types: [created]
+
+# Never cancel in-flight runs; each event is scored independently.
+concurrency:
+  group: comment-mod-${{ github.event_name }}-${{ github.event.comment.id || github.event.review.id || github.event.issue.number || github.event.pull_request.number || github.event.discussion.number || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the trusted default branch (never PR code)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Look up author account age
+        id: acct
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOGIN: >-
+            ${{ github.event.comment.user.login
+              || github.event.issue.user.login
+              || github.event.pull_request.user.login
+              || github.event.discussion.user.login
+              || github.event.review.user.login
+              || github.event.sender.login }}
+        run: |
+          set -uo pipefail
+          created=""; repos=""; followers=""
+          if [ -n "${LOGIN:-}" ]; then
+            if u=$(gh api "/users/${LOGIN}" 2>/dev/null); then
+              created=$(printf '%s' "$u" | jq -r '.created_at // ""')
+              repos=$(printf '%s' "$u" | jq -r '.public_repos // ""')
+              followers=$(printf '%s' "$u" | jq -r '.followers // ""')
+            fi
+          fi
+          {
+            echo "created=$created"
+            echo "repos=$repos"
+            echo "followers=$followers"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Score (report-only)
+        env:
+          BODY: >-
+            ${{ github.event.comment.body
+              || github.event.issue.body
+              || github.event.pull_request.body
+              || github.event.discussion.body
+              || github.event.review.body }}
+          AUTHOR_LOGIN: >-
+            ${{ github.event.comment.user.login
+              || github.event.issue.user.login
+              || github.event.pull_request.user.login
+              || github.event.discussion.user.login
+              || github.event.review.user.login
+              || github.event.sender.login }}
+          AUTHOR_ASSOCIATION: >-
+            ${{ github.event.comment.author_association
+              || github.event.issue.author_association
+              || github.event.pull_request.author_association
+              || github.event.discussion.author_association
+              || github.event.review.author_association }}
+          AUTHOR_TYPE: >-
+            ${{ github.event.comment.user.type
+              || github.event.issue.user.type
+              || github.event.pull_request.user.type
+              || github.event.discussion.user.type
+              || github.event.review.user.type }}
+          THREAD_AUTHOR_LOGIN: >-
+            ${{ github.event.issue.user.login
+              || github.event.pull_request.user.login
+              || github.event.discussion.user.login }}
+          THREAD_CREATED_AT: >-
+            ${{ github.event.issue.created_at
+              || github.event.pull_request.created_at
+              || github.event.discussion.created_at }}
+          EVENT_CREATED_AT: >-
+            ${{ github.event.comment.created_at
+              || github.event.review.submitted_at
+              || github.event.issue.created_at
+              || github.event.pull_request.created_at
+              || github.event.discussion.created_at }}
+          EVENT_NAME: ${{ github.event_name }}
+          ACCOUNT_CREATED_AT: ${{ steps.acct.outputs.created }}
+          ACCOUNT_REPOS: ${{ steps.acct.outputs.repos }}
+          ACCOUNT_FOLLOWERS: ${{ steps.acct.outputs.followers }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/moderate_comment.py | tee -a "$GITHUB_STEP_SUMMARY"
