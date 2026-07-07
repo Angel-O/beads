@@ -44,6 +44,23 @@ type mockDriver struct {
 	// failCheckout makes Prepare of a DOLT_CHECKOUT statement fail, so borrow-path
 	// tests can force beginTxOnConn to error and fall through to the fallback.
 	failCheckout atomic.Bool
+
+	// activeBranch is what a SELECT active_branch() query reports; empty means
+	// "main". Borrow-path tests set it to another branch to prove the borrow
+	// refuses to switch a pooled session's branch and falls back instead.
+	activeBranch atomic.Value // string
+
+	// failActiveBranch makes a SELECT active_branch() query fail, modeling a
+	// stale borrowed connection.
+	failActiveBranch atomic.Bool
+}
+
+// reportedBranch returns the branch active_branch() queries report.
+func (d *mockDriver) reportedBranch() string {
+	if v, ok := d.activeBranch.Load().(string); ok && v != "" {
+		return v
+	}
+	return "main"
 }
 
 // recordQuery appends a prepared query for later assertion.
@@ -103,6 +120,13 @@ func (c *mockConn) Begin() (driver.Tx, error) {
 // We simulate a small amount of work so the concurrency test can observe
 // SetMaxOpenConns back-pressure.
 func (c *mockConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if strings.Contains(query, "active_branch") {
+		c.drv.recordQuery(query)
+		if c.drv.failActiveBranch.Load() {
+			return nil, fmt.Errorf("mock: forced active_branch failure")
+		}
+		return &mockRows{val: c.drv.reportedBranch()}, nil
+	}
 	time.Sleep(20 * time.Millisecond)
 	return &mockRows{}, nil
 }
@@ -121,6 +145,7 @@ func (mockStmt) Query(args []driver.Value) (driver.Rows, error)  { return &mockR
 
 type mockRows struct {
 	done bool
+	val  driver.Value // value for the single row; nil means int64(1)
 }
 
 func (r *mockRows) Columns() []string { return []string{"x"} }
@@ -131,7 +156,11 @@ func (r *mockRows) Next(dest []driver.Value) error {
 	}
 	r.done = true
 	if len(dest) > 0 {
-		dest[0] = int64(1)
+		if r.val != nil {
+			dest[0] = r.val
+		} else {
+			dest[0] = int64(1)
+		}
 	}
 	return nil
 }

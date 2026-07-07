@@ -111,8 +111,40 @@ func TestIgnoredTxBorrowReusesPooledConn(t *testing.T) {
 	if got := drv.opens.Load(); got != 1 {
 		t.Fatalf("drv.opens = %d after %d borrows, want 1 (pooled conn reused, no per-write churn)", got, iterations)
 	}
-	if got := drv.countQuery("DOLT_CHECKOUT"); got != iterations {
-		t.Fatalf("DOLT_CHECKOUT ran %d times, want %d (checkout on the borrowed conn each write)", got, iterations)
+	if got := drv.countQuery("active_branch"); got != iterations {
+		t.Fatalf("active_branch ran %d times, want %d (branch verified on the borrowed conn each write)", got, iterations)
+	}
+	if got := drv.countQuery("DOLT_CHECKOUT"); got != 0 {
+		t.Fatalf("DOLT_CHECKOUT ran %d times on the pool, want 0 (a borrow must never switch a pooled session's branch)", got)
+	}
+}
+
+// TestIgnoredTxBorrowRefusesForeignBranch is the pool-invariant teeth test: a
+// pooled session sitting on a branch other than the regular tx's must NOT be
+// checked out to it (the cleanup returns the conn to the pool without a
+// restore, so a checkout would leak the branch switch to an unrelated later
+// caller). The borrow must refuse and fall back to the fresh dial instead.
+func TestIgnoredTxBorrowRefusesForeignBranch(t *testing.T) {
+	ctx := context.Background()
+	s, drv := newMockStore(t, 10)
+	drv.activeBranch.Store("feature-x") // pool sessions report a foreign branch
+
+	cleanup, tx, err := s.beginIgnoredTxOnBranch(ctx, "main")
+	if err == nil {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+		cleanup()
+		t.Fatal("expected the fallback dial to fail after the borrow refused the foreign branch")
+	}
+	if !strings.Contains(err.Error(), "failed to acquire ignored tx connection") {
+		t.Fatalf("error = %q, want the fallback's %q (proves the borrow refused and fell through)", err.Error(), "failed to acquire ignored tx connection")
+	}
+	if got := drv.countQuery("DOLT_CHECKOUT"); got != 0 {
+		t.Fatalf("DOLT_CHECKOUT ran %d times on the pool, want 0 (borrow must refuse, not switch, a foreign-branch session)", got)
+	}
+	if inUse := s.db.Stats().InUse; inUse != 0 {
+		t.Fatalf("s.db InUse = %d after refusal, want 0 (borrowed conn returned to pool untouched)", inUse)
 	}
 }
 
@@ -173,7 +205,7 @@ func TestIgnoredTxFallbackUsesCredentialCommand(t *testing.T) {
 func TestIgnoredTxBorrowFallsThroughOnBadConn(t *testing.T) {
 	ctx := context.Background()
 	s, drv := newMockStore(t, 10)
-	drv.failCheckout.Store(true) // borrow succeeds, but DOLT_CHECKOUT fails on it
+	drv.failActiveBranch.Store(true) // borrow succeeds, but the conn is stale (branch read fails)
 
 	cleanup, tx, err := s.beginIgnoredTxOnBranch(ctx, "main")
 	if err == nil {
@@ -181,7 +213,7 @@ func TestIgnoredTxBorrowFallsThroughOnBadConn(t *testing.T) {
 			_ = tx.Rollback()
 		}
 		cleanup()
-		t.Fatal("expected the fallback dial to fail after the borrowed conn's checkout failed")
+		t.Fatal("expected the fallback dial to fail after the borrowed conn turned out stale")
 	}
 	if !strings.Contains(err.Error(), "failed to acquire ignored tx connection") {
 		t.Fatalf("error = %q, want the fallback's %q (proves it fell through)", err.Error(), "failed to acquire ignored tx connection")

@@ -161,14 +161,17 @@ const ignoredTxBorrowTimeout = 250 * time.Millisecond
 // The returned cleanup closure releases whichever acquisition path was taken, so
 // the caller does not need to know which one ran.
 func (s *DoltStore) beginIgnoredTxOnBranch(ctx context.Context, branch string) (cleanup func(), tx *sql.Tx, err error) {
-	// Borrow fast path: reuse an already-open pooled connection.
+	// Borrow fast path: reuse an already-open pooled connection. Unlike the
+	// fallback below, this path never switches the session's branch — see
+	// beginBorrowedTx for the pool invariant it preserves.
 	if conn := s.borrowConnForIgnoredTx(ctx); conn != nil {
-		tx, err := beginTxOnConn(ctx, conn, branch)
+		tx, err := beginBorrowedTx(ctx, conn, branch)
 		if err == nil {
 			return func() { _ = conn.Close() }, tx, nil
 		}
-		// A stale pooled connection or a bad branch: a fresh dial always worked
-		// before, so discard this one and fall through to the fallback.
+		// A stale pooled connection or a session on another branch: a fresh
+		// dial always worked before, so discard this one (its session state is
+		// untouched) and fall through to the fallback.
 		_ = conn.Close()
 	}
 
@@ -226,10 +229,43 @@ func (s *DoltStore) borrowConnForIgnoredTx(ctx context.Context) *sql.Conn {
 	return conn
 }
 
-// beginTxOnConn checks a connection out to branch and begins a transaction on it.
-// Both the borrow and fallback paths use it, so their session setup is identical.
-// Every Dolt SQL session has its own active branch, so the explicit checkout is
-// required even on a borrowed pooled connection.
+// beginBorrowedTx begins the ignored-tables transaction on a connection
+// borrowed from the main pool, without ever changing that session's branch.
+//
+// Pool invariant: DOLT_CHECKOUT is session-level, and the borrow cleanup
+// returns the connection to the pool as-is — so switching its branch here
+// would leak a foreign branch into the pool for an unrelated later caller.
+// Every other production checkout site (federation staging, compact, flatten)
+// restores the branch before releasing the connection; the borrow path
+// preserves the same invariant by refusing instead of switching. Today no
+// shipped flow diverges a pool session's branch from the regular tx's branch
+// (DoltStore.Checkout has no non-test callers), so this is defense in depth
+// for future Checkout callers and for multi-connection tests.
+//
+// Instead of an unconditional checkout it verifies the session is already on
+// the requested branch — the overwhelmingly common case — and sends the
+// caller to the fresh-dial fallback otherwise. Same round-trip count as the
+// checkout it replaces (one statement), so the borrow fast path stays free.
+func beginBorrowedTx(ctx context.Context, conn *sql.Conn, branch string) (*sql.Tx, error) {
+	var active string
+	if err := conn.QueryRowContext(ctx, "SELECT active_branch()").Scan(&active); err != nil {
+		return nil, fmt.Errorf("failed to read borrowed conn's active branch: %w", err)
+	}
+	if active != branch {
+		return nil, fmt.Errorf("borrowed conn is on branch %q, want %q: refusing to switch a pooled session's branch", active, branch)
+	}
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin ignored tx: %w", err)
+	}
+	return tx, nil
+}
+
+// beginTxOnConn checks a connection out to branch and begins a transaction on
+// it. Only the fallback path uses it: the fallback owns a dedicated
+// single-connection pool, so checking its session out is safe. Every Dolt SQL
+// session has its own active branch, so the explicit checkout is required on
+// a fresh dial.
 func beginTxOnConn(ctx context.Context, conn *sql.Conn, branch string) (*sql.Tx, error) {
 	if _, err := conn.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", branch); err != nil {
 		return nil, fmt.Errorf("failed to checkout ignored tx branch %s: %w", branch, err)
