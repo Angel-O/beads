@@ -9,7 +9,7 @@ sidebar_position: 0
 <!-- AUTO-GENERATED: do not edit manually -->
 Reference for bd Latest. Generated from `bd help --docs-root`.
 
-This reference covers all 112 live top-level `bd` commands. Regenerate it with:
+This reference covers all 113 live top-level `bd` commands. Regenerate it with:
 
 ```bash
 ./scripts/generate-cli-docs.sh
@@ -26,6 +26,7 @@ This reference covers all 112 live top-level `bd` commands. Regenerate it with:
 - [`bd blocked`](./blocked.md)
 - [`bd bootstrap`](./bootstrap.md)
 - [`bd branch`](./branch.md)
+- [`bd cas`](./cas.md)
 - [`bd children`](./children.md)
 - [`bd close`](./close.md)
 - [`bd comment`](./comment.md)
