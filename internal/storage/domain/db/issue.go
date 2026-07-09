@@ -104,8 +104,8 @@ func (r *issueSQLRepositoryImpl) Update(ctx context.Context, id string, updates 
 		setClauses = append(setClauses, fmt.Sprintf("`%s` = ?", column))
 		args = append(args, normalizeUpdateValue(key, value))
 	}
-	setClauses = append(setClauses, "updated_at = ?")
-	args = append(args, time.Now().UTC())
+	setClauses = append(setClauses, "updated_at = ?", "revision = ?")
+	args = append(args, time.Now().UTC(), issueops.NewRevision())
 	args = append(args, id)
 
 	table := pickIssueTable(opts.UseWispsTable)
@@ -201,16 +201,16 @@ func (r *issueSQLRepositoryImpl) Claim(ctx context.Context, id, actor string, op
 		//nolint:gosec // G201: table is one of two hardcoded constants
 		res, err = r.runner.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE %s
-			SET assignee = ?, status = 'in_progress', updated_at = ?, started_at = ?
+			SET assignee = ?, status = 'in_progress', updated_at = ?, started_at = ?, revision = ?
 			WHERE id = ? AND status = 'open' AND (assignee = '' OR assignee IS NULL OR assignee = ?)
-		`, table), actor, now, now, id, actor)
+		`, table), actor, now, now, issueops.NewRevision(), id, actor)
 	} else {
 		//nolint:gosec // G201: table is one of two hardcoded constants
 		res, err = r.runner.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE %s
-			SET assignee = ?, status = 'in_progress', updated_at = ?
+			SET assignee = ?, status = 'in_progress', updated_at = ?, revision = ?
 			WHERE id = ? AND status = 'open' AND (assignee = '' OR assignee IS NULL OR assignee = ?)
-		`, table), actor, now, id, actor)
+		`, table), actor, now, issueops.NewRevision(), id, actor)
 	}
 	if err != nil {
 		return domain.ClaimRowResult{}, fmt.Errorf("db: Claim %s: %w", id, err)
@@ -466,7 +466,7 @@ func insertIssueRow(ctx context.Context, runner Runner, table string, issue *typ
 			mol_type, work_type, source_system, source_repo, close_reason,
 			event_kind, actor, target, payload,
 			await_type, await_id, timeout_ns, waiters,
-			due_at, defer_until, metadata
+			due_at, defer_until, metadata, revision
 		) VALUES (
 			?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?,
@@ -476,7 +476,7 @@ func insertIssueRow(ctx context.Context, runner Runner, table string, issue *typ
 			?, ?, ?, ?, ?,
 			?, ?, ?, ?,
 			?, ?, ?, ?,
-			?, ?, ?
+			?, ?, ?, ?
 		)
 		ON DUPLICATE KEY UPDATE
 			content_hash = VALUES(content_hash),
@@ -496,7 +496,8 @@ func insertIssueRow(ctx context.Context, runner Runner, table string, issue *typ
 			external_ref = VALUES(external_ref),
 			source_repo = VALUES(source_repo),
 			close_reason = VALUES(close_reason),
-			metadata = VALUES(metadata)
+			metadata = VALUES(metadata),
+			revision = VALUES(revision)
 	`, table),
 		issue.ID, issue.ContentHash, issue.Title, issue.Description, issue.Design, issue.AcceptanceCriteria, issue.Notes,
 		string(issue.Status), issue.Priority, string(issue.IssueType), nullString(issue.Assignee), nullIntPtr(issue.EstimatedMinutes),
@@ -506,7 +507,7 @@ func insertIssueRow(ctx context.Context, runner Runner, table string, issue *typ
 		string(issue.MolType), string(issue.WorkType), issue.SourceSystem, issue.SourceRepo, issue.CloseReason,
 		issue.EventKind, issue.Actor, issue.Target, issue.Payload,
 		issue.AwaitType, issue.AwaitID, issue.Timeout.Nanoseconds(), formatJSONStringArray(issue.Waiters),
-		issue.DueAt, issue.DeferUntil, jsonMetadata(issue.Metadata),
+		issue.DueAt, issue.DeferUntil, jsonMetadata(issue.Metadata), issueops.NewRevision(),
 	)
 	if err != nil {
 		return fmt.Errorf("db: insert into %s: %w", table, err)

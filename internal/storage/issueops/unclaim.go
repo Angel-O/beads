@@ -41,12 +41,14 @@ func UnclaimIssueInTx(ctx context.Context, tx *sql.Tx, id string, actor string) 
 
 	now := time.Now().UTC()
 
-	// Atomic UPDATE: clear assignee and reset status to open
+	// Atomic UPDATE: clear assignee and reset status to open. Stamp a fresh
+	// revision nonce (B1.2) — unclaim is a real content change, so a concurrent
+	// whole-row CAS reading the claimed state must be invalidated.
 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE %s
-		SET assignee = '', status = 'open', updated_at = ?
+		SET assignee = '', status = 'open', updated_at = ?, revision = ?
 		WHERE id = ? AND assignee != '' AND status IN ('open', 'in_progress')
-	`, issueTable), now, id)
+	`, issueTable), now, NewRevision(), id)
 	if err != nil {
 		return fmt.Errorf("failed to unclaim issue: %w", err)
 	}
