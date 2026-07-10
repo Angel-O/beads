@@ -9,7 +9,7 @@ sidebar_position: 0
 <!-- AUTO-GENERATED: do not edit manually -->
 Reference for bd Latest. Generated from `bd help --docs-root`.
 
-This reference covers all 112 live top-level `bd` commands. Regenerate it with:
+This reference covers all 113 live top-level `bd` commands. Regenerate it with:
 
 ```bash
 ./scripts/generate-cli-docs.sh
@@ -70,6 +70,7 @@ This reference covers all 112 live top-level `bd` commands. Regenerate it with:
 - [`bd jira`](./jira.md)
 - [`bd kv`](./kv.md)
 - [`bd label`](./label.md)
+- [`bd lease`](./lease.md)
 - [`bd linear`](./linear.md)
 - [`bd link`](./link.md)
 - [`bd lint`](./lint.md)
