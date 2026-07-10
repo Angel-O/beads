@@ -67,6 +67,22 @@ func stripPasswordBestEffort(dsn string) string {
 	return strings.TrimSpace(strings.Join(strings.Fields(out), " "))
 }
 
+// ScrubDSNString returns s with every cleartext password embedded in dsn replaced
+// by "xxxxx". It is the string-level primitive behind ScrubDSNError, exposed so a
+// caller that echoes a DSN somewhere other than an error — a telemetry span, a log
+// line — can redact it through the SAME parser-backed extraction (URL userinfo, URL
+// query password/sslpassword, and libpq keyword/value tokens) instead of a separate
+// hand-rolled scan that misses a form. dsn and s are usually the same string (scrub a
+// DSN in place); they differ only when the password leaked into surrounding text, as
+// ScrubDSNError passes an error message as s. An empty dsn, or one with no password,
+// returns s unchanged.
+func ScrubDSNString(dsn, s string) string {
+	for _, secret := range dsnPasswordValues(dsn) {
+		s = strings.ReplaceAll(s, secret, "xxxxx")
+	}
+	return s
+}
+
 // ScrubDSNError returns a new error whose message has every cleartext password
 // embedded in dsn removed. pgx's ParseConfigError redacts only URL userinfo, so a
 // `?password=`/`?sslpassword=` URL query param — the shape `bd init` connects with —
@@ -78,11 +94,7 @@ func ScrubDSNError(dsn string, err error) error {
 	if err == nil {
 		return nil
 	}
-	msg := err.Error()
-	for _, secret := range dsnPasswordValues(dsn) {
-		msg = strings.ReplaceAll(msg, secret, "xxxxx")
-	}
-	return errors.New(msg)
+	return errors.New(ScrubDSNString(dsn, err.Error()))
 }
 
 // dsnPasswordValues returns every cleartext password embedded in dsn — URL userinfo,

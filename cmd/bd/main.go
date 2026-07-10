@@ -34,6 +34,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	mysqlstore "github.com/steveyegge/beads/internal/storage/mysql"
+	"github.com/steveyegge/beads/internal/storage/pgdialect"
 	pgstore "github.com/steveyegge/beads/internal/storage/postgres"
 	"github.com/steveyegge/beads/internal/storage/schema"
 	sqlitestore "github.com/steveyegge/beads/internal/storage/sqlite"
@@ -1728,22 +1729,52 @@ func envTruthyValue(v string) bool {
 	return true
 }
 
+// dsnFlags are the flags whose value is a connection string that may embed a
+// password (bd init --backend=postgres/mysql). Their values get the full
+// parser-backed DSN scrub; other args only get the unambiguous userinfo scrub.
+var dsnFlags = map[string]bool{"--pg-url": true, "--mysql-url": true}
+
 // scrubArgsForTelemetry joins argv for the bd.args span attribute with any
 // credential-bearing values redacted. --pg-url/--mysql-url may carry a password
 // for init; RedactPassword protects metadata.json, but the raw argv would
 // otherwise leak the password into the telemetry root span and trace logs.
+//
+// The value of a DSN flag is scrubbed through the parser-backed pgdialect logic so
+// every password form pgx accepts is caught — URL userinfo, URL `?password=`/
+// `?sslpassword=` query params, and libpq `password=`/`sslpassword=` keyword/value
+// tokens — in both the `--pg-url=<dsn>` and `--pg-url <dsn>` spellings. Every other
+// arg still gets the narrow user:PASS@host userinfo scrub as defense in depth,
+// without the broad keyword scan that would over-redact ordinary text.
 func scrubArgsForTelemetry(argv []string) string {
 	parts := make([]string, len(argv))
 	for i, a := range argv {
-		parts[i] = scrubCredsInArg(a)
+		if name, val, ok := strings.Cut(a, "="); ok && dsnFlags[name] {
+			// --pg-url=<dsn> — scrub only the value, keep the flag name.
+			parts[i] = name + "=" + scrubDSNValue(val)
+			continue
+		}
+		if i > 0 && dsnFlags[argv[i-1]] {
+			// <dsn> following a bare --pg-url token.
+			parts[i] = scrubDSNValue(a)
+			continue
+		}
+		parts[i] = scrubUserinfoPassword(a)
 	}
 	return strings.Join(parts, " ")
 }
 
-// scrubCredsInArg redacts the password in a URL/DSN-shaped argument
-// (postgres://user:PASS@host or user:PASS@tcp(...)), whether passed as
-// --flag=value or as a bare value; non-credential args pass through unchanged.
-func scrubCredsInArg(a string) string {
+// scrubDSNValue redacts every password form from a connection-string value. The
+// pgdialect pass covers pgx's URL (userinfo + query) and libpq keyword/value shapes;
+// the trailing userinfo pass covers the MySQL user:PASS@tcp(...) DSN, which is not a
+// scheme URL and so is invisible to the pgdialect extractor.
+func scrubDSNValue(val string) string {
+	return scrubUserinfoPassword(pgdialect.ScrubDSNString(val, val))
+}
+
+// scrubUserinfoPassword redacts the password in a URL/DSN userinfo section
+// (postgres://user:PASS@host or user:PASS@tcp(...)); args without a user:pass@
+// userinfo pass through unchanged, so ordinary text is never mangled.
+func scrubUserinfoPassword(a string) string {
 	at := strings.LastIndexByte(a, '@')
 	if at < 0 {
 		return a

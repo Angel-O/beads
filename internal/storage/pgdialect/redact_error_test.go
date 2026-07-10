@@ -47,6 +47,42 @@ func TestScrubDSNError(t *testing.T) {
 	}
 }
 
+// TestScrubDSNString proves the string-level primitive removes every password form
+// when a DSN is echoed as plain text (a telemetry span, a log line) rather than an
+// error — the same shapes TestScrubDSNError covers, but exercised directly since the
+// telemetry scrubber depends on this function, not on ScrubDSNError.
+func TestScrubDSNString(t *testing.T) {
+	const secret = "SUPERSECRET"
+	cases := []struct {
+		name string
+		dsn  string
+	}{
+		{"url userinfo", "postgres://u:" + secret + "@h:5432/db"},
+		{"url query param", "postgres://u@h:5432/db?password=" + secret},
+		{"url sslpassword", "postgres://u@h:5432/db?sslpassword=" + secret + "&sslmode=require"},
+		{"libpq keyword", "host=h user=u password=" + secret + " dbname=db"},
+		{"libpq sslpassword", "host=h user=u sslpassword=" + secret + " dbname=db"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ScrubDSNString(tc.dsn, tc.dsn)
+			if strings.Contains(got, secret) {
+				t.Errorf("ScrubDSNString(%q) still leaks password: %q", tc.dsn, got)
+			}
+			if !strings.Contains(got, "xxxxx") {
+				t.Errorf("ScrubDSNString(%q) did not redact: %q", tc.dsn, got)
+			}
+		})
+	}
+	// A DSN with no password, and an empty DSN, must pass the target string through.
+	if got := ScrubDSNString("postgres://u@h:5432/db", "postgres://u@h:5432/db"); got != "postgres://u@h:5432/db" {
+		t.Errorf("passwordless DSN altered: %q", got)
+	}
+	if got := ScrubDSNString("", "no dsn here"); got != "no dsn here" {
+		t.Errorf("empty dsn altered s: %q", got)
+	}
+}
+
 // TestOpenRedactsPasswordInError drives the real pgx parser: a DSN that fails to
 // parse while carrying a ?password=/?sslpassword= query param must not leak the
 // secret through Open or OpenRaw. connect_timeout=x is what makes ParseConfig fail;
