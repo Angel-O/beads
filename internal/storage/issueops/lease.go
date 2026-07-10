@@ -204,6 +204,7 @@ func ReclaimExpiredLeasesInTx(ctx context.Context, tx DBTX, cutoff time.Time, ac
 			UPDATE issues
 			SET status = 'open', assignee = NULL, started_at = NULL,
 			    lease_expires_at = NULL, heartbeat_at = NULL,
+			    claim_fence = claim_fence + 1,
 			    updated_at = ?, row_lock = ?
 			WHERE id = ? AND status = 'in_progress'
 			  AND lease_expires_at IS NOT NULL AND lease_expires_at < ?

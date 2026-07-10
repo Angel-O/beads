@@ -77,8 +77,14 @@ var issueUpsertColumns = []string{
 // Tie rows are deliberately NOT short-circuited by the staleRejected
 // pre-check in InsertIssueIfNew, so their aux data (labels/comments/deps,
 // which never bump updated_at) still merges additively.
-func issueUpsertAssignments(rejectStaleUpdate bool) string {
-	assignments := make([]string, 0, len(issueUpsertColumns))
+func issueUpsertAssignments(rejectStaleUpdate bool) (string, []any) {
+	assignments := make([]string, 0, len(issueUpsertColumns)+1)
+	// Ownership-fence discipline on import/sync (see fence.go): the fence
+	// fragment comes FIRST so its assignee/updated_at comparisons see
+	// pre-assignment values. Its bound row_lock arg is returned to the caller,
+	// positioned after the INSERT VALUES placeholders.
+	fenceAssignments, fenceArgs := UpsertFenceAssignments(rejectStaleUpdate)
+	assignments = append(assignments, fenceAssignments)
 	for _, col := range issueUpsertColumns {
 		if rejectStaleUpdate {
 			assignments = append(assignments,
@@ -87,7 +93,7 @@ func issueUpsertAssignments(rejectStaleUpdate bool) string {
 			assignments = append(assignments, fmt.Sprintf("%s = VALUES(%s)", col, col))
 		}
 	}
-	return strings.Join(assignments, ",\n\t\t\t")
+	return strings.Join(assignments, ",\n\t\t\t"), fenceArgs
 }
 
 // InsertIssueIntoTable inserts an issue into the specified table ("issues" or "wisps"),
@@ -98,6 +104,24 @@ func InsertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *
 
 //nolint:gosec // G201: table is a hardcoded constant ("issues" or "wisps")
 func insertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *types.Issue, rejectStaleUpdate bool) error {
+	upsertAssignments, upsertArgs := issueUpsertAssignments(rejectStaleUpdate)
+	args := []any{
+		issue.ID, issue.ContentHash, issue.Title, issue.Description, issue.Design, issue.AcceptanceCriteria, issue.Notes,
+		issue.Status, issue.Priority, issue.IssueType, NullString(issue.Assignee), NullInt(issue.EstimatedMinutes),
+		issue.CreatedAt, issue.CreatedBy, issue.Owner, issue.UpdatedAt, issue.StartedAt, issue.ClosedAt, NullStringPtr(issue.ExternalRef), issue.SpecID,
+		issue.CompactionLevel, issue.CompactedAt, NullStringPtr(issue.CompactedAtCommit), NullIntVal(issue.OriginalSize),
+		issue.Sender, issue.Ephemeral, issue.NoHistory, issue.WispType, issue.Pinned, issue.IsTemplate,
+		issue.MolType, issue.WorkType, issue.SourceSystem, issue.SourceRepo, issue.CloseReason,
+		issue.EventKind, issue.Actor, issue.Target, issue.Payload,
+		issue.AwaitType, issue.AwaitID, issue.Timeout.Nanoseconds(), FormatJSONStringArray(issue.Waiters),
+		issue.DueAt, issue.DeferUntil, JSONMetadata(issue.Metadata),
+		// claim_fence rides fresh inserts so promote/demote table moves carry
+		// the ownership fence instead of resetting it to the column default;
+		// on the duplicate-key path the fence is governed solely by the
+		// assignee-change bump in issueUpsertAssignments, never overwritten.
+		issue.ClaimFence,
+	}
+	args = append(args, upsertArgs...)
 	_, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %s (
 			id, content_hash, title, description, design, acceptance_criteria, notes,
@@ -108,7 +132,7 @@ func insertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *
 			mol_type, work_type, source_system, source_repo, close_reason,
 			event_kind, actor, target, payload,
 			await_type, await_id, timeout_ns, waiters,
-			due_at, defer_until, metadata
+			due_at, defer_until, metadata, claim_fence
 		) VALUES (
 			?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?,
@@ -118,21 +142,11 @@ func insertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *
 			?, ?, ?, ?, ?,
 			?, ?, ?, ?,
 			?, ?, ?, ?,
-			?, ?, ?
+			?, ?, ?, ?
 		)
 		ON DUPLICATE KEY UPDATE
 			%s
-	`, table, issueUpsertAssignments(rejectStaleUpdate)),
-		issue.ID, issue.ContentHash, issue.Title, issue.Description, issue.Design, issue.AcceptanceCriteria, issue.Notes,
-		issue.Status, issue.Priority, issue.IssueType, NullString(issue.Assignee), NullInt(issue.EstimatedMinutes),
-		issue.CreatedAt, issue.CreatedBy, issue.Owner, issue.UpdatedAt, issue.StartedAt, issue.ClosedAt, NullStringPtr(issue.ExternalRef), issue.SpecID,
-		issue.CompactionLevel, issue.CompactedAt, NullStringPtr(issue.CompactedAtCommit), NullIntVal(issue.OriginalSize),
-		issue.Sender, issue.Ephemeral, issue.NoHistory, issue.WispType, issue.Pinned, issue.IsTemplate,
-		issue.MolType, issue.WorkType, issue.SourceSystem, issue.SourceRepo, issue.CloseReason,
-		issue.EventKind, issue.Actor, issue.Target, issue.Payload,
-		issue.AwaitType, issue.AwaitID, issue.Timeout.Nanoseconds(), FormatJSONStringArray(issue.Waiters),
-		issue.DueAt, issue.DeferUntil, JSONMetadata(issue.Metadata),
-	)
+	`, table, upsertAssignments), args...)
 	if err != nil {
 		return fmt.Errorf("insert issue into %s: %w", table, err)
 	}

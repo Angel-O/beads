@@ -44,7 +44,9 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 	// now, and a fresh row_lock (see lease.go). The lease is what makes a claim
 	// recoverable — a worker that dies stops heartbeating and bd reclaim later
 	// reverts the issue. row_lock here also forces a concurrent reclaim/heartbeat
-	// to conflict rather than silently cell-merge.
+	// to conflict rather than silently cell-merge. The claim is an ownership
+	// transition, so it also bumps claim_fence (fenceBumpExpr; row_lock pairing
+	// satisfied by the lease clause in the same statement).
 	leaseClause, leaseArgs := leaseSetClause(now, leaseTTL(ctx))
 
 	// Conditional UPDATE: only succeeds while the issue is still claimable.
@@ -58,17 +60,17 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 		args = append(args, id, actor)
 		result, err = tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE %s
-			SET assignee = ?, status = 'in_progress', updated_at = ?, started_at = ?, %s
+			SET assignee = ?, status = 'in_progress', updated_at = ?, started_at = ?, %s, %s
 			WHERE id = ? AND status = 'open' AND (assignee = '' OR assignee IS NULL OR assignee = ?)
-		`, issueTable, leaseClause), args...)
+		`, issueTable, fenceBumpExpr, leaseClause), args...)
 	} else {
 		args := append([]interface{}{actor, now}, leaseArgs...)
 		args = append(args, id, actor)
 		result, err = tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE %s
-			SET assignee = ?, status = 'in_progress', updated_at = ?, %s
+			SET assignee = ?, status = 'in_progress', updated_at = ?, %s, %s
 			WHERE id = ? AND status = 'open' AND (assignee = '' OR assignee IS NULL OR assignee = ?)
-		`, issueTable, leaseClause), args...)
+		`, issueTable, fenceBumpExpr, leaseClause), args...)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to claim issue: %w", err)
