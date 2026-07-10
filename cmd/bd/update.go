@@ -350,7 +350,10 @@ create, update, show, or close operation).`,
 			if ttl <= 0 {
 				return HandleErrorRespectJSON("--lease-ttl must be positive")
 			}
-			claimCtx = issueops.WithLeaseTTL(ctx, ttl)
+			claimCtx = issueops.WithLeaseTTL(claimCtx, ttl)
+		}
+		if claimFlag {
+			claimCtx = issueops.WithHolderToken(claimCtx, holderTokenFromEnv())
 		}
 
 		updatedIssues := []*types.Issue{}

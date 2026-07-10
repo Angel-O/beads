@@ -59,11 +59,18 @@ const upsertAssigneeChanged = "COALESCE(assignee, '') <> COALESCE(VALUES(assigne
 // assignments: the assignee only actually changes when the incoming row is
 // strictly newer, so the fence only moves then too.
 func UpsertFenceAssignments(rejectStaleUpdate bool) (string, []any) {
+	// An import that changes the owner also clears holder_token: a foreign
+	// import cannot carry a valid incarnation token for the new owner, and a
+	// leftover token would lock the new owner out under enforcement. Same
+	// change-condition as the fence bump.
 	if rejectStaleUpdate {
-		return "claim_fence = claim_fence + IF(VALUES(updated_at) > updated_at AND " + upsertAssigneeChanged + ", 1, 0),\n\t\t\t" +
-			"row_lock = IF(VALUES(updated_at) > updated_at AND " + upsertAssigneeChanged + ", ?, row_lock)", []any{freshRowLock()}
+		cond := "VALUES(updated_at) > updated_at AND " + upsertAssigneeChanged
+		return "claim_fence = claim_fence + IF(" + cond + ", 1, 0),\n\t\t\t" +
+			"holder_token = IF(" + cond + ", '', holder_token),\n\t\t\t" +
+			"row_lock = IF(" + cond + ", ?, row_lock)", []any{freshRowLock()}
 	}
 	return "claim_fence = claim_fence + IF(" + upsertAssigneeChanged + ", 1, 0),\n\t\t\t" +
+		"holder_token = IF(" + upsertAssigneeChanged + ", '', holder_token),\n\t\t\t" +
 		"row_lock = IF(" + upsertAssigneeChanged + ", ?, row_lock)", []any{freshRowLock()}
 }
 

@@ -211,7 +211,7 @@ This is useful for agents executing molecules to see which steps can run next.`,
 		}
 
 		if claimReady {
-			claimCtx := ctx
+			claimCtx := issueops.WithHolderToken(ctx, holderTokenFromEnv())
 			if cmd.Flags().Changed("lease-ttl") {
 				ttl, _ := cmd.Flags().GetDuration("lease-ttl")
 				if ttl <= 0 {
@@ -219,7 +219,7 @@ This is useful for agents executing molecules to see which steps can run next.`,
 				}
 				// Explicitly requested lease: stamps even on stores with
 				// lease.auto=off (the requested-lease opt-in).
-				claimCtx = issueops.WithLeaseTTL(ctx, ttl)
+				claimCtx = issueops.WithLeaseTTL(claimCtx, ttl)
 			}
 			claimed, err := activeStore.ClaimReadyIssue(claimCtx, filter, actor)
 			if err != nil {

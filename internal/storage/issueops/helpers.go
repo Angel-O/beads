@@ -119,6 +119,13 @@ func insertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *
 		// the ownership fence instead of resetting it to the column default;
 		// on the duplicate-key path the fence is governed solely by the
 		// assignee-change bump in issueUpsertAssignments, never overwritten.
+		// holder_token is DELIBERATELY not carried here: it is not a
+		// types.Issue field (never surfaced, D12), so a fresh insert resets it
+		// to '' — a moved or imported row gets no incarnation token until it
+		// is re-claimed. On a same-DB promote/demote of a claimed row this
+		// costs one empty_token_legacy advisory event on the holder's next
+		// in-place write; that noise is accepted rather than widening the
+		// token's read surface to carry it.
 		issue.ClaimFence,
 	}
 	args = append(args, upsertArgs...)

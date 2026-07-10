@@ -32,6 +32,26 @@ func closeIssueInTx(ctx context.Context, tx DBTX, id string, reason, actor, sess
 	isWisp := IsActiveWispInTx(ctx, tx, id)
 	issueTable, _, eventTable, _ := WispTableRouting(isWisp)
 
+	// Capture pre-close ownership for advisory telemetry (close destroys the
+	// old status). Gated on enforcement so an off store pays only one config
+	// read.
+	var advisoryOldAssignee string
+	var advisoryOldStatus types.Status
+	advisoryOn, err := EnforcementIsAdvisory(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if advisoryOn {
+		// A targeted read of just the ownership cells — not a full GetIssueInTx
+		// hydrate (which also fans out to labels and probes wisps).
+		var assignee, status sql.NullString
+		//nolint:gosec // G201: issueTable comes from WispTableRouting (hardcoded constants)
+		if perr := tx.QueryRowContext(ctx, fmt.Sprintf(
+			`SELECT assignee, status FROM %s WHERE id = ?`, issueTable), id).Scan(&assignee, &status); perr == nil {
+			advisoryOldAssignee, advisoryOldStatus = assignee.String, types.Status(status.String)
+		}
+	}
+
 	var affectedIssues, affectedWisps []string
 	var aerr error
 	if isWisp {
@@ -108,6 +128,15 @@ func closeIssueInTx(ctx context.Context, tx DBTX, id string, reason, actor, sess
 	if recordEvent {
 		if err := RecordEventInTable(ctx, tx, eventTable, id, types.EventClosed, actor, reason); err != nil {
 			return nil, fmt.Errorf("failed to record event: %w", err)
+		}
+	}
+
+	// Advisory telemetry: a close is an in-place completion of a claimed row.
+	// close leaves assignee/holder_token intact, so the token read inside the
+	// recorder still reflects the closing holder.
+	if advisoryOn && advisoryOldStatus == types.StatusInProgress && advisoryOldAssignee != "" {
+		if err := recordOwnershipAdvisory(ctx, tx, issueTable, eventTable, id, actor, advisoryOldAssignee); err != nil {
+			return nil, err
 		}
 	}
 

@@ -61,6 +61,11 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 		return nil, fmt.Errorf("resolve claim lease: %w", err)
 	}
 
+	// Record the caller's incarnation token (empty when the caller supplied
+	// none — a tokenless/legacy claim). The token distinguishes runtime
+	// incarnations of a re-used assignee name; enforcement checks it.
+	holderToken := holderTokenFrom(ctx)
+
 	// Conditional UPDATE: only succeeds while the issue is still claimable.
 	// Also set started_at on first transition to in_progress (GH#2796); preserve
 	// any existing value so re-claims don't overwrite the original start time.
@@ -68,19 +73,19 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 		result sql.Result
 	)
 	if oldIssue.StartedAt == nil {
-		args := append([]interface{}{actor, now, now}, leaseArgs...)
+		args := append([]interface{}{actor, holderToken, now, now}, leaseArgs...)
 		args = append(args, id, actor)
 		result, err = tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE %s
-			SET assignee = ?, status = 'in_progress', updated_at = ?, started_at = ?, %s, %s
+			SET assignee = ?, holder_token = ?, status = 'in_progress', updated_at = ?, started_at = ?, %s, %s
 			WHERE id = ? AND status = 'open' AND (assignee = '' OR assignee IS NULL OR assignee = ?)
 		`, issueTable, fenceBumpExpr, leaseClause), args...)
 	} else {
-		args := append([]interface{}{actor, now}, leaseArgs...)
+		args := append([]interface{}{actor, holderToken, now}, leaseArgs...)
 		args = append(args, id, actor)
 		result, err = tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE %s
-			SET assignee = ?, status = 'in_progress', updated_at = ?, %s, %s
+			SET assignee = ?, holder_token = ?, status = 'in_progress', updated_at = ?, %s, %s
 			WHERE id = ? AND status = 'open' AND (assignee = '' OR assignee IS NULL OR assignee = ?)
 		`, issueTable, fenceBumpExpr, leaseClause), args...)
 	}
@@ -110,6 +115,22 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 		// This supports agent retry workflows where claim may be called multiple
 		// times after transient failures (GH#8).
 		if assignee == actor && currentStatus == types.StatusInProgress {
+			// A re-claim by the same actor is an ownership re-assertion: refresh
+			// the holder token so the CURRENT incarnation owns it. Without this a
+			// fresh incarnation of a re-used session name, re-claiming its own
+			// in_progress work through the idempotent path, would keep a prior
+			// incarnation's token and then classify as a zombie against its own
+			// bead — inverting the advisory signal. Only a token-bearing caller
+			// refreshes (a tokenless re-claim must not wipe a live token). Not an
+			// ownership transition — no fence bump. (A-B3b replaces this with a
+			// fenced incarnation_conflict under require mode.)
+			if holderToken != "" {
+				if _, uerr := tx.ExecContext(ctx, fmt.Sprintf(
+					`UPDATE %s SET holder_token = ? WHERE id = ? AND assignee = ? AND status = 'in_progress'`,
+					issueTable), holderToken, id, actor); uerr != nil {
+					return nil, fmt.Errorf("refresh holder token: %w", uerr)
+				}
+			}
 			return &ClaimResult{OldIssue: oldIssue, IsWisp: isWisp}, nil
 		}
 		if assignee != "" && assignee != actor {

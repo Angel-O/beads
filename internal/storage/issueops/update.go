@@ -269,7 +269,11 @@ func updateIssueInTx(ctx context.Context, tx DBTX, id string, updates map[string
 	// bump⇒row_lock pairing invariant holds because row_lock is rewritten
 	// unconditionally just below.
 	if IsOwnershipTransition(oldIssue.Status, oldIssue.Assignee, updates) {
-		setClauses = append(setClauses, fenceBumpExpr)
+		// A transition also clears holder_token: on an assignee change the new
+		// owner has no valid prior token, and a leftover would lock it out
+		// under enforcement (a reassignment is not a token-bearing claim). The
+		// next claim/adoption re-stamps a token.
+		setClauses = append(setClauses, fenceBumpExpr, "holder_token = ''")
 	}
 
 	// Rewrite row_lock on every update so a concurrent lease mutation (heartbeat/
@@ -312,6 +316,16 @@ func updateIssueInTx(ctx context.Context, tx DBTX, id string, updates map[string
 
 		if err := RecordFullEventInTable(ctx, tx, eventTable, id, eventType, actor, string(oldData), string(newData)); err != nil {
 			return nil, fmt.Errorf("failed to record event: %w", err)
+		}
+	}
+
+	// Advisory ownership telemetry: an in-place mutation (not an ownership
+	// transition — the fence covers those) of a row someone else holds is
+	// recorded for the enforcement rollout. Scope is judged from the
+	// pre-mutation ownership.
+	if !IsOwnershipTransition(oldIssue.Status, oldIssue.Assignee, updates) {
+		if err := RecordOwnershipAdvisoryIfMismatch(ctx, tx, issueTable, eventTable, id, actor, oldIssue.Assignee, oldIssue.Status); err != nil {
+			return nil, err
 		}
 	}
 

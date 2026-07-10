@@ -92,7 +92,7 @@ func UnclaimIssueInTx(ctx context.Context, tx *sql.Tx, id string, actor string, 
 	args = append(args, guardArgs...)
 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE %s
-		SET assignee = '', status = 'open', updated_at = ?,
+		SET assignee = '', holder_token = '', status = 'open', updated_at = ?,
 		    lease_expires_at = NULL, heartbeat_at = NULL, started_at = NULL,
 		    claim_fence = claim_fence + 1, row_lock = ?
 		WHERE id = ? AND status IN ('open', 'in_progress') %s%s

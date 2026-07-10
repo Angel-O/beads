@@ -130,7 +130,10 @@ func (r *issueSQLRepositoryImpl) Update(ctx context.Context, id string, updates 
 	// predicate so the two dispatch layers cannot drift (see issueops/fence.go).
 	rowLockRewritten := false
 	if issueops.IsOwnershipTransition(oldStatus, oldAssignee.String, updates) {
-		setClauses = append(setClauses, issueops.FenceBumpExpr, "row_lock = ?")
+		// A transition through the proxied path also clears holder_token when
+		// the assignee changes (the new owner has no valid prior token), matching
+		// issueops. Reopen keeps the token empty via the same clear.
+		setClauses = append(setClauses, issueops.FenceBumpExpr, "holder_token = ''", "row_lock = ?")
 		args = append(args, issueops.FreshRowLock())
 		rowLockRewritten = true
 	}
@@ -233,23 +236,27 @@ func (r *issueSQLRepositoryImpl) Claim(ctx context.Context, id, actor string, op
 		return domain.ClaimRowResult{}, fmt.Errorf("db: Claim %s: %w", id, err)
 	}
 
+	// Record the caller's incarnation token, matching issueops.ClaimIssueInTx
+	// so the proxied path keeps the same enforcement discipline.
+	holderToken := issueops.HolderTokenFrom(ctx)
+
 	var res sql.Result
 	if startedWasZero {
-		args := append([]any{actor, now, now}, leaseArgs...)
+		args := append([]any{actor, holderToken, now, now}, leaseArgs...)
 		args = append(args, id, actor)
 		//nolint:gosec // G201: table is one of two hardcoded constants
 		res, err = r.runner.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE %s
-			SET assignee = ?, status = 'in_progress', updated_at = ?, started_at = ?, %s, %s
+			SET assignee = ?, holder_token = ?, status = 'in_progress', updated_at = ?, started_at = ?, %s, %s
 			WHERE id = ? AND status = 'open' AND (assignee = '' OR assignee IS NULL OR assignee = ?)
 		`, table, issueops.FenceBumpExpr, leaseClause), args...)
 	} else {
-		args := append([]any{actor, now}, leaseArgs...)
+		args := append([]any{actor, holderToken, now}, leaseArgs...)
 		args = append(args, id, actor)
 		//nolint:gosec // G201: table is one of two hardcoded constants
 		res, err = r.runner.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE %s
-			SET assignee = ?, status = 'in_progress', updated_at = ?, %s, %s
+			SET assignee = ?, holder_token = ?, status = 'in_progress', updated_at = ?, %s, %s
 			WHERE id = ? AND status = 'open' AND (assignee = '' OR assignee IS NULL OR assignee = ?)
 		`, table, issueops.FenceBumpExpr, leaseClause), args...)
 	}
@@ -273,6 +280,16 @@ func (r *issueSQLRepositoryImpl) Claim(ctx context.Context, id, actor string, op
 		assignee := ""
 		if currentAssignee.Valid {
 			assignee = currentAssignee.String
+		}
+		// Match issueops: an idempotent same-actor re-claim refreshes the
+		// holder token so the current incarnation owns it (proxied parity).
+		if assignee == actor && currentStatus == types.StatusInProgress && holderToken != "" {
+			//nolint:gosec // G201: table is one of two hardcoded constants
+			if _, uerr := r.runner.ExecContext(ctx, fmt.Sprintf(
+				`UPDATE %s SET holder_token = ? WHERE id = ? AND assignee = ? AND status = 'in_progress'`, table),
+				holderToken, id, actor); uerr != nil {
+				return domain.ClaimRowResult{}, fmt.Errorf("db: Claim %s: refresh holder token: %w", id, uerr)
+			}
 		}
 		return domain.ClaimRowResult{
 			Updated:          false,

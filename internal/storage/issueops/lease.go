@@ -358,7 +358,7 @@ func reclaimExpiredInTable(ctx context.Context, tx DBTX, issueTable, eventTable 
 		// writer conflict; this WHERE makes a winning racer's rescue stick.
 		res, err := tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE %s
-			SET status = 'open', assignee = NULL, started_at = NULL,
+			SET status = 'open', assignee = NULL, holder_token = '', started_at = NULL,
 			    lease_expires_at = NULL, heartbeat_at = NULL,
 			    claim_fence = claim_fence + 1,
 			    updated_at = ?, row_lock = ?
