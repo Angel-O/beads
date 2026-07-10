@@ -115,7 +115,12 @@ func dsnPasswordValues(dsn string) []string {
 	if u, err := url.Parse(dsn); err == nil && u.Scheme != "" {
 		if u.User != nil {
 			if pw, ok := u.User.Password(); ok {
+				// url.Parse percent-decodes userinfo, so u.User.Password() is only
+				// the decoded value. pgx and telemetry sinks echo the DSN verbatim,
+				// so also scrub the raw as-written form — mirroring the query-param
+				// branch below, which adds both raw and decoded values.
 				add(pw)
+				add(rawURLUserinfoPassword(dsn))
 			}
 		}
 		// pgx echoes the raw query string back verbatim, so match the raw value;
@@ -139,4 +144,31 @@ func dsnPasswordValues(dsn string) []string {
 		add(m[2]) // unquoted token
 	}
 	return vals
+}
+
+// rawURLUserinfoPassword returns the userinfo password of a URL-form DSN exactly
+// as written — still percent-encoded — or "" when there is none. url.Parse decodes
+// userinfo, so an encoded secret like SUPER%2ASECRET survives verbatim when a sink
+// echoes the raw DSN; extracting it structurally here (rather than re-encoding the
+// decoded value) captures the original bytes regardless of encoding form. Mirrors
+// the authority split url.Parse performs: password is after the first ':' of the
+// userinfo, which is everything before the last '@' of the authority.
+func rawURLUserinfoPassword(dsn string) string {
+	i := strings.Index(dsn, "://")
+	if i < 0 {
+		return ""
+	}
+	authority := dsn[i+len("://"):]
+	if j := strings.IndexAny(authority, "/?#"); j >= 0 {
+		authority = authority[:j]
+	}
+	at := strings.LastIndex(authority, "@")
+	if at < 0 {
+		return ""
+	}
+	_, pw, ok := strings.Cut(authority[:at], ":")
+	if !ok {
+		return ""
+	}
+	return pw
 }

@@ -23,6 +23,7 @@ func TestScrubDSNError(t *testing.T) {
 		{"url query sslpassword", "postgres://u@h:5432/db?sslpassword=" + secret + "&sslmode=require"},
 		{"url query param encoded", "postgres://u@h:5432/db?password=SUPER%2ASECRET"},
 		{"url userinfo", "postgres://u:" + secret + "@h:5432/db"},
+		{"url userinfo encoded", "postgres://u:SUPER%2ASECRET@h:5432/db"},
 		{"libpq keyword", "host=h user=u password=" + secret + " dbname=db"},
 		{"libpq keyword quoted", "host=h user=u password='" + secret + "' dbname=db"},
 		{"libpq sslpassword", "host=h user=u sslpassword=" + secret + " dbname=db"},
@@ -53,11 +54,13 @@ func TestScrubDSNError(t *testing.T) {
 // telemetry scrubber depends on this function, not on ScrubDSNError.
 func TestScrubDSNString(t *testing.T) {
 	const secret = "SUPERSECRET"
+	leakForms := []string{secret, "SUPER%2ASECRET", "SUPER*SECRET"}
 	cases := []struct {
 		name string
 		dsn  string
 	}{
 		{"url userinfo", "postgres://u:" + secret + "@h:5432/db"},
+		{"url userinfo encoded", "postgres://u:SUPER%2ASECRET@h:5432/db"},
 		{"url query param", "postgres://u@h:5432/db?password=" + secret},
 		{"url sslpassword", "postgres://u@h:5432/db?sslpassword=" + secret + "&sslmode=require"},
 		{"libpq keyword", "host=h user=u password=" + secret + " dbname=db"},
@@ -66,8 +69,10 @@ func TestScrubDSNString(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := ScrubDSNString(tc.dsn, tc.dsn)
-			if strings.Contains(got, secret) {
-				t.Errorf("ScrubDSNString(%q) still leaks password: %q", tc.dsn, got)
+			for _, form := range leakForms {
+				if strings.Contains(got, form) {
+					t.Errorf("ScrubDSNString(%q) still leaks password (%q): %q", tc.dsn, form, got)
+				}
 			}
 			if !strings.Contains(got, "xxxxx") {
 				t.Errorf("ScrubDSNString(%q) did not redact: %q", tc.dsn, got)
