@@ -30,11 +30,11 @@ func TestUpsertRevisionIsTwoSided(t *testing.T) {
 		t.Fatalf("updated_at must be the last upsert column, got %q last in %v", last, issueUpsertColumns)
 	}
 
-	if plain := issueUpsertAssignments(false); !strings.Contains(plain, "revision = VALUES(revision)") {
+	if plain := issueUpsertAssignments("issues", false); !strings.Contains(plain, "revision = VALUES(revision)") {
 		t.Errorf("plain upsert must set revision = VALUES(revision), got:\n%s", plain)
 	}
-	if stale := issueUpsertAssignments(true); !strings.Contains(stale,
-		"revision = IF(VALUES(updated_at) > updated_at, VALUES(revision), revision)") {
+	if stale := issueUpsertAssignments("issues", true); !strings.Contains(stale,
+		"revision = IF(VALUES(updated_at) > issues.updated_at, VALUES(revision), issues.revision)") {
 		t.Errorf("rejectStale upsert must guard revision by updated_at, got:\n%s", stale)
 	}
 }
