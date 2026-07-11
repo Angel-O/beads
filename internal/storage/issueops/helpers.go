@@ -77,7 +77,7 @@ var issueUpsertColumns = []string{
 // Tie rows are deliberately NOT short-circuited by the staleRejected
 // pre-check in InsertIssueIfNew, so their aux data (labels/comments/deps,
 // which never bump updated_at) still merges additively.
-func issueUpsertAssignments(rejectStaleUpdate bool) (string, []any) {
+func issueUpsertAssignments(table string, rejectStaleUpdate bool) (string, []any) {
 	assignments := make([]string, 0, len(issueUpsertColumns)+1)
 	// Ownership-fence discipline on import/sync (see fence.go): the fence
 	// fragment comes FIRST so its assignee/updated_at comparisons see
@@ -87,8 +87,12 @@ func issueUpsertAssignments(rejectStaleUpdate bool) (string, []any) {
 	assignments = append(assignments, fenceAssignments)
 	for _, col := range issueUpsertColumns {
 		if rejectStaleUpdate {
+			// Qualify the existing-row references with the table name. Postgres's
+			// ON CONFLICT DO UPDATE rejects a bare `updated_at` as ambiguous (it could
+			// be the target row or EXCLUDED); <table>.updated_at is unambiguous and is
+			// also accepted by MySQL/Dolt/SQLite. VALUES(...) is the incoming row.
 			assignments = append(assignments,
-				fmt.Sprintf("%s = IF(VALUES(updated_at) > updated_at, VALUES(%s), %s)", col, col, col))
+				fmt.Sprintf("%s = IF(VALUES(updated_at) > %s.updated_at, VALUES(%s), %s.%s)", col, table, col, table, col))
 		} else {
 			assignments = append(assignments, fmt.Sprintf("%s = VALUES(%s)", col, col))
 		}
@@ -104,7 +108,7 @@ func InsertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *
 
 //nolint:gosec // G201: table is a hardcoded constant ("issues" or "wisps")
 func insertIssueIntoTable(ctx context.Context, tx *sql.Tx, table string, issue *types.Issue, rejectStaleUpdate bool) error {
-	upsertAssignments, upsertArgs := issueUpsertAssignments(rejectStaleUpdate)
+	upsertAssignments, upsertArgs := issueUpsertAssignments(table, rejectStaleUpdate)
 	args := []any{
 		issue.ID, issue.ContentHash, issue.Title, issue.Description, issue.Design, issue.AcceptanceCriteria, issue.Notes,
 		issue.Status, issue.Priority, issue.IssueType, NullString(issue.Assignee), NullInt(issue.EstimatedMinutes),

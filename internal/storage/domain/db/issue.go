@@ -91,8 +91,33 @@ func (r *issueSQLRepositoryImpl) Update(ctx context.Context, id string, updates 
 		return nil
 	}
 
-	setClauses := make([]string, 0, len(updates))
-	args := make([]any, 0, len(updates)+1)
+	table := pickIssueTable(opts.UseWispsTable)
+
+	_, statusChanging := updates["status"]
+	_, assigneeChanging := updates["assignee"]
+
+	// When the status or assignee changes we need the prior row. Status drives
+	// the embedded lifecycle side effects (issueops.updateIssueInTx): closed_at
+	// is set on close and cleared on reopen, started_at is set on the
+	// in_progress transition, the audit event type is derived from the
+	// transition, and is_blocked is recomputed for neighbors. The old
+	// status+assignee also decide whether this write is an ownership transition
+	// (see issueops/fence.go). Read the full old issue once so every consumer
+	// uses the same snapshot; the ErrNoRows contract is preserved.
+	var oldIssue *types.Issue
+	if statusChanging || assigneeChanging {
+		var err error
+		oldIssue, err = r.Get(ctx, id, opts)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("db: Update %s: %w", id, sql.ErrNoRows)
+			}
+			return fmt.Errorf("db: Update %s: read old issue: %w", id, err)
+		}
+	}
+
+	setClauses := make([]string, 0, len(updates)+3)
+	args := make([]any, 0, len(updates)+4)
 	for key, value := range updates {
 		if _, ok := allowedUpdateFields[key]; !ok {
 			return fmt.Errorf("db: Update: field %q is not allowed", key)
@@ -107,29 +132,21 @@ func (r *issueSQLRepositoryImpl) Update(ctx context.Context, id string, updates 
 	setClauses = append(setClauses, "updated_at = ?")
 	args = append(args, time.Now().UTC())
 
-	table := pickIssueTable(opts.UseWispsTable)
-
-	var oldStatus types.Status
-	var oldAssignee sql.NullString
-	_, statusChanging := updates["status"]
-	_, assigneeChanging := updates["assignee"]
-	if statusChanging || assigneeChanging {
-		//nolint:gosec // G201: table is one of two hardcoded constants
-		if err := r.runner.QueryRowContext(ctx,
-			fmt.Sprintf("SELECT status, assignee FROM %s WHERE id = ?", table), id,
-		).Scan(&oldStatus, &oldAssignee); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("db: Update %s: %w", id, sql.ErrNoRows)
-			}
-			return fmt.Errorf("db: Update %s: read old status: %w", id, err)
-		}
+	// Lifecycle parity with issueops.updateIssueInTx: auto-manage closed_at and
+	// started_at from the status transition unless the caller set them
+	// explicitly. Both helpers no-op when the status is unchanged.
+	if statusChanging {
+		setClauses, args = issueops.ManageClosedAt(oldIssue, updates, setClauses, args)
+		setClauses, args = issueops.ManageStartedAt(oldIssue, updates, setClauses, args)
 	}
 
 	// Ownership transitions bump the fence, paired with a row_lock rewrite in
 	// the same statement — the proxied path shares issueops' transition
 	// predicate so the two dispatch layers cannot drift (see issueops/fence.go).
+	// oldIssue is read above whenever the status or assignee changes, which
+	// covers every ownership transition (assignee change or reopen).
 	rowLockRewritten := false
-	if issueops.IsOwnershipTransition(oldStatus, oldAssignee.String, updates) {
+	if oldIssue != nil && issueops.IsOwnershipTransition(oldIssue.Status, oldIssue.Assignee, updates) {
 		// A transition through the proxied path also clears holder_token when
 		// the assignee changes (the new owner has no valid prior token), matching
 		// issueops. Reopen keeps the token empty via the same clear.
@@ -168,9 +185,16 @@ func (r *issueSQLRepositoryImpl) Update(ctx context.Context, id string, updates 
 		return fmt.Errorf("db: Update %s: %w", id, sql.ErrNoRows)
 	}
 
+	// Event-type parity: embedded records EventClosed / EventReopened /
+	// EventStatusChanged for status transitions (issueops.DetermineEventType),
+	// EventUpdated otherwise.
+	eventType := types.EventUpdated
+	if statusChanging {
+		eventType = issueops.DetermineEventType(oldIssue, updates)
+	}
 	if err := r.events.Record(ctx, domain.Event{
 		IssueID: id,
-		Type:    types.EventUpdated,
+		Type:    eventType,
 		Actor:   actor,
 	}, domain.RecordEventOpts{UseWispsTable: opts.UseWispsTable}); err != nil {
 		return err
@@ -178,7 +202,7 @@ func (r *issueSQLRepositoryImpl) Update(ctx context.Context, id string, updates 
 
 	if statusChanging {
 		newStatus := coerceStatus(updates["status"])
-		oldActive := oldStatus != types.StatusClosed && oldStatus != types.StatusPinned
+		oldActive := oldIssue.Status != types.StatusClosed && oldIssue.Status != types.StatusPinned
 		newActive := newStatus != types.StatusClosed && newStatus != types.StatusPinned
 		if oldActive != newActive {
 			var (
