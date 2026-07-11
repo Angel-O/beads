@@ -26,7 +26,11 @@ var updateCmd = &cobra.Command{
 	Long: `Update one or more issues.
 
 If no issue ID is provided, updates the last touched issue (from most recent
-create, update, show, or close operation).`,
+create, update, show, or close operation).
+
+Updates are applied per issue ID, not atomically across IDs: when some IDs
+fail, the remaining issues are still updated, every failed ID is reported on
+stderr, and the command exits nonzero.`,
 	Args:          cobra.MinimumNArgs(0),
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -314,6 +318,10 @@ create, update, show, or close operation).`,
 
 		updatedIssues := []*types.Issue{}
 		var firstUpdatedID string // Track first successful update for last-touched
+		var failures []updateIDFailure
+		recordFailure := func(id, reason string) {
+			failures = append(failures, updateIDFailure{ID: id, Error: reason})
+		}
 		mutatedStores := map[storage.DoltStorage][]string{}
 		mutatedResults := map[*RoutedResult]bool{}
 		pendingCloseResults := []*RoutedResult{}
@@ -350,6 +358,7 @@ create, update, show, or close operation).`,
 					result.Close()
 				}
 				fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", id, err)
+				recordFailure(id, fmt.Sprintf("resolving issue: %v", err))
 				continue
 			}
 			if result == nil || result.Issue == nil {
@@ -357,6 +366,7 @@ create, update, show, or close operation).`,
 					result.Close()
 				}
 				fmt.Fprintf(os.Stderr, "Issue %s not found\n", id)
+				recordFailure(id, "issue not found")
 				continue
 			}
 			issue := result.Issue
@@ -364,6 +374,7 @@ create, update, show, or close operation).`,
 
 			if err := validateIssueUpdatable(id, issue); err != nil {
 				fmt.Fprintf(os.Stderr, "%s\n", err)
+				recordFailure(id, err.Error())
 				closeIfUnmutated(result)
 				continue
 			}
@@ -372,6 +383,7 @@ create, update, show, or close operation).`,
 			if claimFlag {
 				if err := issueStore.ClaimIssue(ctx, result.ResolvedID, actor); err != nil {
 					fmt.Fprintf(os.Stderr, "Error claiming %s: %v\n", id, err)
+					recordFailure(id, fmt.Sprintf("claiming issue: %v", err))
 					closeIfUnmutated(result)
 					continue
 				}
@@ -422,6 +434,7 @@ create, update, show, or close operation).`,
 			if len(regularUpdates) > 0 {
 				if err := issueStore.UpdateIssue(ctx, result.ResolvedID, regularUpdates, actor); err != nil {
 					fmt.Fprintf(os.Stderr, "Error updating %s: %v\n", id, err)
+					recordFailure(id, fmt.Sprintf("updating issue: %v", err))
 					closeIfUnmutated(result)
 					continue
 				}
@@ -452,6 +465,7 @@ create, update, show, or close operation).`,
 			if len(setLabels) > 0 || len(addLabels) > 0 || len(removeLabels) > 0 {
 				if err := applyLabelUpdates(ctx, issueStore, result.ResolvedID, actor, setLabels, addLabels, removeLabels); err != nil {
 					fmt.Fprintf(os.Stderr, "Error updating labels for %s: %v\n", id, err)
+					recordFailure(id, fmt.Sprintf("updating labels: %v", err))
 					closeIfUnmutated(result)
 					continue
 				}
@@ -465,11 +479,13 @@ create, update, show, or close operation).`,
 					parentIssue, err := issueStore.GetIssue(ctx, newParent)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "Error getting parent %s: %v\n", newParent, err)
+						recordFailure(id, fmt.Sprintf("getting parent %s: %v", newParent, err))
 						closeIfUnmutated(result)
 						continue
 					}
 					if parentIssue == nil {
 						fmt.Fprintf(os.Stderr, "Error: parent issue %s not found\n", newParent)
+						recordFailure(id, fmt.Sprintf("parent issue %s not found", newParent))
 						closeIfUnmutated(result)
 						continue
 					}
@@ -479,6 +495,7 @@ create, update, show, or close operation).`,
 				deps, err := issueStore.GetDependencyRecords(ctx, result.ResolvedID)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error getting dependencies for %s: %v\n", id, err)
+					recordFailure(id, fmt.Sprintf("getting dependencies: %v", err))
 					closeIfUnmutated(result)
 					continue
 				}
@@ -502,6 +519,7 @@ create, update, show, or close operation).`,
 					}
 					if err := issueStore.AddDependency(ctx, newDep, actor); err != nil {
 						fmt.Fprintf(os.Stderr, "Error adding parent dependency: %v\n", err)
+						recordFailure(id, fmt.Sprintf("adding parent dependency: %v", err))
 						closeIfUnmutated(result)
 						continue
 					}
@@ -558,11 +576,61 @@ create, update, show, or close operation).`,
 			}
 		}
 
-		if len(args) > 0 && firstUpdatedID == "" {
-			return SilentExit()
+		// Updates are per-ID, not atomic across IDs: successful updates above
+		// stay applied (and committed), but any per-ID failure must surface as
+		// a nonzero exit so callers can detect a partial batch (GH audit:
+		// multi-ID update used to exit 0 after mid-batch failures).
+		if len(failures) > 0 {
+			return reportUpdateFailures(failures, len(args))
 		}
 		return nil
 	},
+}
+
+// updateIDFailure records one issue ID that could not be updated and why.
+type updateIDFailure struct {
+	ID    string `json:"id"`
+	Error string `json:"error"`
+}
+
+// reportUpdateFailures emits a per-ID failure report on stderr and returns a
+// nonzero exit error. In --json mode the report is a single compact JSON
+// line — the last line on stderr — so callers can parse which IDs failed
+// while stdout keeps the plain array-of-updated-issues success shape. In
+// text mode the individual errors were already printed inline; this adds a
+// summary naming every failed ID.
+func reportUpdateFailures(failures []updateIDFailure, total int) error {
+	msg := fmt.Sprintf("%d of %d issues failed to update", len(failures), total)
+	if jsonOutput {
+		inner := map[string]interface{}{
+			"error":  msg,
+			"failed": failures,
+		}
+		var payload interface{}
+		if jsonEnvelopeEnabled() {
+			payload = map[string]interface{}{
+				"schema_version": JSONSchemaVersion,
+				"data":           inner,
+			}
+		} else {
+			inner["schema_version"] = JSONSchemaVersion
+			payload = inner
+		}
+		data, err := json.Marshal(payload)
+		if err != nil {
+			// Marshaling flat strings cannot realistically fail; fall back to
+			// the text summary rather than exiting silently.
+			fmt.Fprintf(os.Stderr, "Error: %s\n", msg)
+		} else {
+			fmt.Fprintln(os.Stderr, string(data))
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", msg)
+		for _, f := range failures {
+			fmt.Fprintf(os.Stderr, "  %s: %s\n", f.ID, f.Error)
+		}
+	}
+	return &exitError{Code: 1}
 }
 
 // mergeMetadata merges new metadata JSON into existing metadata.
