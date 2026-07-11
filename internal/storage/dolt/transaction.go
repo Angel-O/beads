@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -709,10 +710,93 @@ func (t *doltTransaction) AddDependencyWithOptions(ctx context.Context, dep *typ
 		SkipCycleCheck: addOpts.SkipCycleCheck,
 		TargetKind:     &kind,
 	}
-	if err := issueops.AddDependencyInTx(ctx, t.txFor(table), dep, actor, opts); err != nil {
-		return err
+
+	// Regular and dolt-ignored tables run on separate SQL sessions, so when
+	// the edge's write table and its target issue live in different tiers,
+	// target reads on the write tx cannot see a target created earlier in
+	// this same logical transaction (e.g. `bd create --deps blocks:<id>`
+	// swapping the new issue into the target slot). Read the target on its
+	// own tx and hand the row to AddDependencyInTx; check cycles on the
+	// merged two-session graph for the same reason.
+	if kind != issueops.DepTargetExternal && t.txFor(targetTable) != t.txFor(table) {
+		precheck, err := t.readDepTargetForPrecheck(ctx, targetTable, dep.DependsOnID)
+		if err != nil {
+			return err
+		}
+		opts.PrecheckedTarget = precheck
+		if !addOpts.SkipCycleCheck {
+			if err := t.checkCrossTierBlockingCycle(ctx, dep); err != nil {
+				return err
+			}
+			opts.SkipCycleCheck = true
+		}
+	}
+
+	var addErr error
+	if opts.PrecheckedTarget != nil && table == "wisp_dependencies" && kind == issueops.DepTargetIssue {
+		addErr = t.addWispDepSuspendingIssueTargetFK(ctx, dep, actor, opts)
+	} else {
+		addErr = issueops.AddDependencyInTx(ctx, t.txFor(table), dep, actor, opts)
+	}
+	if addErr != nil {
+		return addErr
 	}
 	t.dirty.MarkDirty(table)
+	return nil
+}
+
+// addWispDepSuspendingIssueTargetFK inserts a wisp-source dependency whose
+// target is a regular issue created earlier in this logical transaction.
+// wisp_dependencies carries a real FK (depends_on_issue_id -> issues), and
+// the ignored session cannot see an issues row still uncommitted on the
+// regular session, so the insert would fail FK validation even though the
+// target's existence was just validated on the regular tx. The regular tx
+// commits before the ignored tx, so the committed end-state always satisfies
+// the FK; suspend the session's FK checks around this one statement scope.
+func (t *doltTransaction) addWispDepSuspendingIssueTargetFK(ctx context.Context, dep *types.Dependency, actor string, opts issueops.AddDependencyOpts) error {
+	if _, err := t.ignoredTx.ExecContext(ctx, "SET foreign_key_checks = 0"); err != nil {
+		return fmt.Errorf("suspend foreign key checks for cross-tier dependency: %w", err)
+	}
+	addErr := issueops.AddDependencyInTx(ctx, t.ignoredTx, dep, actor, opts)
+	if _, err := t.ignoredTx.ExecContext(ctx, "SET foreign_key_checks = 1"); err != nil && addErr == nil {
+		addErr = fmt.Errorf("restore foreign key checks after cross-tier dependency: %w", err)
+	}
+	return addErr
+}
+
+// readDepTargetForPrecheck validates a dependency target on the transaction
+// that owns its table and returns the row fields AddDependencyInTx needs when
+// it cannot read the target itself (cross-tier edges).
+func (t *doltTransaction) readDepTargetForPrecheck(ctx context.Context, targetTable, id string) (*issueops.DepTargetPrecheck, error) {
+	var p issueops.DepTargetPrecheck
+	//nolint:gosec // G201: targetTable is "issues" or "wisps"
+	err := t.txFor(targetTable).QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT issue_type, status FROM %s WHERE id = ?`, targetTable), id,
+	).Scan(&p.IssueType, &p.Status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("issue %s not found", id)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to check target issue existence: %w", err)
+	}
+	return &p, nil
+}
+
+// checkCrossTierBlockingCycle rejects a blocking edge that would close a
+// cycle, using the merged view of both sessions' dependency tables. The
+// in-tx cycle check scans both tables on the write tx and so misses edges
+// added on the other session earlier in this logical transaction.
+func (t *doltTransaction) checkCrossTierBlockingCycle(ctx context.Context, dep *types.Dependency) error {
+	if dep.Type != types.DepBlocks && dep.Type != types.DepConditionalBlocks {
+		return nil
+	}
+	cycle, err := t.CycleThroughEdges(ctx, [][2]string{{dep.IssueID, dep.DependsOnID}})
+	if err != nil {
+		return err
+	}
+	if cycle != "" {
+		return fmt.Errorf("adding dependency would create a cycle")
+	}
 	return nil
 }
 
