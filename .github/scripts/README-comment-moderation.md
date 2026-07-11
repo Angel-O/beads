@@ -24,9 +24,12 @@ enforcement is ever wired up.
 - **SKIP** — bot/app author.
 
 Two corrections from adversarial review are baked in:
-1. github.com is not blanket-trusted — `/raw/`, `/blob/*?raw=true`, gist `/raw/`,
-   foreign `releases/download`, and `objects.githubusercontent.com` archives are
-   extension-gated, so hosting the zip on a throwaway repo doesn't evade it.
+1. github.com is not blanket-trusted — `/raw/` and `/blob/`, `user-attachments`
+   `files/` and `assets/`, gist archives, foreign `releases/download`, and
+   `objects.githubusercontent.com` (where downloads redirect) are all
+   extension-gated, so hosting the zip on a throwaway repo — or behind a URL
+   decoration like `?x=1`, a trailing slash, a protocol-relative `//host`, or a
+   trailing-dot FQDN — doesn't evade it.
 2. Timing and "third-party" never by themselves justify Tier A — a payload-
    specific signal is required, so an eager helper's `repro.zip` can't be
    auto-actioned.
@@ -37,9 +40,13 @@ Two corrections from adversarial review are baked in:
 python3 .github/scripts/moderate_comment.py --selftest
 ```
 
-Checks both real malware samples (→ A), three evasion variants (→ A), and the
-legitimate patterns (contributor `.tar.gz`, screenshots, logs, release links,
-self-issue `repro.zip`, bots) — none of which reach the destructive tier.
+Checks both real malware samples (→ A), the evasion variants (→ A: percent-
+encoded dot, masquerade double-extension, raw/blob hosting, `assets/` and
+object-store archives, and query/slash/protocol-relative/trailing-dot
+decorations), the legitimate patterns (contributor `.tar.gz`, screenshots,
+logs, release links, `/tree/` nav, self-issue `repro.zip`, bots) — none of
+which reach the destructive tier — plus a set of adversarial 65 536-char bodies
+that must score in well under the run budget (ReDoS guard).
 
 ## Graduating out of report-only (deliberate, staged)
 

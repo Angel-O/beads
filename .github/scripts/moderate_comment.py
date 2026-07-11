@@ -23,7 +23,6 @@ Inputs (all via env; the workflow injects them, never interpolated into shell):
 Run `moderate_comment.py --selftest` to check the logic against the real
 malicious samples and the known-legitimate patterns.
 """
-import base64
 import datetime as dt
 import html
 import json
@@ -33,7 +32,7 @@ import sys
 import unicodedata
 import urllib.parse
 
-OWN_ORG = "gastownhall"
+OWN_ORG = (os.environ.get("REPO_OWNER") or "gastownhall").lower()
 
 TRUSTED_FULL = {"OWNER", "MEMBER", "COLLABORATOR"}   # hard-exempt -> Tier C
 DOWNGRADE = {"CONTRIBUTOR"}                            # capped at Tier B
@@ -60,10 +59,15 @@ FILEHOSTS = {"mediafire.com", "anonfiles.com", "anonfile.com", "gofile.io",
              "litterbox.catbox.moe", "easyupload.io", "bayfiles.com",
              "dosya.co", "mega.nz", "telegra.ph", "t.me"}
 GH_MEDIA = {"camo.githubusercontent.com", "avatars.githubusercontent.com"}
-NAV_PREFIXES = ("/tree/", "/commit/", "/commits/", "/compare/", "/issues",
-                "/pull/", "/pulls", "/discussions", "/wiki", "/actions",
-                "/releases/tag/", "/releases/latest", "/blame/", "/graphs/",
-                "/labels", "/milestones", "/projects", "/security")
+# Third path segment of ordinary repo navigation pages (github.com/<owner>/
+# <repo>/<seg>/...). These are HTML views, not file downloads, so they are
+# allow-listed. NOT included: "raw" and "blob" — those serve/download the file
+# itself and are extension-gated separately.
+NAV_SEGMENTS = {"tree", "commit", "commits", "compare", "issues", "pull",
+                "pulls", "discussions", "wiki", "actions", "runs", "releases",
+                "blame", "graphs", "labels", "milestones", "projects",
+                "security", "settings", "branches", "tags", "network",
+                "pulse", "watchers", "stargazers", "forks"}
 
 BAIT_NAME = re.compile(
     r"(?i)(^|[\W_])(fix|patch|solution|update|crack|keygen|setup|install(er)?)"
@@ -75,7 +79,15 @@ STYLO = [re.compile(p, re.I) for p in (
     r"\bran into the same (thing|issue|problem)\b",
     r"\bI ended up \w+ing\b")]
 
-MD_LINK = re.compile(r"\[(?P<text>[^\]]*)\]\(\s*<?(?P<url>[^)\s<>]+)>?(?:\s+[\"'(][^)\"']*[\"')])?\s*\)")
+# Bounded quantifiers keep this linear: an unbounded [^\]]* rescans to EOF at
+# every "[" (quadratic ReDoS on bracket-flooded bodies up to GitHub's 65 536
+# char limit). Link text / url / title lengths are capped well above anything
+# a real markdown link needs, and newlines are excluded so a link can't span
+# the whole document.
+MD_LINK = re.compile(
+    r"\[(?P<text>[^\]\n]{0,1024})\]"
+    r"\(\s{0,8}<?(?P<url>[^)\s<>]{1,2048})>?"
+    r"(?:\s{1,8}[\"'(][^)\"'\n]{0,512}[\"')])?\s{0,8}\)")
 AUTOLINK = re.compile(r"<(?P<url>https?://[^>\s]+)>")
 HTML_URL = re.compile(r"<(?:a|img|source|video|iframe|form)\b[^>]*?\b(?:href|src|action)\s*=\s*"
                       r"(?:\"(?P<u1>[^\"]*)\"|'(?P<u2>[^']*)'|(?P<u3>[^\s>]+))", re.I)
@@ -85,24 +97,80 @@ ZERO_WIDTH = re.compile("[​‌‍﻿]")
 
 
 def normalize_url(u):
+    # NFKC + trailing-punctuation trim only. Deliberately does NOT percent-decode
+    # the whole URL before parsing: decoding %23/%3F/%2F into #, ?, / fabricates
+    # structural delimiters (e.g. evil%23.zip -> evil#.zip drops ".zip" into a
+    # fragment, defeating the extension gate). Percent-decoding happens per
+    # component, after parsing, in _last_segment().
     u = unicodedata.normalize("NFKC", u)
-    for _ in range(3):
-        d = urllib.parse.unquote(u)
-        if d == u:
-            break
-        u = d
     u = u.rstrip(".,;:!?\"'>]}")
     while u.endswith(")") and u.count("(") < u.count(")"):
         u = u[:-1]
     return u
 
 
+INLINE_CODE_WINDOW = 2048   # max span searched for a closing backtick run
+
+
 def code_regions(body):
+    """(start, end) byte spans covered by fenced code blocks or inline code.
+
+    Found with a single linear scan and no backreferences. A backtracking regex
+    here (the old ``(`+)...\\1`` form) can be driven to a multi-second timeout by
+    an adversarial — or just pasted — run of backticks, the same denial-of-service
+    class as the MD_LINK finding, so it must stay linear on untrusted input."""
+    n = len(body)
     regions = []
-    for m in re.finditer(r"(`{3,}|~{3,})[\s\S]*?\1", body):
-        regions.append((m.start(), m.end()))
-    for m in re.finditer(r"(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)", body):
-        regions.append((m.start(), m.end()))
+
+    # Fenced blocks: a line whose first non-space content is >=3 of ` or ~,
+    # closed by a later line opening with at least as many of the same char.
+    open_fence = None   # (char, count, start_offset)
+    off = 0
+    for line in body.splitlines(keepends=True):
+        stripped = line.lstrip(" ")
+        indent = len(line) - len(stripped)
+        ch = stripped[:1]
+        run = 0
+        if ch in ("`", "~"):
+            while run < len(stripped) and stripped[run] == ch:
+                run += 1
+        if open_fence is None:
+            if run >= 3 and indent <= 3:
+                open_fence = (ch, run, off)
+        elif ch == open_fence[0] and run >= open_fence[1] and not stripped[run:].strip():
+            regions.append((open_fence[2], off + len(line)))
+            open_fence = None
+        off += len(line)
+    if open_fence is not None:                 # unterminated fence runs to EOF
+        regions.append((open_fence[2], n))
+
+    # Inline spans: a run of N backticks closed by the next run of exactly N,
+    # searched within a bounded window so the whole scan stays linear.
+    i = 0
+    while i < n:
+        if body[i] != "`":
+            i += 1
+            continue
+        j = i
+        while j < n and body[j] == "`":
+            j += 1
+        open_len = j - i
+        limit = min(n, j + INLINE_CODE_WINDOW)
+        k, closed = j, False
+        while k < limit:
+            if body[k] != "`":
+                k += 1
+                continue
+            r = k
+            while r < n and body[r] == "`":
+                r += 1
+            if r - k == open_len:
+                regions.append((i, r))
+                i, closed = r, True
+                break
+            k = r
+        if not closed:
+            i = j
     return regions
 
 
@@ -151,8 +219,30 @@ def extract_urls(body):
     return out
 
 
+def _parse_url(raw):
+    """Parse a URL, normalizing protocol-relative and scheme-less forms so the
+    host lands in netloc rather than leaking into the path (finding #5)."""
+    if raw.startswith("//"):
+        raw = "https:" + raw            # //github.com/... -> https://github.com/...
+    elif "://" not in raw:
+        raw = "https://" + raw
+    return urllib.parse.urlparse(raw)
+
+
+def _last_segment(path):
+    """Last path segment, decoration-stripped: drop trailing slashes, take the
+    final segment, then percent-decode (so %2E -> '.' is seen) and trim trailing
+    punctuation. Query/fragment are already gone (urlparse split them off)."""
+    seg = path.rstrip("/").rsplit("/", 1)[-1]
+    return urllib.parse.unquote(seg).lower().rstrip(".,;:!?\"')]}")
+
+
+def basename_of(url):
+    return _last_segment(_parse_url(url).path)
+
+
 def ext_of(path):
-    base = urllib.parse.unquote(path).rsplit("/", 1)[-1].lower().rstrip(".,;:!?\"')]}")
+    base = _last_segment(path)
     for comp in ("tar.gz", "tar.xz", "tar.bz2"):
         if base.endswith("." + comp):
             return comp.split(".")[-1]
@@ -162,47 +252,69 @@ def ext_of(path):
 def classify(u):
     """Return (cls, score, flag_host). cls in {ALLOW, CORE, SUSP}."""
     raw = u["url"]
-    parsed = urllib.parse.urlparse(raw if "://" in raw else "https://" + raw)
+    parsed = _parse_url(raw)
     netloc = parsed.netloc
-    host = (parsed.hostname or "").lower()
+    host = (parsed.hostname or "").lower().rstrip(".")   # strip trailing-dot FQDN (finding #5)
     if host.startswith("www."):
         host = host[4:]
     path = parsed.path
-    ext = ext_of(parsed.path)
+    ext = ext_of(path)
 
     # look-alike / obfuscated hosts
     if "@" in netloc or host.startswith("xn--") or re.fullmatch(r"[\d.]+", host or "x"):
         return ("SUSP", 3, False)
 
     if host == "github.com":
-        if path.startswith("/user-attachments/assets/"):
-            return ("ALLOW", 0, False)
         if path.startswith("/user-attachments/files/"):          # the crux
             if ext in BLOCK_EXT:
                 return ("CORE", 5, False)
             if ext in ALLOW_EXT:
                 return ("ALLOW", 0, False)
             return ("SUSP", 2, False)
+        if path.startswith("/user-attachments/assets/"):
+            # assets/ are normally extensionless media UUIDs, but a concrete
+            # dangerous extension served here must still be gated (finding #3).
+            if ext in BLOCK_EXT:
+                return ("CORE", 5, False)
+            if ext in SUSP_EXT:
+                return ("SUSP", 2, False)
+            return ("ALLOW", 0, False)
         m = re.match(r"^/([^/]+)/[^/]+/releases/download/", path)
         if m:
             return ("ALLOW", 0, False) if m.group(1).lower() == OWN_ORG else ("SUSP", 1, False)
-        # correction #1: raw content on github.com is NOT auto-allowed
-        is_raw = path.startswith("/") and ("/raw/" in path or (re.search(r"/blob/", path) and "raw=true" in (parsed.query or "")))
-        if is_raw:
-            return ("CORE", 5, False) if ext in BLOCK_EXT else ("ALLOW", 0, False)
-        if any(path.startswith("/" + p.split("/")[1]) for p in NAV_PREFIXES) or re.match(r"^/[^/]+/[^/]+/blob/", path):
+        # correction #1: raw content on github.com is NOT auto-allowed. /blob/
+        # is gated the same as /raw/ (finding #2): the blob page has a one-click
+        # "Download raw", so an archive linked via /blob/ is the same payload
+        # vector — the old raw=true requirement was a trivial bypass.
+        if "/raw/" in path or "/blob/" in path:
+            if ext in BLOCK_EXT:
+                return ("CORE", 5, False)
+            if ext in SUSP_EXT:
+                return ("SUSP", 2, False)
+            return ("ALLOW", 0, False)
+        # ordinary repo navigation pages (/<owner>/<repo>/<seg>/...) are HTML
+        # views, not downloads (finding #7 — the old prefix test was dead code
+        # that also mis-allowed top-level paths like /pulls).
+        m_nav = re.match(r"^/[^/]+/[^/]+/([^/]+)", path)
+        if m_nav and m_nav.group(1).lower() in NAV_SEGMENTS:
             return ("ALLOW", 0, False)
         # unknown github.com path: allow unless it dangles a block-class file
         return ("SUSP", 2, False) if ext in BLOCK_EXT else ("ALLOW", 0, False)
 
     if host == "gist.github.com":
-        if "/raw/" in path or ext in BLOCK_EXT:
-            return ("CORE", 5, False) if ext in BLOCK_EXT else ("ALLOW", 0, False)
-        return ("ALLOW", 0, False)
+        # /raw/ guard was redundant with the fallthrough: CORE iff archive/exec.
+        return ("CORE", 5, False) if ext in BLOCK_EXT else ("ALLOW", 0, False)
     if host in GH_MEDIA:
         return ("ALLOW", 0, False)
     if host == "objects.githubusercontent.com":
-        return ("SUSP", 2, False) if ext in BLOCK_EXT else ("ALLOW", 0, False)
+        # user-attachments/files downloads redirect here; an archive served from
+        # the signed object store is the same payload, so escalate to CORE so it
+        # can reach the actionable tier (finding #4).
+        if ext in BLOCK_EXT:
+            return ("CORE", 5, False)
+        if ext in SUSP_EXT:
+            return ("SUSP", 2, False)
+        return ("ALLOW", 0, False)
     if host == "raw.githubusercontent.com":
         return ("CORE", 4, False) if ext in BLOCK_EXT else ("ALLOW", 0, False)
 
@@ -210,7 +322,7 @@ def classify(u):
         return ("CORE", 5, True)
     if host in ("cdn.discordapp.com", "media.discordapp.net"):
         return ("ALLOW", 0, False) if ext in {"png", "jpg", "jpeg", "gif", "webp"} else ("CORE", 5, True)
-    if host.endswith("dropbox.com"):
+    if host == "dropbox.com" or host.endswith(".dropbox.com"):   # dot boundary (finding #8)
         return ("CORE", 5, True) if ("dl=1" in (parsed.query or "") or "/scl/" in path) else ("SUSP", 2, False)
     if host == "drive.google.com":
         return ("SUSP", 3, False) if ("export=download" in (parsed.query or "") or path.startswith("/uc")) else ("SUSP", 1, False)
@@ -266,7 +378,7 @@ def evaluate(ev):
         cls, base, flag = classify(u)
         if cls == "ALLOW":
             continue
-        basename = urllib.parse.unquote(u["url"]).rsplit("/", 1)[-1]
+        basename = basename_of(u["url"])
         bait = bool(BAIT_NAME.search(basename) or BAIT_NAME.search(u.get("text", "")))
         masq = bool(MASQUERADE.search(basename))
         s = base + 3 * bait + 2 * masq + 2 * u["first_line"] + (-2 if u["in_code"] else 0)
@@ -380,6 +492,59 @@ SAMPLES = [
         "THREAD_AUTHOR_LOGIN": "victim", "EVENT_NAME": "issue_comment", "_age_h": 0.1,
         "THREAD_CREATED_AT": "2026-07-07T00:00:00Z", "EVENT_CREATED_AT": "2026-07-07T00:05:00Z",
     }, "A"),
+    ("E4 query-string decoration (finding #5)", {
+        "BODY": "[fix](https://github.com/user-attachments/files/1/bd_fix_v1.zip?x=1)",
+        "AUTHOR_LOGIN": "burner", "AUTHOR_ASSOCIATION": "NONE", "AUTHOR_TYPE": "User",
+        "THREAD_AUTHOR_LOGIN": "victim", "EVENT_NAME": "issue_comment", "_age_h": 0.1,
+        "THREAD_CREATED_AT": "2026-07-07T00:00:00Z", "EVENT_CREATED_AT": "2026-07-07T00:05:00Z",
+    }, "A"),
+    ("E5 trailing-slash decoration (finding #5)", {
+        "BODY": "[fix](https://github.com/user-attachments/files/1/bd_fix_v1.zip/)",
+        "AUTHOR_LOGIN": "burner", "AUTHOR_ASSOCIATION": "NONE", "AUTHOR_TYPE": "User",
+        "THREAD_AUTHOR_LOGIN": "victim", "EVENT_NAME": "issue_comment", "_age_h": 0.1,
+        "THREAD_CREATED_AT": "2026-07-07T00:00:00Z", "EVENT_CREATED_AT": "2026-07-07T00:05:00Z",
+    }, "A"),
+    ("E6 protocol-relative host (finding #5)", {
+        "BODY": "[fix](//github.com/user-attachments/files/1/bd_fix_v1.zip)",
+        "AUTHOR_LOGIN": "burner", "AUTHOR_ASSOCIATION": "NONE", "AUTHOR_TYPE": "User",
+        "THREAD_AUTHOR_LOGIN": "victim", "EVENT_NAME": "issue_comment", "_age_h": 0.1,
+        "THREAD_CREATED_AT": "2026-07-07T00:00:00Z", "EVENT_CREATED_AT": "2026-07-07T00:05:00Z",
+    }, "A"),
+    ("E7 trailing-dot FQDN (finding #5)", {
+        "BODY": "[fix](https://github.com./user-attachments/files/1/bd_fix_v1.zip)",
+        "AUTHOR_LOGIN": "burner", "AUTHOR_ASSOCIATION": "NONE", "AUTHOR_TYPE": "User",
+        "THREAD_AUTHOR_LOGIN": "victim", "EVENT_NAME": "issue_comment", "_age_h": 0.1,
+        "THREAD_CREATED_AT": "2026-07-07T00:00:00Z", "EVENT_CREATED_AT": "2026-07-07T00:05:00Z",
+    }, "A"),
+    ("E8 github.com /blob/ archive (finding #2)", {
+        "BODY": "grab it: https://github.com/attacker/beads/blob/main/bd_fix_v1.zip",
+        "AUTHOR_LOGIN": "burner", "AUTHOR_ASSOCIATION": "NONE", "AUTHOR_TYPE": "User",
+        "THREAD_AUTHOR_LOGIN": "victim", "EVENT_NAME": "issue_comment", "_age_h": 0.1,
+        "THREAD_CREATED_AT": "2026-07-07T00:00:00Z", "EVENT_CREATED_AT": "2026-07-07T00:05:00Z",
+    }, "A"),
+    ("E9 user-attachments/assets archive (finding #3)", {
+        "BODY": "[fix](https://github.com/user-attachments/assets/abcd1234/bd_fix_v1.zip)",
+        "AUTHOR_LOGIN": "burner", "AUTHOR_ASSOCIATION": "NONE", "AUTHOR_TYPE": "User",
+        "THREAD_AUTHOR_LOGIN": "victim", "EVENT_NAME": "issue_comment", "_age_h": 0.1,
+        "THREAD_CREATED_AT": "2026-07-07T00:00:00Z", "EVENT_CREATED_AT": "2026-07-07T00:05:00Z",
+    }, "A"),
+    ("E10 objects.githubusercontent.com redirect target (finding #4)", {
+        "BODY": "[fix](https://objects.githubusercontent.com/github-production-repository-file/x/bd_fix_v1.zip?token=abc)",
+        "AUTHOR_LOGIN": "burner", "AUTHOR_ASSOCIATION": "NONE", "AUTHOR_TYPE": "User",
+        "THREAD_AUTHOR_LOGIN": "victim", "EVENT_NAME": "issue_comment", "_age_h": 0.1,
+        "THREAD_CREATED_AT": "2026-07-07T00:00:00Z", "EVENT_CREATED_AT": "2026-07-07T00:05:00Z",
+    }, "A"),
+    ("E11 dropbox look-alike host is NOT auto-hard (finding #8)", {
+        "BODY": "[fix](https://notdropbox.com/scl/x/bd_fix_v1.zip)",
+        "AUTHOR_LOGIN": "burner", "AUTHOR_ASSOCIATION": "NONE", "AUTHOR_TYPE": "User",
+        "THREAD_AUTHOR_LOGIN": "victim", "EVENT_NAME": "issue_comment", "_age_h": 0.1,
+        "THREAD_CREATED_AT": "2026-07-07T00:00:00Z", "EVENT_CREATED_AT": "2026-07-07T00:05:00Z",
+    }, {"B", "C"}),
+    ("E12 repo /tree/ nav link is not a download (finding #7)", {
+        "BODY": "see [dist](https://github.com/owner/repo/tree/main/dist/tool.zip) for the build",
+        "AUTHOR_LOGIN": "helper", "AUTHOR_ASSOCIATION": "NONE", "AUTHOR_TYPE": "User",
+        "THREAD_AUTHOR_LOGIN": "victim", "EVENT_NAME": "issue_comment", "_age_h": 0.1,
+    }, "C"),
     ("L1 contributor .tar.gz harness (not destructive)", {
         "BODY": "Here's a repro harness [bd-hooks-testbed.tar.gz](https://github.com/user-attachments/files/27/bd-hooks-testbed.tar.gz)",
         "AUTHOR_LOGIN": "pmgledhill102", "AUTHOR_ASSOCIATION": "CONTRIBUTOR", "AUTHOR_TYPE": "User",
@@ -415,6 +580,20 @@ SAMPLES = [
 ]
 
 
+# Adversarial bodies at GitHub's 65 536-char body limit. Each must score in
+# well under the workflow's per-run budget — a catastrophic-backtracking
+# regression here (finding #6) manifests as a multi-second-to-minutes hang.
+DOS_BUDGET_S = 5.0
+DOS_BODIES = [
+    ("bracket flood", "[" * 65536),
+    ("backtick flood", "`" * 65536),
+    ("tilde flood", "~" * 65536),
+    ("paren flood", "(" * 65536),
+    ("alt-length backticks", "```a``b" * 8000),
+    ("unclosed md-link tail", "[a](" + "x" * 60000),
+]
+
+
 def selftest():
     ok = True
     for name, ev, expected in SAMPLES:
@@ -426,6 +605,19 @@ def selftest():
         print(f"[{'PASS' if passed else 'FAIL'}] {name}: got {tier} (score {v['score']}), want {exp}")
         if not passed:
             print(f"        reason={v.get('reason')} findings={json.dumps(v.get('findings'))}")
+
+    import time
+    for name, body in DOS_BODIES:
+        ev = {"BODY": body, "AUTHOR_LOGIN": "x", "AUTHOR_ASSOCIATION": "NONE",
+              "AUTHOR_TYPE": "User", "EVENT_NAME": "issue_comment"}
+        t0 = time.perf_counter()
+        evaluate(ev)
+        dt_s = time.perf_counter() - t0
+        passed = dt_s < DOS_BUDGET_S
+        ok = ok and passed
+        print(f"[{'PASS' if passed else 'FAIL'}] DoS {name} ({len(body)} chars): {dt_s:.3f}s "
+              f"(budget {DOS_BUDGET_S:.0f}s)")
+
     print("\nSELFTEST", "OK" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -437,9 +629,6 @@ def main():
         "BODY", "AUTHOR_LOGIN", "AUTHOR_ASSOCIATION", "AUTHOR_TYPE",
         "THREAD_AUTHOR_LOGIN", "THREAD_CREATED_AT", "EVENT_CREATED_AT",
         "EVENT_NAME", "ACCOUNT_CREATED_AT", "ACCOUNT_REPOS", "ACCOUNT_FOLLOWERS")}
-    # BODY may arrive base64-encoded (BODY_B64) to dodge shell/env quoting issues
-    if os.environ.get("BODY_B64"):
-        ev["BODY"] = base64.b64decode(os.environ["BODY_B64"]).decode("utf-8", "replace")
     v = evaluate(ev)
     tier = v["tier"]
     label = {"A": "would-hard-action (report-only)", "B": "would-quarantine (report-only)",

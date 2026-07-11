@@ -41,8 +41,9 @@ on:
     types: [created, edited]
   discussion_comment:
     types: [created, edited]
-  commit_comment:
-    types: [created]
+  # NOTE: commit_comment is intentionally absent — it is a webhook event but NOT
+  # a supported GitHub Actions workflow trigger, so `on: commit_comment` never
+  # fires (confirmed by actionlint and the events-that-trigger-workflows docs).
 
 # Never cancel in-flight runs; each event is scored independently.
 concurrency:
@@ -56,6 +57,61 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Derived once at job scope so the account-age and scoring steps read the
+    # SAME values and cannot drift (they used to carry duplicate `||` chains).
+    # Precedence matters: for `pull_request_review` the payload carries BOTH
+    # `review.*` and `pull_request.*`; the review is what was posted, so
+    # `review.*` MUST precede `pull_request.*` — otherwise the clean PR
+    # description/author is scored instead of the review (finding #1).
+    # `comment.*` still wins for the *_comment events. These `${{ }}` values are
+    # expanded into env var VALUES, never interpolated into a shell command, so
+    # untrusted body content stays injection-safe.
+    env:
+      EVENT_NAME: ${{ github.event_name }}
+      REPO_OWNER: ${{ github.repository_owner }}
+      AUTHOR_LOGIN: >-
+        ${{ github.event.comment.user.login
+          || github.event.review.user.login
+          || github.event.issue.user.login
+          || github.event.pull_request.user.login
+          || github.event.discussion.user.login
+          || github.event.sender.login }}
+      AUTHOR_ASSOCIATION: >-
+        ${{ github.event.comment.author_association
+          || github.event.review.author_association
+          || github.event.issue.author_association
+          || github.event.pull_request.author_association
+          || github.event.discussion.author_association }}
+      AUTHOR_TYPE: >-
+        ${{ github.event.comment.user.type
+          || github.event.review.user.type
+          || github.event.issue.user.type
+          || github.event.pull_request.user.type
+          || github.event.discussion.user.type }}
+      # For pull_request_review, the issue/PR bodies are guarded off so an
+      # empty-body approval scores '' (nothing) rather than falling through to
+      # the PR description under the reviewer's identity (finding #1, other
+      # direction). review_comment carries its text in comment.body.
+      BODY: >-
+        ${{ github.event.comment.body
+          || github.event.review.body
+          || (github.event_name != 'pull_request_review' && github.event.issue.body)
+          || (github.event_name != 'pull_request_review' && github.event.pull_request.body)
+          || github.event.discussion.body }}
+      THREAD_AUTHOR_LOGIN: >-
+        ${{ github.event.issue.user.login
+          || github.event.pull_request.user.login
+          || github.event.discussion.user.login }}
+      THREAD_CREATED_AT: >-
+        ${{ github.event.issue.created_at
+          || github.event.pull_request.created_at
+          || github.event.discussion.created_at }}
+      EVENT_CREATED_AT: >-
+        ${{ github.event.comment.created_at
+          || github.event.review.submitted_at
+          || github.event.issue.created_at
+          || github.event.pull_request.created_at
+          || github.event.discussion.created_at }}
     steps:
       - name: Check out the trusted default branch (never PR code)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -67,18 +123,11 @@ jobs:
         id: acct
         env:
           GH_TOKEN: ${{ github.token }}
-          LOGIN: >-
-            ${{ github.event.comment.user.login
-              || github.event.issue.user.login
-              || github.event.pull_request.user.login
-              || github.event.discussion.user.login
-              || github.event.review.user.login
-              || github.event.sender.login }}
         run: |
           set -uo pipefail
           created=""; repos=""; followers=""
-          if [ -n "${LOGIN:-}" ]; then
-            if u=$(gh api "/users/${LOGIN}" 2>/dev/null); then
+          if [ -n "${AUTHOR_LOGIN:-}" ]; then
+            if u=$(gh api "/users/${AUTHOR_LOGIN}" 2>/dev/null); then
               created=$(printf '%s' "$u" | jq -r '.created_at // ""')
               repos=$(printf '%s' "$u" | jq -r '.public_repos // ""')
               followers=$(printf '%s' "$u" | jq -r '.followers // ""')
@@ -91,47 +140,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Score (report-only)
+        # BODY / AUTHOR_* / THREAD_* / EVENT_* come from the job-level env above
+        # (single source of truth). Only the account-age lookup outputs are
+        # step-scoped, since they depend on the previous step.
         env:
-          BODY: >-
-            ${{ github.event.comment.body
-              || github.event.issue.body
-              || github.event.pull_request.body
-              || github.event.discussion.body
-              || github.event.review.body }}
-          AUTHOR_LOGIN: >-
-            ${{ github.event.comment.user.login
-              || github.event.issue.user.login
-              || github.event.pull_request.user.login
-              || github.event.discussion.user.login
-              || github.event.review.user.login
-              || github.event.sender.login }}
-          AUTHOR_ASSOCIATION: >-
-            ${{ github.event.comment.author_association
-              || github.event.issue.author_association
-              || github.event.pull_request.author_association
-              || github.event.discussion.author_association
-              || github.event.review.author_association }}
-          AUTHOR_TYPE: >-
-            ${{ github.event.comment.user.type
-              || github.event.issue.user.type
-              || github.event.pull_request.user.type
-              || github.event.discussion.user.type
-              || github.event.review.user.type }}
-          THREAD_AUTHOR_LOGIN: >-
-            ${{ github.event.issue.user.login
-              || github.event.pull_request.user.login
-              || github.event.discussion.user.login }}
-          THREAD_CREATED_AT: >-
-            ${{ github.event.issue.created_at
-              || github.event.pull_request.created_at
-              || github.event.discussion.created_at }}
-          EVENT_CREATED_AT: >-
-            ${{ github.event.comment.created_at
-              || github.event.review.submitted_at
-              || github.event.issue.created_at
-              || github.event.pull_request.created_at
-              || github.event.discussion.created_at }}
-          EVENT_NAME: ${{ github.event_name }}
           ACCOUNT_CREATED_AT: ${{ steps.acct.outputs.created }}
           ACCOUNT_REPOS: ${{ steps.acct.outputs.repos }}
           ACCOUNT_FOLLOWERS: ${{ steps.acct.outputs.followers }}
