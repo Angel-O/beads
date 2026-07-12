@@ -168,6 +168,42 @@ func TestScrubArgsForTelemetryRedactsFederationPassword(t *testing.T) {
 	}
 }
 
+// TestScrubArgsForTelemetryRedactsShorthandCluster proves a pflag boolean-shorthand
+// cluster ending in the secret shorthand (-qpSECRET, -vpSECRET) is redacted, not just
+// the bare -pSECRET spelling. pflag parses a leading run of registered boolean
+// shorthands followed by a value-taking shorthand as that cluster: -q (--quiet, bool)
+// and -v (--verbose, bool) are both root persistent flags, so `-qp<secret>` on
+// federation add-peer parses as -q, then -p <secret> — the same secret value
+// secretShorthandPrefix must catch when it only recognized a[:2] == "-p".
+func TestScrubArgsForTelemetryRedactsShorthandCluster(t *testing.T) {
+	const secret = "s3cr3t-pw"
+	secretFlags := map[string]bool{"--password": true, "-p": true}
+	cases := []struct {
+		name string
+		argv []string
+	}{
+		{
+			name: "boolean shorthand -q then -p cluster",
+			argv: []string{"federation", "add-peer", "partner", "h:3306/db", "-qp" + secret},
+		},
+		{
+			name: "boolean shorthand -v then -p cluster",
+			argv: []string{"federation", "add-peer", "partner", "h:3306/db", "-vp" + secret},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := scrubArgsForTelemetry(tc.argv, secretFlags)
+			if strings.Contains(out, secret) {
+				t.Fatalf("PASSWORD LEAK: scrubArgsForTelemetry(%v) = %q still contains %q", tc.argv, out, secret)
+			}
+			if !strings.Contains(out, "xxxxx") {
+				t.Fatalf("expected redaction marker xxxxx in %q", out)
+			}
+		})
+	}
+}
+
 // TestScrubArgsForTelemetryKeepsOverloadedShortFlag proves the -p value on
 // non-secret commands is left intact: when no secret token is resolved (exactly
 // what secretFlagTokens returns for --priority/--prefix commands), -p and its value

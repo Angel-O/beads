@@ -27,6 +27,9 @@ func TestScrubDSNError(t *testing.T) {
 		{"libpq keyword", "host=h user=u password=" + secret + " dbname=db"},
 		{"libpq keyword quoted", "host=h user=u password='" + secret + "' dbname=db"},
 		{"libpq sslpassword", "host=h user=u sslpassword=" + secret + " dbname=db"},
+		{"url query param percent-encoded key (pass%77ord)", "postgres://u@h:5432/db?pass%77ord=" + secret},
+		{"url query sslpassword percent-encoded key (sslpass%77ord)", "postgres://u@h:5432/db?sslpass%77ord=" + secret + "&sslmode=require"},
+		{"url query param fully percent-encoded key (%70assword)", "postgres://u@h:5432/db?%70assword=" + secret},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -65,6 +68,9 @@ func TestScrubDSNString(t *testing.T) {
 		{"url sslpassword", "postgres://u@h:5432/db?sslpassword=" + secret + "&sslmode=require"},
 		{"libpq keyword", "host=h user=u password=" + secret + " dbname=db"},
 		{"libpq sslpassword", "host=h user=u sslpassword=" + secret + " dbname=db"},
+		{"url query param percent-encoded key (pass%77ord)", "postgres://u@h:5432/db?pass%77ord=" + secret},
+		{"url query sslpassword percent-encoded key (sslpass%77ord)", "postgres://u@h:5432/db?sslpass%77ord=" + secret + "&sslmode=require"},
+		{"url query param fully percent-encoded key (%70assword)", "postgres://u@h:5432/db?%70assword=" + secret},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -118,5 +124,65 @@ func TestOpenRedactsPasswordInError(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestScrubDSNStringEscapedWhitespaceValue proves an unquoted libpq keyword/value
+// password containing a backslash-escaped space is redacted in full. pgx accepts
+// password=SUPER\ SECRET as the single password `SUPER\ SECRET` (the backslash is
+// retained literally, the escaped space is part of the value — confirmed against
+// pgx.ParseConfig); the pre-fix value regex (a \S+-shaped run) stopped at the
+// unescaped whitespace boundary and left the tail " SECRET" behind in plaintext.
+func TestScrubDSNStringEscapedWhitespaceValue(t *testing.T) {
+	dsn := `host=h user=u password=SUPER\ SECRET dbname=db`
+	got := ScrubDSNString(dsn, dsn)
+	if strings.Contains(got, "SECRET") {
+		t.Errorf("ScrubDSNString(%q) leaked escaped-whitespace password tail: %q", dsn, got)
+	}
+	if strings.Contains(got, `SUPER\`) {
+		t.Errorf("ScrubDSNString(%q) leaked escaped-whitespace password head: %q", dsn, got)
+	}
+	if !strings.Contains(got, "xxxxx") {
+		t.Errorf("ScrubDSNString(%q) did not redact: %q", dsn, got)
+	}
+	if !strings.Contains(got, "host=h") || !strings.Contains(got, "dbname=db") {
+		t.Errorf("ScrubDSNString(%q) mangled non-secret structure: %q", dsn, got)
+	}
+}
+
+// TestScrubDSNStringVerticalTabSeparator proves a password separated from the
+// preceding keyword/value token by a vertical tab (\v) is still found and redacted.
+// pgx treats \v as inter-token whitespace in libpq keyword/value DSNs (confirmed
+// against pgx.ParseConfig: "host=h\vpassword=x" parses host="h", password="x"), but
+// Go's regexp \s class is [\t\n\f\r ] and does NOT include \v, so the pre-fix
+// password regex — anchored on (^|\s) — never matched at a \v boundary and the
+// password leaked entirely.
+func TestScrubDSNStringVerticalTabSeparator(t *testing.T) {
+	const secret = "SUPERSECRET"
+	dsn := "host=h user=u" + "\v" + "password=" + secret + " dbname=db"
+	got := ScrubDSNString(dsn, dsn)
+	if strings.Contains(got, secret) {
+		t.Errorf("ScrubDSNString(%q) leaked password separated by a vertical tab: %q", dsn, got)
+	}
+	if !strings.Contains(got, "xxxxx") {
+		t.Errorf("ScrubDSNString(%q) did not redact vertical-tab-separated password: %q", dsn, got)
+	}
+}
+
+// TestScrubDSNStringOverlappingSecretsPrefix proves that when one collected secret is
+// a byte-for-byte prefix of another (userinfo password "foo", query password
+// "fooACTUAL"), redaction does not leak the longer secret's non-overlapping tail.
+// ScrubDSNString applies strings.ReplaceAll sequentially per collected secret; doing
+// the short secret ("foo") first turns "fooACTUAL" into "xxxxxACTUAL" before the
+// long-secret pass ever runs, so the second pass finds no "fooACTUAL" substring left
+// to replace and "ACTUAL" survives in plaintext.
+func TestScrubDSNStringOverlappingSecretsPrefix(t *testing.T) {
+	dsn := "postgres://u:foo@h:5432/db?password=fooACTUAL"
+	got := ScrubDSNString(dsn, dsn)
+	if strings.Contains(got, "ACTUAL") {
+		t.Errorf("ScrubDSNString(%q) leaked the tail of a secret that is a prefix of another secret: %q", dsn, got)
+	}
+	if strings.Contains(got, ":foo@") {
+		t.Errorf("ScrubDSNString(%q) did not redact the shorter overlapping secret: %q", dsn, got)
 	}
 }

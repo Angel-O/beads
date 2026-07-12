@@ -5,18 +5,31 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
 
+// dsnWSClass is the regexp character class spelling out every byte pgx treats as
+// whitespace between libpq keyword/value tokens. Go's regexp \s is [\t\n\f\r ] and
+// does NOT include \v (vertical tab); pgx.ParseConfig DOES accept \v as a token
+// separator (confirmed: "host=h\vpassword=x" parses host="h", password="x"). Relying
+// on \s here would silently fail to match a \v-separated password token at all,
+// leaking it in full — so the class is spelled out explicitly instead.
+const dsnWSClass = `\t\n\f\r \v`
+
 // kvPasswordRe matches a libpq keyword/value password token (password= or
-// sslpassword=), whose value is either single-quoted or a run of non-space chars.
-var kvPasswordRe = regexp.MustCompile(`(?i)(^|\s)(?:password|sslpassword)\s*=\s*(?:'(?:[^'\\]|\\.)*'|\S*)`)
+// sslpassword=), whose value is either single-quoted or an unquoted run of
+// non-whitespace characters that may itself contain backslash-escaped whitespace
+// (pgx accepts password=SUPER\ SECRET as the single value `SUPER\ SECRET`, backslash
+// retained literally — confirmed against pgx.ParseConfig).
+var kvPasswordRe = regexp.MustCompile(`(?i)(^|[` + dsnWSClass + `])(?:password|sslpassword)[` + dsnWSClass + `]*=[` + dsnWSClass + `]*(?:'(?:[^'\\]|\\.)*'|(?:[^` + dsnWSClass + `\\]|\\.)*)`)
 
 // pwValueRe captures the VALUE of a libpq keyword/value password token: group 1 is
-// the single-quoted body, group 2 is an unquoted run of non-space characters.
-var pwValueRe = regexp.MustCompile(`(?i)(?:^|\s)(?:password|sslpassword)\s*=\s*(?:'((?:[^'\\]|\\.)*)'|(\S+))`)
+// the single-quoted body, group 2 is an unquoted run of non-whitespace characters,
+// including any backslash-escaped whitespace sequences (see kvPasswordRe).
+var pwValueRe = regexp.MustCompile(`(?i)(?:^|[` + dsnWSClass + `])(?:password|sslpassword)[` + dsnWSClass + `]*=[` + dsnWSClass + `]*(?:'((?:[^'\\]|\\.)*)'|((?:[^` + dsnWSClass + `\\]|\\.)+))`)
 
 // RedactPassword returns dsn with the password removed, or an error if a password
 // cannot be safely removed. It strips every known password location — URL userinfo,
@@ -77,7 +90,14 @@ func stripPasswordBestEffort(dsn string) string {
 // ScrubDSNError passes an error message as s. An empty dsn, or one with no password,
 // returns s unchanged.
 func ScrubDSNString(dsn, s string) string {
-	for _, secret := range dsnPasswordValues(dsn) {
+	secrets := dsnPasswordValues(dsn)
+	// Replace the longest secrets first. dsnPasswordValues can return one secret that
+	// is a byte-for-byte prefix of another (e.g. a userinfo password "foo" and a query
+	// password "fooACTUAL"); replacing the short one first would turn "fooACTUAL" into
+	// "xxxxxACTUAL" before the long-secret pass ever runs, leaking the "ACTUAL" tail
+	// since ReplaceAll can no longer find the (now-mangled) longer substring.
+	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
+	for _, secret := range secrets {
 		s = strings.ReplaceAll(s, secret, "xxxxx")
 	}
 	return s
@@ -95,6 +115,16 @@ func ScrubDSNError(dsn string, err error) error {
 		return nil
 	}
 	return errors.New(ScrubDSNString(dsn, err.Error()))
+}
+
+// isPasswordKey reports whether k names one of the URL query password params
+// (case-insensitively).
+func isPasswordKey(k string) bool {
+	switch strings.ToLower(k) {
+	case "password", "sslpassword":
+		return true
+	}
+	return false
 }
 
 // dsnPasswordValues returns every cleartext password embedded in dsn — URL userinfo,
@@ -130,8 +160,18 @@ func dsnPasswordValues(dsn string) []string {
 			if !ok {
 				continue
 			}
-			switch strings.ToLower(key) {
-			case "password", "sslpassword":
+			// url.Query() (which pgx.ParseConfig uses) percent-decodes query KEYS as
+			// well as values, so a query key of pass%77ord or %70assword is a live
+			// "password" param even though the raw key string doesn't say so. Compare
+			// both the raw (as-written) key and its unescaped form — ignoring an
+			// unescape error and falling back to the raw compare, which already ran.
+			matched := isPasswordKey(key)
+			if !matched {
+				if dk, err := url.QueryUnescape(key); err == nil {
+					matched = isPasswordKey(dk)
+				}
+			}
+			if matched {
 				add(val)
 				if dec, err := url.QueryUnescape(val); err == nil {
 					add(dec)

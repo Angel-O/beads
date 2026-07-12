@@ -1817,17 +1817,37 @@ func scrubArgsForTelemetry(argv []string, secretFlags map[string]bool) string {
 }
 
 // secretShorthandPrefix reports whether a is pflag's concatenated secret-shorthand
-// spelling (-p<secret>, no space or '='), returning the "-p" prefix to preserve.
-// Long flags cannot concatenate a value, so only -X<value> shorthands are matched.
+// spelling, returning the "-x...-p" prefix to preserve. Long flags cannot concatenate
+// a value, so only -X<value> shorthands are matched.
+//
+// pflag also accepts a CLUSTER of boolean shorthands ending in a value-taking
+// shorthand: given boolean flags -q/-v and value flag -p, "-qpSECRET" parses as -q
+// followed by -p SECRET, and "-vpSECRET" parses as -v followed by -p SECRET — but the
+// raw token still reaches telemetry as one string. Walk the leading run of letters in
+// a; the first letter whose "-x" token is a registered secret shorthand ends the
+// cluster, and everything after it is that flag's value, regardless of how many
+// boolean shorthands preceded it. This mirrors pflag's own grammar (a cluster is zero
+// or more boolean shorthands followed by one value-taking shorthand) without needing
+// the running command's flag set here: it is conservative in the safe direction,
+// since treating a longer prefix as consumed by the secret shorthand only ever
+// over-redacts, never under-redacts.
 func secretShorthandPrefix(a string, secretFlags map[string]bool) (string, bool) {
 	if len(a) < 3 || a[0] != '-' || a[1] == '-' {
 		return "", false
 	}
-	short := a[:2]
-	if !secretFlags[short] {
-		return "", false
+	for i := 1; i < len(a); i++ {
+		c := a[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+			return "", false
+		}
+		if secretFlags["-"+string(c)] {
+			if i+1 >= len(a) {
+				return "", false // no value follows; not the concatenated spelling
+			}
+			return a[:i+1], true
+		}
 	}
-	return short, true
+	return "", false
 }
 
 // scrubDSNValue redacts every password form from a connection-string value. The
