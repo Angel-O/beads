@@ -60,10 +60,16 @@ def _decode_path(value, label):
         decoded = base64.b64decode(value, validate=True)
     except (ValueError, TypeError) as error:
         raise QuiescenceError("%s must be canonical base64" % label) from error
-    if base64.b64encode(decoded).decode("ascii") != value or not decoded or b"\0" in decoded:
+    if (
+        base64.b64encode(decoded).decode("ascii") != value
+        or not decoded
+        or b"\0" in decoded
+    ):
         raise QuiescenceError("%s must be canonical base64" % label)
     if not os.path.isabs(decoded):
         raise QuiescenceError("%s must encode an absolute path" % label)
+    if os.path.normpath(b"/" + decoded.lstrip(b"/")) != decoded:
+        raise QuiescenceError("%s must encode a canonical path" % label)
     return decoded
 
 def _unique_object(pairs):
@@ -112,15 +118,31 @@ def _inside(candidate, root):
 def _require_external(path, roots):
     absolute = os.path.abspath(path)
     resolved = os.path.realpath(absolute)
-    for root in roots:
-        root_absolute = os.path.abspath(os.fsencode(root))
-        root_resolved = os.path.realpath(root_absolute)
+    protected_identities = {identity for _, _, identity in roots}
+    for root_absolute, root_resolved, _ in roots:
         if any(
             _inside(candidate, protected)
             for candidate in (absolute, resolved)
             for protected in (root_absolute, root_resolved)
         ):
             raise QuiescenceError("quiescence receipt must be outside every protected repository path")
+    ancestor = os.path.dirname(absolute)
+    while True:
+        try:
+            if _namespace(os.stat(ancestor)) in protected_identities:
+                raise QuiescenceError(
+                    "quiescence receipt must be outside every protected repository path"
+                )
+        except FileNotFoundError:
+            pass
+        except QuiescenceError:
+            raise
+        except OSError as error:
+            raise QuiescenceError("cannot inspect quiescence receipt ancestry: %s" % error) from error
+        parent = os.path.dirname(ancestor)
+        if parent == ancestor:
+            break
+        ancestor = parent
 
 
 def _prepare_roots(roots, common):
@@ -141,12 +163,10 @@ def _prepare_roots(roots, common):
 
 
 def _revalidate_roots(prepared):
-    paths = []
     for absolute, resolved, identity in prepared:
         if os.path.realpath(absolute) != resolved or _namespace(os.stat(resolved, follow_symlinks=False)) != identity:
             raise QuiescenceError("protected repository root identity changed")
-        paths.extend((absolute, resolved))
-    return paths
+    return prepared
 
 
 def _control_parent(path, expected=None):
@@ -247,26 +267,69 @@ def _prove_exclusive_owner(descriptor, path):
         raise QuiescenceError("cannot verify the supplied lease descriptor: %s" % error) from error
 
 
-def _registry_count(raw):
+def _registry_records(raw):
     if not isinstance(raw, bytes) or len(raw) > MAX_REGISTRY_BYTES or not raw.endswith(b"\0\0"):
         raise QuiescenceError("worktree registry must be bounded porcelain-v1 NUL data")
-    records = raw[:-2].split(b"\0\0")
-    if not records:
+    encoded_records = raw[:-2].split(b"\0\0")
+    if not encoded_records or any(not record for record in encoded_records):
         raise QuiescenceError("worktree registry must contain at least one worktree")
-    for record in records:
-        fields = record.split(b"\0")
-        paths = [field for field in fields if field.startswith(b"worktree ")]
-        heads = [field for field in fields if field.startswith(b"HEAD ")]
-        if len(paths) != 1 or paths[0] != fields[0] or not paths[0][9:] or not os.path.isabs(paths[0][9:]):
+    records = []
+    paths = set()
+    head_width = None
+    for index, encoded in enumerate(encoded_records):
+        fields = encoded.split(b"\0")
+        parsed = {}
+        for field_index, field in enumerate(fields):
+            key, separator, value = field.partition(b" ")
+            if key not in (b"worktree", b"HEAD", b"branch", b"detached", b"bare", b"locked", b"prunable"):
+                raise QuiescenceError("worktree registry contains an unknown field")
+            if key in parsed or (key == b"worktree") != (field_index == 0):
+                raise QuiescenceError("worktree registry contains a duplicate or misplaced field")
+            if key in (b"worktree", b"HEAD", b"branch") and (not separator or not value):
+                raise QuiescenceError("worktree registry contains a field without a value")
+            if key in (b"detached", b"bare") and separator:
+                raise QuiescenceError("worktree registry contains a valued flag field")
+            if key in (b"locked", b"prunable") and separator and not value:
+                raise QuiescenceError("worktree registry contains an empty reason")
+            if key == b"prunable" and not separator:
+                raise QuiescenceError("worktree registry contains a prunable flag without a reason")
+            parsed[key] = value if separator else True
+        path = parsed.get(b"worktree")
+        if not isinstance(path, bytes) or not os.path.isabs(path):
             raise QuiescenceError("worktree registry contains a malformed path record")
-        if len(heads) != 1 or len(heads[0][5:]) not in (40, 64) or any(chr(byte) not in HEX for byte in heads[0][5:]):
-            raise QuiescenceError("worktree registry contains a malformed HEAD record")
-    return len(records)
+        canonical_path = os.path.normpath(b"/" + path.lstrip(b"/"))
+        if canonical_path != path or canonical_path in paths:
+            raise QuiescenceError("worktree registry contains a malformed path record")
+        paths.add(canonical_path)
+        is_bare = parsed.get(b"bare") is True
+        if is_bare:
+            if index != 0 or set(parsed) != {b"worktree", b"bare"}:
+                raise QuiescenceError("worktree registry contains a malformed bare record")
+        else:
+            head = parsed.get(b"HEAD")
+            lineage = int(b"branch" in parsed) + int(parsed.get(b"detached") is True)
+            if (
+                not isinstance(head, bytes)
+                or len(head) not in (40, 64)
+                or any(chr(byte) not in HEX for byte in head)
+                or lineage != 1
+            ):
+                raise QuiescenceError("worktree registry contains a malformed checkout record")
+            if head_width is None:
+                head_width = len(head)
+            elif len(head) != head_width:
+                raise QuiescenceError("worktree registry mixes object ID widths")
+        records.append(parsed)
+    return tuple(records)
 
 
-def _validate_receipt(
-    data, path, identity, expected_plan_sha256,
-    expected_git_common_dir, registry_raw, now,
+def _registry_count(raw):
+    return len(_registry_records(raw))
+
+
+def _validate_receipt_semantics(
+    data, expected_plan_sha256, expected_git_common_dir, registry_raw,
+    live=None, validation_now=None,
 ):
     value = _parse(data)
     _mapping(
@@ -288,19 +351,33 @@ def _validate_receipt(
     authority_pid = _strict_int(authority["pid"], "lease.authority.pid", 1)
     if _strict_int(authority["uid"], "lease.authority.uid") != os.geteuid():
         raise QuiescenceError("lease authority belongs to a different user")
-    try:
-        os.kill(authority_pid, 0)
-    except (OSError, ValueError) as error:
-        raise QuiescenceError("lease authority process is not live") from error
+    if live is not None:
+        try:
+            os.kill(authority_pid, 0)
+        except (OSError, ValueError) as error:
+            raise QuiescenceError("lease authority process is not live") from error
     _strict_int(lease["epoch"], "lease.epoch", 1)
     issued = _strict_int(lease["issued_at_ns"], "lease.issued_at_ns", 0)
     expires = _strict_int(lease["expires_at_ns"], "lease.expires_at_ns", 1)
-    if issued > now or now - issued > MAX_HANDOFF_NS or expires <= now or expires <= issued or expires - issued > MAX_LEASE_NS:
+    if live is not None:
+        path, identity, live_now = live
+        validation_now = live_now if validation_now is None else validation_now
+    if type(validation_now) is not int:
+        raise QuiescenceError("receipt validation time must be an integer nanosecond timestamp")
+    if issued > validation_now or expires <= issued or expires - issued > MAX_LEASE_NS:
         raise QuiescenceError("quiescence lease is future-issued, expired, reversed, or too long")
+    if live is not None:
+        if validation_now - issued > MAX_HANDOFF_NS or expires <= validation_now:
+            raise QuiescenceError("quiescence lease is future-issued, expired, reversed, or too long")
     lock = _mapping(lease["lock"], ("path_b64", "dev", "ino"), "lease.lock")
-    if _decode_path(lock["path_b64"], "lease.lock.path_b64") != path:
+    lock_path = _decode_path(lock["path_b64"], "lease.lock.path_b64")
+    lock_identity = (
+        _strict_int(lock["dev"], "lease.lock.dev"),
+        _strict_int(lock["ino"], "lease.lock.ino"),
+    )
+    if live is not None and lock_path != path:
         raise QuiescenceError("quiescence lease path does not match the held descriptor")
-    if _strict_int(lock["dev"], "lease.lock.dev") != identity[0] or _strict_int(lock["ino"], "lease.lock.ino") != identity[1]:
+    if live is not None and lock_identity != identity[:2]:
         raise QuiescenceError("quiescence lease identity does not match the held descriptor")
     plan = _mapping(value["plan"], ("sha256",), "plan")
     if _digest(plan["sha256"], "plan.sha256") != _digest(expected_plan_sha256, "expected plan SHA-256"):
@@ -314,7 +391,16 @@ def _validate_receipt(
         raise QuiescenceError("quiescence lease is bound to a different Git common directory")
     if _strict_int(repository["dev"], "repository.dev") != common_info.st_dev or _strict_int(repository["ino"], "repository.ino") != common_info.st_ino:
         raise QuiescenceError("Git common directory identity drifted")
-    registry_count = _registry_count(registry_raw)
+    registry_records = _registry_records(registry_raw)
+    if registry_records[0].get(b"bare") is True:
+        bare_path = os.path.realpath(os.path.abspath(registry_records[0][b"worktree"]))
+        try:
+            bare_info = os.stat(bare_path, follow_symlinks=False)
+        except OSError as error:
+            raise QuiescenceError("bare primary worktree is unavailable: %s" % error) from error
+        if _namespace(bare_info) != _namespace(common_info):
+            raise QuiescenceError("bare primary worktree does not match the Git common directory")
+    registry_count = len(registry_records)
     registry_digest = hashlib.sha256(registry_raw).hexdigest()
     registry = _mapping(value["registry"], ("count", "sha256"), "registry")
     if _strict_int(registry["count"], "registry.count") != registry_count:
@@ -341,7 +427,44 @@ def _validate_receipt(
         previous = observed
     if samples[1]["observed_at_ns"] - samples[0]["observed_at_ns"] < MIN_STABILITY_NS or issued - previous > MAX_HANDOFF_NS:
         raise QuiescenceError("stability samples are too close together or stale")
+    return value, expires, lock_path
+
+
+def _validate_receipt(
+    data, path, identity, expected_plan_sha256,
+    expected_git_common_dir, registry_raw, now,
+):
+    value, expires, _ = _validate_receipt_semantics(
+        data,
+        expected_plan_sha256,
+        expected_git_common_dir,
+        registry_raw,
+        live=(path, identity, now),
+    )
     return value, expires
+
+
+def validate_historical_receipt(
+    data, expected_plan_sha256, expected_git_common_dir,
+    registry_raw, protected_roots, *, now=None,
+):
+    """Validate stored evidence without requiring its old lease to remain live."""
+    if type(data) is not bytes or len(data) > MAX_RECEIPT_BYTES:
+        raise QuiescenceError("historical quiescence receipt exceeds the read limit")
+    if now is not None and type(now) is not int:
+        raise QuiescenceError("now must be an integer nanosecond timestamp")
+    current = time.time_ns() if now is None else now
+    common = os.path.realpath(os.path.abspath(os.fsencode(expected_git_common_dir)))
+    roots = _prepare_roots(protected_roots, common)
+    value, _, lock_path = _validate_receipt_semantics(
+        data,
+        expected_plan_sha256,
+        expected_git_common_dir,
+        registry_raw,
+        validation_now=current,
+    )
+    _require_external(lock_path, _revalidate_roots(roots))
+    return value
 
 
 class RepositoryLease:

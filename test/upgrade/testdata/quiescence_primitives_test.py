@@ -20,7 +20,7 @@ import upgrade_baseline_quiescence as subject
 SCHEMA = "beads.upgrade.quiescence/v1"
 NOW_NS = 2_000_000_000_000_000_000
 OVERSIZED_RECEIPT_BYTES = 1024 * 1024 + 1
-EXPECTED_TEST_COUNT = 21
+EXPECTED_TEST_COUNT = 28
 AUTHORITY_KIND = "operator-supervisor-v1"
 
 
@@ -550,6 +550,192 @@ class QuiescencePrimitivesTest(unittest.TestCase):
                 self._assert_rejected(path, descriptor)
                 self._assert_closed(descriptor)
 
+    def test_registry_grammar_accepts_bare_primary_topologies(self):
+        head = self._git_output("rev-parse", "HEAD").strip()
+        bare = b"worktree " + self.common_dir + b"\0bare\0\0"
+        missing_linked = (
+            b"worktree "
+            + os.path.join(self.root, b"missing-linked-worktree")
+            + b"\0HEAD "
+            + head
+            + b"\0detached\0prunable administrative path missing\0\0"
+        )
+        registries = {
+            "checkout only": self.registry_raw,
+            "locked checkout": self.registry_raw[:-1] + b"locked\0\0",
+            "locked checkout with reason": self.registry_raw[:-1]
+            + b"locked operator hold\ncontinued\0\0",
+            "prunable checkout with reason": self.registry_raw[:-1]
+            + b"prunable administrative path missing\0\0",
+            "pure bare": bare,
+            "bare primary with linked checkout": bare + self.registry_raw,
+            "bare primary with missing linked checkout": bare + missing_linked,
+        }
+        for index, (name, registry) in enumerate(registries.items()):
+            with self.subTest(name=name):
+                path = os.path.join(self.control, b"registry-valid-%d.receipt" % index)
+                descriptor = self._create_receipt(path, registry_raw=registry, lock=True)
+                with self._hold(path, descriptor, registry_raw=registry):
+                    self._assert_closed(descriptor)
+
+    def test_registry_grammar_rejects_noncanonical_and_alias_paths(self):
+        first_field, separator, remainder = self.registry_raw.partition(b"\0")
+        self.assertTrue(separator)
+        self.assertTrue(first_field.startswith(b"worktree "))
+        canonical = first_field.removeprefix(b"worktree ")
+        parent_alias = os.path.join(
+            os.path.dirname(canonical), b"x", b"..", os.path.basename(canonical)
+        )
+
+        def checkout(path):
+            return b"worktree " + path + b"\0" + remainder
+
+        registries = {
+            "trailing separator": checkout(canonical + b"/"),
+            "parent component": checkout(parent_alias),
+            "double leading separator": checkout(b"/" + canonical),
+            "duplicate canonical aliases": (
+                checkout(canonical)
+                + checkout(canonical + b"/")
+                + checkout(parent_alias)
+            ),
+            "duplicate double-leading alias": (
+                checkout(canonical) + checkout(b"/" + canonical)
+            ),
+        }
+        for name, registry in registries.items():
+            with self.subTest(name=name):
+                with self.assertRaises(subject.QuiescenceError):
+                    subject._registry_records(registry)
+
+    def test_registry_grammar_rejects_malformed_records(self):
+        head = self._git_output("rev-parse", "HEAD").strip()
+        bare = b"worktree " + self.common_dir + b"\0bare\0\0"
+        ambiguous = (
+            b"worktree "
+            + self.common_dir
+            + b"\0HEAD "
+            + head
+            + b"\0bare\0\0"
+        )
+        registries = {
+            "bare record with checkout HEAD": ambiguous,
+            "bare record after checkout": self.registry_raw + bare,
+            "multiple bare records": bare + bare,
+            "empty locked reason": self.registry_raw[:-1] + b"locked \0\0",
+            "empty prunable reason": self.registry_raw[:-1] + b"prunable \0\0",
+            "unknown field": self.registry_raw[:-1] + b"unknown value\0\0",
+            "duplicate HEAD": self.registry_raw[:-1] + b"HEAD " + head + b"\0\0",
+            "missing checkout lineage": (
+                b"worktree " + self.repo + b"\0HEAD " + head + b"\0\0"
+            ),
+            "duplicate checkout lineage": self.registry_raw[:-1] + b"detached\0\0",
+            "mixed object ID widths": (
+                self.registry_raw
+                + b"worktree "
+                + os.path.join(self.root, b"missing-linked-worktree")
+                + b"\0HEAD "
+                + (b"0" * (64 if len(head) == 40 else 40))
+                + b"\0detached\0\0"
+            ),
+        }
+        for index, (name, registry) in enumerate(registries.items()):
+            with self.subTest(name=name):
+                path = os.path.join(self.control, b"registry-invalid-%d.receipt" % index)
+                descriptor = self._create_receipt(path, registry_raw=registry, lock=True)
+                self._assert_rejected(path, descriptor, registry_raw=registry)
+                self._assert_closed(descriptor)
+
+    def test_historical_validation_relaxes_only_live_process_and_deadline(self):
+        path = os.path.join(self.control, b"historical.receipt")
+        issued = NOW_NS - 120_000_000_000
+
+        def make_historical(value):
+            value["lease"]["authority"]["pid"] = self._dead_pid()
+            value["lease"]["issued_at_ns"] = issued
+            value["lease"]["expires_at_ns"] = issued + 60_000_000_000
+            value["stability"]["samples"][0]["observed_at_ns"] = issued - 2_000_000_000
+            value["stability"]["samples"][1]["observed_at_ns"] = issued - 1_000_000_000
+
+        descriptor = self._create_receipt(path, mutate=make_historical)
+        data = os.pread(descriptor, os.fstat(descriptor).st_size, 0)
+        os.link(path, path + b".archived")
+        validated = subject.validate_historical_receipt(
+            data,
+            self.plan_digest,
+            self.common_dir,
+            self.registry_raw,
+            self.protected_roots,
+            now=NOW_NS,
+        )
+        self.assertEqual(validated["schema"], SCHEMA)
+
+    def test_historical_validation_rejects_malformed_lease_semantics(self):
+        mutations = {
+            "wrong authority kind": lambda value: value["lease"]["authority"].update(
+                kind="other"
+            ),
+            "wrong authority uid": lambda value: value["lease"]["authority"].update(
+                uid=os.geteuid() + 1
+            ),
+            "short lease id": lambda value: value["lease"].update(id="0123"),
+            "bool authority pid": lambda value: value["lease"]["authority"].update(pid=True),
+            "bool epoch": lambda value: value["lease"].update(epoch=True),
+            "future issue time": lambda value: value["lease"].update(
+                issued_at_ns=NOW_NS + 1
+            ),
+            "reversed expiry": lambda value: value["lease"].update(
+                expires_at_ns=value["lease"]["issued_at_ns"]
+            ),
+            "excessive duration": lambda value: value["lease"].update(
+                expires_at_ns=value["lease"]["issued_at_ns"] + subject.MAX_LEASE_NS + 1
+            ),
+            "relative lock path": lambda value: value["lease"]["lock"].update(
+                path_b64=self._b64(b"relative/lease")
+            ),
+            "noncanonical absolute lock path": lambda value: value["lease"]["lock"].update(
+                path_b64=self._b64(os.path.join(self.control, b"dot", b"..", b"lease"))
+            ),
+            "double-leading absolute lock path": lambda value: value["lease"]["lock"].update(
+                path_b64=self._b64(b"/" + os.path.join(self.control, b"historical-double"))
+            ),
+            "bool lock identity": lambda value: value["lease"]["lock"].update(dev=True),
+            "float registry count": lambda value: value["registry"].update(count=1.0),
+            "writers not drained": lambda value: value["writer_drain"].update(
+                drained=False
+            ),
+            "bool writer count": lambda value: value["writer_drain"].update(
+                write_capable_handle_count=False
+            ),
+            "single stability sample": lambda value: value["stability"].update(
+                samples=value["stability"]["samples"][:1]
+            ),
+            "mismatched stability sample": lambda value: value["stability"]["samples"][1].update(
+                digest="0" * 64
+            ),
+            "short stability interval": lambda value: value["stability"]["samples"][1].update(
+                observed_at_ns=value["stability"]["samples"][0]["observed_at_ns"] + 1
+            ),
+            "reversed stability samples": lambda value: value["stability"].update(
+                samples=list(reversed(value["stability"]["samples"]))
+            ),
+        }
+        for index, (name, mutate) in enumerate(mutations.items()):
+            with self.subTest(name=name):
+                path = os.path.join(self.control, b"historical-invalid-%d.receipt" % index)
+                descriptor = self._create_receipt(path, mutate=mutate)
+                data = os.pread(descriptor, os.fstat(descriptor).st_size, 0)
+                self.assertEqual(subject._parse(data)["schema"], SCHEMA)
+                with self.assertRaises(subject.QuiescenceError):
+                    subject.validate_historical_receipt(
+                        data,
+                        self.plan_digest,
+                        self.common_dir,
+                        self.registry_raw,
+                        self.protected_roots,
+                        now=NOW_NS,
+                    )
+
     def test_empty_registry_and_empty_protected_roots_fail_closed(self):
         empty_registry = b"\0"
         empty_path = os.path.join(self.control, b"empty-registry.receipt")
@@ -611,6 +797,46 @@ class QuiescencePrimitivesTest(unittest.TestCase):
                 self._assert_rejected(path, descriptor)
                 self._assert_closed(descriptor)
 
+    def test_external_containment_rejects_filesystem_identity_alias(self):
+        descriptor = self._create_receipt(self.receipt_path, lock=True)
+        real_stat = os.stat
+        protected_identity = real_stat(self.repo, follow_symlinks=False)
+        aliased_parent = os.path.abspath(self.control)
+
+        def stat_with_identity_alias(path, *args, **kwargs):
+            if os.path.abspath(os.fsencode(path)) == aliased_parent:
+                return protected_identity
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(subject.os, "stat", side_effect=stat_with_identity_alias):
+            self._assert_rejected(self.receipt_path, descriptor)
+        self._assert_closed(descriptor)
+
+    def test_external_containment_rejects_protected_root_drift(self):
+        swapped_path = os.path.join(self.control, b"swapped-root.receipt")
+        descriptor = self._create_receipt(swapped_path, lock=True)
+        real_stat = os.stat
+        replacement_identity = real_stat(self.control, follow_symlinks=False)
+        protected_path = os.path.abspath(self.repo)
+        protected_reads = [0]
+
+        def stat_with_root_swap(path, *args, **kwargs):
+            absolute = os.path.abspath(os.fsencode(path))
+            if absolute == protected_path:
+                protected_reads[0] += 1
+                if protected_reads[0] > 1:
+                    return replacement_identity
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(subject.os, "stat", side_effect=stat_with_root_swap):
+            with self.assertRaisesRegex(
+                subject.QuiescenceError, "protected repository root identity changed"
+            ):
+                with self._hold(swapped_path, descriptor):
+                    self.fail("protected-root drift became a live lease")
+        self.assertGreater(protected_reads[0], 1)
+        self._assert_closed(descriptor)
+
     def test_oversized_sparse_receipt_is_rejected(self):
         descriptor = os.open(
             self.receipt_path,
@@ -623,6 +849,16 @@ class QuiescencePrimitivesTest(unittest.TestCase):
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self._assert_rejected(self.receipt_path, descriptor)
         self._assert_closed(descriptor)
+
+        with self.assertRaises(subject.QuiescenceError):
+            subject.validate_historical_receipt(
+                b"x" * (subject.MAX_RECEIPT_BYTES + 1),
+                self.plan_digest,
+                self.common_dir,
+                self.registry_raw,
+                self.protected_roots,
+                now=NOW_NS,
+            )
 
     def test_final_revalidation_detects_path_replacement(self):
         descriptor = self._create_receipt(self.receipt_path, lock=True)
