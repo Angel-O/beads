@@ -743,7 +743,7 @@ var rootCmd = &cobra.Command{
 			oteltrace.WithAttributes(
 				attribute.String("bd.command", cmd.Name()),
 				attribute.String("bd.version", Version),
-				attribute.String("bd.args", scrubArgsForTelemetry(os.Args[1:], secretFlagTokens(cmd))),
+				attribute.String("bd.args", scrubArgsForTelemetry(os.Args[1:], secretFlagTokens(cmd), dsnPositionalValues(cmd))),
 			),
 		)
 
@@ -1765,6 +1765,28 @@ func secretFlagTokens(cmd *cobra.Command) map[string]bool {
 	return tokens
 }
 
+// dsnPositionalValues returns the exact positional-argument values for cmd whose
+// content is a connection string, so scrubArgsForTelemetry can give them the same full
+// DSN scrub as the --pg-url/--mysql-url flags. federation add-peer takes its peer URL
+// as a positional operand rather than a DSN flag, so a password embedded in that URL
+// (?password=/?sslpassword= or a libpq keyword) would otherwise reach bd.args through
+// only the narrow userinfo scrub. Matching by exact operand value keeps the broad DSN
+// scan off every other positional arg, so ordinary text is never over-redacted. Flags
+// are parsed before PersistentPreRunE runs, so Flags().Args() holds the positionals.
+func dsnPositionalValues(cmd *cobra.Command) map[string]bool {
+	vals := make(map[string]bool)
+	if cmd == nil {
+		return vals
+	}
+	// federation add-peer <name> <url>: the second operand is a connection string.
+	if cmd.Name() == "add-peer" && cmd.Parent() != nil && cmd.Parent().Name() == "federation" {
+		if args := cmd.Flags().Args(); len(args) >= 2 && args[1] != "" {
+			vals[args[1]] = true
+		}
+	}
+	return vals
+}
+
 // scrubArgsForTelemetry joins argv for the bd.args span attribute with any
 // credential-bearing values redacted. --pg-url/--mysql-url may carry a password
 // for init, and federation add-peer --password/-p carries a SQL password;
@@ -1774,12 +1796,14 @@ func secretFlagTokens(cmd *cobra.Command) map[string]bool {
 // A DSN flag's value is scrubbed through the parser-backed pgdialect logic so every
 // password form pgx accepts is caught — URL userinfo, URL `?password=`/`?sslpassword=`
 // query params, and libpq `password=`/`sslpassword=` keyword/value tokens — in both
-// the `--pg-url=<dsn>` and `--pg-url <dsn>` spellings. A secretFlags token's value is
-// an opaque credential and is redacted wholesale across the `--password <v>`,
-// `--password=<v>`, `-p <v>`, `-p=<v>`, and `-p<v>` spellings pflag accepts. Every
-// other arg still gets the narrow user:PASS@host userinfo scrub as defense in depth,
-// without the broad keyword scan that would over-redact ordinary text.
-func scrubArgsForTelemetry(argv []string, secretFlags map[string]bool) string {
+// the `--pg-url=<dsn>` and `--pg-url <dsn>` spellings. A DSN that arrives as a
+// positional operand instead of a flag (federation add-peer's peer URL, listed in
+// dsnPositionals by exact value) gets that same full scrub. A secretFlags token's value
+// is an opaque credential and is redacted wholesale across the `--password <v>`,
+// `--password=<v>`, `-p <v>`, `-p=<v>`, and `-p<v>` spellings pflag accepts. Every other
+// arg still gets the narrow user:PASS@host userinfo scrub as defense in depth, without
+// the broad keyword scan that would over-redact ordinary text.
+func scrubArgsForTelemetry(argv []string, secretFlags, dsnPositionals map[string]bool) string {
 	parts := make([]string, len(argv))
 	for i, a := range argv {
 		if name, val, ok := strings.Cut(a, "="); ok {
@@ -1809,6 +1833,12 @@ func scrubArgsForTelemetry(argv []string, secretFlags map[string]bool) string {
 		if short, ok := secretShorthandPrefix(a, secretFlags); ok {
 			// -p<secret> — pflag's concatenated shorthand spelling.
 			parts[i] = short + "xxxxx"
+			continue
+		}
+		if dsnPositionals[a] {
+			// federation add-peer's positional peer URL — a full DSN, so scrub every
+			// password form, not just the userinfo the fallthrough below would catch.
+			parts[i] = scrubDSNValue(a)
 			continue
 		}
 		parts[i] = scrubUserinfoPassword(a)

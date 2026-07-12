@@ -143,47 +143,73 @@ func dsnPasswordValues(dsn string) []string {
 		vals = append(vals, v)
 	}
 	if u, err := url.Parse(dsn); err == nil && u.Scheme != "" {
-		if u.User != nil {
-			if pw, ok := u.User.Password(); ok {
-				// url.Parse percent-decodes userinfo, so u.User.Password() is only
-				// the decoded value. pgx and telemetry sinks echo the DSN verbatim,
-				// so also scrub the raw as-written form — mirroring the query-param
-				// branch below, which adds both raw and decoded values.
-				add(pw)
-				add(rawURLUserinfoPassword(dsn))
-			}
+		addURLUserinfoPassword(dsn, u, add)
+		addURLQueryPasswords(u, add)
+	}
+	addLibpqKeywordPasswords(dsn, add)
+	return vals
+}
+
+// addURLUserinfoPassword passes the userinfo password of a URL-form DSN to add in
+// both its decoded and raw as-written forms. url.Parse percent-decodes userinfo, so
+// u.User.Password() is only the decoded value; pgx and telemetry sinks echo the DSN
+// verbatim, so the raw form is added too — mirroring addURLQueryPasswords, which adds
+// both raw and decoded values.
+func addURLUserinfoPassword(dsn string, u *url.URL, add func(string)) {
+	if u.User == nil {
+		return
+	}
+	pw, ok := u.User.Password()
+	if !ok {
+		return
+	}
+	add(pw)
+	add(rawURLUserinfoPassword(dsn))
+}
+
+// addURLQueryPasswords passes the value of every URL query password/sslpassword param
+// to add. pgx echoes the raw query string back verbatim, so the raw value is matched;
+// the decoded value is added too in case a caller logs the parsed form.
+func addURLQueryPasswords(u *url.URL, add func(string)) {
+	for _, pair := range strings.Split(u.RawQuery, "&") {
+		key, val, ok := strings.Cut(pair, "=")
+		if !ok {
+			continue
 		}
-		// pgx echoes the raw query string back verbatim, so match the raw value;
-		// also add the decoded value in case a caller logs the parsed form.
-		for _, pair := range strings.Split(u.RawQuery, "&") {
-			key, val, ok := strings.Cut(pair, "=")
-			if !ok {
-				continue
-			}
-			// url.Query() (which pgx.ParseConfig uses) percent-decodes query KEYS as
-			// well as values, so a query key of pass%77ord or %70assword is a live
-			// "password" param even though the raw key string doesn't say so. Compare
-			// both the raw (as-written) key and its unescaped form — ignoring an
-			// unescape error and falling back to the raw compare, which already ran.
-			matched := isPasswordKey(key)
-			if !matched {
-				if dk, err := url.QueryUnescape(key); err == nil {
-					matched = isPasswordKey(dk)
-				}
-			}
-			if matched {
-				add(val)
-				if dec, err := url.QueryUnescape(val); err == nil {
-					add(dec)
-				}
-			}
+		if !queryKeyIsPassword(key) {
+			continue
+		}
+		add(val)
+		if dec, err := url.QueryUnescape(val); err == nil {
+			add(dec)
 		}
 	}
+}
+
+// queryKeyIsPassword reports whether a raw URL query key names a password param.
+// url.Query() (which pgx.ParseConfig uses) percent-decodes query KEYS as well as
+// values, so a query key of pass%77ord or %70assword is a live "password" param even
+// though the raw key string doesn't say so. Both the raw (as-written) key and its
+// unescaped form are compared — an unescape error falls back to the raw compare, which
+// already ran.
+func queryKeyIsPassword(key string) bool {
+	if isPasswordKey(key) {
+		return true
+	}
+	if dk, err := url.QueryUnescape(key); err == nil {
+		return isPasswordKey(dk)
+	}
+	return false
+}
+
+// addLibpqKeywordPasswords passes the value of every libpq keyword/value password
+// token (password=, sslpassword=) in dsn to add, in both its single-quoted body and
+// unquoted-token spellings.
+func addLibpqKeywordPasswords(dsn string, add func(string)) {
 	for _, m := range pwValueRe.FindAllStringSubmatch(dsn, -1) {
 		add(m[1]) // single-quoted body
 		add(m[2]) // unquoted token
 	}
-	return vals
 }
 
 // rawURLUserinfoPassword returns the userinfo password of a URL-form DSN exactly

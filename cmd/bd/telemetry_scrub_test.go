@@ -53,7 +53,7 @@ func TestScrubArgsForTelemetry(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := scrubArgsForTelemetry(tc.argv, nil)
+			out := scrubArgsForTelemetry(tc.argv, nil, nil)
 			if strings.Contains(out, secret) {
 				t.Fatalf("PASSWORD LEAK: scrubArgsForTelemetry(%v) = %q still contains %q", tc.argv, out, secret)
 			}
@@ -75,12 +75,12 @@ func TestScrubArgsForTelemetry(t *testing.T) {
 // bare user:pass@host userinfo anywhere is still redacted as defense in depth.
 func TestScrubArgsForTelemetryLeavesOrdinaryArgs(t *testing.T) {
 	argv := []string{"create", "--title", "document the password= knob"}
-	if out := scrubArgsForTelemetry(argv, nil); out != "create --title document the password= knob" {
+	if out := scrubArgsForTelemetry(argv, nil, nil); out != "create --title document the password= knob" {
 		t.Fatalf("over-redacted ordinary args: got %q", out)
 	}
 
 	argv = []string{"weird", "postgres://u:leak@h:5432/db"}
-	if out := scrubArgsForTelemetry(argv, nil); strings.Contains(out, "leak") {
+	if out := scrubArgsForTelemetry(argv, nil, nil); strings.Contains(out, "leak") {
 		t.Fatalf("userinfo password not scrubbed as defense in depth: %q", out)
 	}
 }
@@ -152,7 +152,7 @@ func TestScrubArgsForTelemetryRedactsFederationPassword(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := scrubArgsForTelemetry(tc.argv, secretFlags)
+			out := scrubArgsForTelemetry(tc.argv, secretFlags, nil)
 			if strings.Contains(out, secret) {
 				t.Fatalf("PASSWORD LEAK: scrubArgsForTelemetry(%v) = %q still contains %q", tc.argv, out, secret)
 			}
@@ -193,7 +193,7 @@ func TestScrubArgsForTelemetryRedactsShorthandCluster(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := scrubArgsForTelemetry(tc.argv, secretFlags)
+			out := scrubArgsForTelemetry(tc.argv, secretFlags, nil)
 			if strings.Contains(out, secret) {
 				t.Fatalf("PASSWORD LEAK: scrubArgsForTelemetry(%v) = %q still contains %q", tc.argv, out, secret)
 			}
@@ -210,13 +210,128 @@ func TestScrubArgsForTelemetryRedactsShorthandCluster(t *testing.T) {
 // pass through untouched. Without this guarantee the fix would silently redact
 // priority/prefix on the most common bd invocations.
 func TestScrubArgsForTelemetryKeepsOverloadedShortFlag(t *testing.T) {
-	if out := scrubArgsForTelemetry([]string{"ready", "-p", "1"}, nil); out != "ready -p 1" {
+	if out := scrubArgsForTelemetry([]string{"ready", "-p", "1"}, nil, nil); out != "ready -p 1" {
 		t.Fatalf("over-redacted non-secret -p priority: got %q", out)
 	}
-	if out := scrubArgsForTelemetry([]string{"init", "-p", "myprefix"}, map[string]bool{}); out != "init -p myprefix" {
+	if out := scrubArgsForTelemetry([]string{"init", "-p", "myprefix"}, map[string]bool{}, nil); out != "init -p myprefix" {
 		t.Fatalf("over-redacted non-secret -p prefix: got %q", out)
 	}
-	if out := scrubArgsForTelemetry([]string{"init", "-p=myprefix"}, nil); out != "init -p=myprefix" {
+	if out := scrubArgsForTelemetry([]string{"init", "-p=myprefix"}, nil, nil); out != "init -p=myprefix" {
 		t.Fatalf("over-redacted non-secret -p=prefix: got %q", out)
+	}
+}
+
+// TestScrubArgsForTelemetryRedactsPositionalPeerURL locks that a password embedded in
+// federation add-peer's POSITIONAL peer URL never reaches bd.args. --password/-p and
+// URL userinfo were already covered, but the connection target is a positional operand,
+// not a --pg-url/--mysql-url flag, so its ?password=/?sslpassword= query params and
+// libpq keyword passwords otherwise fell through to the userinfo-only scrub and leaked.
+// dsnPositionalValues lists the exact operand so it gets the full parser-backed scrub.
+func TestScrubArgsForTelemetryRedactsPositionalPeerURL(t *testing.T) {
+	const secret = "s3cr3t-pw"
+	secretFlags := map[string]bool{"--password": true, "-p": true}
+	cases := []struct {
+		name string
+		url  string
+		keep []string // non-secret structure that must survive redaction
+	}{
+		{
+			name: "query password param",
+			url:  "postgres://bts@127.0.0.1:5432/db?password=" + secret,
+			keep: []string{"127.0.0.1:5432/db", "password="},
+		},
+		{
+			name: "query sslpassword param",
+			url:  "postgres://bts@h:5432/db?sslpassword=" + secret + "&sslmode=require",
+			keep: []string{"sslmode=require"},
+		},
+		{
+			name: "userinfo password",
+			url:  "postgres://bts:" + secret + "@127.0.0.1:5432/db",
+			keep: []string{"127.0.0.1:5432/db"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			argv := []string{"federation", "add-peer", "partner", tc.url, "--user", "admin"}
+			dsnPositionals := map[string]bool{tc.url: true}
+			out := scrubArgsForTelemetry(argv, secretFlags, dsnPositionals)
+			if strings.Contains(out, secret) {
+				t.Fatalf("PASSWORD LEAK: scrubArgsForTelemetry(%v) = %q still contains %q", argv, out, secret)
+			}
+			if !strings.Contains(out, "xxxxx") {
+				t.Fatalf("expected redaction marker xxxxx in %q", out)
+			}
+			if !strings.Contains(out, "--user admin") {
+				t.Errorf("expected non-secret --user admin to survive in %q", out)
+			}
+			for _, k := range tc.keep {
+				if !strings.Contains(out, k) {
+					t.Errorf("expected %q to survive redaction in %q", k, out)
+				}
+			}
+		})
+	}
+
+	// A positional URL that is NOT listed (e.g. some other command's operand) still gets
+	// only the userinfo scrub, so an ordinary token carrying a literal "password=" is
+	// never over-redacted by a broad keyword scan.
+	argv := []string{"create", "--title", "postgres://h/db?password=notascan"}
+	if out := scrubArgsForTelemetry(argv, nil, nil); !strings.Contains(out, "password=notascan") {
+		t.Fatalf("over-redacted an unlisted positional as a DSN: got %q", out)
+	}
+}
+
+// TestDSNPositionalValuesResolvesFederationAddPeerURL proves the resolver returns
+// federation add-peer's <url> operand (its second positional) after flag parsing, and
+// nothing for other commands, too-few operands, or a nil command — so only the peer URL
+// is matched for the full DSN scrub.
+func TestDSNPositionalValuesResolvesFederationAddPeerURL(t *testing.T) {
+	newAddPeer := func() *cobra.Command {
+		fed := &cobra.Command{Use: "federation"}
+		var user, pw string
+		addPeer := &cobra.Command{Use: "add-peer <name> <url>", RunE: func(*cobra.Command, []string) error { return nil }}
+		addPeer.Flags().StringVarP(&user, "user", "u", "", "")
+		addPeer.Flags().StringVarP(&pw, "password", "p", "", "")
+		fed.AddCommand(addPeer)
+		return addPeer
+	}
+
+	const url = "postgres://bts@127.0.0.1:5432/db?password=s3cr3t"
+	addPeer := newAddPeer()
+	if err := addPeer.ParseFlags([]string{"partner", url, "--user", "admin"}); err != nil {
+		t.Fatalf("ParseFlags: %v", err)
+	}
+	got := dsnPositionalValues(addPeer)
+	if !got[url] || len(got) != 1 {
+		t.Fatalf("dsnPositionalValues = %v, want exactly {%q}", got, url)
+	}
+
+	// Fewer than two operands: no peer URL to scrub.
+	onlyName := newAddPeer()
+	if err := onlyName.ParseFlags([]string{"partner"}); err != nil {
+		t.Fatalf("ParseFlags: %v", err)
+	}
+	if got := dsnPositionalValues(onlyName); len(got) != 0 {
+		t.Fatalf("dsnPositionalValues(one operand) = %v, want empty", got)
+	}
+
+	// A same-named command whose parent is not federation must not match.
+	orphan := &cobra.Command{Use: "add-peer"}
+	if err := orphan.ParseFlags([]string{"a", "b"}); err != nil {
+		t.Fatalf("ParseFlags: %v", err)
+	}
+	if got := dsnPositionalValues(orphan); len(got) != 0 {
+		t.Fatalf("dsnPositionalValues(no federation parent) = %v, want empty", got)
+	}
+
+	// Unrelated command and nil resolve to nothing.
+	other := &cobra.Command{Use: "init"}
+	_ = other.ParseFlags([]string{"--backend", "postgres"})
+	if got := dsnPositionalValues(other); len(got) != 0 {
+		t.Fatalf("dsnPositionalValues(init) = %v, want empty", got)
+	}
+	if got := dsnPositionalValues(nil); len(got) != 0 {
+		t.Fatalf("dsnPositionalValues(nil) = %v, want empty", got)
 	}
 }
