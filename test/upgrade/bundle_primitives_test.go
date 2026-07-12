@@ -1,6 +1,7 @@
 package upgrade_test
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"testing"
 )
+
+const bundlePythonTestCount = 83
 
 func TestBundlePrimitivesPythonSuite(t *testing.T) {
 	if runtime.GOOS == "windows" {
@@ -21,7 +24,19 @@ func TestBundlePrimitivesPythonSuite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bundle primitive suite failed: %v\n%s", err, output)
 	}
-	if !strings.Contains(string(output), "OK") {
-		t.Fatalf("bundle primitive suite did not report success:\n%s", output)
+	executed := fmt.Sprintf("BUNDLE_TESTS_EXECUTED count=%d", bundlePythonTestCount)
+	passed := fmt.Sprintf("BUNDLE_TESTS_PASSED count=%d", bundlePythonTestCount)
+	if bundleExactOutputLineCount(output, executed) != 1 || bundleExactOutputLineCount(output, passed) != 1 {
+		t.Fatalf("bundle primitive suite did not report exactly %d successful tests:\n%s", bundlePythonTestCount, output)
 	}
+}
+
+func bundleExactOutputLineCount(output []byte, expected string) int {
+	count := 0
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.TrimSuffix(line, "\r") == expected {
+			count++
+		}
+	}
+	return count
 }

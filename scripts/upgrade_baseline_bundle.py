@@ -9,12 +9,84 @@ import secrets
 import stat
 
 CHUNK_SIZE = 1024 * 1024
+CLEANUP_RETRIES = 3
 INCOMPLETE_MARKER = b"capture has not completed\n"
 COMPLETE_MARKER = b"owner-only preservation bundle complete\n"
 
 class PreservationError(RuntimeError):
     """A preservation bundle could not be captured or verified safely."""
 
+def _chain_failures(primary, failures):
+    failures = [failure for failure in failures if failure is not None and failure is not primary]
+    if not failures:
+        return
+    original = getattr(primary, "_preservation_original_cause", primary.__cause__)
+    previous_tail = getattr(primary, "_preservation_failure_tail", None)
+    head = failures[0]
+    tail = None
+    for failure in failures:
+        if tail is not None and tail.__cause__ in (None, original):
+            tail.__cause__ = failure
+        tail = failure
+        seen = {id(primary), id(failure)}
+        if original is not None:
+            seen.add(id(original))
+        while tail.__cause__ is not None and id(tail.__cause__) not in seen:
+            tail = tail.__cause__
+            seen.add(id(tail))
+    if tail.__cause__ is None:
+        tail.__cause__ = original
+    if previous_tail is None:
+        primary.__cause__ = head
+        primary._preservation_original_cause = original
+    elif previous_tail.__cause__ in (None, original):
+        previous_tail.__cause__ = head
+    primary._preservation_failure_tail = tail
+
+def _wrap_preservation_error(message, error):
+    failure = PreservationError(message)
+    tail = getattr(error, "_preservation_failure_tail", None)
+    if tail is None:
+        failure.__cause__ = error
+    else:
+        head = error.__cause__
+        original = getattr(error, "_preservation_original_cause", None)
+        error.__cause__ = original
+        tail.__cause__ = error
+        failure.__cause__ = head
+        failure._preservation_original_cause = error
+        failure._preservation_failure_tail = tail
+        del error._preservation_original_cause
+        del error._preservation_failure_tail
+    failure.__suppress_context__ = True
+    return failure
+
+def _close_descriptors(primary, descriptors):
+    failures = []
+    for descriptor in descriptors:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                failures.append(error)
+    if not failures:
+        return
+    if primary is not None:
+        _chain_failures(primary, failures)
+        return
+    first = failures[0]
+    if not isinstance(first, Exception):
+        _chain_failures(first, failures[1:])
+        raise first
+    failure = PreservationError(
+        "cannot close preservation bundle: %s"
+        % "; ".join(str(error) for error in failures)
+    )
+    _chain_failures(failure, failures)
+    raise failure
+
+def _close_all(primary, *descriptors):
+    _close_descriptors(primary, descriptors)
 def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -50,6 +122,7 @@ def _identity(info):
 def _namespace_identity(info):
     return info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)
 
+def _anchor_identity(info): return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_uid, stat.S_IMODE(info.st_mode))
 def _open_stable_source(path):
     try:
         before = os.lstat(path)
@@ -95,8 +168,86 @@ def inspect_file(path):
 class Bundle:
     def __init__(self, path):
         self.path = os.path.abspath(os.fsencode(path))
-        self._root_identity = _namespace_identity(os.stat(self.path, follow_symlinks=False))
-
+        parent = root = None
+        primary = None
+        try:
+            parent, root = self._open_root_descriptors()
+            self._record_anchors(parent, root)
+            self._revalidate_open_anchor(parent, root, require_owner_only=False)
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            _close_all(primary, root, parent)
+    @classmethod
+    def create_started(cls, path):
+        bundle = cls.__new__(cls)
+        bundle.path = os.path.abspath(os.fsencode(path))
+        parent = root = None
+        staging = staging_identity = None
+        marker_durable = published = False
+        primary = None
+        try:
+            parent_path, name = bundle._path_parts()
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+            parent = os.open(parent_path, flags)
+            parent_info = os.fstat(parent)
+            bundle._require_owner_only(parent_info, parent_path, directory=True)
+            bundle._parent_identity = _anchor_identity(parent_info)
+            bundle._revalidate_parent(parent)
+            bundle._require_destination_absent(parent, name)
+            staging = bundle._create_staging(parent)
+            root = os.open(staging, flags, dir_fd=parent)
+            fcntl.flock(root, fcntl.LOCK_EX)
+            opened = os.fstat(root)
+            created = os.stat(staging, dir_fd=parent, follow_symlinks=False)
+            if _anchor_identity(created) != _anchor_identity(opened):
+                raise PreservationError("preservation bundle staging root changed while opening")
+            bundle._require_owner_only(opened, staging, directory=True)
+            bundle._root_identity = _anchor_identity(opened)
+            staging_identity = bundle._root_identity
+            bundle._revalidate_staging(parent, root, staging)
+            bundle._write_artifact(root, b"INCOMPLETE", INCOMPLETE_MARKER)
+            os.fsync(root); marker_durable = True
+            bundle._revalidate_parent(parent)
+            bundle._revalidate_staging(parent, root, staging)
+            # POSIX rename can replace an empty directory, so reject any
+            # destination visible at the last descriptor-relative check.
+            bundle._require_destination_absent(parent, name)
+            os.rename(staging, name, src_dir_fd=parent, dst_dir_fd=parent)
+            published = True; staging = None
+            os.fsync(parent)
+            bundle._revalidate_open_anchor(parent, root)
+            bundle._require_active(root)
+            bundle._revalidate_open_anchor(parent, root)
+            return bundle
+        except (OSError, ValueError) as error:
+            primary = _wrap_preservation_error(
+                "cannot create preservation bundle: %s" % error, error
+            )
+            raise primary
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            cleanup_primary = primary
+            try:
+                if not published and parent is not None and staging is not None:
+                    bundle._cleanup_staging(
+                        parent,
+                        root,
+                        staging,
+                        staging_identity,
+                        marker_durable,
+                        primary,
+                    )
+            except BaseException as error:
+                cleanup_primary = error
+                raise
+            finally:
+                _close_all(cleanup_primary, root, parent)
+    def revalidate_anchor(self):
+        with self._root(exclusive=False): pass
     def artifact(self, relative, data):
         relative_bytes = validate_relative(os.fsencode(relative), "artifact path")
         top = relative_bytes.split(b"/", 1)[0]
@@ -212,45 +363,280 @@ class Bundle:
                 os.fsync(root)
                 os.fsync(parent)
 
-    @contextlib.contextmanager
-    def _root(self, exclusive):
+    def _path_parts(self):
         parent_path = os.path.dirname(self.path)
         name = os.path.basename(self.path)
         if not name:
             raise PreservationError("preservation bundle path cannot be a filesystem root")
+        return parent_path, name
+
+    def _open_root_descriptors(self):
+        parent_path, name = self._path_parts()
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        parent = None
         try:
             parent = os.open(parent_path, flags)
-            try:
-                root = os.open(name, flags, dir_fd=parent)
-            except Exception:
-                os.close(parent)
-                raise
+            return parent, os.open(name, flags, dir_fd=parent)
         except OSError as error:
-            raise PreservationError("cannot open preservation bundle: %s" % error) from error
+            primary = _wrap_preservation_error(
+                "cannot open preservation bundle: %s" % error, error
+            )
+            _close_all(primary, parent)
+            raise primary
+        except BaseException as primary:
+            _close_all(primary, parent)
+            raise
+
+    def _record_anchors(self, parent, root):
+        self._parent_identity, self._root_identity = _anchor_identity(os.fstat(parent)), _anchor_identity(os.fstat(root))
+
+    def _revalidate_parent(self, parent, require_owner_only=True):
+        parent_path, _ = self._path_parts()
+        try:
+            opened = os.fstat(parent)
+            current = os.stat(parent_path, follow_symlinks=False)
+        except OSError as error:
+            raise PreservationError("cannot revalidate preservation bundle parent: %s" % error) from error
+        if require_owner_only:
+            for info in (opened, current):
+                self._require_owner_only(info, parent_path, directory=True)
+        if any(_anchor_identity(info) != self._parent_identity for info in (opened, current)):
+            raise PreservationError("preservation bundle parent anchor changed")
+
+    def _revalidate_open_anchor(self, parent, root, require_owner_only=True):
+        self._revalidate_parent(parent, require_owner_only)
+        _, name = self._path_parts()
+        try:
+            opened = os.fstat(root)
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except OSError as error:
+            raise PreservationError("cannot revalidate preservation bundle root: %s" % error) from error
+        if require_owner_only:
+            for info in (opened, current):
+                self._require_owner_only(info, self.path, directory=True)
+        if any(_anchor_identity(info) != self._root_identity for info in (opened, current)):
+            raise PreservationError("preservation bundle root anchor changed")
+        self._revalidate_parent(parent, require_owner_only)
+
+    def _revalidate_staging(self, parent, root, staging):
+        opened = os.fstat(root)
+        current = os.stat(staging, dir_fd=parent, follow_symlinks=False)
+        for info in (opened, current):
+            self._require_owner_only(info, staging, directory=True)
+        if any(_anchor_identity(info) != self._root_identity for info in (opened, current)):
+            raise PreservationError("preservation bundle staging root changed")
+
+    def _require_destination_absent(self, parent, name):
+        try:
+            os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise PreservationError("cannot inspect preservation bundle destination: %s" % error) from error
+        raise PreservationError("preservation bundle destination already exists")
+
+    def _create_staging(self, parent):
+        previous_umask = os.umask(0o077)
+        try:
+            for _ in range(100):
+                name = os.fsencode(".bundle-staging-" + secrets.token_hex(16))
+                try:
+                    os.mkdir(name, 0o700, dir_fd=parent)
+                    return name
+                except FileExistsError:
+                    continue
+                except BaseException as primary:
+                    self._cleanup_staging(parent, None, name, None, False, primary)
+                    raise
+        finally:
+            os.umask(previous_umask)
+        raise PreservationError("cannot allocate a unique preservation bundle staging root")
+
+    def _cleanup_staging(self, parent, root, staging, expected, marker_durable, primary):
+        cleanup_root, opened_here = root, False
+        try:
+            if marker_durable:
+                self._retry_cleanup(lambda: os.fsync(parent), "staging parent sync")
+                return
+            def inspect_staging():
+                try:
+                    return os.stat(staging, dir_fd=parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    return None
+
+            current = self._retry_cleanup(
+                inspect_staging,
+                "staging entry stat",
+            )
+            if current is None:
+                self._retry_cleanup(lambda: os.fsync(parent), "removed staging parent sync")
+                return
+            self._require_owner_only(current, staging, directory=True)
+            if expected is not None and _anchor_identity(current) != expected:
+                raise PreservationError("preservation bundle staging root changed during cleanup")
+            if cleanup_root is not None:
+                opened = self._retry_cleanup(
+                    lambda: os.fstat(cleanup_root), "staging descriptor stat"
+                )
+                self._require_owner_only(opened, staging, directory=True)
+                if _anchor_identity(opened) != _anchor_identity(current):
+                    raise PreservationError("preservation bundle staging root changed during cleanup")
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+            removed = False
+            if cleanup_root is None:
+                for _ in range(CLEANUP_RETRIES):
+                    try:
+                        os.rmdir(staging, dir_fd=parent)
+                    except FileNotFoundError:
+                        removed = True
+                        break
+                    except OSError:
+                        pass
+                    else:
+                        removed = True
+                        break
+                    try:
+                        cleanup_root = os.open(staging, flags, dir_fd=parent)
+                    except OSError:
+                        rechecked = self._retry_cleanup(
+                            lambda: os.stat(
+                                staging, dir_fd=parent, follow_symlinks=False
+                            ),
+                            "staging entry restat",
+                        )
+                        self._require_owner_only(rechecked, staging, directory=True)
+                        if _anchor_identity(rechecked) != _anchor_identity(current):
+                            raise PreservationError(
+                                "preservation bundle staging root changed during cleanup"
+                            )
+                        current = rechecked
+                        continue
+                    opened_here = True
+                    opened = self._retry_cleanup(
+                        lambda: os.fstat(cleanup_root), "fallback descriptor stat"
+                    )
+                    current = self._retry_cleanup(
+                        lambda: os.stat(
+                            staging, dir_fd=parent, follow_symlinks=False
+                        ),
+                        "fallback entry stat",
+                    )
+                    for info in (opened, current):
+                        self._require_owner_only(info, staging, directory=True)
+                    if _anchor_identity(opened) != _anchor_identity(current):
+                        raise PreservationError(
+                            "preservation bundle staging root changed during cleanup"
+                        )
+                    break
+                else:
+                    raise PreservationError(
+                        "cannot remove or open preservation bundle staging root"
+                    )
+            else:
+                try:
+                    os.rmdir(staging, dir_fd=parent)
+                except FileNotFoundError:
+                    removed = True
+                except OSError:
+                    pass
+                else:
+                    removed = True
+            if removed:
+                self._retry_cleanup(lambda: os.fsync(parent), "removed staging parent sync")
+                return
+            self._retry_cleanup(
+                lambda: self._sync_cleanup_marker(cleanup_root),
+                "INCOMPLETE marker durability",
+            )
+            self._retry_cleanup(lambda: os.fsync(cleanup_root), "staging root sync")
+            self._retry_cleanup(lambda: os.fsync(parent), "retained staging parent sync")
+        except BaseException as error:
+            if error is primary:
+                raise
+            failure = PreservationError(
+                "cannot make preservation bundle staging cleanup durable: %s" % error
+            )
+            failure.__cause__ = error
+            if primary is None:
+                raise failure
+            _chain_failures(primary, [failure])
+        finally:
+            if opened_here:
+                _close_descriptors(primary, [cleanup_root])
+
+    @staticmethod
+    def _retry_cleanup(operation, label):
+        failure = None
+        for _ in range(CLEANUP_RETRIES):
+            try:
+                return operation()
+            except (OSError, PreservationError) as error:
+                failure = error
+        raise PreservationError("cannot complete %s: %s" % (label, failure)) from failure
+
+    def _sync_cleanup_marker(self, root):
+        name = b"INCOMPLETE"
+        if not self._entry_exists(root, name):
+            self._write_artifact(root, name, INCOMPLETE_MARKER)
+            return
+        descriptor, before = self._open_entry(root, name, writable=True)
+        primary = None
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            current_data = os.read(descriptor, len(INCOMPLETE_MARKER) + 1)
+            if current_data != INCOMPLETE_MARKER:
+                os.ftruncate(descriptor, 0)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                remaining = memoryview(INCOMPLETE_MARKER)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise PreservationError("cannot rewrite INCOMPLETE marker")
+                    remaining = remaining[written:]
+            os.fsync(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if os.read(descriptor, len(INCOMPLETE_MARKER) + 1) != INCOMPLETE_MARKER:
+                raise PreservationError("preservation bundle has an invalid INCOMPLETE marker")
+            opened = os.fstat(descriptor)
+            current = self._require_entry(root, name)
+            expected = _anchor_identity(before)
+            if any(_anchor_identity(info) != expected for info in (opened, current)):
+                raise PreservationError("INCOMPLETE marker changed during cleanup")
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            _close_all(primary, descriptor)
+
+    @contextlib.contextmanager
+    def _root(self, exclusive):
+        parent, root = self._open_root_descriptors()
+        primary = None
         try:
             fcntl.flock(root, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-            opened = os.fstat(root)
-            if self._root_identity != _namespace_identity(opened):
-                raise PreservationError("preservation bundle identity changed between operations")
-            parent_identity = _namespace_identity(os.fstat(parent))
-            self._require_owner_only(opened, self.path, directory=True)
-            yield parent, root
-            if parent_identity != _namespace_identity(os.stat(parent_path, follow_symlinks=False)):
-                raise PreservationError("preservation bundle parent changed during operation")
-            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
-            self._require_owner_only(current, self.path, directory=True)
-            if _namespace_identity(opened) != _namespace_identity(current):
-                raise PreservationError("preservation bundle root changed during operation")
+            self._revalidate_open_anchor(parent, root)
+            try:
+                yield parent, root
+            except BaseException as body_error:
+                try:
+                    self._revalidate_open_anchor(parent, root)
+                except BaseException as validation_error:
+                    _chain_failures(body_error, [validation_error])
+                raise
+            else:
+                self._revalidate_open_anchor(parent, root)
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            os.close(root)
-            os.close(parent)
+            _close_all(primary, root, parent)
 
     @contextlib.contextmanager
     def _directory(self, root, parts, create):
         descriptors = [os.dup(root)]
         links = []
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        primary = None
         try:
             for part in parts:
                 current = descriptors[-1]
@@ -281,9 +667,11 @@ class Bundle:
                 self._require_owner_only(current, part, directory=True)
                 if _namespace_identity(current) != expected:
                     raise PreservationError("artifact directory changed during operation: %s" % display(part))
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            for descriptor in reversed(descriptors):
-                os.close(descriptor)
+            _close_all(primary, *reversed(descriptors))
 
     def _write_artifact(self, root, relative, data):
         relative_bytes = validate_relative(os.fsencode(relative), "artifact path")
@@ -302,12 +690,27 @@ class Bundle:
                     handle.write(data)
                     self._sync_file(handle)
                     written = os.fstat(handle.fileno())
-            except Exception:
+            except BaseException as primary:
+                # Once fdopen owns the descriptor, preserve the established
+                # interruption semantics so lifecycle cleanup can normalize a
+                # possibly published marker. Raw descriptors are always ours.
+                if descriptor is None and not isinstance(primary, Exception):
+                    raise
+                cleanup_failures = []
                 if descriptor is not None:
-                    os.close(descriptor)
+                    try:
+                        os.close(descriptor)
+                    except BaseException as cleanup_error:
+                        cleanup_failures.append(cleanup_error)
                 if created:
-                    with contextlib.suppress(FileNotFoundError):
+                    try:
                         os.unlink(parts[-1], dir_fd=directory)
+                    except FileNotFoundError:
+                        pass
+                    except BaseException as cleanup_error:
+                        cleanup_failures.append(cleanup_error)
+                if cleanup_failures:
+                    _chain_failures(primary, cleanup_failures)
                 raise
             current = self._require_entry(directory, parts[-1])
             if _identity(written) != _identity(current):
