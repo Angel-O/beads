@@ -121,22 +121,44 @@ func TestWindowsMetadataNoFollowHasNoDataAccess(t *testing.T) {
 }
 
 func TestWindowsMetadataNoFollowRejectsRawDeviceNamespace(t *testing.T) {
-	for _, path := range []string{
-		`\\.\NUL`,
-		`\\server\pipe\name`,
-		`\\?\UNC\server\mailslot\name`,
+	for _, tt := range []struct {
+		path string
+		want string
+	}{
+		{path: `\\.\NUL`, want: "device namespace"},
+		{path: `\\server\pipe\name`, want: "device namespace"},
+		{path: `\\server\PIPE.\name`, want: "device namespace"},
+		{path: `\\?\UNC\server\mailslot\name`, want: "device namespace"},
+		{path: `C:\workspace\NUL:$DATA`, want: "alternate data stream"},
+		{path: `C:\workspace\COM1:stream`, want: "alternate data stream"},
+		{path: `C:\workspace\COM¹`, want: "reserved DOS device"},
+		{path: `C:\workspace\LPT².txt`, want: "reserved DOS device"},
 	} {
-		t.Run(path, func(t *testing.T) {
-			file, err := OpenMetadataNoFollow(path)
+		t.Run(tt.path, func(t *testing.T) {
+			file, err := OpenMetadataNoFollow(tt.path)
 			if err == nil || file != nil {
 				if file != nil {
 					_ = file.Close()
 				}
 				t.Fatalf("device namespace open got file=%v err=%v, want rejection", file, err)
 			}
-			if !strings.Contains(err.Error(), "device namespace") {
-				t.Fatalf("device namespace error = %v, want device-namespace rejection", err)
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("unsafe-path error = %v, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestWindowsMetadataPathAllowsDOSDeviceNearMisses(t *testing.T) {
+	for _, path := range []string{
+		`C:\workspace\COMLPT1`,
+		`C:\workspace\LPTCOM1`,
+		`C:\workspace\COM0`,
+		`C:\workspace\LPT10`,
+		`C:\workspace\COMLPT²`,
+	} {
+		if err := validateWindowsMetadataPath(path); err != nil {
+			t.Fatalf("safe near-miss path %q: %v", path, err)
+		}
 	}
 }

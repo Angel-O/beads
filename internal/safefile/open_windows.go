@@ -85,20 +85,67 @@ func validateWindowsMetadataPath(path string) error {
 	if strings.HasPrefix(upper, `\\.\`) || strings.HasPrefix(upper, `\\?\GLOBALROOT\`) {
 		return errors.New("metadata path uses a raw device namespace")
 	}
-	if share, ok := windowsUNCShare(upper); ok && (share == "PIPE" || share == "MAILSLOT") {
+	if share, ok := windowsUNCShare(cleanedWindowsNamespaceComponent(upper)); ok && (share == "PIPE" || share == "MAILSLOT") {
 		return errors.New("metadata path uses an IPC device namespace")
 	}
 	if !strings.HasPrefix(upper, `\\?\`) {
-		return nil
+		return validateWindowsMetadataComponents(abs)
 	}
 	remainder := strings.TrimPrefix(upper, `\\?\`)
 	if strings.HasPrefix(remainder, `UNC\`) || strings.HasPrefix(remainder, `VOLUME{`) {
-		return nil
+		return validateWindowsMetadataComponents(abs)
 	}
 	if len(remainder) >= 3 && remainder[1] == ':' && remainder[2] == '\\' {
-		return nil
+		return validateWindowsMetadataComponents(abs)
 	}
 	return errors.New("metadata path uses an unsupported device namespace")
+}
+
+func validateWindowsMetadataComponents(path string) error {
+	volume := filepath.VolumeName(path)
+	remainder := strings.TrimPrefix(path, volume)
+	for _, component := range strings.FieldsFunc(remainder, func(r rune) bool { return r == '\\' || r == '/' }) {
+		if strings.ContainsRune(component, ':') {
+			return errors.New("metadata path uses an alternate data stream")
+		}
+		if isReservedWindowsMetadataComponent(component) {
+			return errors.New("metadata path contains a reserved DOS device component")
+		}
+	}
+	return nil
+}
+
+func isReservedWindowsMetadataComponent(component string) bool {
+	base := component
+	if index := strings.IndexAny(base, ".:"); index >= 0 {
+		base = base[:index]
+	}
+	base = strings.TrimRight(base, " ")
+	upper := strings.ToUpper(base)
+	switch upper {
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$":
+		return true
+	}
+	var suffix string
+	switch {
+	case strings.HasPrefix(upper, "COM"):
+		suffix = strings.TrimPrefix(upper, "COM")
+	case strings.HasPrefix(upper, "LPT"):
+		suffix = strings.TrimPrefix(upper, "LPT")
+	default:
+		return false
+	}
+	return suffix == "1" || suffix == "2" || suffix == "3" || suffix == "4" || suffix == "5" ||
+		suffix == "6" || suffix == "7" || suffix == "8" || suffix == "9" ||
+		suffix == "¹" || suffix == "²" || suffix == "³"
+}
+
+func cleanedWindowsNamespaceComponent(path string) string {
+	parts := strings.Split(path, `\`)
+	for index := range parts {
+		parts[index] = strings.TrimRight(parts[index], " .")
+	}
+	return strings.Join(parts, `\`)
 }
 
 func windowsUNCShare(path string) (string, bool) {
