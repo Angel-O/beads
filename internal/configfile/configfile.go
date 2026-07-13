@@ -1,11 +1,15 @@
 package configfile
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -13,7 +17,16 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 )
 
-const ConfigFileName = "metadata.json"
+const (
+	ConfigFileName             = "metadata.json"
+	maxReadOnlyConfigFileBytes = 1 << 20
+	proxiedDoltDataDirName     = "proxieddb"
+)
+
+var (
+	errStrictConfigAbsent = errors.New("strict config metadata is absent")
+	errConfigChanged      = errors.New("config changed during inspection")
+)
 
 type Config struct {
 	Database string `json:"database"`
@@ -78,47 +91,290 @@ func ConfigPath(beadsDir string) string {
 	return filepath.Join(beadsDir, ConfigFileName)
 }
 
-func Load(beadsDir string) (*Config, error) {
+func loadConfig(
+	beadsDir string,
+	readFile func(string) ([]byte, error),
+	decode func([]byte, *Config) error,
+	isAbsent func(error) bool,
+) (*Config, bool, error) {
 	configPath := ConfigPath(beadsDir)
 
-	data, err := os.ReadFile(configPath) // #nosec G304 - controlled path from config
-	if os.IsNotExist(err) {
-		// Try legacy config.json location (migration path)
+	data, err := readFile(configPath)
+	legacy := false
+	if isAbsent(err) {
+		// Try the legacy location without migrating it. Callers that only need
+		// selection metadata must never mutate a workspace as a side effect.
 		legacyPath := filepath.Join(beadsDir, "config.json")
-		data, err = os.ReadFile(legacyPath) // #nosec G304 - controlled path from config
-		if os.IsNotExist(err) {
-			return nil, nil
+		data, err = readFile(legacyPath)
+		if isAbsent(err) {
+			return nil, false, nil
 		}
 		if err != nil {
-			return nil, fmt.Errorf("reading legacy config: %w", err)
+			return nil, false, fmt.Errorf("reading legacy config: %w", err)
 		}
-
-		// Migrate: parse legacy config, save as metadata.json, remove old file
-		var cfg Config
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			return nil, fmt.Errorf("parsing legacy config: %w", err)
-		}
-
-		// Save to new location
-		if err := cfg.Save(beadsDir); err != nil {
-			return nil, fmt.Errorf("migrating config to metadata.json: %w", err)
-		}
-
-		// Remove legacy file (best effort: migration already saved to new location)
-		_ = os.Remove(legacyPath)
-
-		return &cfg, nil
+		legacy = true
 	}
 	if err != nil {
-		return nil, fmt.Errorf("reading config: %w", err)
+		return nil, false, fmt.Errorf("reading config: %w", err)
 	}
 
 	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing config: %w", err)
+	if err := decode(data, &cfg); err != nil {
+		if legacy {
+			return nil, false, fmt.Errorf("parsing legacy config: %w", err)
+		}
+		return nil, false, fmt.Errorf("parsing config: %w", err)
+	}
+	return &cfg, legacy, nil
+}
+
+// LoadReadOnly strictly decodes bounded, regular current or legacy workspace
+// metadata, rejecting final-component symlinks and special files and verifying
+// each file's identity around its open and read. It does not pin the workspace
+// root, ancestor components, current-versus-legacy precedence across concurrent
+// pathname changes, or metadata identity after return; lifecycle mutations
+// require the descriptor-bound workspace fence tracked by bd-3u1fs. Unlike
+// compatibility Load, this function never migrates or writes and rejects
+// duplicate, case-variant, and unknown JSON fields. It returns (nil, nil) only
+// when both metadata files were absent at their initial lookups; disappearance
+// after validation and platforms without a safe opener return errors.
+func LoadReadOnly(beadsDir string) (*Config, error) {
+	exists, err := validateReadOnlyConfigRoot(beadsDir)
+	if err != nil || !exists {
+		return nil, err
+	}
+	cfg, _, err := loadConfig(beadsDir, readStableConfigFile, decodeConfigStrict, isStrictConfigAbsent)
+	return cfg, err
+}
+
+func Load(beadsDir string) (*Config, error) {
+	cfg, legacy, err := loadConfig(beadsDir, os.ReadFile, decodeConfigCompatible, isCompatibleConfigAbsent)
+	if err != nil || cfg == nil || !legacy {
+		return cfg, err
 	}
 
-	return &cfg, nil
+	if err := cfg.Save(beadsDir); err != nil {
+		return nil, fmt.Errorf("migrating config to metadata.json: %w", err)
+	}
+	_ = os.Remove(filepath.Join(beadsDir, "config.json"))
+	return cfg, nil
+}
+
+func decodeConfigCompatible(data []byte, cfg *Config) error {
+	return json.Unmarshal(data, cfg)
+}
+
+func isCompatibleConfigAbsent(err error) bool {
+	return errors.Is(err, os.ErrNotExist)
+}
+
+func isStrictConfigAbsent(err error) bool {
+	return errors.Is(err, errStrictConfigAbsent)
+}
+
+func decodeConfigStrict(data []byte, cfg *Config) error {
+	allowed := make(map[string]struct{})
+	typ := reflect.TypeOf(Config{})
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		name := strings.Split(field.Tag.Get("json"), ",")[0]
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = field.Name
+		}
+		allowed[name] = struct{}{}
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return errors.New("metadata must be a JSON object")
+	}
+	seen := make(map[string]string)
+	for decoder.More() {
+		token, err = decoder.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return errors.New("metadata object key is not a string")
+		}
+		folded := strings.ToLower(key)
+		if prior, duplicate := seen[folded]; duplicate {
+			return fmt.Errorf("duplicate or case-variant metadata keys %q and %q", prior, key)
+		}
+		seen[folded] = key
+		if _, ok := allowed[key]; !ok {
+			return fmt.Errorf("unknown or noncanonical metadata field %q", key)
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return err
+		}
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return fmt.Errorf("metadata field %q must not be null", key)
+		}
+		if key == "backend" {
+			var backend string
+			if err := json.Unmarshal(raw, &backend); err != nil {
+				return errors.New("backend must be a string")
+			}
+			if backend == "" {
+				return errors.New("backend must not be empty when present")
+			}
+			switch backend {
+			case BackendDolt, BackendPostgres, BackendMySQL, BackendSQLite:
+			default:
+				return fmt.Errorf("unsupported backend %q", backend)
+			}
+		}
+		if key == "dolt_mode" {
+			var mode string
+			if err := json.Unmarshal(raw, &mode); err != nil {
+				return errors.New("dolt_mode must be a string")
+			}
+			switch strings.ToLower(mode) {
+			case "", DoltModeEmbedded, DoltModeServer, DoltModeProxiedServer:
+			default:
+				return fmt.Errorf("unsupported dolt_mode %q", mode)
+			}
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return errors.New("metadata must contain exactly one JSON object")
+	}
+
+	decoder = json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(cfg)
+}
+
+func validateReadOnlyConfigRoot(beadsDir string) (bool, error) {
+	if beadsDir == "" {
+		return false, errors.New("read-only config load requires a workspace directory")
+	}
+	info, err := os.Lstat(beadsDir)
+	if err == nil {
+		if !info.IsDir() {
+			return false, fmt.Errorf("config workspace root is not a directory: %q", beadsDir)
+		}
+		return true, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, safeConfigPathError("inspect config workspace root", beadsDir, err)
+	}
+
+	for parent := filepath.Dir(filepath.Clean(beadsDir)); ; parent = filepath.Dir(parent) {
+		info, err := os.Lstat(parent)
+		switch {
+		case err == nil && info.Mode()&os.ModeSymlink != 0:
+			targetInfo, statErr := os.Stat(parent)
+			if statErr != nil {
+				return false, safeConfigPathError("resolve config workspace parent", parent, statErr)
+			}
+			if !targetInfo.IsDir() {
+				return false, fmt.Errorf("config workspace parent is not a directory: %q", parent)
+			}
+			return false, nil
+		case err == nil && !info.IsDir():
+			return false, fmt.Errorf("config workspace parent is not a directory: %q", parent)
+		case err == nil:
+			return false, nil
+		case !errors.Is(err, os.ErrNotExist):
+			return false, safeConfigPathError("inspect config workspace parent", parent, err)
+		}
+		next := filepath.Dir(parent)
+		if next == parent {
+			return false, fmt.Errorf("config workspace has no existing directory ancestor: %q", beadsDir)
+		}
+	}
+}
+
+func readStableConfigFile(path string) ([]byte, error) {
+	return readStableConfigFileWithOpener(path, openReadOnlyConfigFile)
+}
+
+func readStableConfigFileWithOpener(path string, opener func(string) (*os.File, error)) ([]byte, error) {
+	namedInfo, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %w", errStrictConfigAbsent, safeConfigPathError("inspect config", path, err))
+		}
+		return nil, safeConfigPathError("inspect config", path, err)
+	}
+	if !namedInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("config is not a regular file: %q", path)
+	}
+	if namedInfo.Size() > maxReadOnlyConfigFileBytes {
+		return nil, fmt.Errorf("config %q exceeds %d bytes", path, maxReadOnlyConfigFileBytes)
+	}
+
+	file, err := opener(path)
+	if err != nil {
+		return nil, stableConfigOperationError("open config", path, err)
+	}
+	defer file.Close() //nolint:errcheck // read-only metadata descriptor
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return nil, stableConfigOperationError("inspect opened config", path, err)
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(namedInfo, openedInfo) {
+		return nil, configChangedError("opening config", path)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(file, maxReadOnlyConfigFileBytes+1))
+	if err != nil {
+		return nil, stableConfigOperationError("read config", path, err)
+	}
+	if len(data) > maxReadOnlyConfigFileBytes {
+		return nil, fmt.Errorf("config %q exceeds %d bytes", path, maxReadOnlyConfigFileBytes)
+	}
+	afterInfo, err := file.Stat()
+	if err != nil {
+		return nil, stableConfigOperationError("reinspect config", path, err)
+	}
+	namedAfter, err := os.Lstat(path)
+	if err != nil {
+		return nil, stableConfigOperationError("reinspect config name", path, err)
+	}
+	if !namedAfter.Mode().IsRegular() || !os.SameFile(openedInfo, afterInfo) ||
+		!os.SameFile(openedInfo, namedAfter) || openedInfo.Size() != afterInfo.Size() ||
+		!openedInfo.ModTime().Equal(afterInfo.ModTime()) {
+		return nil, configChangedError("reading config", path)
+	}
+	return data, nil
+}
+
+func stableConfigOperationError(operation, path string, err error) error {
+	if errors.Is(err, os.ErrNotExist) {
+		return configChangedError(operation, path)
+	}
+	return safeConfigPathError(operation, path, err)
+}
+
+func configChangedError(operation, path string) error {
+	return fmt.Errorf("%w (%s): %q", errConfigChanged, operation, path)
+}
+
+func safeConfigPathError(operation, path string, err error) error {
+	var pathErr *os.PathError
+	for errors.As(err, &pathErr) {
+		err = pathErr.Err
+		pathErr = nil
+	}
+	return fmt.Errorf("%s %q: %w", operation, path, err)
 }
 
 func (c *Config) Save(beadsDir string) error {
@@ -187,6 +443,37 @@ func (c *Config) DatabasePath(beadsDir string) string {
 	// Always use "dolt" as the directory name.
 	// Stale values like "town", "wyvern", "beads_rig" caused split-brain (see DOLT-HEALTH-P0.md).
 	return filepath.Join(beadsDir, "dolt")
+}
+
+// PersistedDoltDataPath resolves only metadata fields, without consulting
+// environment variables or config.yaml. It returns an empty path for a
+// non-Dolt backend. Proxied-server sidecar overrides are outside metadata;
+// proxied mode therefore resolves to its default workspace-local root.
+func (c *Config) PersistedDoltDataPath(beadsDir string) string {
+	if c == nil {
+		return filepath.Join(beadsDir, "embeddeddolt")
+	}
+	if c.Backend != "" && c.Backend != BackendDolt {
+		return ""
+	}
+	if strings.EqualFold(c.DoltMode, DoltModeProxiedServer) {
+		return filepath.Join(beadsDir, proxiedDoltDataDirName)
+	}
+	if c.DoltDataDir != "" {
+		if filepath.IsAbs(c.DoltDataDir) {
+			return c.DoltDataDir
+		}
+		return filepath.Join(beadsDir, c.DoltDataDir)
+	}
+	if filepath.IsAbs(c.Database) {
+		return c.Database
+	}
+	switch strings.ToLower(c.DoltMode) {
+	case "", DoltModeEmbedded:
+		return filepath.Join(beadsDir, "embeddeddolt")
+	default:
+		return filepath.Join(beadsDir, "dolt")
+	}
 }
 
 // DefaultDeletionsRetentionDays is the default retention period for deletion records.
