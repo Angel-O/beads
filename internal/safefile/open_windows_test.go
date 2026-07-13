@@ -3,6 +3,7 @@
 package safefile
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,8 +19,17 @@ func TestWindowsReadOnlyNoFollowRejectsSymlink(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
 	}
+	file, err := OpenReadOnly(link)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	data, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil || string(data) != "target data" {
+		t.Fatalf("followed read got %q readErr=%v closeErr=%v", data, readErr, closeErr)
+	}
 
-	file, err := OpenReadOnlyNoFollow(link)
+	file, err = OpenReadOnlyNoFollow(link)
 	if err == nil || file != nil {
 		if file != nil {
 			_ = file.Close()

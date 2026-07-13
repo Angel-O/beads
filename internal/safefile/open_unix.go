@@ -9,10 +9,17 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const readOnlyNoFollowFlags = unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NONBLOCK | unix.O_NOFOLLOW
+const (
+	readOnlyOpenFlags = unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NONBLOCK
+	noFollowOpenFlag  = unix.O_NOFOLLOW
+)
 
-func openReadOnlyNoFollow(path string) (*os.File, error) {
-	fd, err := unix.Open(path, readOnlyNoFollowFlags, 0)
+func openReadOnly(path string, noFollow bool) (*os.File, error) {
+	flags := readOnlyOpenFlags
+	if noFollow {
+		flags |= noFollowOpenFlag
+	}
+	fd, err := unix.Open(path, flags, 0)
 	if err != nil {
 		return nil, err
 	}

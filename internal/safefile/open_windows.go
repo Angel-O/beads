@@ -11,7 +11,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func openReadOnlyNoFollow(path string) (*os.File, error) {
+func openReadOnly(path string, noFollow bool) (*os.File, error) {
 	extendedPath, err := extendedWindowsPath(path)
 	if err != nil {
 		return nil, err
@@ -20,9 +20,12 @@ func openReadOnlyNoFollow(path string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Open the final reparse point itself so callers can reject it rather
-	// than consuming a replacement symlink target.
-	flags := uint32(windows.FILE_FLAG_BACKUP_SEMANTICS | windows.FILE_FLAG_OPEN_REPARSE_POINT)
+	flags := uint32(windows.FILE_FLAG_BACKUP_SEMANTICS)
+	if noFollow {
+		// Open the final reparse point itself so callers can reject it rather
+		// than consuming a replacement symlink target.
+		flags |= windows.FILE_FLAG_OPEN_REPARSE_POINT
+	}
 	handle, err := windows.CreateFile(
 		pathPtr,
 		windows.GENERIC_READ,
@@ -46,12 +49,14 @@ func openReadOnlyNoFollow(path string) (*os.File, error) {
 	if fileType != windows.FILE_TYPE_DISK {
 		return closeOnError(errors.New("read-only handle is not a disk file"))
 	}
-	var info windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
-		return closeOnError(err)
-	}
-	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return closeOnError(errors.New("read-only handle is a reparse point"))
+	if noFollow {
+		var info windows.ByHandleFileInformation
+		if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
+			return closeOnError(err)
+		}
+		if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return closeOnError(errors.New("read-only handle is a reparse point"))
+		}
 	}
 	file := os.NewFile(uintptr(handle), path)
 	if file == nil {

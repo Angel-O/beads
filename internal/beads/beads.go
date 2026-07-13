@@ -10,7 +10,9 @@ package beads
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/safefile"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/utils"
 )
@@ -29,6 +32,10 @@ const CanonicalDatabaseName = "beads.db"
 
 // RedirectFileName is the name of the file that redirects to another .beads directory
 const RedirectFileName = "redirect"
+
+const maxRedirectFileBytes = 64 << 10
+
+var errRedirectChanged = errors.New("redirect changed during inspection")
 
 // SourceDatabaseInfo contains the dolt_database name from a source .beads/metadata.json,
 // preserved across a redirect so that the source directory's database identity is not
@@ -101,26 +108,18 @@ func ResolveRedirect(beadsDir string) SourceDatabaseInfo {
 // Redirect chains are not followed - only one level of redirection is supported.
 // This prevents infinite loops and keeps the behavior predictable.
 func FollowRedirect(beadsDir string) string {
+	return followRedirectWithOpener(beadsDir, safefile.OpenReadOnly)
+}
+
+func followRedirectWithOpener(beadsDir string, opener func(string) (*os.File, error)) string {
 	redirectFile := filepath.Join(beadsDir, RedirectFileName)
-	data, err := os.ReadFile(redirectFile)
+	data, err := readLenientRedirectFileWithOpener(redirectFile, opener)
 	if err != nil {
 		// No redirect file or can't read it - use original path
 		return beadsDir
 	}
 
-	// Parse the redirect target (trim whitespace and handle comments)
-	target := strings.TrimSpace(string(data))
-
-	// Skip empty lines and comments to find the actual path
-	lines := strings.Split(target, "\n")
-	target = ""
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" && !strings.HasPrefix(line, "#") {
-			target = line
-			break
-		}
-	}
+	target, _ := parseRedirectTarget(data, false)
 
 	if target == "" {
 		return beadsDir
@@ -136,25 +135,211 @@ func FollowRedirect(beadsDir string) string {
 	// redirect points at a detached snapshot checkout.
 	target = canonicalizeBeadsDirPath(target)
 
-	// Verify the target exists and is a directory
+	// Verify the target exists and is a directory. Discovery itself stays
+	// silent so structured output is not contaminated; mutation admission uses
+	// FollowRedirectStrict when invalid routing must be surfaced as an error.
 	info, err := os.Stat(target)
 	if err != nil || !info.IsDir() {
-		// Invalid redirect target - fall back to original
-		fmt.Fprintf(os.Stderr, "Warning: redirect target does not exist or is not a directory: %s\n", target)
 		return beadsDir
 	}
-
-	// Prevent redirect chains - don't follow if target also has a redirect
-	targetRedirect := filepath.Join(target, RedirectFileName)
-	if _, err := os.Stat(targetRedirect); err == nil {
-		fmt.Fprintf(os.Stderr, "Warning: redirect chains not allowed, ignoring redirect in %s\n", target)
-	}
-
 	if os.Getenv("BD_DEBUG_ROUTING") != "" {
-		fmt.Fprintf(os.Stderr, "[routing] Followed redirect from %s -> %s\n", beadsDir, target)
+		fmt.Fprintf(os.Stderr, "[routing] Followed redirect from %q -> %q\n", beadsDir, target)
 	}
 
 	return target
+}
+
+// FollowRedirectStrict resolves one bounded observation of a redirect. An
+// initially absent redirect returns (beadsDir, nil); an observed unreadable,
+// malformed, changed, chained, or unavailable redirect returns an error. It
+// does not pin source/target roots, ancestors, names, or chain state after
+// return; mutation admission requires the descriptor-bound workspace fence
+// tracked by bd-3u1fs through the provider effect.
+func FollowRedirectStrict(beadsDir string) (string, error) {
+	return followRedirectStrictWithOpener(beadsDir, safefile.OpenReadOnlyNoFollow)
+}
+
+func followRedirectStrictWithOpener(beadsDir string, opener func(string) (*os.File, error)) (string, error) {
+	redirectFile := filepath.Join(beadsDir, RedirectFileName)
+	info, err := os.Lstat(redirectFile)
+	if os.IsNotExist(err) {
+		return beadsDir, nil
+	}
+	if err != nil {
+		return "", safeRedirectPathError("inspect redirect", redirectFile, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("redirect is not a regular file: %q", redirectFile)
+	}
+	data, err := readStableRedirectFileWithOpener(redirectFile, info, opener)
+	if err != nil {
+		return "", err
+	}
+
+	target, err := parseRedirectTarget(data, true)
+	if err != nil {
+		return "", fmt.Errorf("parse redirect %q: %w", redirectFile, err)
+	}
+	if target == "" {
+		return "", fmt.Errorf("redirect has no target: %q", redirectFile)
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(beadsDir), target)
+	}
+	target = filepath.Clean(target)
+	if err := validateStrictRedirectDirectory(target); err != nil {
+		return "", err
+	}
+	canonicalTarget := canonicalizeBeadsDirPath(target)
+	if canonicalTarget != target {
+		if err := validateStrictRedirectDirectory(canonicalTarget); err != nil {
+			return "", err
+		}
+	}
+	target = canonicalTarget
+	if _, err := os.Lstat(filepath.Join(target, RedirectFileName)); err == nil {
+		return "", fmt.Errorf("redirect chains are not supported: %q", target)
+	} else if !os.IsNotExist(err) {
+		return "", safeRedirectPathError("inspect redirect chain", filepath.Join(target, RedirectFileName), err)
+	}
+	return target, nil
+}
+
+func validateStrictRedirectDirectory(path string) error {
+	return validateStrictRedirectDirectoryWithOpener(path, safefile.OpenReadOnlyNoFollow)
+}
+
+func validateStrictRedirectDirectoryWithOpener(path string, opener func(string) (*os.File, error)) error {
+	namedInfo, err := os.Lstat(path)
+	if err != nil {
+		return safeRedirectPathError("inspect redirect target", path, err)
+	}
+	if namedInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("redirect target is a symlink: %q", path)
+	}
+	if !namedInfo.IsDir() {
+		return fmt.Errorf("redirect target is not a directory: %q", path)
+	}
+	file, err := opener(path)
+	if err != nil {
+		return stableRedirectOperationError("open redirect target", path, err)
+	}
+	defer file.Close() //nolint:errcheck // read-only directory descriptor
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return stableRedirectOperationError("inspect opened redirect target", path, err)
+	}
+	namedAfter, err := os.Lstat(path)
+	if err != nil {
+		return stableRedirectOperationError("reinspect redirect target", path, err)
+	}
+	if !openedInfo.IsDir() || !namedAfter.IsDir() || !os.SameFile(namedInfo, openedInfo) ||
+		!os.SameFile(openedInfo, namedAfter) {
+		return redirectChangedError("inspecting redirect target", path)
+	}
+	return nil
+}
+
+func parseRedirectTarget(data []byte, requireSingle bool) (string, error) {
+	target := ""
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if target != "" && requireSingle {
+			return "", errors.New("redirect contains multiple targets")
+		}
+		if target == "" {
+			target = line
+		}
+	}
+	return target, nil
+}
+
+func readLenientRedirectFileWithOpener(path string, opener func(string) (*os.File, error)) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, safeRedirectPathError("inspect redirect", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("redirect is not a regular file: %q", path)
+	}
+	return readBoundedRedirectFile(path, info, opener, os.Stat)
+}
+
+func readStableRedirectFileWithOpener(
+	path string,
+	namedInfo os.FileInfo,
+	opener func(string) (*os.File, error),
+) ([]byte, error) {
+	return readBoundedRedirectFile(path, namedInfo, opener, os.Lstat)
+}
+
+func readBoundedRedirectFile(
+	path string,
+	namedInfo os.FileInfo,
+	opener func(string) (*os.File, error),
+	reinspectName func(string) (os.FileInfo, error),
+) ([]byte, error) {
+	if namedInfo.Size() > maxRedirectFileBytes {
+		return nil, fmt.Errorf("redirect file %q exceeds %d bytes", path, maxRedirectFileBytes)
+	}
+	file, err := opener(path)
+	if err != nil {
+		return nil, stableRedirectOperationError("open redirect", path, err)
+	}
+	defer file.Close() //nolint:errcheck // read-only redirect descriptor
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return nil, stableRedirectOperationError("inspect opened redirect", path, err)
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(namedInfo, openedInfo) ||
+		namedInfo.Size() != openedInfo.Size() || !namedInfo.ModTime().Equal(openedInfo.ModTime()) {
+		return nil, redirectChangedError("opening redirect", path)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(file, maxRedirectFileBytes+1))
+	if err != nil {
+		return nil, stableRedirectOperationError("read redirect", path, err)
+	}
+	if len(data) > maxRedirectFileBytes {
+		return nil, fmt.Errorf("redirect file %q exceeds %d bytes", path, maxRedirectFileBytes)
+	}
+	afterInfo, err := file.Stat()
+	if err != nil {
+		return nil, stableRedirectOperationError("reinspect redirect", path, err)
+	}
+	namedAfter, err := reinspectName(path)
+	if err != nil {
+		return nil, stableRedirectOperationError("reinspect redirect name", path, err)
+	}
+	if !namedAfter.Mode().IsRegular() || !os.SameFile(openedInfo, afterInfo) ||
+		!os.SameFile(openedInfo, namedAfter) || openedInfo.Size() != afterInfo.Size() ||
+		!openedInfo.ModTime().Equal(afterInfo.ModTime()) {
+		return nil, redirectChangedError("reading redirect", path)
+	}
+	return data, nil
+}
+
+func stableRedirectOperationError(operation, path string, err error) error {
+	if errors.Is(err, os.ErrNotExist) {
+		return redirectChangedError(operation, path)
+	}
+	return safeRedirectPathError(operation, path, err)
+}
+
+func redirectChangedError(operation, path string) error {
+	return fmt.Errorf("%w (%s): %q", errRedirectChanged, operation, path)
+}
+
+func safeRedirectPathError(operation, path string, err error) error {
+	var pathErr *os.PathError
+	for errors.As(err, &pathErr) {
+		err = pathErr.Err
+		pathErr = nil
+	}
+	return fmt.Errorf("%s %q: %w", operation, path, err)
 }
 
 func canonicalizeBeadsDirPath(beadsDir string) string {

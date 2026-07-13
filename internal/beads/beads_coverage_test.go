@@ -439,7 +439,7 @@ func TestFollowRedirect_ChainPrevention(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Should follow to dir2 but not further (and log warning about chain)
+	// Should follow to dir2 but not follow dir2's redirect.
 	result := FollowRedirect(dir1)
 	resultResolved, _ := filepath.EvalSymlinks(result)
 	dir2Resolved, _ := filepath.EvalSymlinks(dir2)

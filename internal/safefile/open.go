@@ -1,12 +1,22 @@
-// Package safefile provides the smallest cross-platform primitive needed to
-// open untrusted filesystem leaves without blocking on Unix special files.
+// Package safefile provides cross-platform primitives for opening untrusted
+// filesystem leaves with explicit symlink and nonblocking policies.
 package safefile
 
 import "os"
 
-// OpenReadOnlyNoFollow opens path for reading without following a final
-// symlink or waiting for Unix FIFO/device readiness. Callers must still inspect
-// the returned descriptor and reject non-regular files before reading it.
+// OpenReadOnly opens path for reading with nonblocking Unix semantics so a FIFO
+// does not wait for a writer. It follows a final symlink for
+// compatibility-sensitive readers. On success, the caller owns the returned
+// file and must inspect and close it.
+func OpenReadOnly(path string) (*os.File, error) {
+	return openReadOnly(path, false)
+}
+
+// OpenReadOnlyNoFollow opens path for reading with nonblocking Unix semantics
+// without following its final path component. Ancestor symlinks are still
+// followed. On success, the caller owns the returned file and must inspect,
+// validate the expected object type, and close it. Unsupported platforms
+// return errors.ErrUnsupported.
 func OpenReadOnlyNoFollow(path string) (*os.File, error) {
-	return openReadOnlyNoFollow(path)
+	return openReadOnly(path, true)
 }
