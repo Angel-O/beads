@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-const quiescencePythonTestCount = 21
+const quiescencePythonTestCount = 32
 
 func TestQuiescencePrimitivesPythonSuite(t *testing.T) {
 	if runtime.GOOS == "windows" {
