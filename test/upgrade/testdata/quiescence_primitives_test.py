@@ -14,13 +14,14 @@ import threading
 import unittest
 from unittest import mock
 
+import upgrade_baseline_bundle
 import upgrade_baseline_quiescence as subject
 
 
 SCHEMA = "beads.upgrade.quiescence/v1"
 NOW_NS = 2_000_000_000_000_000_000
 OVERSIZED_RECEIPT_BYTES = 1024 * 1024 + 1
-EXPECTED_TEST_COUNT = 28
+EXPECTED_TEST_COUNT = 32
 AUTHORITY_KIND = "operator-supervisor-v1"
 
 
@@ -222,7 +223,516 @@ class QuiescencePrimitivesTest(unittest.TestCase):
             for duplicate in retained:
                 self._close(duplicate)
 
-    def test_interruption_before_close_cannot_leak_a_descriptor(self):
+    def test_context_preserves_bundle_body_primary_when_close_fails(self):
+        path = os.path.join(self.control, b"bundle-primary-close-failure.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+
+        underlying = OSError(errno.EIO, "injected bundle underlying failure")
+        bundle_cleanup = OSError(errno.ENOSPC, "injected bundle cleanup failure")
+        body = upgrade_baseline_bundle.PreservationError(
+            "injected preservation body failure"
+        )
+        body.__cause__ = bundle_cleanup
+        body.__suppress_context__ = True
+        bundle_cleanup.__cause__ = underlying
+        bundle_cleanup.__context__ = body
+        body._preservation_original_cause = underlying
+        body._preservation_failure_tail = bundle_cleanup
+        lease_close = OSError(errno.EBADF, "injected lease close failure")
+        lease_close.__cause__ = body
+        close_fd = subject._close_fd
+
+        def close_then_fail(value, tombstone, mark_target_ambiguous):
+            self.assertIsNone(
+                close_fd(value, tombstone, mark_target_ambiguous)
+            )
+            return lease_close
+
+        with mock.patch.object(subject, "_close_fd", close_then_fail):
+            with self.assertRaises(BaseException) as raised:
+                with lease:
+                    raise body
+
+        self.assertIs(raised.exception, body)
+        self._assert_cleanup_graph(
+            body,
+            [body, bundle_cleanup, lease_close, underlying],
+            [bundle_cleanup, lease_close],
+        )
+        subject._chain_cleanup_failures(
+            body,
+            [lease_close, bundle_cleanup, lease_close],
+        )
+        self._assert_cleanup_graph(
+            body,
+            [body, bundle_cleanup, lease_close, underlying],
+            [bundle_cleanup, lease_close],
+        )
+        self.assertIs(body._preservation_original_cause, underlying)
+        self.assertIs(body._preservation_failure_tail, lease_close)
+        self.assertIsNone(lease._descriptor)
+        self.assertIsNone(lease._reserve)
+        for value in (retained, *reserve):
+            self._assert_closed(value)
+        self.assertTrue(self._contender_can_lock(path))
+
+        path = os.path.join(self.control, b"body-primary-lock-enter.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+        primary_underlying = OSError(
+            errno.EIO,
+            "injected body lock underlying failure",
+        )
+        primary = upgrade_baseline_bundle.PreservationError(
+            "injected body failure before lock entry"
+        )
+        primary.__cause__ = primary_underlying
+        primary.__suppress_context__ = True
+        lock_interruption = KeyboardInterrupt("injected close-lock entry interruption")
+        close_lock = lease._close_lock
+        release_attempts = []
+
+        class EnterInterruptLock:
+            def acquire(self):
+                raise lock_interruption
+
+            def release(self):
+                release_attempts.append(True)
+                return close_lock.release()
+
+        lease._close_lock = EnterInterruptLock()
+        with self.assertRaises(BaseException) as raised:
+            with lease:
+                raise primary
+
+        self.assertIs(raised.exception, primary)
+        self._assert_cleanup_graph(
+            primary,
+            [primary, lock_interruption, primary_underlying],
+            [lock_interruption],
+        )
+        self.assertEqual(release_attempts, [True])
+        self.assertEqual(lease._descriptor, retained)
+        self.assertEqual(lease._reserve, reserve)
+        for value in (retained, *reserve):
+            os.fstat(value)
+        subject._chain_cleanup_failures(primary, [lock_interruption, lock_interruption])
+        self._assert_cleanup_graph(
+            primary,
+            [primary, lock_interruption, primary_underlying],
+            [lock_interruption],
+        )
+        lease._close_lock = close_lock
+        lease.close()
+        for value in (retained, *reserve):
+            self._assert_closed(value)
+        self.assertTrue(self._contender_can_lock(path))
+
+        path = os.path.join(self.control, b"body-primary-lock-acquire-after.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+        primary = upgrade_baseline_bundle.PreservationError(
+            "injected body failure before side-effecting lock acquisition"
+        )
+        lock_interruption = KeyboardInterrupt(
+            "injected after close-lock acquisition"
+        )
+        close_lock = lease._close_lock
+        release_attempts = []
+
+        class AcquireThenInterruptLock:
+            def acquire(self, *args, **kwargs):
+                close_lock.acquire(*args, **kwargs)
+                raise lock_interruption
+
+            def release(self):
+                release_attempts.append(True)
+                return close_lock.release()
+
+            def __enter__(self):
+                return self.acquire()
+
+            def __exit__(self, *args):
+                del args
+                return self.release()
+
+        lease._close_lock = AcquireThenInterruptLock()
+        with self.assertRaises(BaseException) as raised:
+            with lease:
+                raise primary
+
+        self.assertIs(raised.exception, primary)
+        self._assert_cleanup_graph(
+            primary,
+            [primary, lock_interruption],
+            [lock_interruption],
+        )
+        available = []
+
+        def probe_lock():
+            acquired = close_lock.acquire(timeout=1)
+            available.append(acquired)
+            if acquired:
+                close_lock.release()
+
+        probe = threading.Thread(target=probe_lock)
+        probe.start()
+        probe.join(2)
+        self.assertFalse(probe.is_alive(), "lock availability probe did not finish")
+        if available == [False]:
+            close_lock.release()
+        self.assertEqual(release_attempts, [True])
+        self.assertEqual(available, [True])
+        self.assertEqual(lease._descriptor, retained)
+        self.assertIs(lease._reserve, reserve)
+        lease._close_lock = close_lock
+        lease.close()
+        for value in (retained, *reserve):
+            self._assert_closed(value)
+        self.assertTrue(self._contender_can_lock(path))
+
+        path = os.path.join(self.control, b"body-primary-post-acquire-seam.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+        primary = upgrade_baseline_bundle.PreservationError(
+            "injected body failure at the post-acquire seam"
+        )
+        lock_interruption = KeyboardInterrupt(
+            "injected on the first line after close-lock acquisition"
+        )
+        close_lock = lease._close_lock
+        acquired = []
+        release_attempts = []
+
+        class TraceObservedLock:
+            def acquire(self):
+                result = close_lock.acquire()
+                acquired.append(True)
+                return result
+
+            def release(self):
+                release_attempts.append(True)
+                return close_lock.release()
+
+        lease._close_lock = TraceObservedLock()
+        close_code = subject.RepositoryLease._close_under_lock.__code__
+        injected = []
+
+        def interrupt_after_acquire(frame, event, argument):
+            del argument
+            if (
+                event == "line"
+                and frame.f_code is close_code
+                and acquired
+                and not injected
+            ):
+                injected.append(frame.f_lineno)
+                raise lock_interruption
+            return interrupt_after_acquire
+
+        caught = None
+        sys.settrace(interrupt_after_acquire)
+        try:
+            with lease:
+                raise primary
+        except BaseException as error:
+            caught = error
+        finally:
+            sys.settrace(None)
+
+        available = []
+
+        def probe_lock():
+            result = close_lock.acquire(timeout=1)
+            available.append(result)
+            if result:
+                close_lock.release()
+
+        probe = threading.Thread(target=probe_lock)
+        probe.start()
+        probe.join(2)
+        self.assertFalse(probe.is_alive(), "post-acquire lock probe did not finish")
+        if available == [False]:
+            close_lock.release()
+        self.assertIs(caught, primary)
+        self._assert_cleanup_graph(
+            primary,
+            [primary, lock_interruption],
+            [lock_interruption],
+        )
+        self.assertEqual(len(injected), 1)
+        self.assertEqual(release_attempts, [True])
+        self.assertEqual(available, [True])
+        self.assertEqual(lease._descriptor, retained)
+        self.assertIs(lease._reserve, reserve)
+        lease._close_lock = close_lock
+        lease.close()
+        for value in (retained, *reserve):
+            self._assert_closed(value)
+        self.assertTrue(self._contender_can_lock(path))
+
+        path = os.path.join(self.control, b"body-primary-post-cleanup-seam.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+        primary = upgrade_baseline_bundle.PreservationError(
+            "injected body failure at the post-cleanup seam"
+        )
+        lock_interruption = KeyboardInterrupt(
+            "injected on the first line after descriptor cleanup"
+        )
+        close_lock = lease._close_lock
+        release_attempts = []
+
+        class CleanupTraceObservedLock:
+            def acquire(self):
+                return close_lock.acquire()
+
+            def release(self):
+                release_attempts.append(True)
+                return close_lock.release()
+
+        lease._close_lock = CleanupTraceObservedLock()
+        close_owned_descriptors = lease._close_owned_descriptors
+        cleanup_returned = []
+
+        def close_then_mark(failures):
+            close_owned_descriptors(failures)
+            cleanup_returned.append(True)
+
+        close_code = subject.RepositoryLease._close_under_lock.__code__
+        injected = []
+
+        def interrupt_after_cleanup(frame, event, argument):
+            del argument
+            if (
+                event == "line"
+                and frame.f_code is close_code
+                and cleanup_returned
+                and not injected
+            ):
+                injected.append(frame.f_lineno)
+                raise lock_interruption
+            return interrupt_after_cleanup
+
+        caught = None
+        with mock.patch.object(
+            lease,
+            "_close_owned_descriptors",
+            close_then_mark,
+        ):
+            sys.settrace(interrupt_after_cleanup)
+            try:
+                with lease:
+                    raise primary
+            except BaseException as error:
+                caught = error
+            finally:
+                sys.settrace(None)
+
+        available = []
+
+        def probe_lock():
+            result = close_lock.acquire(timeout=1)
+            available.append(result)
+            if result:
+                close_lock.release()
+
+        probe = threading.Thread(target=probe_lock)
+        probe.start()
+        probe.join(2)
+        self.assertFalse(probe.is_alive(), "post-cleanup lock probe did not finish")
+        if available == [False]:
+            close_lock.release()
+        self.assertIs(caught, primary)
+        self._assert_cleanup_graph(
+            primary,
+            [primary, lock_interruption],
+            [lock_interruption],
+        )
+        self.assertEqual(len(injected), 1)
+        self.assertEqual(release_attempts, [True])
+        self.assertEqual(available, [True])
+        self.assertIsNone(lease._descriptor)
+        self.assertIsNone(lease._reserve)
+        for value in (retained, *reserve):
+            self._assert_closed(value)
+        self.assertTrue(self._contender_can_lock(path))
+
+    def test_context_preserves_revalidation_primary_when_close_fails(self):
+        path = os.path.join(self.control, b"revalidation-primary-close-failure.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+
+        underlying = OSError(errno.EIO, "injected revalidation underlying failure")
+        primary = subject.QuiescenceError("injected final revalidation failure")
+        primary.__cause__ = underlying
+        primary.__suppress_context__ = True
+        lease_close = OSError(errno.EBADF, "injected lease close failure")
+        lease_close.__context__ = primary
+        close_fd = subject._close_fd
+
+        def close_then_fail(value, tombstone, mark_target_ambiguous):
+            self.assertIsNone(
+                close_fd(value, tombstone, mark_target_ambiguous)
+            )
+            return lease_close
+
+        with mock.patch.object(lease, "revalidate", side_effect=primary), mock.patch.object(
+            subject,
+            "_close_fd",
+            close_then_fail,
+        ):
+            with self.assertRaises(BaseException) as raised:
+                with lease:
+                    pass
+
+        self.assertIs(raised.exception, primary)
+        self._assert_cleanup_graph(
+            primary,
+            [primary, lease_close, underlying],
+            [lease_close],
+        )
+        subject._chain_cleanup_failures(primary, [lease_close, lease_close])
+        self._assert_cleanup_graph(
+            primary,
+            [primary, lease_close, underlying],
+            [lease_close],
+        )
+        self.assertIs(primary._preservation_original_cause, underlying)
+        self.assertIs(primary._preservation_failure_tail, lease_close)
+        self.assertIsNone(lease._descriptor)
+        self.assertIsNone(lease._reserve)
+        for value in (retained, *reserve):
+            self._assert_closed(value)
+        self.assertTrue(self._contender_can_lock(path))
+
+        path = os.path.join(self.control, b"revalidation-primary-lock-exit.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+        primary_underlying = OSError(
+            errno.EIO,
+            "injected revalidation lock underlying failure",
+        )
+        primary = subject.QuiescenceError(
+            "injected revalidation failure before lock exit"
+        )
+        primary.__cause__ = primary_underlying
+        primary.__suppress_context__ = True
+        lock_interruption = KeyboardInterrupt("injected close-lock exit interruption")
+        close_lock = lease._close_lock
+        release_attempts = []
+
+        class ExitInterruptLock:
+            def acquire(self):
+                return close_lock.acquire()
+
+            def release(self):
+                release_attempts.append(True)
+                close_lock.release()
+                raise lock_interruption
+
+        lease._close_lock = ExitInterruptLock()
+        with mock.patch.object(lease, "revalidate", side_effect=primary):
+            with self.assertRaises(BaseException) as raised:
+                with lease:
+                    pass
+
+        self.assertIs(raised.exception, primary)
+        self._assert_cleanup_graph(
+            primary,
+            [primary, lock_interruption, primary_underlying],
+            [lock_interruption],
+        )
+        subject._chain_cleanup_failures(primary, [lock_interruption, lock_interruption])
+        self._assert_cleanup_graph(
+            primary,
+            [primary, lock_interruption, primary_underlying],
+            [lock_interruption],
+        )
+        self.assertEqual(release_attempts, [True, True])
+        self.assertIsNone(lease._descriptor)
+        self.assertIsNone(lease._reserve)
+        for value in (retained, *reserve):
+            self._assert_closed(value)
+        self.assertTrue(self._contender_can_lock(path))
+
+        path = os.path.join(self.control, b"revalidation-lock-release-before.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+        primary = subject.QuiescenceError(
+            "injected revalidation failure before lock release"
+        )
+        lock_interruption = KeyboardInterrupt(
+            "injected before close-lock release"
+        )
+        close_lock = lease._close_lock
+        release_attempts = []
+
+        class ReleaseInterruptLock:
+            def acquire(self):
+                return close_lock.acquire()
+
+            def release(self):
+                release_attempts.append(True)
+                if len(release_attempts) == 1:
+                    raise lock_interruption
+                return close_lock.release()
+
+        lease._close_lock = ReleaseInterruptLock()
+        with mock.patch.object(lease, "revalidate", side_effect=primary):
+            with self.assertRaises(BaseException) as raised:
+                with lease:
+                    pass
+
+        self.assertIs(raised.exception, primary)
+        self._assert_cleanup_graph(
+            primary,
+            [primary, lock_interruption],
+            [lock_interruption],
+        )
+        self.assertEqual(release_attempts, [True, True])
+        self.assertIsNone(lease._descriptor)
+        self.assertIsNone(lease._reserve)
+        for value in (retained, *reserve):
+            self._assert_closed(value)
+        lease.close()
+        self.assertEqual(release_attempts, [True, True, True])
+        self.assertTrue(self._contender_can_lock(path))
+
+    def test_close_interruption_is_bounded_and_never_retries_unsafe_descriptor(self):
         path = os.path.join(self.control, b"interrupt-before-incoming-close.receipt")
         descriptor = self._create_receipt(path, lock=True)
         original_close = os.close
@@ -237,8 +747,10 @@ class QuiescencePrimitivesTest(unittest.TestCase):
         with mock.patch.object(subject.os, "close", interrupt_once):
             with self.assertRaises(KeyboardInterrupt):
                 self._hold(path, descriptor)
-        self._assert_closed(descriptor)
+        os.fstat(descriptor)
         self.assertTrue(self._contender_can_lock(path))
+        os.close(descriptor)
+        self._assert_closed(descriptor)
 
         path = os.path.join(self.control, b"interrupt-before-retained-close.receipt")
         descriptor = self._create_receipt(path, lock=True)
@@ -249,8 +761,10 @@ class QuiescencePrimitivesTest(unittest.TestCase):
         with mock.patch.object(subject.os, "close", interrupt_once):
             with self.assertRaises(KeyboardInterrupt):
                 lease.close()
-        self._assert_closed(retained)
+        os.fstat(retained)
         self.assertTrue(self._contender_can_lock(path))
+        os.close(retained)
+        self._assert_closed(retained)
 
         path = os.path.join(self.control, b"interrupt-before-fstat.receipt")
         descriptor = self._create_receipt(path, lock=True)
@@ -329,18 +843,18 @@ class QuiescencePrimitivesTest(unittest.TestCase):
                 self.wrapped = wrapped
                 self.attempts = 0
 
-            def __enter__(self):
+            def acquire(self, *args, **kwargs):
                 self.attempts += 1
                 if self.attempts == 2:
                     second_attempted.set()
-                return self.wrapped.__enter__()
+                return self.wrapped.acquire(*args, **kwargs)
 
-            def __exit__(self, *args):
-                return self.wrapped.__exit__(*args)
+            def release(self):
+                return self.wrapped.release()
 
         lease._close_lock = ObservedLock(lease._close_lock)
 
-        def delayed_close(value, tombstone):
+        def delayed_close(value, tombstone, mark_target_ambiguous):
             with calls_lock:
                 calls.append(value)
                 if len(calls) == 2:
@@ -348,7 +862,7 @@ class QuiescencePrimitivesTest(unittest.TestCase):
             entered.set()
             if not release.wait(3):
                 raise AssertionError("timed out coordinating concurrent close")
-            return close_fd(value, tombstone)
+            return close_fd(value, tombstone, mark_target_ambiguous)
 
         def close_lease():
             try:
@@ -374,6 +888,167 @@ class QuiescencePrimitivesTest(unittest.TestCase):
         self.assertEqual(calls, [retained])
         self.assertTrue(self._contender_can_lock(path))
 
+        path = os.path.join(self.control, b"reentrant-release-after.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+        close_lock = lease._close_lock
+        release_interruption = KeyboardInterrupt(
+            "injected after inner close-lock release"
+        )
+        release_calls = []
+
+        class ReleaseAfterInterruptLock:
+            def acquire(self):
+                return close_lock.acquire()
+
+            def release(self):
+                release_calls.append(True)
+                result = close_lock.release()
+                if len(release_calls) == 1:
+                    raise release_interruption
+                return result
+
+        lease._close_lock = ReleaseAfterInterruptLock()
+        close_owned_descriptors = lease._close_owned_descriptors
+        outer_body_entered = []
+        inner_errors = []
+        concurrent_entry = []
+
+        def close_with_recursive_attempt(failures):
+            if not outer_body_entered:
+                outer_body_entered.append(True)
+                try:
+                    lease.close()
+                except BaseException as error:
+                    inner_errors.append(error)
+
+                def probe_lock():
+                    acquired = close_lock.acquire(timeout=1)
+                    concurrent_entry.append(acquired)
+                    if acquired:
+                        close_lock.release()
+
+                probe = threading.Thread(target=probe_lock)
+                probe.start()
+                probe.join(2)
+                self.assertFalse(
+                    probe.is_alive(),
+                    "reentrant close lock probe did not finish",
+                )
+            close_owned_descriptors(failures)
+
+        caught = None
+        with mock.patch.object(
+            lease,
+            "_close_owned_descriptors",
+            close_with_recursive_attempt,
+        ):
+            try:
+                lease.close()
+            except BaseException as error:
+                caught = error
+
+        self.assertIs(caught, release_interruption)
+        self._assert_cleanup_graph(
+            release_interruption,
+            [release_interruption],
+            [release_interruption],
+        )
+        self.assertEqual(inner_errors, [])
+        self.assertEqual(concurrent_entry, [False])
+        self.assertEqual(release_calls, [True, True])
+        self.assertIsNone(lease._descriptor)
+        self.assertIsNone(lease._reserve)
+        for value in (retained, *reserve):
+            self._assert_closed(value)
+        self.assertTrue(self._contender_can_lock(path))
+
+        path = os.path.join(self.control, b"close-context-clear-interrupt.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+        cleanup_interruption = KeyboardInterrupt(
+            "injected retryable close cleanup failure"
+        )
+        clear_interruption = SystemExit(
+            "injected before close-context clear"
+        )
+        close_owned_descriptors = lease._close_owned_descriptors
+        close_calls = []
+        close_lock = lease._close_lock
+        lock_released = []
+
+        class ClearTraceObservedLock:
+            def acquire(self):
+                return close_lock.acquire()
+
+            def release(self):
+                result = close_lock.release()
+                lock_released.append(True)
+                return result
+
+        lease._close_lock = ClearTraceObservedLock()
+
+        def fail_once_then_close(failures):
+            close_calls.append(True)
+            if len(close_calls) == 1:
+                failures.append(cleanup_interruption)
+                return
+            close_owned_descriptors(failures)
+
+        injected = []
+
+        def interrupt_before_context_clear(frame, event, argument):
+            del argument
+            if (
+                event == "line"
+                and frame.f_code is subject.RepositoryLease._close.__code__
+                and close_calls
+                and lock_released
+                and getattr(lease._close_context, "active", False)
+                and not injected
+            ):
+                injected.append(frame.f_lineno)
+                raise clear_interruption
+            return interrupt_before_context_clear
+
+        caught = None
+        with mock.patch.object(
+            lease,
+            "_close_owned_descriptors",
+            fail_once_then_close,
+        ):
+            sys.settrace(interrupt_before_context_clear)
+            try:
+                lease.close()
+            except BaseException as error:
+                caught = error
+            finally:
+                sys.settrace(None)
+
+            self.assertIs(caught, cleanup_interruption)
+            self._assert_cleanup_graph(
+                cleanup_interruption,
+                [cleanup_interruption, clear_interruption],
+                [cleanup_interruption, clear_interruption],
+            )
+            self.assertEqual(len(injected), 1)
+            lease.close()
+
+        self.assertEqual(close_calls, [True, True])
+        self.assertIsNone(lease._descriptor)
+        self.assertIsNone(lease._reserve)
+        for value in (retained, *reserve):
+            self._assert_closed(value)
+        self.assertTrue(self._contender_can_lock(path))
+
         path = os.path.join(self.control, b"fd-exhaustion-close.receipt")
         descriptor = self._create_receipt(path, lock=True)
         lease = self._hold(path, descriptor)
@@ -387,6 +1062,350 @@ class QuiescencePrimitivesTest(unittest.TestCase):
             lease.close()
         self._assert_closed(retained)
         self.assertTrue(self._contender_can_lock(path))
+
+    def test_close_attempts_all_reserve_descriptors_after_base_exception(self):
+        for index, interruption in enumerate(
+            (
+                KeyboardInterrupt("injected reserve close interruption"),
+                SystemExit("injected reserve close termination"),
+            )
+        ):
+            with self.subTest(interruption=type(interruption).__name__):
+                path = os.path.join(
+                    self.control,
+                    b"reserve-attempt-all-%d.receipt" % index,
+                )
+                descriptor = self._create_receipt(path, lock=True)
+                lease = self._hold(path, descriptor)
+                retained = lease._descriptor
+                reserve = lease._reserve
+                for value in (retained, *reserve):
+                    self.addCleanup(self._close, value)
+                close = os.close
+                close_fd = subject._close_fd
+                attempts = []
+                descriptor_error = OSError(
+                    errno.EIO,
+                    "injected descriptor close failure",
+                )
+
+                def close_descriptor_then_fail(
+                    value,
+                    tombstone,
+                    mark_target_ambiguous,
+                ):
+                    self.assertIsNone(
+                        close_fd(value, tombstone, mark_target_ambiguous)
+                    )
+                    return descriptor_error
+
+                def interrupt_first_reserve(value):
+                    if value in reserve:
+                        attempts.append(value)
+                    close(value)
+                    if value == reserve[0]:
+                        raise interruption
+
+                with mock.patch.object(
+                    subject,
+                    "_close_fd",
+                    close_descriptor_then_fail,
+                ), mock.patch.object(subject.os, "close", interrupt_first_reserve):
+                    with self.assertRaises(BaseException) as raised:
+                        lease.close()
+
+                self.assertIs(raised.exception, interruption)
+                self._assert_cleanup_graph(
+                    interruption,
+                    [interruption, descriptor_error],
+                    [interruption, descriptor_error],
+                )
+                subject._chain_cleanup_failures(
+                    interruption,
+                    [descriptor_error, interruption, descriptor_error],
+                )
+                self._assert_cleanup_graph(
+                    interruption,
+                    [interruption, descriptor_error],
+                    [interruption, descriptor_error],
+                )
+                self.assertEqual(attempts, list(reserve))
+                self.assertIsNone(lease._descriptor)
+                self.assertIsNone(lease._reserve)
+                for value in (retained, *reserve):
+                    self._assert_closed(value)
+                lease.close()
+                self.assertTrue(self._contender_can_lock(path))
+
+        path = os.path.join(self.control, b"helper-entry-interruption.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+        failure = KeyboardInterrupt("injected at close helper entry")
+        helper_arguments = []
+        reserve_attempts = []
+        close = os.close
+
+        def fail_before_consumption(*arguments):
+            helper_arguments.append(arguments)
+            raise failure
+
+        def record_reserve_close(value):
+            if value in reserve:
+                reserve_attempts.append(value)
+            close(value)
+
+        with mock.patch.object(
+            subject,
+            "_close_fd",
+            fail_before_consumption,
+        ), mock.patch.object(subject.os, "close", record_reserve_close):
+            with self.assertRaises(BaseException) as raised:
+                lease.close()
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(helper_arguments[0][:2], (retained, reserve[0]))
+        self.assertEqual(reserve_attempts, [])
+        self.assertEqual(lease._descriptor, retained)
+        self.assertIs(lease._reserve, reserve)
+        for value in (retained, *reserve):
+            os.fstat(value)
+        self.assertFalse(self._contender_can_lock(path))
+
+        lease.close()
+        self.assertIsNone(lease._descriptor)
+        self.assertIsNone(lease._reserve)
+        for value in (retained, *reserve):
+            self._assert_closed(value)
+        self.assertTrue(self._contender_can_lock(path))
+
+        path = os.path.join(self.control, b"post-boundary-interruption.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+        interruption = KeyboardInterrupt(
+            "injected after target became unsafe to retry"
+        )
+        dup2_attempts = []
+
+        def interrupt_dup2(source, target, *, inheritable):
+            dup2_attempts.append((source, target, inheritable))
+            raise interruption
+
+        with mock.patch.object(subject.os, "dup2", interrupt_dup2):
+            with self.assertRaises(BaseException) as raised:
+                lease.close()
+
+        self.assertIs(raised.exception, interruption)
+        self.assertEqual(dup2_attempts, [(reserve[0], retained, False)])
+        self.assertIsNone(lease._descriptor)
+        self.assertIsNone(lease._reserve)
+        os.fstat(retained)
+        for value in reserve:
+            self._assert_closed(value)
+        self.assertFalse(self._contender_can_lock(path))
+        lease.close()
+        self.assertEqual(dup2_attempts, [(reserve[0], retained, False)])
+        os.close(retained)
+        self._assert_closed(retained)
+        self.assertTrue(self._contender_can_lock(path))
+
+        path = os.path.join(self.control, b"reserve-reuse-interruption.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+        replacement_path = os.path.join(self.control, b"reserve-reuse-unrelated")
+        replacement_seed = os.open(
+            replacement_path,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+        )
+        os.close(replacement_seed)
+        guards = []
+        while not guards or guards[-1] < reserve[0]:
+            guard = os.open(replacement_path, os.O_RDWR | os.O_CLOEXEC)
+            guards.append(guard)
+            self.addCleanup(self._close, guard)
+        close = os.close
+        attempts = []
+        replacement = []
+        interruption = KeyboardInterrupt(
+            "injected after reserve close and descriptor reuse"
+        )
+
+        def close_reserve_reuse_then_interrupt(value):
+            if value in reserve:
+                attempts.append(value)
+            close(value)
+            if value == reserve[0] and not replacement:
+                reused = os.open(replacement_path, os.O_RDWR | os.O_CLOEXEC)
+                self.assertEqual(
+                    reused,
+                    value,
+                    "test could not force reserve descriptor-number reuse",
+                )
+                replacement.append(reused)
+                self.addCleanup(self._close, reused)
+                raise interruption
+
+        with mock.patch.object(
+            subject.os,
+            "close",
+            close_reserve_reuse_then_interrupt,
+        ):
+            with self.assertRaises(BaseException) as raised:
+                lease.close()
+
+        self.assertIs(raised.exception, interruption)
+        self.assertEqual(attempts, list(reserve))
+        self.assertIsNone(lease._descriptor)
+        self.assertIsNone(lease._reserve)
+        self._assert_closed(retained)
+        self._assert_closed(reserve[1])
+        os.fstat(replacement[0])
+        lease.close()
+        os.fstat(replacement[0])
+        self.assertTrue(self._contender_can_lock(path))
+        os.close(replacement.pop())
+        self._assert_closed(reserve[0])
+
+        path = os.path.join(self.control, b"post-mutation-proof-interrupt.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+        replacement_path = os.path.join(self.control, b"unrelated-reused-descriptor")
+        replacement_seed = os.open(
+            replacement_path,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+        )
+        os.close(replacement_seed)
+        close = os.close
+        fstat = os.fstat
+        guards = []
+        while not guards or guards[-1] < retained:
+            guard = os.open(replacement_path, os.O_RDWR | os.O_CLOEXEC)
+            guards.append(guard)
+            self.addCleanup(self._close, guard)
+        replacement = []
+        proof_attempted = []
+        close_interruption = KeyboardInterrupt(
+            "injected after destructive descriptor close"
+        )
+        proof_interruption = SystemExit("injected during post-close identity proof")
+
+        def close_reuse_then_interrupt(value):
+            close(value)
+            if value == retained and not replacement:
+                reused = os.open(replacement_path, os.O_RDWR | os.O_CLOEXEC)
+                self.assertEqual(
+                    reused,
+                    retained,
+                    "test could not force descriptor-number reuse",
+                )
+                replacement.append(reused)
+                self.addCleanup(self._close, reused)
+                raise close_interruption
+
+        def interrupt_post_close_proof(value):
+            if value == retained and replacement:
+                proof_attempted.append(value)
+                raise proof_interruption
+            return fstat(value)
+
+        with mock.patch.object(
+            subject.os,
+            "close",
+            close_reuse_then_interrupt,
+        ), mock.patch.object(subject.os, "fstat", interrupt_post_close_proof):
+            with self.assertRaises(BaseException) as raised:
+                lease.close()
+
+        lease.close()
+        os.fstat(replacement[0])
+        self.assertIs(raised.exception, close_interruption)
+        self._assert_cleanup_graph(
+            close_interruption,
+            [close_interruption],
+            [close_interruption],
+        )
+        self.assertEqual(proof_attempted, [])
+        self.assertIsNone(lease._descriptor)
+        self.assertIsNone(lease._reserve)
+        for value in reserve:
+            self._assert_closed(value)
+        self.assertTrue(self._contender_can_lock(path))
+        os.close(replacement.pop())
+        self._assert_closed(retained)
+
+        path = os.path.join(self.control, b"post-helper-return-interrupt.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        lease = self._hold(path, descriptor)
+        retained = lease._descriptor
+        reserve = lease._reserve
+        for value in (retained, *reserve):
+            self.addCleanup(self._close, value)
+        replacement_path = os.path.join(self.control, b"post-helper-unrelated")
+        replacement_seed = os.open(
+            replacement_path,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+        )
+        os.close(replacement_seed)
+        guards = []
+        while not guards or guards[-1] < retained:
+            guard = os.open(replacement_path, os.O_RDWR | os.O_CLOEXEC)
+            guards.append(guard)
+            self.addCleanup(self._close, guard)
+        close_fd = subject._close_fd
+        replacement = []
+        interruption = KeyboardInterrupt("injected after close helper return")
+
+        def consume_then_interrupt(value, tombstone, mark_target_ambiguous):
+            self.assertIsNone(
+                close_fd(value, tombstone, mark_target_ambiguous)
+            )
+            reused = os.open(replacement_path, os.O_RDWR | os.O_CLOEXEC)
+            self.assertEqual(
+                reused,
+                retained,
+                "test could not force post-helper descriptor reuse",
+            )
+            replacement.append(reused)
+            self.addCleanup(self._close, reused)
+            raise interruption
+
+        with mock.patch.object(subject, "_close_fd", consume_then_interrupt):
+            with self.assertRaises(BaseException) as raised:
+                lease.close()
+
+        lease.close()
+        os.fstat(replacement[0])
+        self.assertIs(raised.exception, interruption)
+        self._assert_cleanup_graph(
+            interruption,
+            [interruption],
+            [interruption],
+        )
+        self.assertIsNone(lease._descriptor)
+        self.assertIsNone(lease._reserve)
+        for value in reserve:
+            self._assert_closed(value)
+        self.assertTrue(self._contender_can_lock(path))
+        os.close(replacement.pop())
+        self._assert_closed(retained)
 
     def test_acquisition_reservation_consumes_on_failure(self):
         path = os.path.join(self.control, b"acquisition-emfile.receipt")
@@ -427,11 +1446,314 @@ class QuiescencePrimitivesTest(unittest.TestCase):
             interrupt_peer_close,
         ):
             lease = self._hold(path, descriptor)
-        lease.close()
+            with self.assertRaises(KeyboardInterrupt):
+                lease.close()
+        self.assertEqual(interrupt, [])
         self._assert_closed(descriptor)
-        for value in pipe_descriptors:
+        self._assert_closed(pipe_descriptors[0])
+        os.fstat(pipe_descriptors[1])
+        lease.close()
+        os.fstat(pipe_descriptors[1])
+        self.assertTrue(self._contender_can_lock(path))
+        os.close(pipe_descriptors[1])
+        self._assert_closed(pipe_descriptors[1])
+
+    def test_acquisition_cleanup_preserves_primary_and_attempts_all_reserve_closes(self):
+        path = os.path.join(self.control, b"acquisition-helper-entry.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        pipe = os.pipe
+        duplicate = os.dup
+        pipe_descriptors = []
+        retained = []
+        close_calls = []
+        interruption = KeyboardInterrupt(
+            "injected at acquisition close helper entry"
+        )
+        fallback_interruption = SystemExit(
+            "injected before acquisition fallback boundary"
+        )
+        mark_target_ambiguous = subject._DescriptorSlot.mark_target_ambiguous
+        fallback_attempts = []
+
+        def record_pipe():
+            result = pipe()
+            pipe_descriptors.extend(result)
+            for value in result:
+                self.addCleanup(self._close, value)
+            return result
+
+        def record_duplicate(value):
+            result = duplicate(value)
+            retained.append(result)
+            self.addCleanup(self._close, result)
+            return result
+
+        def interrupt_initial_helper(*arguments):
+            close_calls.append(arguments[0])
+            raise interruption
+
+        def interrupt_initial_fallback(slot):
+            if slot.target == descriptor and not fallback_attempts:
+                fallback_attempts.append(slot.target)
+                raise fallback_interruption
+            return mark_target_ambiguous(slot)
+
+        with mock.patch.object(subject.os, "pipe", record_pipe), mock.patch.object(
+            subject.os,
+            "dup",
+            record_duplicate,
+        ), mock.patch.object(
+            subject,
+            "_close_fd",
+            interrupt_initial_helper,
+        ), mock.patch.object(
+            subject._DescriptorSlot,
+            "mark_target_ambiguous",
+            interrupt_initial_fallback,
+        ):
+            with self.assertRaises(BaseException) as raised:
+                self._hold(path, descriptor)
+
+        self.assertIs(raised.exception, interruption)
+        self._assert_cleanup_graph(
+            interruption,
+            [interruption, fallback_interruption],
+            [fallback_interruption],
+        )
+        self.assertEqual(close_calls, [descriptor, descriptor, retained[0]])
+        self.assertEqual(fallback_attempts, [descriptor])
+        self._assert_closed(descriptor)
+        for value in (*retained, *pipe_descriptors):
             self._assert_closed(value)
         self.assertTrue(self._contender_can_lock(path))
+
+        path = os.path.join(self.control, b"acquisition-fallback-bounded.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        pipe = os.pipe
+        duplicate = os.dup
+        pipe_descriptors = []
+        retained = []
+        close_calls = []
+        fallback_attempts = []
+        interruption = KeyboardInterrupt(
+            "injected persistently at acquisition helper entry"
+        )
+        fallback_interruption = SystemExit(
+            "injected persistently before acquisition fallback boundary"
+        )
+
+        def record_pipe():
+            result = pipe()
+            pipe_descriptors.extend(result)
+            for value in result:
+                self.addCleanup(self._close, value)
+            return result
+
+        def record_duplicate(value):
+            result = duplicate(value)
+            retained.append(result)
+            self.addCleanup(self._close, result)
+            return result
+
+        def interrupt_every_helper(*arguments):
+            close_calls.append(arguments[0])
+            raise interruption
+
+        def interrupt_every_fallback(slot):
+            fallback_attempts.append(slot.target)
+            raise fallback_interruption
+
+        with mock.patch.object(subject.os, "pipe", record_pipe), mock.patch.object(
+            subject.os,
+            "dup",
+            record_duplicate,
+        ), mock.patch.object(
+            subject,
+            "_close_fd",
+            interrupt_every_helper,
+        ), mock.patch.object(
+            subject._DescriptorSlot,
+            "mark_target_ambiguous",
+            interrupt_every_fallback,
+        ):
+            with self.assertRaises(BaseException) as raised:
+                self._hold(path, descriptor)
+
+        self.assertIs(raised.exception, interruption)
+        self._assert_cleanup_graph(
+            interruption,
+            [interruption, fallback_interruption],
+            [fallback_interruption],
+        )
+        self.assertEqual(close_calls, [descriptor, descriptor, retained[0]])
+        self.assertEqual(
+            fallback_attempts,
+            [descriptor, descriptor, retained[0], retained[0]],
+        )
+        os.fstat(descriptor)
+        os.fstat(retained[0])
+        for value in pipe_descriptors:
+            self._assert_closed(value)
+        self.assertFalse(self._contender_can_lock(path))
+        os.close(descriptor)
+        os.close(retained[0])
+        self._assert_closed(descriptor)
+        self._assert_closed(retained[0])
+        self.assertTrue(self._contender_can_lock(path))
+
+        path = os.path.join(self.control, b"acquisition-cleanup-composition.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        pipe = os.pipe
+        duplicate = os.dup
+        close = os.close
+        reserve = []
+        retained = []
+        reserve_attempts = []
+
+        def record_pipe():
+            pair = pipe()
+            reserve.extend(pair)
+            for value in pair:
+                self.addCleanup(self._close, value)
+            return pair
+
+        def record_duplicate(value):
+            result = duplicate(value)
+            retained.append(result)
+            self.addCleanup(self._close, result)
+            return result
+
+        interruption = KeyboardInterrupt("injected acquisition reserve interruption")
+
+        def interrupt_first_reserve(value):
+            if value in reserve:
+                reserve_attempts.append(value)
+            close(value)
+            if reserve and value == reserve[0]:
+                raise interruption
+
+        underlying = OSError(errno.EIO, "injected acquisition underlying failure")
+        primary = subject.QuiescenceError("injected acquisition primary failure")
+        primary.__cause__ = underlying
+        primary.__suppress_context__ = True
+
+        with mock.patch.object(subject.os, "pipe", record_pipe), mock.patch.object(
+            subject.os,
+            "dup",
+            record_duplicate,
+        ), mock.patch.object(
+            subject.os,
+            "close",
+            interrupt_first_reserve,
+        ), mock.patch.object(
+            subject,
+            "_prepare_roots",
+            side_effect=primary,
+        ):
+            with self.assertRaises(BaseException) as raised:
+                self._hold(path, descriptor)
+
+        self.assertIs(raised.exception, primary)
+        self._assert_cleanup_graph(
+            primary,
+            [primary, interruption, underlying],
+            [interruption],
+        )
+        subject._chain_cleanup_failures(primary, [interruption, interruption])
+        self._assert_cleanup_graph(
+            primary,
+            [primary, interruption, underlying],
+            [interruption],
+        )
+        self.assertEqual(reserve_attempts, reserve)
+        self._assert_closed(descriptor)
+        for value in (*retained, *reserve):
+            self._assert_closed(value)
+        self.assertTrue(self._contender_can_lock(path))
+
+        path = os.path.join(self.control, b"acquisition-post-helper-interrupt.receipt")
+        descriptor = self._create_receipt(path, lock=True)
+        pipe = os.pipe
+        duplicate = os.dup
+        close_fd = subject._close_fd
+        reserve = []
+        retained = []
+        replacement = []
+        replacement_path = os.path.join(self.control, b"acquisition-unrelated")
+        replacement_seed = os.open(
+            replacement_path,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+        )
+        os.close(replacement_seed)
+        guards = []
+        while not guards or guards[-1] < descriptor:
+            guard = os.open(replacement_path, os.O_RDWR | os.O_CLOEXEC)
+            guards.append(guard)
+            self.addCleanup(self._close, guard)
+        interruption = KeyboardInterrupt(
+            "injected after acquisition close helper return"
+        )
+        close_calls = []
+
+        def record_pipe():
+            result = pipe()
+            reserve.extend(result)
+            for value in result:
+                self.addCleanup(self._close, value)
+            return result
+
+        def record_duplicate(value):
+            result = duplicate(value)
+            retained.append(result)
+            self.addCleanup(self._close, result)
+            return result
+
+        def consume_incoming_then_interrupt(
+            value,
+            tombstone,
+            mark_target_ambiguous,
+        ):
+            close_calls.append(value)
+            result = close_fd(value, tombstone, mark_target_ambiguous)
+            if len(close_calls) == 1:
+                self.assertIsNone(result)
+                reused = os.open(replacement_path, os.O_RDWR | os.O_CLOEXEC)
+                self.assertEqual(
+                    reused,
+                    descriptor,
+                    "test could not force acquisition descriptor reuse",
+                )
+                replacement.append(reused)
+                self.addCleanup(self._close, reused)
+                raise interruption
+            return result
+
+        with mock.patch.object(subject.os, "pipe", record_pipe), mock.patch.object(
+            subject.os,
+            "dup",
+            record_duplicate,
+        ), mock.patch.object(
+            subject,
+            "_close_fd",
+            consume_incoming_then_interrupt,
+        ):
+            with self.assertRaises(BaseException) as raised:
+                self._hold(path, descriptor)
+
+        os.fstat(replacement[0])
+        self.assertIs(raised.exception, interruption)
+        self._assert_cleanup_graph(
+            interruption,
+            [interruption],
+            [interruption],
+        )
+        self.assertEqual(close_calls, [descriptor, retained[0]])
+        for value in (*retained, *reserve):
+            self._assert_closed(value)
+        self.assertTrue(self._contender_can_lock(path))
+        os.close(replacement.pop())
+        self._assert_closed(descriptor)
 
     def test_process_death_releases_kernel_lease(self):
         registry_b64 = base64.b64encode(self.registry_raw).decode("ascii")
@@ -1193,6 +2515,24 @@ finally:
     def _assert_closed(self, descriptor):
         with self.assertRaises(OSError):
             os.fstat(descriptor)
+
+    def _assert_cleanup_graph(self, primary, expected, cleanups):
+        observed = []
+        identities = set()
+        current = primary
+        while current is not None:
+            self.assertNotIn(id(current), identities, "cleanup cause graph contains a cycle")
+            identities.add(id(current))
+            observed.append(current)
+            current = current.__cause__
+        self.assertEqual(observed, expected)
+        for cleanup in cleanups:
+            self.assertFalse(
+                subject._exception_graph_reaches(cleanup.__context__, {id(primary)}),
+                "cleanup context points back to its active primary",
+            )
+            if cleanup is not primary:
+                self.assertTrue(cleanup.__suppress_context__)
 
     @staticmethod
     def _dead_pid():

@@ -23,6 +23,121 @@ HEX = frozenset("0123456789abcdef")
 class QuiescenceError(RuntimeError):
     """A repository quiescence lease could not be certified safely."""
 
+def _exception_graph_reaches(error, forbidden):
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        if id(current) in forbidden:
+            return True
+        seen.add(id(current))
+        pending.extend((current.__cause__, current.__context__))
+    return False
+
+def _cause_chain(error):
+    chain = []
+    seen = set()
+    while error is not None and id(error) not in seen:
+        chain.append(error)
+        seen.add(id(error))
+        error = error.__cause__
+    return chain
+
+def _sanitize_cleanup_chain(error, forbidden):
+    seen = set()
+    current = error
+    while True:
+        seen.add(id(current))
+        current.__suppress_context__ = True
+        if _exception_graph_reaches(current.__context__, forbidden | seen):
+            current.__context__ = None
+        following = current.__cause__
+        if following is None:
+            return current, seen
+        if id(following) in forbidden or id(following) in seen:
+            current.__cause__ = None
+            return current, seen
+        current = following
+
+def _chain_cleanup_failures(primary, failures):
+    """Append unique cleanup failures as an acyclic authoritative cause chain."""
+    original = getattr(primary, "_preservation_original_cause", primary.__cause__)
+    primary_chain = _cause_chain(primary)
+    known = {id(error) for error in primary_chain}
+    if primary_chain and primary_chain[-1].__cause__ is not None:
+        primary_chain[-1].__cause__ = None
+    if original is primary:
+        original = None
+
+    candidates = []
+    candidate_ids = set()
+    for failure in failures:
+        if (
+            failure is None
+            or failure is primary
+            or id(failure) in known
+            or id(failure) in candidate_ids
+        ):
+            continue
+        candidates.append(failure)
+        candidate_ids.add(id(failure))
+    if not candidates:
+        for error in primary_chain[1:]:
+            error.__suppress_context__ = True
+            if _exception_graph_reaches(error.__context__, known):
+                error.__context__ = None
+        return
+
+    tails = []
+    claimed = set()
+    for failure in candidates:
+        tail, chain_ids = _sanitize_cleanup_chain(
+            failure,
+            known | candidate_ids | claimed,
+        )
+        tails.append(tail)
+        claimed.update(chain_ids)
+    forbidden_context = known | candidate_ids | claimed
+    for error in primary_chain[1:]:
+        error.__suppress_context__ = True
+        if _exception_graph_reaches(error.__context__, forbidden_context):
+            error.__context__ = None
+    for tail, following in zip(tails, candidates[1:]):
+        tail.__cause__ = following
+    tails[-1].__cause__ = original
+
+    previous_tail = getattr(primary, "_preservation_failure_tail", None)
+    if previous_tail is None or id(previous_tail) not in known:
+        primary.__cause__ = candidates[0]
+        primary._preservation_original_cause = original
+    else:
+        previous_tail.__cause__ = candidates[0]
+    primary.__suppress_context__ = True
+    primary._preservation_failure_tail = tails[-1]
+
+def _finish_cleanup(primary, failures):
+    failures = [failure for failure in failures if failure is not None]
+    if not failures:
+        return
+    if primary is not None:
+        _chain_cleanup_failures(primary, failures)
+        return
+    failure = _cleanup_failure(failures)
+    raise failure
+
+def _cleanup_failure(failures):
+    failure = next(
+        (error for error in failures if not isinstance(error, Exception)),
+        failures[0],
+    )
+    _chain_cleanup_failures(
+        failure,
+        [error for error in failures if error is not failure],
+    )
+    return failure
+
 def _identity(info):
     return (
         info.st_dev,
@@ -216,31 +331,29 @@ def _would_block(error):
     return isinstance(error, OSError) and error.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK)
 
 
-def _close_fd(descriptor, tombstone):
-    interrupted = None
+def _close_fd(descriptor, tombstone, mark_target_ambiguous=None):
+    failures = []
     try:
-        identity = _namespace(os.fstat(tombstone))
+        os.fstat(tombstone)
     except BaseException as error:
-        interrupted = error
-        identity = _namespace(os.fstat(tombstone))
+        failures.append(error)
+        try:
+            os.fstat(tombstone)
+        except BaseException as retry_error:
+            failures.append(retry_error)
+            raise _cleanup_failure(failures)
+    if mark_target_ambiguous is not None:
+        mark_target_ambiguous()
     try:
         os.dup2(tombstone, descriptor, inheritable=False)
     except BaseException as error:
-        interrupted = interrupted or error
-        os.dup2(tombstone, descriptor, inheritable=False)
+        failures.append(error)
+        return _cleanup_failure(failures)
     try:
         os.close(descriptor)
     except BaseException as error:
-        interrupted = interrupted or error
-        try:
-            current = os.fstat(descriptor)
-        except OSError as state:
-            if state.errno != errno.EBADF:
-                raise
-        else:
-            if _namespace(current) == identity:
-                os.close(descriptor)
-    return interrupted
+        failures.append(error)
+    return _cleanup_failure(failures) if failures else None
 
 def _prove_exclusive_owner(descriptor, path):
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -467,13 +580,184 @@ def validate_historical_receipt(
     return value
 
 
+class _DescriptorSlot:
+    """A numeric descriptor retained only while it is safe to retry."""
+    def __init__(self, target):
+        self.target_state = ("retryable", target)
+
+    @property
+    def target(self):
+        return self.target_state[1]
+
+    @property
+    def target_phase(self):
+        return self.target_state[0]
+
+    def mark_target_ambiguous(self):
+        self.target_state = ("ambiguous", None)
+
+
+class _DescriptorOwnership:
+    """Lease target and reserve slots that survive interrupted cleanup."""
+    def __init__(self, target, reserve):
+        self.target_slot = _DescriptorSlot(target)
+        self.reserve = reserve
+
+    @property
+    def target(self):
+        return self.target_slot.target
+
+    @property
+    def target_phase(self):
+        return self.target_slot.target_phase
+
+    def mark_target_ambiguous(self):
+        self.target_slot.mark_target_ambiguous()
+
+
+class _AcquisitionOwnership:
+    """Descriptor slots retained across interrupted acquisition cleanup."""
+    def __init__(self, incoming):
+        self.incoming = _DescriptorSlot(incoming)
+        self.retained = None
+        self.reserve = ()
+
+
+def _close_acquisition_ownership(ownership, failures):
+    slots = tuple(
+        slot for slot in (ownership.incoming, ownership.retained)
+        if slot is not None
+    )
+    if ownership.reserve:
+        tombstone = ownership.reserve[0]
+        for slot in slots:
+            if slot.target_phase == "retryable":
+                try:
+                    error = _close_fd(
+                        slot.target,
+                        tombstone,
+                        slot.mark_target_ambiguous,
+                    )
+                except BaseException as error:
+                    failures.append(error)
+                else:
+                    if error is not None:
+                        failures.append(error)
+    for slot in slots:
+        for _attempt in range(2):
+            if slot.target_phase != "retryable":
+                break
+            try:
+                value = slot.target
+                slot.mark_target_ambiguous()
+                os.close(value)
+            except BaseException as error:
+                failures.append(error)
+    while ownership.reserve:
+        reserve = ownership.reserve
+        value = reserve[0]
+        try:
+            ownership.reserve = reserve[1:]
+            os.close(value)
+        except BaseException as error:
+            failures.append(error)
+
+
+def _release_close_lock(lock, failures):
+    for _attempt in range(2):
+        try:
+            lock.release()
+        except RuntimeError:
+            return
+        except BaseException as error:
+            failures.append(error)
+        else:
+            return
+
+
+def _clear_close_context(context, failures):
+    for _attempt in range(2):
+        try:
+            context.active = False
+        except BaseException as error:
+            failures.append(error)
+        else:
+            return
+
+
+class _CloseLockGuard:
+    """Owner-aware close serialization that composes asynchronous failures."""
+    def __init__(self, lock, failures):
+        self.lock = lock
+        self.failures = failures
+
+    def _release(self):
+        try:
+            _release_close_lock(self.lock, self.failures)
+        except BaseException as error:
+            self.failures.append(error)
+            try:
+                _release_close_lock(self.lock, self.failures)
+            except BaseException as retry_error:
+                self.failures.append(retry_error)
+
+    def __enter__(self):
+        try:
+            self.lock.acquire()
+        except BaseException as error:
+            self.failures.append(error)
+            self._release()
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        del exc_type, traceback
+        if exc_value is not None:
+            self.failures.append(exc_value)
+        self._release()
+        return exc_value is not None
+
+
+class _CloseContextGuard:
+    """Thread-local recursion guard with bounded, compositional reset."""
+    def __init__(self, context, failures):
+        self.context = context
+        self.failures = failures
+
+    def _clear(self):
+        try:
+            _clear_close_context(self.context, self.failures)
+        except BaseException as error:
+            self.failures.append(error)
+            try:
+                _clear_close_context(self.context, self.failures)
+            except BaseException as retry_error:
+                self.failures.append(retry_error)
+
+    def __enter__(self):
+        try:
+            self.context.active = True
+        except BaseException as error:
+            self.failures.append(error)
+            self._clear()
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        del exc_type, traceback
+        if exc_value is not None:
+            self.failures.append(exc_value)
+        self._clear()
+        return exc_value is not None
+
+
 class RepositoryLease:
     """An exclusively held local-filesystem lease consumed from its caller."""
     def __init__(
         self, descriptor, path, identity, receipt_bytes, monotonic_clock,
         monotonic_deadline, protected_roots, parent_identity, reserve,
     ):
-        self._descriptor = descriptor
+        self._ownership = _DescriptorOwnership(descriptor, reserve)
         self._path = path
         self._identity = identity
         self._receipt_bytes = receipt_bytes
@@ -481,9 +765,17 @@ class RepositoryLease:
         self._monotonic_deadline = monotonic_deadline
         self._protected_roots = protected_roots
         self._parent_identity = parent_identity
-        self._reserve = reserve
-        self._close_lock = threading.Lock()
+        self._close_lock = threading.RLock()
+        self._close_context = threading.local()
 
+    @property
+    def _descriptor(self):
+        return None if self._ownership is None else self._ownership.target
+    @property
+    def _reserve(self):
+        if self._ownership is None or not self._ownership.reserve:
+            return None
+        return self._ownership.reserve
     @property
     def receipt_bytes(self):
         return self._receipt_bytes
@@ -498,23 +790,73 @@ class RepositoryLease:
             raise QuiescenceError("quiescence lease expired before capture")
         return self
     def __exit__(self, exc_type, exc_value, traceback):
+        if exc_value is not None:
+            self._close(exc_value)
+            return False
         try:
-            if exc_type is None:
-                self.revalidate()
-        finally:
-            self.close()
+            self.revalidate()
+        except BaseException as primary:
+            self._close(primary)
+            raise
+        self.close()
         return False
     def close(self):
-        with self._close_lock:
-            descriptor = self._descriptor
-            if descriptor is not None:
-                error = _close_fd(descriptor, self._reserve[0])
-                self._descriptor = None
-                reserve, self._reserve = self._reserve, None
-                for value in reserve:
-                    os.close(value)
+        self._close(None)
+    def _close_under_lock(self, failures):
+        guard = _CloseLockGuard(self._close_lock, failures)
+        try:
+            with guard:
+                self._close_owned_descriptors(failures)
+        except BaseException as error:
+            if not any(failure is error for failure in failures):
+                failures.append(error)
+                guard._release()
+
+    def _close(self, primary):
+        if getattr(self._close_context, "active", False):
+            return
+        failures = []
+        context_guard = _CloseContextGuard(self._close_context, failures)
+        try:
+            with context_guard:
+                self._close_under_lock(failures)
+        except BaseException as error:
+            if not any(failure is error for failure in failures):
+                failures.append(error)
+                context_guard._clear()
+        # Helper/guard failures above compose under primary. A new arbitrary
+        # Python line-event here is terminal and may supersede diagnostic
+        # primary. The caller must exit, or retry close before continuing when
+        # ownership remains reachable and retryable.
+        _finish_cleanup(primary, failures)
+
+    def _close_owned_descriptors(self, failures):
+        ownership = self._ownership
+        if ownership is None:
+            return
+        if ownership.target_phase == "retryable":
+            try:
+                error = _close_fd(
+                    ownership.target,
+                    ownership.reserve[0],
+                    ownership.mark_target_ambiguous,
+                )
+            except BaseException as error:
+                failures.append(error)
+            else:
                 if error is not None:
-                    raise error
+                    failures.append(error)
+            if ownership.target_phase == "retryable":
+                return
+        while ownership.reserve:
+            reserve = ownership.reserve
+            value = reserve[0]
+            try:
+                ownership.reserve = reserve[1:]
+                os.close(value)
+            except BaseException as error:
+                failures.append(error)
+        self._ownership = None
 
     def revalidate(self):
         if self._descriptor is None:
@@ -547,32 +889,39 @@ def hold_quiescence(
         raise QuiescenceError("quiescence leases require POSIX CLOEXEC, NOFOLLOW, and pread")
     if type(descriptor) is not int or descriptor < 3:
         raise QuiescenceError("quiescence lease descriptor must be an inherited non-stdio fd")
-    retained = tombstone = peer = None
-    incoming = descriptor
+    ownership = _AcquisitionOwnership(descriptor)
     try:
-        tombstone, peer = os.pipe()
+        # Ownership starts when allocators return a descriptor. A wrapper that
+        # allocates and then raises without returning hides the number from
+        # every Python caller; process-exit fail-stop is the recovery boundary.
+        ownership.reserve = os.pipe()
         try:
-            retained = os.dup(incoming)
+            ownership.retained = _DescriptorSlot(
+                os.dup(ownership.incoming.target)
+            )
         except OSError as error:
             raise QuiescenceError("cannot duplicate quiescence lease descriptor: %s" % error) from error
-        error = _close_fd(incoming, tombstone)
-        incoming = None
+        error = _close_fd(
+            ownership.incoming.target,
+            ownership.reserve[0],
+            ownership.incoming.mark_target_ambiguous,
+        )
         if error is not None:
             raise error
-        os.set_inheritable(retained, False)
-        if fcntl.fcntl(retained, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDWR:
+        os.set_inheritable(ownership.retained.target, False)
+        if fcntl.fcntl(ownership.retained.target, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDWR:
             raise QuiescenceError("quiescence lease descriptor must be open read-write")
         path = os.path.abspath(os.fsencode(receipt_path))
         common = os.path.realpath(os.path.abspath(os.fsencode(expected_git_common_dir)))
         roots = _prepare_roots(protected_roots, common)
         _require_external(path, _revalidate_roots(roots))
         parent_identity = _control_parent(path)
-        info = os.fstat(retained)
+        info = os.fstat(ownership.retained.target)
         _require_owner_file(info, "quiescence receipt")
         identity = _identity(info)
         _require_path_identity(path, identity)
-        _prove_exclusive_owner(retained, path)
-        data = _read_receipt(retained, path, identity)
+        _prove_exclusive_owner(ownership.retained.target, path)
+        data = _read_receipt(ownership.retained.target, path, identity)
         if now is not None and type(now) is not int:
             raise QuiescenceError("now must be an integer nanosecond timestamp")
         wall_clock = (lambda: now) if now is not None else time.time_ns
@@ -594,7 +943,7 @@ def hold_quiescence(
         if monotonic_clock() >= deadline:
             raise QuiescenceError("quiescence lease expired during acquisition")
         return RepositoryLease(
-            retained,
+            ownership.retained.target,
             path,
             identity,
             data,
@@ -602,22 +951,19 @@ def hold_quiescence(
             deadline,
             roots,
             parent_identity,
-            (tombstone, peer),
+            ownership.reserve,
         )
-    except BaseException:
-        cleanup_error = None
-        if tombstone is None:
+    except BaseException as primary:
+        cleanup_failures = []
+        for _attempt in range(2):
             try:
-                fcntl.flock(incoming, fcntl.LOCK_UN)
-            finally:
-                os.close(incoming)
-        else:
-            for value in (incoming, retained):
-                if value is not None:
-                    error = _close_fd(value, tombstone)
-                    cleanup_error = cleanup_error or error
-            os.close(tombstone)
-            os.close(peer)
-        if cleanup_error is not None:
-            raise cleanup_error
+                _close_acquisition_ownership(ownership, cleanup_failures)
+                break
+            except BaseException as error:
+                cleanup_failures.append(error)
+        # Cleanup failures compose under primary. A new arbitrary Python
+        # line-event here is terminal and may supersede diagnostic primary.
+        # The caller must exit so the OS releases process-owned descriptors, or
+        # an internal catcher must rerun cleanup before continuing.
+        _finish_cleanup(primary, cleanup_failures)
         raise
