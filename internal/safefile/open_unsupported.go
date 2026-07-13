@@ -16,3 +16,7 @@ func openReadOnly(path string, noFollow bool) (*os.File, error) {
 	// and fail closed above.
 	return os.Open(path) // #nosec G304 -- compatibility read on unsupported OS
 }
+
+func openMetadataNoFollow(string) (*os.File, error) {
+	return nil, errors.ErrUnsupported
+}

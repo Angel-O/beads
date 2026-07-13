@@ -23,10 +23,14 @@ func openReadOnly(path string, noFollow bool) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	return wrapUnixFileDescriptor(fd, path, "read-only")
+}
+
+func wrapUnixFileDescriptor(fd int, path, kind string) (*os.File, error) {
 	file := os.NewFile(uintptr(fd), path)
 	if file == nil {
 		_ = unix.Close(fd)
-		return nil, errors.New("could not wrap read-only file descriptor")
+		return nil, errors.New("could not wrap " + kind + " file descriptor")
 	}
 	return file, nil
 }
