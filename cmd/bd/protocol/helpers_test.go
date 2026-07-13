@@ -215,6 +215,13 @@ func (w *workspace) env() []string {
 		"HOME=" + w.dir,
 		"GIT_CONFIG_NOSYSTEM=1",
 		"BEADS_TEST_MODE=1",
+		// Metrics off. Two reasons, one of them a test-stability bug: bd spawns a
+		// DETACHED `bd send-metrics` child that writes $HOME/.beads/eventsData
+		// after the parent exits, and HOME here is the t.TempDir() workspace — so
+		// the child races Go's RemoveAll and the test fails its own cleanup with
+		// "unlinkat …: directory not empty". (The other reason: a test suite
+		// should not ship telemetry.)
+		"BD_DISABLE_METRICS=1",
 	}
 	if testDoltPort > 0 {
 		env = append(env, "BEADS_DOLT_PORT="+strconv.Itoa(testDoltPort))
