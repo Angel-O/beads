@@ -1,6 +1,6 @@
 //go:build windows
 
-package configfile
+package safefile
 
 import (
 	"errors"
@@ -11,7 +11,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func openReadOnlyConfigFile(path string) (*os.File, error) {
+func openReadOnlyNoFollow(path string) (*os.File, error) {
 	extendedPath, err := extendedWindowsPath(path)
 	if err != nil {
 		return nil, err
@@ -20,15 +20,16 @@ func openReadOnlyConfigFile(path string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Open the final reparse point itself so a replacement symlink is rejected
-	// from handle metadata rather than followed to its target.
+	// Open the final reparse point itself so callers can reject it rather
+	// than consuming a replacement symlink target.
+	flags := uint32(windows.FILE_FLAG_BACKUP_SEMANTICS | windows.FILE_FLAG_OPEN_REPARSE_POINT)
 	handle, err := windows.CreateFile(
 		pathPtr,
 		windows.GENERIC_READ,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil,
 		windows.OPEN_EXISTING,
-		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS,
+		flags,
 		0,
 	)
 	if err != nil {
@@ -43,18 +44,18 @@ func openReadOnlyConfigFile(path string) (*os.File, error) {
 		return closeOnError(err)
 	}
 	if fileType != windows.FILE_TYPE_DISK {
-		return closeOnError(errors.New("config handle is not a disk file"))
+		return closeOnError(errors.New("read-only handle is not a disk file"))
 	}
 	var info windows.ByHandleFileInformation
 	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
 		return closeOnError(err)
 	}
 	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return closeOnError(errors.New("config handle is a reparse point"))
+		return closeOnError(errors.New("read-only handle is a reparse point"))
 	}
 	file := os.NewFile(uintptr(handle), path)
 	if file == nil {
-		return closeOnError(errors.New("could not wrap config file handle"))
+		return closeOnError(errors.New("could not wrap read-only file handle"))
 	}
 	return file, nil
 }

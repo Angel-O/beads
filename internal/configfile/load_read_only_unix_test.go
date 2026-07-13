@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/beads/internal/safefile"
 	"golang.org/x/sys/unix"
 )
 
@@ -29,7 +30,7 @@ func TestReadStableConfigFileDoesNotFollowReplacementSymlinkToFIFO(t *testing.T)
 		if err := os.Symlink(target, path); err != nil {
 			return nil, err
 		}
-		return openReadOnlyConfigFile(path)
+		return safefile.OpenReadOnlyNoFollow(path)
 	})
 }
 
@@ -47,16 +48,12 @@ func TestReadStableConfigFileDoesNotBlockOnReplacementFIFO(t *testing.T) {
 		if err := unix.Mkfifo(path, 0o600); err != nil {
 			return nil, err
 		}
-		return openReadOnlyConfigFile(path)
+		return safefile.OpenReadOnlyNoFollow(path)
 	})
 }
 
 func assertStableReadReturnsPromptly(t *testing.T, path string, opener func(string) (*os.File, error)) {
 	t.Helper()
-	wantFlags := unix.O_NOFOLLOW | unix.O_NONBLOCK
-	if openReadOnlyConfigFlags&wantFlags != wantFlags {
-		t.Fatalf("safe-open flags = %#x, want at least %#x", openReadOnlyConfigFlags, wantFlags)
-	}
 	result := make(chan error, 1)
 	go func() {
 		_, err := readStableConfigFileWithOpener(path, opener)

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/safefile"
 )
 
 func TestReadStableConfigFileDoesNotFollowReplacementReparsePoint(t *testing.T) {
@@ -27,7 +29,7 @@ func TestReadStableConfigFileDoesNotFollowReplacementReparsePoint(t *testing.T) 
 		if err := os.Symlink(target, path); err != nil {
 			t.Skipf("symlink unavailable: %v", err)
 		}
-		return openReadOnlyConfigFile(path)
+		return safefile.OpenReadOnlyNoFollow(path)
 	})
 	if err == nil {
 		t.Fatal("replacement reparse point was accepted")

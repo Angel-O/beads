@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/safefile"
 )
 
 const (
@@ -303,7 +304,7 @@ func validateReadOnlyConfigRoot(beadsDir string) (bool, error) {
 }
 
 func readStableConfigFile(path string) ([]byte, error) {
-	return readStableConfigFileWithOpener(path, openReadOnlyConfigFile)
+	return readStableConfigFileWithOpener(path, safefile.OpenReadOnlyNoFollow)
 }
 
 func readStableConfigFileWithOpener(path string, opener func(string) (*os.File, error)) ([]byte, error) {

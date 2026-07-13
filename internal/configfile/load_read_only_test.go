@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/safefile"
 )
 
 func TestLoadReadOnlyDoesNotMigrateLegacyConfig(t *testing.T) {
@@ -94,7 +96,7 @@ func TestLoadReadOnlyRejectsCurrentMetadataReplacementDuringOpen(t *testing.T) {
 	}
 
 	readFile := func(path string) ([]byte, error) {
-		opener := openReadOnlyConfigFile
+		opener := safefile.OpenReadOnlyNoFollow
 		if path == currentPath {
 			opener = func(path string) (*os.File, error) {
 				if err := os.Remove(path); err != nil {
@@ -103,7 +105,7 @@ func TestLoadReadOnlyRejectsCurrentMetadataReplacementDuringOpen(t *testing.T) {
 				if err := os.Rename(replacementPath, path); err != nil {
 					return nil, err
 				}
-				return openReadOnlyConfigFile(path)
+				return safefile.OpenReadOnlyNoFollow(path)
 			}
 		}
 		return readStableConfigFileWithOpener(path, opener)
@@ -130,13 +132,13 @@ func TestLoadReadOnlyDoesNotFallbackWhenCurrentDisappearsDuringOpen(t *testing.T
 
 	legacyRead := false
 	readFile := func(path string) ([]byte, error) {
-		opener := openReadOnlyConfigFile
+		opener := safefile.OpenReadOnlyNoFollow
 		if path == currentPath {
 			opener = func(path string) (*os.File, error) {
 				if err := os.Remove(path); err != nil {
 					return nil, err
 				}
-				return openReadOnlyConfigFile(path)
+				return safefile.OpenReadOnlyNoFollow(path)
 			}
 		} else if path == legacyPath {
 			legacyRead = true
@@ -168,10 +170,10 @@ func TestLoadReadOnlyDoesNotFallbackWhenCurrentDisappearsAfterRead(t *testing.T)
 
 	legacyRead := false
 	readFile := func(path string) ([]byte, error) {
-		opener := openReadOnlyConfigFile
+		opener := safefile.OpenReadOnlyNoFollow
 		if path == currentPath {
 			opener = func(path string) (*os.File, error) {
-				file, err := openReadOnlyConfigFile(path)
+				file, err := safefile.OpenReadOnlyNoFollow(path)
 				if err != nil {
 					return nil, err
 				}
@@ -206,13 +208,13 @@ func TestLoadReadOnlyDoesNotTreatLegacyDisappearanceAsAbsence(t *testing.T) {
 	}
 
 	readFile := func(path string) ([]byte, error) {
-		opener := openReadOnlyConfigFile
+		opener := safefile.OpenReadOnlyNoFollow
 		if path == legacyPath {
 			opener = func(path string) (*os.File, error) {
 				if err := os.Remove(path); err != nil {
 					return nil, err
 				}
-				return openReadOnlyConfigFile(path)
+				return safefile.OpenReadOnlyNoFollow(path)
 			}
 		}
 		return readStableConfigFileWithOpener(path, opener)
