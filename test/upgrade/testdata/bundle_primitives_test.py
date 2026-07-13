@@ -13,7 +13,7 @@ import unittest
 
 import upgrade_baseline_bundle as subject
 
-EXPECTED_TEST_COUNT = 83
+EXPECTED_TEST_COUNT = 104
 
 
 class BundlePrimitivesTest(unittest.TestCase):
@@ -25,11 +25,679 @@ class BundlePrimitivesTest(unittest.TestCase):
         self.bundle = subject.Bundle(self.bundle_path)
         self.bundle.start()
 
+    def _durable_staging(self, parent, name, marker=subject.INCOMPLETE_MARKER):
+        path = os.path.join(parent, name)
+        os.mkdir(path, 0o700)
+        root = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            if marker is not None:
+                marker_path = os.path.join(path, "INCOMPLETE")
+                with open(marker_path, "xb") as handle:
+                    handle.write(marker)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(marker_path, 0o600)
+            os.fsync(root)
+        finally:
+            os.close(root)
+        parent_descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+        return path
+
+    def test_abandoned_staging_is_reaped_before_new_bundle_allocation(self):
+        parent = os.path.join(self.temporary.name, "reap-abandoned")
+        output = os.path.join(parent, "bundle")
+        os.mkdir(parent, 0o700)
+        staging = self._durable_staging(
+            parent, ".bundle-staging-" + "1" * 32
+        )
+
+        bundle = subject.Bundle.create_started(output)
+
+        self.assertFalse(os.path.lexists(staging))
+        self.assertTrue(os.path.isfile(os.path.join(output, "INCOMPLETE")))
+        bundle.revalidate_anchor()
+
+    def test_busy_staging_is_never_reaped_until_creator_releases_lock(self):
+        parent = os.path.join(self.temporary.name, "reap-busy")
+        first_output = os.path.join(parent, "first")
+        second_output = os.path.join(parent, "second")
+        os.mkdir(parent, 0o700)
+        staging = self._durable_staging(
+            parent, ".bundle-staging-" + "2" * 32
+        )
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                (
+                    "import fcntl,os,sys; "
+                    "fd=os.open(sys.argv[1],os.O_RDONLY|os.O_DIRECTORY); "
+                    "fcntl.flock(fd,fcntl.LOCK_EX); print('locked',flush=True); "
+                    "sys.stdin.buffer.read(1)"
+                ),
+                staging,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=os.environ,
+        )
+        try:
+            ready, _, _ = select.select([holder.stdout], [], [], 2)
+            self.assertTrue(ready, "staging lock holder did not become ready")
+            self.assertEqual(holder.stdout.readline(), b"locked\n")
+            subject.Bundle.create_started(first_output)
+            self.assertTrue(os.path.isdir(staging))
+            holder.stdin.write(b"x")
+            holder.stdin.close()
+            holder.wait(timeout=2)
+            subject.Bundle.create_started(second_output)
+            self.assertFalse(os.path.lexists(staging))
+        finally:
+            if holder.poll() is None:
+                holder.terminate()
+                holder.wait(timeout=2)
+            if holder.stdin is not None and not holder.stdin.closed:
+                holder.stdin.close()
+            if holder.stdout is not None:
+                holder.stdout.close()
+
+    def test_staging_reaper_rejects_every_noncanonical_candidate_unchanged(self):
+        cases = (
+            "malformed-name", "symlink", "mode", "bad-marker",
+            "prefix-mode", "final-prefix", "final-zero",
+            "zero-mode-content", "hardlink", "extra",
+        )
+        for index, case in enumerate(cases):
+            with self.subTest(case=case):
+                parent = os.path.join(self.temporary.name, "invalid-staging-%d" % index)
+                output = os.path.join(parent, "bundle")
+                os.mkdir(parent, 0o700)
+                name = ".bundle-staging-" + ("%x" % index) * 32
+                if case == "malformed-name":
+                    name = ".bundle-staging-short"
+                if case == "symlink":
+                    target = self._durable_staging(parent, "candidate-target")
+                    candidate = os.path.join(parent, name)
+                    os.symlink(target, candidate)
+                else:
+                    candidate = self._durable_staging(
+                        parent,
+                        name,
+                        (
+                            b"not canonical\n"
+                            if case == "bad-marker"
+                            else subject.INCOMPLETE_MARKER[:7]
+                            if case in ("prefix-mode", "final-prefix")
+                            else b""
+                            if case == "final-zero"
+                            else subject.INCOMPLETE_MARKER
+                        ),
+                    )
+                if case == "mode":
+                    os.chmod(candidate, 0o750)
+                elif case == "prefix-mode":
+                    os.chmod(os.path.join(candidate, "INCOMPLETE"), 0o400)
+                elif case == "zero-mode-content":
+                    os.chmod(os.path.join(candidate, "INCOMPLETE"), 0)
+                elif case == "hardlink":
+                    os.link(
+                        os.path.join(candidate, "INCOMPLETE"),
+                        os.path.join(parent, "linked-marker"),
+                    )
+                elif case == "extra":
+                    extra = os.path.join(candidate, "extra")
+                    with open(extra, "xb") as handle:
+                        handle.write(b"unexpected")
+                    os.chmod(extra, 0o600)
+                before = os.lstat(candidate)
+
+                with self.assertRaises(subject.PreservationError):
+                    subject.Bundle.create_started(output)
+
+                after = os.lstat(candidate)
+                self.assertEqual(
+                    (after.st_dev, after.st_ino, after.st_mode, after.st_nlink),
+                    (before.st_dev, before.st_ino, before.st_mode, before.st_nlink),
+                )
+                self.assertFalse(os.path.lexists(output))
+
+    def test_staging_reaper_rejects_malformed_marker_temporary_unchanged(self):
+        temporary_name = ".object-INCOMPLETE"
+        cases = (
+            "content", "mode", "hardlink", "directory",
+            "cross-inode", "third-link",
+        )
+        for index, case in enumerate(cases):
+            with self.subTest(case=case):
+                parent = os.path.join(self.temporary.name, "invalid-marker-temp-%d" % index)
+                output = os.path.join(parent, "bundle")
+                os.mkdir(parent, 0o700)
+                candidate = os.path.join(parent, ".bundle-staging-" + ("%x" % index) * 32)
+                os.mkdir(candidate, 0o700)
+                temporary = os.path.join(candidate, temporary_name)
+                if case == "directory":
+                    os.mkdir(temporary, 0o700)
+                else:
+                    with open(temporary, "xb") as handle:
+                        if case == "content":
+                            handle.write(b"not an unpublished zero marker")
+                        elif case in ("cross-inode", "third-link"):
+                            handle.write(subject.INCOMPLETE_MARKER)
+                    os.chmod(temporary, 0o400 if case == "mode" else 0o600)
+                if case == "hardlink":
+                    os.link(temporary, os.path.join(parent, "linked-marker-temp"))
+                final = os.path.join(candidate, "INCOMPLETE")
+                if case == "cross-inode":
+                    with open(final, "xb") as handle:
+                        handle.write(subject.INCOMPLETE_MARKER)
+                    os.chmod(final, 0o600)
+                elif case == "third-link":
+                    os.link(temporary, final)
+                    os.link(temporary, os.path.join(parent, "third-marker-link"))
+                before = os.lstat(temporary)
+                final_before = (
+                    os.lstat(final)
+                    if case in ("cross-inode", "third-link")
+                    else None
+                )
+
+                with self.assertRaises(subject.PreservationError):
+                    subject.Bundle.create_started(output)
+
+                after = os.lstat(temporary)
+                self.assertEqual(
+                    (after.st_dev, after.st_ino, after.st_mode, after.st_nlink, after.st_size),
+                    (before.st_dev, before.st_ino, before.st_mode, before.st_nlink, before.st_size),
+                )
+                if final_before is not None:
+                    final_after = os.lstat(final)
+                    self.assertEqual(
+                        (
+                            final_after.st_dev, final_after.st_ino,
+                            final_after.st_mode, final_after.st_nlink,
+                            final_after.st_size,
+                        ),
+                        (
+                            final_before.st_dev, final_before.st_ino,
+                            final_before.st_mode, final_before.st_nlink,
+                            final_before.st_size,
+                        ),
+                    )
+                self.assertFalse(os.path.lexists(output))
+
+    def test_staging_reaper_recovers_nonzero_canonical_marker_temporary(self):
+        for index, data in enumerate(
+            (subject.INCOMPLETE_MARKER[:7], subject.INCOMPLETE_MARKER)
+        ):
+            with self.subTest(size=len(data)):
+                parent = os.path.join(self.temporary.name, "nonzero-marker-temp-%d" % index)
+                output = os.path.join(parent, "bundle")
+                os.mkdir(parent, 0o700)
+                staging = os.path.join(parent, ".bundle-staging-" + ("%x" % index) * 32)
+                os.mkdir(staging, 0o700)
+                temporary = os.path.join(staging, ".object-INCOMPLETE")
+                with open(temporary, "xb") as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(temporary, 0o600)
+                root = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+                parent_descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(root)
+                    os.fsync(parent_descriptor)
+                finally:
+                    os.close(root)
+                    os.close(parent_descriptor)
+
+                recovered = subject.Bundle.create_started(output)
+
+                recovered.revalidate_anchor()
+                self.assertFalse(os.path.lexists(staging))
+                with open(os.path.join(output, "INCOMPLETE"), "rb") as marker:
+                    self.assertEqual(marker.read(), subject.INCOMPLETE_MARKER)
+
+    def test_marker_publication_race_never_replaces_final_name(self):
+        parent = os.path.join(self.temporary.name, "marker-publication-race")
+        output = os.path.join(parent, "bundle")
+        os.mkdir(parent, 0o700)
+        original_rename = subject.os.rename
+        original_link = subject.os.link
+        replacement = []
+        payload = b"raced final marker must survive"
+
+        def install_replacement(destination, directory):
+            if replacement:
+                return
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=directory,
+            )
+            try:
+                os.write(descriptor, payload)
+                os.fchmod(descriptor, 0o600)
+                replacement.append(os.fstat(descriptor))
+            finally:
+                os.close(descriptor)
+
+        def race_rename(source, destination, *args, **kwargs):
+            if os.fsencode(source) == b".object-INCOMPLETE" and os.fsencode(destination) == b"INCOMPLETE":
+                install_replacement(destination, kwargs["dst_dir_fd"])
+            return original_rename(source, destination, *args, **kwargs)
+
+        def race_link(source, destination, *args, **kwargs):
+            if os.fsencode(source) == b".object-INCOMPLETE" and os.fsencode(destination) == b"INCOMPLETE":
+                install_replacement(destination, kwargs["dst_dir_fd"])
+            return original_link(source, destination, *args, **kwargs)
+
+        subject.os.rename = race_rename
+        subject.os.link = race_link
+        self.addCleanup(setattr, subject.os, "rename", original_rename)
+        self.addCleanup(setattr, subject.os, "link", original_link)
+        failure = None
+        try:
+            subject.Bundle.create_started(output)
+        except subject.PreservationError as error:
+            failure = error
+
+        self.assertTrue(replacement)
+        matching = []
+        for root, _, files in os.walk(parent):
+            for name in files:
+                path = os.path.join(root, name)
+                info = os.lstat(path)
+                if (info.st_dev, info.st_ino) == (
+                    replacement[0].st_dev,
+                    replacement[0].st_ino,
+                ):
+                    matching.append(path)
+        self.assertEqual(len(matching), 1)
+        with open(matching[0], "rb") as handle:
+            self.assertEqual(handle.read(), payload)
+        self.assertEqual(stat.S_IMODE(os.lstat(matching[0]).st_mode), 0o600)
+        self.assertIsNotNone(failure)
+        self.assertFalse(os.path.lexists(output))
+
+    def test_marker_publication_rejects_temporary_substitution_at_link_seam(self):
+        path = os.path.join(self.temporary.name, "marker-temp-substitution")
+        os.mkdir(path, 0o700)
+        bundle = subject.Bundle(path)
+        original_link = subject.os.link
+        replacement = []
+
+        def substitute_before_link(source, destination, *args, **kwargs):
+            if os.fsencode(source) == b".object-INCOMPLETE" and not replacement:
+                directory = kwargs["src_dir_fd"]
+                os.unlink(source, dir_fd=directory)
+                descriptor = os.open(
+                    source,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory,
+                )
+                try:
+                    os.write(descriptor, subject.INCOMPLETE_MARKER)
+                    os.fchmod(descriptor, 0o600)
+                    replacement.append(os.fstat(descriptor))
+                finally:
+                    os.close(descriptor)
+            return original_link(source, destination, *args, **kwargs)
+
+        subject.os.link = substitute_before_link
+        self.addCleanup(setattr, subject.os, "link", original_link)
+        with self.assertRaisesRegex(
+            subject.PreservationError, "lifecycle marker"
+        ):
+            bundle.start()
+
+        temporary = os.lstat(os.path.join(path, ".object-INCOMPLETE"))
+        final = os.lstat(os.path.join(path, "INCOMPLETE"))
+        self.assertEqual(
+            (temporary.st_dev, temporary.st_ino),
+            (replacement[0].st_dev, replacement[0].st_ino),
+        )
+        self.assertEqual(
+            (final.st_dev, final.st_ino),
+            (replacement[0].st_dev, replacement[0].st_ino),
+        )
+        self.assertEqual(temporary.st_nlink, 2)
+
+    def test_final_marker_recovery_rejects_swap_during_directory_sync(self):
+        path = os.path.join(self.temporary.name, "final-marker-sync-swap")
+        os.mkdir(path, 0o700)
+        bundle = subject.Bundle(path)
+        bundle.start()
+        original_fsync = subject.os.fsync
+        replacement = []
+
+        def swap_after_directory_sync(descriptor):
+            result = original_fsync(descriptor)
+            info = os.fstat(descriptor)
+            if stat.S_ISDIR(info.st_mode) and not replacement:
+                os.unlink(b"INCOMPLETE", dir_fd=descriptor)
+                marker = os.open(
+                    b"INCOMPLETE",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=descriptor,
+                )
+                try:
+                    os.write(marker, subject.INCOMPLETE_MARKER)
+                    os.fchmod(marker, 0o600)
+                    replacement.append(os.fstat(marker))
+                finally:
+                    os.close(marker)
+            return result
+
+        subject.os.fsync = swap_after_directory_sync
+        self.addCleanup(setattr, subject.os, "fsync", original_fsync)
+        with self.assertRaises(subject.PreservationError):
+            bundle.start()
+
+        current = os.lstat(os.path.join(path, "INCOMPLETE"))
+        self.assertEqual(
+            (current.st_dev, current.st_ino, current.st_mode, current.st_size),
+            (
+                replacement[0].st_dev,
+                replacement[0].st_ino,
+                replacement[0].st_mode,
+                replacement[0].st_size,
+            ),
+        )
+
+    def test_zero_marker_normalization_never_chmods_substituted_name(self):
+        parent = os.path.join(self.temporary.name, "zero-marker-substitution")
+        output = os.path.join(parent, "bundle")
+        os.mkdir(parent, 0o700)
+        candidate = self._durable_staging(
+            parent, ".bundle-staging-" + "a" * 32, b""
+        )
+        marker = os.path.join(candidate, "INCOMPLETE")
+        os.chmod(marker, 0)
+        original_marker = os.lstat(marker)
+        original_chmod = subject.os.chmod
+        original_unlink = subject.os.unlink
+        original_open = subject.os.open
+        replacement = []
+        payload = b"must not be chmodded"
+
+        def swap_before_path_chmod(value, mode, *args, **kwargs):
+            if os.fsencode(value) == b"INCOMPLETE" and not replacement:
+                directory = kwargs["dir_fd"]
+                original_unlink(value, dir_fd=directory)
+                descriptor = original_open(
+                    value,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o400,
+                    dir_fd=directory,
+                )
+                try:
+                    os.write(descriptor, payload)
+                    os.fchmod(descriptor, 0o400)
+                    replacement.append(os.fstat(descriptor))
+                finally:
+                    os.close(descriptor)
+            return original_chmod(value, mode, *args, **kwargs)
+
+        subject.os.chmod = swap_before_path_chmod
+        self.addCleanup(setattr, subject.os, "chmod", original_chmod)
+        with self.assertRaises(subject.PreservationError):
+            subject.Bundle.create_started(output)
+        self.assertFalse(os.path.lexists(output))
+
+        current = os.lstat(marker)
+        if replacement:
+            expected = replacement[0]
+            self.assertEqual(
+                (current.st_dev, current.st_ino, current.st_mode, current.st_size),
+                (expected.st_dev, expected.st_ino, expected.st_mode, expected.st_size),
+            )
+            with open(marker, "rb") as handle:
+                self.assertEqual(handle.read(), payload)
+        else:
+            self.assertEqual(
+                (current.st_dev, current.st_ino, current.st_mode, current.st_size),
+                (
+                    original_marker.st_dev,
+                    original_marker.st_ino,
+                    original_marker.st_mode,
+                    original_marker.st_size,
+                ),
+            )
+
+    def test_staging_reaper_resumes_after_claim_rename_interruption(self):
+        parent = os.path.join(self.temporary.name, "resume-claim")
+        output = os.path.join(parent, "bundle")
+        os.mkdir(parent, 0o700)
+        self._durable_staging(parent, ".bundle-staging-" + "3" * 32)
+        original_rename = subject.os.rename
+        interrupted = False
+
+        def interrupt_after_claim(source, destination, *args, **kwargs):
+            nonlocal interrupted
+            result = original_rename(source, destination, *args, **kwargs)
+            if os.fsdecode(destination).startswith(".bundle-reaping-") and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt("injected staging claim interruption")
+            return result
+
+        subject.os.rename = interrupt_after_claim
+        try:
+            with self.assertRaisesRegex(KeyboardInterrupt, "claim interruption"):
+                subject.Bundle.create_started(output)
+        finally:
+            subject.os.rename = original_rename
+        self.assertTrue(interrupted)
+        reaping = os.fsdecode(
+            getattr(subject, "REAPING_NAME", b".bundle-reaping-" + b"0" * 32)
+        )
+        self.assertEqual(
+            [name for name in os.listdir(parent) if name.startswith(".bundle-reaping-")],
+            [reaping],
+        )
+
+        subject.Bundle.create_started(output)
+        self.assertEqual(os.listdir(os.path.join(parent, reaping)), [])
+
+    def test_staging_reaper_resumes_after_marker_unlink_interruption(self):
+        parent = os.path.join(self.temporary.name, "resume-unlink")
+        output = os.path.join(parent, "bundle")
+        os.mkdir(parent, 0o700)
+        self._durable_staging(parent, ".bundle-staging-" + "4" * 32)
+        original_unlink = subject.os.unlink
+        interrupted = False
+
+        def interrupt_after_marker_unlink(name, *args, **kwargs):
+            nonlocal interrupted
+            result = original_unlink(name, *args, **kwargs)
+            if os.fsdecode(name) == "INCOMPLETE" and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt("injected staging unlink interruption")
+            return result
+
+        subject.os.unlink = interrupt_after_marker_unlink
+        try:
+            with self.assertRaisesRegex(KeyboardInterrupt, "unlink interruption"):
+                subject.Bundle.create_started(output)
+        finally:
+            subject.os.unlink = original_unlink
+        self.assertTrue(interrupted)
+        claimed = [
+            name for name in os.listdir(parent) if name.startswith(".bundle-reaping-")
+        ]
+        reaping = os.fsdecode(
+            getattr(subject, "REAPING_NAME", b".bundle-reaping-" + b"0" * 32)
+        )
+        self.assertEqual(claimed, [reaping])
+        self.assertEqual(os.listdir(os.path.join(parent, claimed[0])), [])
+
+        subject.Bundle.create_started(output)
+        self.assertEqual(os.listdir(os.path.join(parent, claimed[0])), [])
+
+    def test_staging_reaper_rejects_path_substitution_without_deleting_replacement(self):
+        parent = os.path.join(self.temporary.name, "reap-substitution")
+        output = os.path.join(parent, "bundle")
+        name = ".bundle-staging-" + "5" * 32
+        os.mkdir(parent, 0o700)
+        candidate = self._durable_staging(parent, name)
+        moved = candidate + "-moved"
+        original_open = subject.os.open
+        substituted = False
+
+        def substitute_after_candidate_open(value, *args, **kwargs):
+            nonlocal substituted
+            descriptor = original_open(value, *args, **kwargs)
+            if os.fsdecode(value) == name and not substituted:
+                os.rename(candidate, moved)
+                self._durable_staging(parent, name)
+                substituted = True
+            return descriptor
+
+        subject.os.open = substitute_after_candidate_open
+        try:
+            with self.assertRaises(subject.PreservationError):
+                subject.Bundle.create_started(output)
+        finally:
+            subject.os.open = original_open
+        self.assertTrue(substituted)
+        self.assertTrue(os.path.isdir(candidate))
+        self.assertTrue(os.path.isdir(moved))
+        self.assertFalse(os.path.lexists(output))
+
+        final_parent = os.path.join(self.temporary.name, "reap-final-substitution")
+        final_output = os.path.join(final_parent, "bundle")
+        os.mkdir(final_parent, 0o700)
+        final_staging = self._durable_staging(
+            final_parent, ".bundle-staging-" + "6" * 32
+        )
+        final_inode = os.lstat(final_staging).st_ino
+        original_listdir = subject.os.listdir
+        final_swap = {}
+
+        def swap_claim_after_final_list(value):
+            result = original_listdir(value)
+            claims = [
+                entry for entry in original_listdir(final_parent)
+                if entry.startswith(".bundle-reaping-")
+            ]
+            claimed_inode = None
+            if claims:
+                claimed_inode = os.lstat(os.path.join(final_parent, claims[0])).st_ino
+            if (isinstance(value, int) and os.fstat(value).st_ino == final_inode
+                    and claimed_inode == final_inode and result == [] and not final_swap):
+                claimed = os.path.join(final_parent, claims[0])
+                moved_claim = claimed + "-moved"
+                os.rename(claimed, moved_claim)
+                os.mkdir(claimed, 0o700)
+                final_swap.update(claimed=claimed, moved=moved_claim)
+            return result
+
+        subject.os.listdir = swap_claim_after_final_list
+        try:
+            with self.assertRaises(subject.PreservationError):
+                subject.Bundle.create_started(final_output)
+        finally:
+            subject.os.listdir = original_listdir
+        self.assertTrue(final_swap)
+        self.assertTrue(os.path.isdir(final_swap["claimed"]))
+        self.assertTrue(os.path.isdir(final_swap["moved"]))
+        self.assertFalse(os.path.lexists(final_output))
+
+        claim_parent = os.path.join(self.temporary.name, "reap-claim-serialization")
+        claim_output = os.path.join(claim_parent, "bundle")
+        os.mkdir(claim_parent, 0o700)
+        self._durable_staging(
+            claim_parent, ".bundle-staging-" + "7" * 32
+        )
+        original_rename = subject.os.rename
+        claim_ready = threading.Event()
+        release_claim = threading.Event()
+        attacker_done = threading.Event()
+        destination = {}
+        errors = []
+        acquired_before_output = []
+
+        def pause_before_claim(source, target, *args, **kwargs):
+            if os.fsdecode(target).startswith(".bundle-reaping-") and not destination:
+                destination["name"] = os.fsdecode(target)
+                claim_ready.set()
+                if not release_claim.wait(3):
+                    raise AssertionError("timed out pausing staging claim")
+            return original_rename(source, target, *args, **kwargs)
+
+        def create_claimed_output():
+            try:
+                subject.Bundle.create_started(claim_output)
+            except BaseException as error:
+                errors.append(error)
+
+        def attempt_cooperative_swap():
+            descriptor = os.open(claim_parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                subject.fcntl.flock(descriptor, subject.fcntl.LOCK_EX)
+                before_output = not os.path.lexists(claim_output)
+                acquired_before_output.append(before_output)
+                if before_output:
+                    target = os.path.join(claim_parent, destination["name"])
+                    if os.path.lexists(target):
+                        os.rename(target, target + "-moved")
+                    os.mkdir(target, 0o700)
+            finally:
+                os.close(descriptor)
+                attacker_done.set()
+
+        subject.os.rename = pause_before_claim
+        creator = threading.Thread(target=create_claimed_output, name="claim-creator")
+        attacker = threading.Thread(target=attempt_cooperative_swap, name="claim-attacker")
+        try:
+            creator.start()
+            self.assertTrue(claim_ready.wait(3), "creator did not reach claim rename")
+            attacker.start()
+            attacker_finished_early = attacker_done.wait(0.2)
+        finally:
+            release_claim.set()
+            creator.join(3)
+            attacker.join(3)
+            subject.os.rename = original_rename
+        self.assertFalse(creator.is_alive() or attacker.is_alive())
+        self.assertFalse(attacker_finished_early)
+        self.assertEqual(acquired_before_output, [False])
+        self.assertEqual(errors, [])
+        self.assertTrue(os.path.isfile(os.path.join(claim_output, "INCOMPLETE")))
+
+    def test_staging_scan_limit_fails_before_allocating_new_staging(self):
+        parent = os.path.join(self.temporary.name, "bounded-scan")
+        output = os.path.join(parent, "bundle")
+        os.mkdir(parent, 0o700)
+        limit = getattr(subject, "STAGING_SCAN_LIMIT", 256)
+        for index in range(limit + 1):
+            path = os.path.join(parent, "entry-%04d" % index)
+            with open(path, "xb"):
+                pass
+            os.chmod(path, 0o600)
+
+        with self.assertRaisesRegex(subject.PreservationError, "scan limit"):
+            subject.Bundle.create_started(output)
+
+        self.assertFalse(os.path.lexists(output))
+        self.assertFalse(
+            any(name.startswith(".bundle-staging-") for name in os.listdir(parent))
+        )
+
     def test_create_started_returns_only_after_durable_incomplete_marker(self):
         path = os.path.join(self.temporary.name, "created-bundle")
         parent_inode = os.lstat(self.temporary.name).st_ino
         original_fsync = subject.os.fsync
         original_rename = subject.os.rename
+        original_link = subject.os.link
         events = []
 
         def record_fsync(descriptor):
@@ -42,18 +710,29 @@ class BundlePrimitivesTest(unittest.TestCase):
                 events.append("staging-root-sync")
             return original_fsync(descriptor)
 
-        def record_rename(*args, **kwargs):
+        def record_rename(source, destination, *args, **kwargs):
             events.append("publish")
-            return original_rename(*args, **kwargs)
+            return original_rename(source, destination, *args, **kwargs)
+
+        def record_link(source, destination, *args, **kwargs):
+            if os.fsencode(destination) == b"INCOMPLETE":
+                events.append("marker-publish")
+            return original_link(source, destination, *args, **kwargs)
 
         subject.os.fsync = record_fsync
         subject.os.rename = record_rename
+        subject.os.link = record_link
         self.addCleanup(setattr, subject.os, "fsync", original_fsync)
         self.addCleanup(setattr, subject.os, "rename", original_rename)
+        self.addCleanup(setattr, subject.os, "link", original_link)
         bundle = subject.Bundle.create_started(path)
         self.assertEqual(
             events,
-            ["marker-file-sync", "staging-root-sync", "publish", "parent-sync"],
+            [
+                "marker-file-sync", "marker-publish", "marker-file-sync",
+                "staging-root-sync", "staging-root-sync", "staging-root-sync",
+                "publish", "parent-sync",
+            ],
         )
         with open(os.path.join(path, "INCOMPLETE"), "rb") as marker:
             self.assertEqual(marker.read(), subject.INCOMPLETE_MARKER)
@@ -187,6 +866,163 @@ subject.Bundle.create_started(sys.argv[1])
         )
         self.assertEqual(result.returncode, -signal.SIGKILL)
         self.assertFalse(os.path.lexists(path))
+        recovered = subject.Bundle.create_started(path)
+        recovered.revalidate_anchor()
+        self.assertTrue(os.path.isfile(os.path.join(path, "INCOMPLETE")))
+
+    def test_create_started_recovers_marker_publication_crash_states(self):
+        code = r'''
+import os, signal, sys
+import upgrade_baseline_bundle as subject
+os.umask(0o777)
+state = sys.argv[2]
+temporary = b".object-INCOMPLETE"
+if state == "temp-create":
+    original_open = subject.os.open
+    def die_after_marker_create(value, *args, **kwargs):
+        descriptor = original_open(value, *args, **kwargs)
+        if os.fsencode(value) == temporary:
+            os.kill(os.getpid(), signal.SIGKILL)
+        return descriptor
+    subject.os.open = die_after_marker_create
+elif state == "temp-fchmod":
+    original_fchmod = subject.os.fchmod
+    def die_after_marker_fchmod(descriptor, mode):
+        result = original_fchmod(descriptor, mode)
+        if mode == 0o600 and os.fstat(descriptor).st_size == 0:
+            os.kill(os.getpid(), signal.SIGKILL)
+        return result
+    subject.os.fchmod = die_after_marker_fchmod
+elif state == "link":
+    original_link = subject.os.link
+    def die_after_marker_link(source, destination, *args, **kwargs):
+        result = original_link(source, destination, *args, **kwargs)
+        if os.fsencode(source) == temporary and os.fsencode(destination) == b"INCOMPLETE":
+            os.kill(os.getpid(), signal.SIGKILL)
+        return result
+    subject.os.link = die_after_marker_link
+elif state == "unlink":
+    original_unlink = subject.os.unlink
+    def die_after_marker_temp_unlink(value, *args, **kwargs):
+        result = original_unlink(value, *args, **kwargs)
+        if os.fsencode(value) == temporary:
+            os.kill(os.getpid(), signal.SIGKILL)
+        return result
+    subject.os.unlink = die_after_marker_temp_unlink
+else:
+    def die_after_prefix(handle):
+        handle.seek(0)
+        handle.truncate(0)
+        handle.write(subject.INCOMPLETE_MARKER[:7])
+        handle.flush()
+        os.kill(os.getpid(), signal.SIGKILL)
+    subject.Bundle._sync_file = staticmethod(die_after_prefix)
+subject.Bundle.create_started(sys.argv[1])
+'''
+        cases = (
+            ("temp-create", ((".object-INCOMPLETE", 0, 0o000),)),
+            ("temp-fchmod", ((".object-INCOMPLETE", 0, 0o600),)),
+            (
+                "link",
+                (
+                    (".object-INCOMPLETE", len(subject.INCOMPLETE_MARKER), 0o600),
+                    ("INCOMPLETE", len(subject.INCOMPLETE_MARKER), 0o600),
+                ),
+            ),
+            ("unlink", (("INCOMPLETE", len(subject.INCOMPLETE_MARKER), 0o600),)),
+            ("prefix", ((".object-INCOMPLETE", 7, 0o600),)),
+        )
+        for state, expected_entries in cases:
+            with self.subTest(state=state):
+                parent = os.path.join(self.temporary.name, "marker-death-" + state)
+                output = os.path.join(parent, "bundle")
+                os.mkdir(parent, 0o700)
+                result = subprocess.run(
+                    [sys.executable, "-B", "-c", code, output, state],
+                    check=False,
+                    env=os.environ,
+                    timeout=2,
+                )
+                self.assertEqual(result.returncode, -signal.SIGKILL)
+                self.assertFalse(os.path.lexists(output))
+                staging = [
+                    name for name in os.listdir(parent)
+                    if name.startswith(".bundle-staging-")
+                ]
+                self.assertEqual(len(staging), 1)
+                identities = []
+                for expected_name, expected_size, expected_mode in expected_entries:
+                    marker = os.path.join(parent, staging[0], expected_name)
+                    info = os.lstat(marker)
+                    identities.append((info.st_dev, info.st_ino))
+                    self.assertEqual(info.st_size, expected_size)
+                    self.assertEqual(stat.S_IMODE(info.st_mode), expected_mode)
+                    self.assertEqual(info.st_nlink, len(expected_entries))
+                if len(identities) == 2:
+                    self.assertEqual(identities[0], identities[1])
+
+                recovered = subject.Bundle.create_started(output)
+                recovered.revalidate_anchor()
+                self.assertFalse(os.path.lexists(os.path.join(parent, staging[0])))
+                self.assertTrue(os.path.isfile(os.path.join(output, "INCOMPLETE")))
+
+    def test_parent_lock_serializes_the_staging_mkdir_to_flock_window(self):
+        parent = os.path.join(self.temporary.name, "mkdir-flock-serialization")
+        first_output = os.path.join(parent, "first")
+        second_output = os.path.join(parent, "second")
+        os.mkdir(parent, 0o700)
+        original_create = subject.Bundle._create_staging
+        first_created = threading.Event()
+        release_first = threading.Event()
+        second_done = threading.Event()
+        errors = {}
+
+        def pause_after_first_mkdir(bundle, descriptor):
+            name = original_create(bundle, descriptor)
+            if threading.current_thread().name == "first-creator":
+                first_created.set()
+                if not release_first.wait(3):
+                    raise AssertionError("timed out pausing after staging mkdir")
+            return name
+
+        def create(label, path, done=None):
+            try:
+                subject.Bundle.create_started(path)
+            except BaseException as error:
+                errors[label] = error
+            finally:
+                if done is not None:
+                    done.set()
+
+        subject.Bundle._create_staging = pause_after_first_mkdir
+        first = threading.Thread(
+            target=create, args=("first", first_output), name="first-creator"
+        )
+        second = threading.Thread(
+            target=create,
+            args=("second", second_output, second_done),
+            name="second-creator",
+        )
+        try:
+            first.start()
+            self.assertTrue(first_created.wait(3), "first creator did not allocate staging")
+            second.start()
+            second_finished_early = second_done.wait(0.2)
+        finally:
+            release_first.set()
+            first.join(3)
+            second.join(3)
+            subject.Bundle._create_staging = original_create
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertTrue(second_finished_early)
+        self.assertNotIn("first", errors)
+        self.assertIsInstance(errors.get("second"), subject.PreservationError)
+        self.assertRegex(str(errors["second"]), "parent.*busy")
+        self.assertTrue(os.path.isfile(os.path.join(first_output, "INCOMPLETE")))
+        self.assertFalse(os.path.lexists(second_output))
+
+        subject.Bundle.create_started(second_output)
+        self.assertTrue(os.path.isfile(os.path.join(second_output, "INCOMPLETE")))
 
     def test_create_started_does_not_replace_existing_empty_destination(self):
         path = os.path.join(self.temporary.name, "existing-destination")
@@ -244,6 +1080,51 @@ subject.Bundle.create_started(sys.argv[1])
         with open(os.path.join(safe_parent, staging[0], "INCOMPLETE"), "rb") as marker:
             self.assertEqual(marker.read(), subject.INCOMPLETE_MARKER)
         self.assertFalse(os.path.lexists(os.path.join(safe_parent, staging[0], "COMPLETE")))
+
+    def test_finish_recovers_zero_or_partial_complete_publication_after_process_death(self):
+        code = r'''
+import os, signal, sys
+import upgrade_baseline_bundle as subject
+state = sys.argv[2]
+if state == "zero":
+    original_open = subject.os.open
+    def die_after_complete_create(value, *args, **kwargs):
+        descriptor = original_open(value, *args, **kwargs)
+        if os.fsencode(value) in (b"COMPLETE", b".object-COMPLETE"):
+            os.kill(os.getpid(), signal.SIGKILL)
+        return descriptor
+    subject.os.open = die_after_complete_create
+else:
+    def die_after_complete_prefix(handle):
+        handle.seek(0)
+        handle.truncate(0)
+        handle.write(subject.COMPLETE_MARKER[:9])
+        handle.flush()
+        os.kill(os.getpid(), signal.SIGKILL)
+    subject.Bundle._sync_file = staticmethod(die_after_complete_prefix)
+subject.Bundle(sys.argv[1]).finish()
+'''
+        for state in ("zero", "prefix"):
+            with self.subTest(state=state):
+                parent = os.path.join(self.temporary.name, "complete-death-" + state)
+                path = os.path.join(parent, "bundle")
+                os.mkdir(parent, 0o700)
+                subject.Bundle.create_started(path)
+                result = subprocess.run(
+                    [sys.executable, "-B", "-c", code, path, state],
+                    check=False,
+                    env=os.environ,
+                    timeout=2,
+                )
+                self.assertEqual(result.returncode, -signal.SIGKILL)
+                self.assertTrue(os.path.isfile(os.path.join(path, "INCOMPLETE")))
+
+                subject.Bundle(path).finish()
+
+                self.assertFalse(os.path.lexists(os.path.join(path, "INCOMPLETE")))
+                self.assertFalse(os.path.lexists(os.path.join(path, ".object-COMPLETE")))
+                with open(os.path.join(path, "COMPLETE"), "rb") as marker:
+                    self.assertEqual(marker.read(), subject.COMPLETE_MARKER)
 
     def test_create_started_cleans_empty_staging_after_open_or_fstat_failure(self):
         for case in ("open", "fstat"):
@@ -417,6 +1298,8 @@ subject.Bundle.create_started(sys.argv[1])
         descriptors = {}
         sync_attempts = 0
         close_attempts = []
+        permission_failed = False
+        marker_close_failed = False
 
         def track_open(value, *args, **kwargs):
             descriptor = original_open(value, *args, **kwargs)
@@ -424,12 +1307,14 @@ subject.Bundle.create_started(sys.argv[1])
                 descriptors["parent"] = descriptor
             elif os.fsdecode(value).startswith(".bundle-staging-"):
                 descriptors["root"] = descriptor
-            elif value == b"INCOMPLETE":
+            elif value in (b"INCOMPLETE", subject.INCOMPLETE_TEMP):
                 descriptors["marker"] = descriptor
             return descriptor
 
         def fail_marker_permissions(descriptor, mode):
-            if descriptor == descriptors.get("marker"):
+            nonlocal permission_failed
+            if descriptor == descriptors.get("marker") and not permission_failed:
+                permission_failed = True
                 raise body_error
             return original_fchmod(descriptor, mode)
 
@@ -441,9 +1326,14 @@ subject.Bundle.create_started(sys.argv[1])
             return original_fsync(descriptor)
 
         def close_then_fail(descriptor):
+            nonlocal marker_close_failed
             original_close(descriptor)
             for label in ("marker", "root", "parent"):
                 if descriptor == descriptors.get(label):
+                    if label == "marker" and marker_close_failed:
+                        return
+                    if label == "marker":
+                        marker_close_failed = True
                     close_attempts.append(label)
                     raise OSError("injected %s close failure" % label)
 
@@ -535,7 +1425,13 @@ subject.Bundle.create_started(sys.argv[1])
             self.assertEqual(len(staging), 1)
             with open(os.path.join(parent, staging[0], "INCOMPLETE"), "rb") as marker:
                 self.assertEqual(marker.read(), subject.INCOMPLETE_MARKER)
-            self.assertEqual(syncs, ["marker-file", "staging-root", "parent"])
+            self.assertEqual(
+                syncs,
+                [
+                    "marker-file", "marker-file", "staging-root",
+                    "staging-root", "staging-root", "parent",
+                ],
+            )
         else:
             self.assertEqual(syncs, ["parent"])
 
@@ -590,7 +1486,13 @@ subject.Bundle.create_started(sys.argv[1])
                 self.assertEqual(len(staging), 1)
                 with open(os.path.join(parent, staging[0], "INCOMPLETE"), "rb") as marker:
                     self.assertEqual(marker.read(), subject.INCOMPLETE_MARKER)
-                self.assertEqual(syncs, ["marker-file", "staging-root", "parent"])
+                self.assertEqual(
+                    syncs,
+                    [
+                        "marker-file", "marker-file", "staging-root",
+                        "staging-root", "staging-root", "parent",
+                    ],
+                )
 
     def test_cleanup_reaches_durable_state_after_transient_failures(self):
         cases = (
@@ -612,6 +1514,7 @@ subject.Bundle.create_started(sys.argv[1])
                 original_stat = subject.os.stat
                 original_fsync = subject.os.fsync
                 original_write = subject.Bundle._write_artifact
+                original_publish = subject.Bundle._publish_marker
                 open_failures = rmdir_failures = injected_failures = 0
                 successful_syncs = []
 
@@ -650,7 +1553,7 @@ subject.Bundle.create_started(sys.argv[1])
                     if case == "marker-create" and not injected_failures:
                         injected_failures += 1
                         raise OSError("injected marker creation failure")
-                    return original_write(bundle, root, relative, data)
+                    return original_publish(bundle, root, relative, data)
 
                 def fail_sync_once(descriptor):
                     nonlocal injected_failures
@@ -678,7 +1581,7 @@ subject.Bundle.create_started(sys.argv[1])
                 subject.os.rmdir = fail_first_staging_rmdir
                 subject.os.stat = fail_cleanup_stat_once
                 subject.os.fsync = fail_sync_once
-                subject.Bundle._write_artifact = fail_marker_create_once
+                subject.Bundle._publish_marker = fail_marker_create_once
                 try:
                     with self.assertRaisesRegex(
                         subject.PreservationError, "primary staging open failure"
@@ -690,6 +1593,7 @@ subject.Bundle.create_started(sys.argv[1])
                     subject.os.stat = original_stat
                     subject.os.fsync = original_fsync
                     subject.Bundle._write_artifact = original_write
+                    subject.Bundle._publish_marker = original_publish
                 self.assertEqual(open_failures, 1)
                 expected_failures = (
                     subject.CLEANUP_RETRIES
@@ -719,7 +1623,10 @@ subject.Bundle.create_started(sys.argv[1])
                     self.assertEqual(len(staging), 1)
                     with open(os.path.join(parent, staging[0], "INCOMPLETE"), "rb") as marker:
                         self.assertEqual(marker.read(), subject.INCOMPLETE_MARKER)
-                    self.assertEqual(successful_syncs[-3:], ["marker-file", "staging-root", "parent"])
+                    self.assertEqual(
+                        successful_syncs[-3:],
+                        ["staging-root", "staging-root", "parent"],
+                    )
 
     def test_cleanup_chains_fallback_descriptor_close_failure(self):
         parent = os.path.join(self.temporary.name, "cleanup-close")
@@ -784,25 +1691,41 @@ subject.Bundle.create_started(sys.argv[1])
         primary = subject.PreservationError("injected primary failure")
         underlying = OSError("injected underlying body failure")
         first = OSError("injected first cleanup failure")
+        contextual = OSError("injected contextual cleanup failure")
         second = OSError("injected second cleanup failure")
         primary.__cause__ = underlying
+        contextual.__context__ = primary
+        second.__cause__ = primary
 
-        subject._chain_failures(primary, [first])
-        subject._chain_failures(primary, [second])
+        subject._chain_failures(primary, [first, first])
+        subject._chain_failures(primary, [first, contextual, contextual, second])
+        subject._chain_failures(primary, [second, contextual])
 
         chain = []
         current = primary.__cause__
         while current is not None and len(chain) < 8:
-            chain.append(str(current))
+            chain.append(current)
             current = current.__cause__
         self.assertEqual(
-            chain,
+            [str(error) for error in chain],
             [
                 "injected first cleanup failure",
+                "injected contextual cleanup failure",
                 "injected second cleanup failure",
                 "injected underlying body failure",
             ],
         )
+        self.assertEqual(len({id(error) for error in chain}), len(chain))
+        self.assertNotIn(primary, chain)
+        self.assertIsNone(contextual.__context__)
+        self.assertTrue(all(error.__suppress_context__ for error in chain[:-1]))
+
+        cyclic_primary = subject.PreservationError("injected self-caused primary")
+        cyclic_primary.__cause__ = cyclic_primary
+        cycle_cleanup = OSError("injected self-cause cleanup failure")
+        subject._chain_failures(cyclic_primary, [cycle_cleanup])
+        self.assertIs(cyclic_primary.__cause__, cycle_cleanup)
+        self.assertIsNone(cycle_cleanup.__cause__)
 
     def test_close_all_attempts_every_descriptor_after_base_exception(self):
         for active_primary in (False, True):
@@ -853,6 +1776,42 @@ subject.Bundle.create_started(sys.argv[1])
                         with contextlib.suppress(OSError):
                             original_close(descriptor)
                 self.assertEqual(attempts, descriptors)
+
+    def test_close_descriptors_never_demotes_interrupt_based_on_failure_order(self):
+        for order in ("error-first", "interrupt-first"):
+            with self.subTest(order=order):
+                descriptors = list(os.pipe())
+                original_close = subject.os.close
+                interruption = KeyboardInterrupt("injected ordered close interruption")
+                ordinary = OSError("injected ordered close error")
+                failures = (
+                    [ordinary, interruption]
+                    if order == "error-first"
+                    else [interruption, ordinary]
+                )
+                by_descriptor = dict(zip(descriptors, failures))
+                attempts = []
+
+                def close_then_fail(descriptor):
+                    attempts.append(descriptor)
+                    original_close(descriptor)
+                    raise by_descriptor[descriptor]
+
+                subject.os.close = close_then_fail
+                caught = None
+                try:
+                    try:
+                        subject._close_descriptors(None, descriptors)
+                    except BaseException as error:
+                        caught = error
+                finally:
+                    subject.os.close = original_close
+                    for descriptor in descriptors:
+                        with contextlib.suppress(OSError):
+                            original_close(descriptor)
+                self.assertIs(caught, interruption)
+                self.assertEqual(attempts, descriptors)
+                self.assertIs(interruption.__cause__, ordinary)
 
     def test_directory_preserves_body_error_and_attempts_all_closes(self):
         original_dup = subject.os.dup
@@ -1536,6 +2495,35 @@ subject.Bundle.create_started(sys.argv[1])
         with self.assertRaisesRegex(subject.PreservationError, "not owner-only"):
             self.bundle.verify_artifact(saved)
 
+    def test_open_entry_closes_descriptor_when_post_open_fstat_is_interrupted(self):
+        saved = self.bundle.artifact("receipts/fstat-interrupt", b"receipt")
+        original_open = subject.os.open
+        original_fstat = subject.os.fstat
+        opened = []
+
+        def track_open(value, *args, **kwargs):
+            descriptor = original_open(value, *args, **kwargs)
+            if os.fsencode(value) == b"fstat-interrupt":
+                opened.append(descriptor)
+            return descriptor
+
+        def interrupt_fstat(descriptor):
+            if descriptor in opened:
+                raise KeyboardInterrupt("injected post-open fstat interruption")
+            return original_fstat(descriptor)
+
+        subject.os.open = track_open
+        subject.os.fstat = interrupt_fstat
+        try:
+            with self.assertRaisesRegex(KeyboardInterrupt, "post-open fstat"):
+                self.bundle.verify_artifact(saved)
+        finally:
+            subject.os.open = original_open
+            subject.os.fstat = original_fstat
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened[0])
+
     def test_artifact_writer_rejects_escape(self):
         outside = os.path.join(self.temporary.name, "escape")
         with self.assertRaises(subject.PreservationError):
@@ -1557,6 +2545,8 @@ subject.Bundle.create_started(sys.argv[1])
             "INCOMPLETE/child",
             "OBJECTS/not-cas",
             "objects/not-cas",
+            ".object-INCOMPLETE",
+            ".object-COMPLETE",
             ".ObJeCt-forged",
             ".object-forged",
         ):
@@ -1564,16 +2554,90 @@ subject.Bundle.create_started(sys.argv[1])
                 with self.assertRaises(subject.PreservationError):
                     self.bundle.artifact(path, b"reserved")
 
+    def test_bundle_staging_and_reaping_namespaces_are_always_reserved(self):
+        names = (
+            ".bundle-staging-" + "a" * 32,
+            ".BuNdLe-StAgInG-" + "b" * 32 + "/child",
+            ".bundle-reaping-" + "c" * 32,
+            ".BuNdLe-ReApInG-" + "d" * 32 + "/child",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(subject.PreservationError, "reserved"):
+                    self.bundle.artifact(name, b"reserved")
+                record = {"path": name, "sha256": "0" * 64, "size": 0}
+                with self.assertRaisesRegex(subject.PreservationError, "reserved"):
+                    self.bundle.verify_artifact(record)
+
+        for index, prefix in enumerate((".bundle-staging-", ".BuNdLe-ReApInG-")):
+            with self.subTest(output_prefix=prefix):
+                parent = os.path.join(self.temporary.name, "reserved-output-%d" % index)
+                os.mkdir(parent, 0o700)
+                self._durable_staging(parent, ".bundle-staging-malformed")
+                output = os.path.join(parent, prefix + "8" * 32)
+                with self.assertRaisesRegex(subject.PreservationError, "reserved"):
+                    subject.Bundle.create_started(output)
+                self.assertFalse(os.path.lexists(output))
+
+        active_parent = os.path.join(self.temporary.name, "active-reserved-output")
+        ordinary_output = os.path.join(active_parent, "ordinary")
+        os.mkdir(active_parent, 0o700)
+        active_path = self._durable_staging(
+            active_parent, ".bundle-staging-" + "9" * 32
+        )
+        active = subject.Bundle(active_path)
+        active_descriptor = os.open(active_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            subject.fcntl.flock(active_descriptor, subject.fcntl.LOCK_EX)
+            subject.Bundle.create_started(ordinary_output)
+            self.assertTrue(os.path.isfile(os.path.join(active_path, "INCOMPLETE")))
+        finally:
+            os.close(active_descriptor)
+        active.revalidate_anchor()
+
+    def test_finish_rejects_staging_or_reaping_debris_before_complete(self):
+        cases = (
+            (".bundle-staging-" + "e" * 32, True),
+            (".bundle-reaping-" + "f" * 32, False),
+        )
+        for index, (name, marker) in enumerate(cases):
+            with self.subTest(name=name):
+                path = os.path.join(self.temporary.name, "reserved-debris-%d" % index)
+                os.mkdir(path, 0o700)
+                bundle = subject.Bundle(path)
+                bundle.start()
+                debris = os.path.join(path, name)
+                os.mkdir(debris, 0o700)
+                if marker:
+                    marker_path = os.path.join(debris, "INCOMPLETE")
+                    with open(marker_path, "xb") as handle:
+                        handle.write(subject.INCOMPLETE_MARKER)
+                    os.chmod(marker_path, 0o600)
+
+                with self.assertRaisesRegex(subject.PreservationError, "temporary"):
+                    bundle.finish()
+
+                self.assertTrue(os.path.isfile(os.path.join(path, "INCOMPLETE")))
+                self.assertFalse(os.path.lexists(os.path.join(path, "COMPLETE")))
+
     def test_finish_rejects_structurally_invalid_reserved_namespaces(self):
-        cases = ("objects-file", "mixed-temp", "mixed-lifecycle", "empty-object-tree", "mixed-objects")
+        cases = (
+            "objects-file", "mixed-temp", "mixed-complete-temp",
+            "mixed-lifecycle", "empty-object-tree", "mixed-objects",
+        )
         for index, case in enumerate(cases):
             with self.subTest(case=case):
                 path = os.path.join(self.temporary.name, "invalid-namespace-%d" % index)
                 os.mkdir(path, 0o700)
                 bundle = subject.Bundle(path)
                 bundle.start()
-                if case in ("objects-file", "mixed-temp", "mixed-lifecycle"):
-                    name = {"objects-file": "objects", "mixed-temp": ".ObJeCt-forged", "mixed-lifecycle": "Complete"}[case]
+                if case in ("objects-file", "mixed-temp", "mixed-complete-temp", "mixed-lifecycle"):
+                    name = {
+                        "objects-file": "objects",
+                        "mixed-temp": ".object-INCOMPLETE",
+                        "mixed-complete-temp": ".object-COMPLETE",
+                        "mixed-lifecycle": "Complete",
+                    }[case]
                     with open(os.path.join(path, name), "wb") as handle:
                         handle.write(b"invalid reserved entry")
                     os.chmod(os.path.join(path, name), 0o600)
@@ -1792,6 +2856,7 @@ subject.Bundle.create_started(sys.argv[1])
     def test_completion_marker_replaces_durable_incomplete_marker(self):
         self.bundle.capture_bytes(b"payload")
         self.bundle.finish()
+        self.bundle.finish()
         self.assertTrue(os.path.isfile(os.path.join(self.bundle_path, "COMPLETE")))
         self.assertFalse(os.path.lexists(os.path.join(self.bundle_path, "INCOMPLETE")))
         self.bundle.verify_permissions()
@@ -1823,6 +2888,19 @@ subject.Bundle.create_started(sys.argv[1])
         with self.assertRaises(subject.PreservationError):
             self.bundle.artifact("after-complete", b"data")
 
+        publishing_path = os.path.join(self.temporary.name, "complete-publication")
+        os.mkdir(publishing_path, 0o700)
+        publishing = subject.Bundle(publishing_path)
+        publishing.start()
+        temporary = os.path.join(publishing_path, ".object-COMPLETE")
+        with open(temporary, "xb"):
+            pass
+        os.chmod(temporary, 0o600)
+        with self.assertRaisesRegex(subject.PreservationError, "publication"):
+            publishing.capture_bytes(b"during complete publication")
+        with self.assertRaisesRegex(subject.PreservationError, "publication"):
+            publishing.artifact("during-publication", b"data")
+
     def test_start_rejects_nonempty_root(self):
         path = os.path.join(self.temporary.name, "nonempty")
         os.mkdir(path, 0o700)
@@ -1847,16 +2925,51 @@ subject.Bundle.create_started(sys.argv[1])
             os.umask(previous)
         bundle.verify_permissions()
 
+    def test_marker_umask_side_effect_then_interrupt_never_leaks_process_umask(self):
+        path = os.path.join(self.temporary.name, "interrupted-marker-umask")
+        os.mkdir(path, 0o700)
+        bundle = subject.Bundle(path)
+        original_umask = subject.os.umask
+        previous_umask = original_umask(0o027)
+        interrupted = None
+
+        def interrupt_after_side_effect(mode):
+            if mode == 0:
+                original_umask(mode)
+                raise KeyboardInterrupt("injected post-umask interruption")
+            return original_umask(mode)
+
+        try:
+            subject.os.umask = interrupt_after_side_effect
+            try:
+                bundle.start()
+            except KeyboardInterrupt as error:
+                interrupted = error
+            current_umask = original_umask(0o027)
+            self.assertEqual(current_umask, 0o027)
+        finally:
+            subject.os.umask = original_umask
+            original_umask(previous_umask)
+
+        if interrupted is None:
+            marker = os.lstat(os.path.join(path, "INCOMPLETE"))
+            self.assertEqual(stat.S_IMODE(marker.st_mode), 0o600)
+
     def test_descriptor_verification_rejects_reserved_namespaces(self):
         marker = {
             "path": "INCOMPLETE",
             "sha256": subject.sha256(subject.INCOMPLETE_MARKER),
             "size": len(subject.INCOMPLETE_MARKER),
         }
-        with self.assertRaises(subject.PreservationError):
-            self.bundle.verify_artifact(marker)
-        with self.assertRaises(subject.PreservationError):
-            self.bundle.read_artifact(marker, marker["size"])
+        temporaries = tuple(
+            {"path": path, "sha256": subject.sha256(b""), "size": 0}
+            for path in (".object-INCOMPLETE", ".object-COMPLETE")
+        )
+        for reserved in (marker, *temporaries):
+            with self.assertRaises(subject.PreservationError):
+                self.bundle.verify_artifact(reserved)
+            with self.assertRaises(subject.PreservationError):
+                self.bundle.read_artifact(reserved, reserved["size"])
 
         path = os.path.join(self.bundle_path, "objects", "custom")
         os.makedirs(path, mode=0o700)

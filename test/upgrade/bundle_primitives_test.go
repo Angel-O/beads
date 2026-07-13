@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-const bundlePythonTestCount = 83
+const bundlePythonTestCount = 104
 
 func TestBundlePrimitivesPythonSuite(t *testing.T) {
 	if runtime.GOOS == "windows" {

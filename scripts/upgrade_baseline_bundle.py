@@ -1,6 +1,7 @@
 """POSIX single-threaded durable storage primitives for owner-only upgrade bundles."""
 
 import contextlib
+import errno
 import fcntl
 import hashlib
 import io
@@ -10,38 +11,71 @@ import stat
 
 CHUNK_SIZE = 1024 * 1024
 CLEANUP_RETRIES = 3
+STAGING_SCAN_LIMIT = 256
 INCOMPLETE_MARKER = b"capture has not completed\n"
 COMPLETE_MARKER = b"owner-only preservation bundle complete\n"
+INCOMPLETE_TEMP = b".object-INCOMPLETE"
+COMPLETE_TEMP = b".object-COMPLETE"
+MARKER_TEMPS = {b"INCOMPLETE": INCOMPLETE_TEMP, b"COMPLETE": COMPLETE_TEMP}
+STAGING_PREFIX, REAPING_PREFIX = b".bundle-staging-", b".bundle-reaping-"
+REAPING_NAME = REAPING_PREFIX + b"0" * 32
 
 class PreservationError(RuntimeError):
     """A preservation bundle could not be captured or verified safely."""
 
+def _sanitize_failure_chain(failure, original, forbidden):
+    current = failure
+    while True:
+        forbidden.add(id(current))
+        current.__context__ = None
+        current.__suppress_context__ = True
+        following = current.__cause__
+        if following is None or following is original:
+            return current
+        if id(following) in forbidden:
+            current.__cause__ = None
+            return current
+        current = following
+
 def _chain_failures(primary, failures):
-    failures = [failure for failure in failures if failure is not None and failure is not primary]
-    if not failures:
-        return
     original = getattr(primary, "_preservation_original_cause", primary.__cause__)
-    previous_tail = getattr(primary, "_preservation_failure_tail", None)
-    head = failures[0]
-    tail = None
+    if original is primary: original = None
+    forbidden = {id(primary)}
+    if original is not None:
+        forbidden.add(id(original))
+    previous_tail = None
+    current = primary.__cause__
+    while current is not None and current is not original and id(current) not in forbidden:
+        forbidden.add(id(current))
+        current.__context__ = None
+        current.__suppress_context__ = True
+        previous_tail = current
+        following = current.__cause__
+        if following is primary or (following is not original and id(following) in forbidden):
+            current.__cause__ = original
+            break
+        current = following
+    head = tail = None
     for failure in failures:
-        if tail is not None and tail.__cause__ in (None, original):
+        if failure is None or id(failure) in forbidden:
+            continue
+        failure_tail = _sanitize_failure_chain(failure, original, forbidden)
+        if head is None:
+            head = failure
+        if tail is not None:
             tail.__cause__ = failure
-        tail = failure
-        seen = {id(primary), id(failure)}
-        if original is not None:
-            seen.add(id(original))
-        while tail.__cause__ is not None and id(tail.__cause__) not in seen:
-            tail = tail.__cause__
-            seen.add(id(tail))
+        tail = failure_tail
+    if head is None:
+        return
     if tail.__cause__ is None:
         tail.__cause__ = original
     if previous_tail is None:
         primary.__cause__ = head
         primary._preservation_original_cause = original
-    elif previous_tail.__cause__ in (None, original):
+    else:
         previous_tail.__cause__ = head
     primary._preservation_failure_tail = tail
+    primary.__suppress_context__ = True
 
 def _wrap_preservation_error(message, error):
     failure = PreservationError(message)
@@ -74,10 +108,16 @@ def _close_descriptors(primary, descriptors):
     if primary is not None:
         _chain_failures(primary, failures)
         return
-    first = failures[0]
-    if not isinstance(first, Exception):
-        _chain_failures(first, failures[1:])
-        raise first
+    interruption = next(
+        (failure for failure in failures if not isinstance(failure, Exception)),
+        None,
+    )
+    if interruption is not None:
+        _chain_failures(
+            interruption,
+            [failure for failure in failures if failure is not interruption],
+        )
+        raise interruption
     failure = PreservationError(
         "cannot close preservation bundle: %s"
         % "; ".join(str(error) for error in failures)
@@ -92,6 +132,8 @@ def sha256(data):
 
 def display(value):
     return os.fsdecode(value).encode("utf-8", "backslashreplace").decode("utf-8")
+
+def _reserved_temporary(top): return top.lower().startswith((STAGING_PREFIX, REAPING_PREFIX))
 
 def validate_relative(value, label):
     if not value or value.startswith(b"/") or b"\0" in value:
@@ -189,13 +231,24 @@ class Bundle:
         primary = None
         try:
             parent_path, name = bundle._path_parts()
+            if _reserved_temporary(name):
+                raise PreservationError("preservation bundle path uses a reserved basename")
             flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
             parent = os.open(parent_path, flags)
             parent_info = os.fstat(parent)
             bundle._require_owner_only(parent_info, parent_path, directory=True)
+            # Cooperating processes serialize here; uncooperative same-UID mutation is outside the portable owner-only boundary.
+            try:
+                fcntl.flock(parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in (errno.EACCES, errno.EAGAIN):
+                    raise PreservationError("preservation bundle parent is busy") from error
+                raise
             bundle._parent_identity = _anchor_identity(parent_info)
             bundle._revalidate_parent(parent)
             bundle._require_destination_absent(parent, name)
+            bundle._reap_abandoned_staging(parent)
+            bundle._revalidate_parent(parent)
             staging = bundle._create_staging(parent)
             root = os.open(staging, flags, dir_fd=parent)
             fcntl.flock(root, fcntl.LOCK_EX)
@@ -251,7 +304,8 @@ class Bundle:
     def artifact(self, relative, data):
         relative_bytes = validate_relative(os.fsencode(relative), "artifact path")
         top = relative_bytes.split(b"/", 1)[0]
-        if top.lower() in (b"incomplete", b"complete", b"objects") or top.lower().startswith(b".object-"):
+        if (top.lower() in (b"incomplete", b"complete", b"objects")
+                or top.lower().startswith(b".object-") or _reserved_temporary(top)):
             raise PreservationError("artifact path uses a reserved bundle namespace")
         with self._root(exclusive=True) as (_, root):
             self._require_active(root)
@@ -324,7 +378,8 @@ class Bundle:
         relative_bytes = validate_relative(os.fsencode(relative), "artifact path")
         parts = relative_bytes.split(b"/")
         top = parts[0].lower()
-        if top in (b"incomplete", b"complete") or top.startswith(b".object-"):
+        if (top in (b"incomplete", b"complete") or top.startswith(b".object-")
+                or _reserved_temporary(top)):
             raise PreservationError("manifest artifact uses a reserved bundle namespace")
         canonical = [b"objects", b"sha256", expected_digest[:2].encode(), expected_digest.encode()]
         if top == b"objects" and parts != canonical:
@@ -337,7 +392,8 @@ class Bundle:
 
     def start(self):
         with self._root(exclusive=True) as (parent, root):
-            if os.listdir(root):
+            entries = set(os.fsencode(entry) for entry in os.listdir(root))
+            if entries - {b"INCOMPLETE", INCOMPLETE_TEMP}:
                 raise PreservationError("preservation bundle must be empty before start")
             self._write_artifact(root, "INCOMPLETE", INCOMPLETE_MARKER)
             os.fsync(root)
@@ -347,10 +403,16 @@ class Bundle:
         with self._root(exclusive=True) as (parent, root):
             has_incomplete = self._entry_exists(root, b"INCOMPLETE")
             has_complete = self._entry_exists(root, b"COMPLETE")
-            if not has_incomplete and not has_complete:
+            has_complete_temp = self._entry_exists(root, COMPLETE_TEMP)
+            if not has_incomplete and not has_complete and not has_complete_temp:
                 raise PreservationError("preservation bundle has not been started")
             if has_incomplete:
                 self._require_marker(root, b"INCOMPLETE", INCOMPLETE_MARKER)
+            if has_complete_temp and not has_incomplete:
+                raise PreservationError("COMPLETE publication has no INCOMPLETE marker")
+            if has_complete or has_complete_temp:
+                self._publish_marker(root, b"COMPLETE", COMPLETE_MARKER)
+                has_complete = True
             if has_complete:
                 self._require_marker(root, b"COMPLETE", COMPLETE_MARKER)
             self._sync_tree(root)
@@ -362,6 +424,7 @@ class Bundle:
                 os.unlink(b"INCOMPLETE", dir_fd=root)
                 os.fsync(root)
                 os.fsync(parent)
+                self._require_marker(root, b"COMPLETE", COMPLETE_MARKER)
 
     def _path_parts(self):
         parent_path = os.path.dirname(self.path)
@@ -451,6 +514,165 @@ class Bundle:
         finally:
             os.umask(previous_umask)
         raise PreservationError("cannot allocate a unique preservation bundle staging root")
+
+    def _reap_abandoned_staging(self, parent):
+        candidates = []
+        try:
+            with os.scandir(parent) as entries:
+                for count, entry in enumerate(entries, 1):
+                    if count > STAGING_SCAN_LIMIT:
+                        raise PreservationError(
+                            "preservation bundle staging scan limit exceeded"
+                        )
+                    name = os.fsencode(entry.name)
+                    lowered = name.lower()
+                    if not (
+                        lowered.startswith(STAGING_PREFIX)
+                        or lowered.startswith(REAPING_PREFIX)
+                    ):
+                        continue
+                    prefix = (
+                        STAGING_PREFIX
+                        if lowered.startswith(STAGING_PREFIX)
+                        else REAPING_PREFIX
+                    )
+                    token = name[len(prefix):]
+                    if (not name.startswith(prefix) or len(token) != 32
+                            or any(byte not in b"0123456789abcdef" for byte in token)):
+                        raise PreservationError(
+                            "preservation bundle contains a malformed temporary staging name"
+                        )
+                    candidates.append(name)
+        except PreservationError:
+            raise
+        except OSError as error:
+            raise PreservationError(
+                "cannot scan preservation bundle staging roots: %s" % error
+            ) from error
+        for name in sorted(candidates, key=lambda value: (value != REAPING_NAME, value)):
+            self._reap_candidate(parent, name)
+
+    def _reap_candidate(self, parent, name):
+        root = tombstone = None
+        primary = None
+        try:
+            before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            self._require_cleanup_root(before, name)
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+            root = os.open(name, flags, dir_fd=parent)
+            opened = os.fstat(root)
+            self._require_cleanup_root(opened, name)
+            expected = _anchor_identity(opened)
+            if _anchor_identity(before) != expected:
+                raise PreservationError("temporary staging root changed while opening")
+            try:
+                fcntl.flock(root, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in (errno.EACCES, errno.EAGAIN):
+                    return
+                raise
+            self._revalidate_cleanup_root(parent, root, name, expected)
+            has_marker = self._inspect_cleanup_root(parent, root, name, expected)
+            if name == REAPING_NAME:
+                self._empty_cleanup_root(parent, root, name, expected, has_marker)
+                return
+
+            created = False
+            previous_umask = os.umask(0o077)
+            try:
+                try:
+                    os.mkdir(REAPING_NAME, 0o700, dir_fd=parent)
+                except FileExistsError:
+                    pass
+                else:
+                    created = True
+            finally:
+                os.umask(previous_umask)
+            if created:
+                os.fsync(parent)
+            before_tombstone = os.stat(
+                REAPING_NAME, dir_fd=parent, follow_symlinks=False
+            )
+            self._require_cleanup_root(before_tombstone, REAPING_NAME)
+            tombstone = os.open(REAPING_NAME, flags, dir_fd=parent)
+            opened_tombstone = os.fstat(tombstone)
+            self._require_cleanup_root(opened_tombstone, REAPING_NAME)
+            tombstone_identity = _anchor_identity(opened_tombstone)
+            if _anchor_identity(before_tombstone) != tombstone_identity:
+                raise PreservationError("cleanup tombstone changed while opening")
+            try:
+                fcntl.flock(tombstone, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in (errno.EACCES, errno.EAGAIN):
+                    raise PreservationError("preservation cleanup tombstone is busy") from error
+                raise
+            self._revalidate_cleanup_root(
+                parent, tombstone, REAPING_NAME, tombstone_identity
+            )
+            tombstone_marker = self._inspect_cleanup_root(
+                parent, tombstone, REAPING_NAME, tombstone_identity
+            )
+            self._empty_cleanup_root(
+                parent, tombstone, REAPING_NAME, tombstone_identity, tombstone_marker
+            )
+            self._revalidate_cleanup_root(parent, root, name, expected)
+            os.rename(name, REAPING_NAME, src_dir_fd=parent, dst_dir_fd=parent)
+            os.fsync(parent)
+            name = REAPING_NAME
+            self._revalidate_cleanup_root(parent, root, name, expected)
+            self._empty_cleanup_root(parent, root, name, expected, has_marker)
+        except (OSError, ValueError) as error:
+            primary = _wrap_preservation_error(
+                "cannot reap preservation bundle staging root: %s" % error,
+                error,
+            )
+            raise primary
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            _close_all(primary, tombstone, root)
+
+    def _inspect_cleanup_root(self, parent, root, name, expected):
+        entries = sorted(os.fsencode(entry) for entry in os.listdir(root))
+        self._revalidate_cleanup_root(parent, root, name, expected)
+        if not entries:
+            return None
+        allowed = ([INCOMPLETE_TEMP], [b"INCOMPLETE"], sorted((INCOMPLETE_TEMP, b"INCOMPLETE")))
+        if entries not in allowed:
+            raise PreservationError(
+                "temporary staging root is not empty or exact INCOMPLETE evidence"
+            )
+        self._publish_marker(root, b"INCOMPLETE", INCOMPLETE_MARKER)
+        os.fsync(parent)
+        self._revalidate_cleanup_root(parent, root, name, expected)
+        return b"INCOMPLETE"
+
+    def _empty_cleanup_root(self, parent, root, name, expected, marker):
+        if marker is not None:
+            os.unlink(marker, dir_fd=root)
+        os.fsync(root)
+        self._revalidate_cleanup_root(parent, root, name, expected)
+        if os.listdir(root):
+            raise PreservationError("cleanup tombstone is not empty")
+        self._revalidate_cleanup_root(parent, root, name, expected)
+
+    def _revalidate_cleanup_root(self, parent, root, name, expected):
+        opened = os.fstat(root)
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        for info in (opened, current):
+            self._require_cleanup_root(info, name)
+        if any(_anchor_identity(info) != expected for info in (opened, current)):
+            raise PreservationError("temporary staging root changed")
+
+    @staticmethod
+    def _require_cleanup_root(info, name):
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700):
+            raise PreservationError(
+                "temporary staging root is not an exact owner-only directory: %s"
+                % display(name)
+            )
 
     def _cleanup_staging(self, parent, root, staging, expected, marker_durable, primary):
         cleanup_root, opened_here = root, False
@@ -575,38 +797,7 @@ class Bundle:
         raise PreservationError("cannot complete %s: %s" % (label, failure)) from failure
 
     def _sync_cleanup_marker(self, root):
-        name = b"INCOMPLETE"
-        if not self._entry_exists(root, name):
-            self._write_artifact(root, name, INCOMPLETE_MARKER)
-            return
-        descriptor, before = self._open_entry(root, name, writable=True)
-        primary = None
-        try:
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            current_data = os.read(descriptor, len(INCOMPLETE_MARKER) + 1)
-            if current_data != INCOMPLETE_MARKER:
-                os.ftruncate(descriptor, 0)
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                remaining = memoryview(INCOMPLETE_MARKER)
-                while remaining:
-                    written = os.write(descriptor, remaining)
-                    if written <= 0:
-                        raise PreservationError("cannot rewrite INCOMPLETE marker")
-                    remaining = remaining[written:]
-            os.fsync(descriptor)
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            if os.read(descriptor, len(INCOMPLETE_MARKER) + 1) != INCOMPLETE_MARKER:
-                raise PreservationError("preservation bundle has an invalid INCOMPLETE marker")
-            opened = os.fstat(descriptor)
-            current = self._require_entry(root, name)
-            expected = _anchor_identity(before)
-            if any(_anchor_identity(info) != expected for info in (opened, current)):
-                raise PreservationError("INCOMPLETE marker changed during cleanup")
-        except BaseException as error:
-            primary = error
-            raise
-        finally:
-            _close_all(primary, descriptor)
+        self._publish_marker(root, b"INCOMPLETE", INCOMPLETE_MARKER)
 
     @contextlib.contextmanager
     def _root(self, exclusive):
@@ -673,10 +864,198 @@ class Bundle:
         finally:
             _close_all(primary, *reversed(descriptors))
 
+    @staticmethod
+    def _require_marker_metadata(info, name, links, modes=(0o600,)):
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != links or stat.S_IMODE(info.st_mode) not in modes):
+            raise PreservationError("lifecycle marker state is not canonical: %s" % display(name))
+    def _marker_info(self, directory, name, links, modes=(0o600,)):
+        try:
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except OSError as error:
+            raise PreservationError("cannot inspect lifecycle marker %s: %s" % (display(name), error)) from error
+        self._require_marker_metadata(info, name, links, modes)
+        return info
+    def _open_exact_marker(self, directory, name, expected, links):
+        before = self._marker_info(directory, name, links)
+        if before.st_size != len(expected):
+            raise PreservationError("lifecycle marker size is not canonical: %s" % display(name))
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = None
+        try:
+            descriptor = os.open(name, flags, dir_fd=directory)
+            opened = os.fstat(descriptor)
+            self._require_marker_metadata(opened, name, links)
+            if _identity(before) != _identity(opened):
+                raise PreservationError("lifecycle marker changed while opening: %s" % display(name))
+            data = os.read(descriptor, len(expected) + 1)
+            after = os.fstat(descriptor)
+            current = self._marker_info(directory, name, links)
+            if any(_identity(info) != _identity(before) for info in (after, current)):
+                raise PreservationError("lifecycle marker changed while reading: %s" % display(name))
+            if data != expected:
+                raise PreservationError("lifecycle marker bytes are not canonical: %s" % display(name))
+            return descriptor, before
+        except BaseException as error:
+            _close_all(error, descriptor)
+            raise
+    def _verify_exact_marker(self, directory, name, expected, links):
+        descriptor = primary = None
+        try:
+            descriptor, info = self._open_exact_marker(directory, name, expected, links)
+            return info
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            _close_all(primary, descriptor)
+    def _prepare_marker_temporary(self, directory, temporary, expected):
+        if self._entry_exists(directory, temporary):
+            before = self._marker_info(directory, temporary, 1, (0, 0o600))
+            if stat.S_IMODE(before.st_mode) == 0:
+                if before.st_size != 0:
+                    raise PreservationError("zero-mode marker temporary is not empty")
+                current = self._marker_info(directory, temporary, 1, (0,))
+                if _identity(before) != _identity(current):
+                    raise PreservationError("marker temporary changed before removal")
+                os.unlink(temporary, dir_fd=directory)
+                os.fsync(directory)
+
+        descriptor = None
+        try:
+            if self._entry_exists(directory, temporary):
+                descriptor, before = self._open_entry(directory, temporary, writable=True)
+                if (stat.S_IMODE(before.st_mode) != 0o600
+                        or before.st_size > len(expected)):
+                    raise PreservationError("marker temporary metadata is not canonical")
+                handle = os.fdopen(descriptor, "r+b", buffering=0, closefd=False)
+                current_data = handle.read(len(expected) + 1)
+                if (len(current_data) != before.st_size
+                        or not expected.startswith(current_data)):
+                    raise PreservationError("marker temporary bytes are not canonical")
+            else:
+                flags = os.O_RDWR | os.O_CLOEXEC | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(temporary, flags, 0, dir_fd=directory)
+                os.fchmod(descriptor, 0o600)
+                handle = os.fdopen(descriptor, "r+b", buffering=0, closefd=False)
+            with handle:
+                handle.seek(0)
+                handle.truncate(0)
+                remaining = memoryview(expected)
+                while remaining:
+                    written = handle.write(remaining)
+                    if written is None or written <= 0:
+                        raise PreservationError("cannot write lifecycle marker temporary")
+                    remaining = remaining[written:]
+                self._sync_file(handle)
+                handle.seek(0)
+                if handle.read(len(expected) + 1) != expected:
+                    raise PreservationError("lifecycle marker temporary write was not stable")
+            opened = os.fstat(descriptor)
+            self._require_marker_metadata(opened, temporary, 1)
+            current = self._marker_info(directory, temporary, 1)
+            if _identity(opened) != _identity(current):
+                raise PreservationError("lifecycle marker temporary changed after write")
+            return descriptor, opened
+        except BaseException as error:
+            _close_all(error, descriptor)
+            raise
+
+    def _finish_marker_publication(
+        self, directory, temporary, name, expected, descriptor, identity,
+    ):
+        opened = os.fstat(descriptor)
+        self._require_marker_metadata(opened, temporary, 2)
+        if ((opened.st_dev, opened.st_ino) != identity
+                or os.pread(descriptor, len(expected) + 1, 0) != expected):
+            raise PreservationError("pinned lifecycle marker changed during publication")
+        temporary_info = self._marker_info(directory, temporary, 2)
+        marker_info = self._marker_info(directory, name, 2)
+        if any((info.st_dev, info.st_ino) != identity for info in (temporary_info, marker_info)):
+            raise PreservationError("lifecycle marker links do not share an inode")
+        os.fsync(descriptor)
+        os.fsync(directory)
+        opened = os.fstat(descriptor)
+        self._require_marker_metadata(opened, temporary, 2)
+        temporary_info = self._verify_exact_marker(directory, temporary, expected, 2)
+        marker_info = self._verify_exact_marker(directory, name, expected, 2)
+        if any((info.st_dev, info.st_ino) != identity for info in (temporary_info, marker_info)):
+            raise PreservationError("lifecycle marker links changed before cleanup")
+        if (opened.st_dev, opened.st_ino) != identity:
+            raise PreservationError("pinned lifecycle marker changed before cleanup")
+        os.unlink(temporary, dir_fd=directory)
+        os.fsync(directory)
+        if self._entry_exists(directory, temporary):
+            raise PreservationError("lifecycle marker temporary reappeared after cleanup")
+        marker_info = self._verify_exact_marker(directory, name, expected, 1)
+        opened = os.fstat(descriptor)
+        self._require_marker_metadata(opened, name, 1)
+        if any((info.st_dev, info.st_ino) != identity for info in (opened, marker_info)):
+            raise PreservationError("lifecycle marker changed after temporary cleanup")
+
+    def _finish_final_marker(
+        self, directory, temporary, name, expected, descriptor, identity,
+    ):
+        os.fsync(descriptor)
+        os.fsync(directory)
+        opened = os.fstat(descriptor)
+        self._require_marker_metadata(opened, name, 1)
+        current = self._marker_info(directory, name, 1)
+        if (self._entry_exists(directory, temporary)
+                or any((info.st_dev, info.st_ino) != identity for info in (opened, current))
+                or os.pread(descriptor, len(expected) + 1, 0) != expected):
+            raise PreservationError("final lifecycle marker changed while syncing")
+
+    def _publish_marker(self, directory, name, expected):
+        temporary = MARKER_TEMPS.get(name)
+        if temporary is None or expected != (INCOMPLETE_MARKER if name == b"INCOMPLETE" else COMPLETE_MARKER):
+            raise PreservationError("unknown lifecycle marker publication")
+        descriptor = primary = None
+        try:
+            has_temporary = self._entry_exists(directory, temporary)
+            has_marker = self._entry_exists(directory, name)
+            if has_marker and not has_temporary:
+                descriptor, info = self._open_exact_marker(
+                    directory, name, expected, 1
+                )
+                identity = (info.st_dev, info.st_ino)
+                self._finish_final_marker(
+                    directory, temporary, name, expected, descriptor, identity
+                )
+                return
+            if has_marker:
+                descriptor, info = self._open_exact_marker(
+                    directory, temporary, expected, 2
+                )
+            else:
+                descriptor, info = self._prepare_marker_temporary(
+                    directory, temporary, expected
+                )
+                try:
+                    os.link(
+                        temporary, name,
+                        src_dir_fd=directory, dst_dir_fd=directory,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    pass
+            identity = (info.st_dev, info.st_ino)
+            self._finish_marker_publication(
+                directory, temporary, name, expected, descriptor, identity
+            )
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            _close_all(primary, descriptor)
+
     def _write_artifact(self, root, relative, data):
         relative_bytes = validate_relative(os.fsencode(relative), "artifact path")
         parts = relative_bytes.split(b"/")
         with self._directory(root, parts[:-1], create=True) as directory:
+            if parts == [parts[-1]] and parts[-1] in MARKER_TEMPS:
+                self._publish_marker(directory, parts[-1], data)
+                return {"path": os.fsdecode(relative_bytes), "sha256": sha256(data), "size": len(data)}
             descriptor = None
             created = False
             try:
@@ -691,9 +1070,6 @@ class Bundle:
                     self._sync_file(handle)
                     written = os.fstat(handle.fileno())
             except BaseException as primary:
-                # Once fdopen owns the descriptor, preserve the established
-                # interruption semantics so lifecycle cleanup can normalize a
-                # possibly published marker. Raw descriptors are always ours.
                 if descriptor is None and not isinstance(primary, Exception):
                     raise
                 cleanup_failures = []
@@ -755,6 +1131,8 @@ class Bundle:
     def _require_active(self, root):
         if self._entry_exists(root, b"COMPLETE"):
             raise PreservationError("preservation bundle is already complete")
+        if any(self._entry_exists(root, name) for name in MARKER_TEMPS.values()):
+            raise PreservationError("preservation bundle has an unfinished marker publication")
         self._require_marker(root, b"INCOMPLETE", INCOMPLETE_MARKER)
 
     def _require_marker(self, root, name, expected):
@@ -816,8 +1194,8 @@ class Bundle:
                     "preservation artifact changed while it was being opened: %s" % display(name)
                 )
             return descriptor, info
-        except Exception:
-            os.close(descriptor)
+        except BaseException as error:
+            _close_all(error, descriptor)
             raise
 
     def _require_entry(self, directory, name, is_directory=False):
@@ -843,7 +1221,7 @@ class Bundle:
             if directory or parts != [marker]:
                 raise PreservationError("lifecycle marker namespace is not canonical")
             return None
-        if top.startswith(b".object-"):
+        if top.startswith(b".object-") or _reserved_temporary(top):
             raise PreservationError("preservation bundle contains an incomplete temporary object")
         if top != b"objects":
             return None
