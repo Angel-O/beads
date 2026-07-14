@@ -98,7 +98,7 @@ func TestStrictDatabaseOwnershipPreservesWindowsCaseSensitiveIdentity(t *testing
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertWindowsCandidateContradictionMode(t, candidates, beadsDir, databaseOwnershipContradictUnlessNestedOwner)
+		assertWindowsCandidatePolicy(t, candidates, beadsDir, databaseOwnershipContradictUnlessNestedOwner, false)
 	})
 }
 
@@ -123,7 +123,7 @@ func TestDatabaseOwnershipStoredCaseBeadsMergesStructuralPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertWindowsCandidateContradictionMode(t, candidates, beadsDir, databaseOwnershipAlwaysContradict)
+	assertWindowsCandidatePolicy(t, candidates, beadsDir, databaseOwnershipAlwaysContradict, true)
 }
 
 func TestResolveDatabaseOwnershipStrictFindsOwnerThroughWindowsJunction(t *testing.T) {
@@ -147,6 +147,91 @@ func TestResolveDatabaseOwnershipStrictFindsOwnerThroughWindowsJunction(t *testi
 	if binding.backend != configfile.BackendDolt || binding.scope != databaseOwnershipScopeDescendant {
 		t.Fatalf("junction binding=%#v, want Dolt descendant scope", binding)
 	}
+}
+
+func TestStructuralDatabaseOwnershipHandlesWindowsReparsePoints(t *testing.T) {
+	createJunction := func(t *testing.T, junction, target string) {
+		t.Helper()
+		if output, err := exec.Command("cmd", "/c", "mklink", "/J", junction, target).CombinedOutput(); err != nil {
+			t.Skipf("junction unavailable: %v (%s)", err, strings.TrimSpace(string(output)))
+		}
+	}
+	assertRejected := func(t *testing.T, selector string) {
+		t.Helper()
+		result, err := resolveDatabaseOwnershipStrictResult(selector, false)
+		if result != (databaseOwnershipResolution{}) || err == nil {
+			t.Fatalf("result=%#v err=%v, want metadata-less reparse rejection", result, err)
+		}
+	}
+	assertNoStructure := func(t *testing.T, selector string) {
+		t.Helper()
+		result, err := resolveDatabaseOwnershipStrictResult(selector, false)
+		if result != (databaseOwnershipResolution{}) || err != nil {
+			t.Fatalf("result=%#v err=%v, want no canonical structural containment", result, err)
+		}
+	}
+
+	t.Run("valid ancestor junction", func(t *testing.T) {
+		root := t.TempDir()
+		realRoot := filepath.Join(root, "real")
+		beadsDir := filepath.Join(realRoot, ".beads")
+		if err := os.MkdirAll(filepath.Join(beadsDir, "selected"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		junction := filepath.Join(root, "junction")
+		createJunction(t, junction, realRoot)
+
+		result, err := resolveDatabaseOwnershipStrictResult(filepath.Join(junction, ".beads", "selected"), false)
+		if err != nil || result.binding != nil || result.structural == nil ||
+			!databasePathsEqualForTest(t, result.structural.beadsDir, beadsDir) ||
+			!databasePathsEqualForTest(t, result.structural.sourceResolved.path, beadsDir) {
+			t.Fatalf("result=%#v err=%v, want canonical structural workspace %q", result, err, beadsDir)
+		}
+	})
+
+	t.Run("final selector junction", func(t *testing.T) {
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		providerRoot := filepath.Join(beadsDir, "embeddeddolt")
+		if err := os.MkdirAll(providerRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		target := t.TempDir()
+		selector := filepath.Join(providerRoot, "source")
+		createJunction(t, selector, target)
+		assertRejected(t, selector)
+	})
+
+	t.Run("outward provider root junction", func(t *testing.T) {
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		if err := os.MkdirAll(beadsDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		target := t.TempDir()
+		if err := os.Mkdir(filepath.Join(target, "source"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		createJunction(t, filepath.Join(beadsDir, "embeddeddolt"), target)
+		assertNoStructure(t, filepath.Join(beadsDir, "embeddeddolt", "source"))
+	})
+
+	t.Run("redirect target junction", func(t *testing.T) {
+		root := t.TempDir()
+		source := filepath.Join(root, "source", ".beads")
+		selector := filepath.Join(source, "embeddeddolt", "source")
+		if err := os.MkdirAll(selector, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		realTarget := filepath.Join(root, "real-target", ".beads")
+		if err := os.MkdirAll(realTarget, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		junction := filepath.Join(root, "target-junction")
+		createJunction(t, junction, realTarget)
+		if err := os.WriteFile(filepath.Join(source, "redirect"), []byte(junction+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected(t, selector)
+	})
 }
 
 func TestStrictDatabaseOwnershipValidatesCaseOnlyRedirectSource(t *testing.T) {
@@ -185,7 +270,7 @@ func requireCaseSensitiveOwnershipDirectory(t *testing.T, path string) {
 	}
 }
 
-func assertWindowsCandidateContradictionMode(t *testing.T, candidates []databaseOwnershipCandidate, path string, want databaseOwnershipContradictionMode) {
+func assertWindowsCandidatePolicy(t *testing.T, candidates []databaseOwnershipCandidate, path string, wantMode databaseOwnershipContradictionMode, wantStructural bool) {
 	t.Helper()
 	resolved, err := resolveCanonicalDatabasePath(path)
 	if err != nil {
@@ -197,8 +282,9 @@ func assertWindowsCandidateContradictionMode(t *testing.T, candidates []database
 			continue
 		}
 		matches++
-		if candidate.contradictionMode != want {
-			t.Fatalf("candidate %q contradiction mode = %v, want %v", candidate.source, candidate.contradictionMode, want)
+		if candidate.contradictionMode != wantMode || candidate.structural != wantStructural {
+			t.Fatalf("candidate %q policy = {contradiction:%v structural:%t}, want {%v %t}",
+				candidate.source, candidate.contradictionMode, candidate.structural, wantMode, wantStructural)
 		}
 	}
 	if matches != 1 {

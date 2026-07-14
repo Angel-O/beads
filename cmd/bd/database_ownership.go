@@ -67,6 +67,26 @@ type databaseOwnershipBinding struct {
 	sourceResolved []*resolvedDatabasePath
 }
 
+// databaseWorkspaceCandidate is an inspection-only structural route. It is
+// not an ownership binding and cannot authorize a provider effect. The source
+// observation records the selector-derived .beads directory; resolved records
+// its strictly routed target. A later consumer must also receive the original
+// selector, then revalidate selector-to-source containment and source-to-target
+// routing under the workspace lifetime fence before mutation.
+type databaseWorkspaceCandidate struct {
+	beadsDir       string
+	resolved       *resolvedDatabasePath
+	sourceResolved *resolvedDatabasePath
+}
+
+// databaseOwnershipResolution keeps persisted ownership and metadata-less
+// structural discovery in separate capability lanes. Successful resolution
+// returns at most one of binding or structural.
+type databaseOwnershipResolution struct {
+	binding    *databaseOwnershipBinding
+	structural *databaseWorkspaceCandidate
+}
+
 type databaseOwnershipContradictionMode uint8
 
 const (
@@ -82,6 +102,7 @@ type databaseOwnershipCandidate struct {
 	requireMetadata                      bool
 	contradictionMode                    databaseOwnershipContradictionMode
 	workspaceRootSelected                bool
+	structural                           bool
 }
 
 type routedDatabaseOwnershipCandidate struct {
@@ -91,11 +112,13 @@ type routedDatabaseOwnershipCandidate struct {
 	allowAuthoritativeEnvironmentDataDir bool
 	requireMetadata                      bool
 	workspaceRootSelected                bool
+	structural                           bool
 }
 
 type routedDatabaseOwnershipSource struct {
 	resolved          *resolvedDatabasePath
 	contradictionMode databaseOwnershipContradictionMode
+	structural        bool
 }
 
 type databaseOwnershipRedirectProbe func(string) (bool, error)
@@ -112,17 +135,41 @@ type conditionalDatabaseOwnershipContradiction struct {
 // return; provider effects require the descriptor-bound lifetime fence tracked
 // by bd-3u1fs.
 func resolveDatabaseOwnershipStrict(dbPath string, hints ...databaseWorkspaceHint) (*databaseOwnershipBinding, error) {
-	selector, err := validatedDatabaseSelector(dbPath)
+	result, err := resolveDatabaseOwnershipStrictWithPolicy(dbPath, true, false, hints...)
 	if err != nil {
 		return nil, err
+	}
+	return result.binding, nil
+}
+
+// resolveDatabaseOwnershipStrictWithoutAutomaticHints is for an explicit
+// database selector whose path-derived evidence must not be broadened by an
+// ambient BEADS_DIR. Caller-provided hints remain available for persisted
+// ownership checks, but hints never acquire structural provenance.
+func resolveDatabaseOwnershipStrictWithoutAutomaticHints(dbPath string, hints ...databaseWorkspaceHint) (*databaseOwnershipBinding, error) {
+	result, err := resolveDatabaseOwnershipStrictWithPolicy(dbPath, false, false, hints...)
+	if err != nil {
+		return nil, err
+	}
+	return result.binding, nil
+}
+
+func resolveDatabaseOwnershipStrictResult(dbPath string, includeAutomaticHints bool, hints ...databaseWorkspaceHint) (databaseOwnershipResolution, error) {
+	return resolveDatabaseOwnershipStrictWithPolicy(dbPath, includeAutomaticHints, true, hints...)
+}
+
+func resolveDatabaseOwnershipStrictWithPolicy(dbPath string, includeAutomaticHints, includeStructural bool, hints ...databaseWorkspaceHint) (databaseOwnershipResolution, error) {
+	zero := databaseOwnershipResolution{}
+	selector, err := validatedDatabaseSelector(dbPath)
+	if err != nil {
+		return zero, err
 	}
 
 	candidates, err := databasePathOwnershipCandidates(dbPath, selector)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
 	var automaticHints []databaseWorkspaceHint
-	includeAutomaticHints := true
 	for _, hint := range hints {
 		if hint.authoritative {
 			includeAutomaticHints = false
@@ -132,17 +179,17 @@ func resolveDatabaseOwnershipStrict(dbPath string, hints ...databaseWorkspaceHin
 	if includeAutomaticHints {
 		automaticHints, err = databaseResolutionHintsStrict()
 		if err != nil {
-			return nil, err
+			return zero, err
 		}
 	}
 	if len(hints)+len(automaticHints) > maxDatabaseWorkspaceHints {
-		return nil, fmt.Errorf("%w: at most %d workspace hints are allowed", errDatabaseOwnershipLimit, maxDatabaseWorkspaceHints)
+		return zero, fmt.Errorf("%w: at most %d workspace hints are allowed", errDatabaseOwnershipLimit, maxDatabaseWorkspaceHints)
 	}
 	hints = append(hints, automaticHints...)
 	for _, hint := range hints {
 		if hint.beadsDir == "" {
 			if hint.authoritative {
-				return nil, fmt.Errorf("%w: authoritative workspace hint is empty", errDatabaseOwnershipContradiction)
+				return zero, fmt.Errorf("%w: authoritative workspace hint is empty", errDatabaseOwnershipContradiction)
 			}
 			continue
 		}
@@ -160,35 +207,39 @@ func resolveDatabaseOwnershipStrict(dbPath string, hints ...databaseWorkspaceHin
 			if !hint.authoritative && errors.Is(appendErr, os.ErrNotExist) && databaseWorkspaceHintIsVerifiedMissing(hint.beadsDir) {
 				continue
 			}
-			return nil, appendErr
+			return zero, appendErr
 		}
 		candidates = updatedCandidates
 	}
 
 	routed, err := routeDatabaseOwnershipCandidates(candidates)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
 
 	owners := make([]databaseOwnershipBinding, 0, 1)
+	structuralCandidates := make([]routedDatabaseOwnershipCandidate, 0, 1)
 	var contradiction error
 	var conditionalContradictions []conditionalDatabaseOwnershipContradiction
 	for _, candidate := range routed {
 		cfg, err := configfile.LoadReadOnly(candidate.beadsDir)
 		if err != nil {
-			return nil, databasePathOperationError("inspect database owner metadata", candidate.beadsDir, err)
+			return zero, databasePathOperationError("inspect database owner metadata", candidate.beadsDir, err)
 		}
 		if cfg == nil {
 			if candidate.requireMetadata && contradiction == nil {
 				contradiction = fmt.Errorf("%w: authoritative workspace %q has no metadata for selector %q",
 					errDatabaseOwnershipContradiction, candidate.beadsDir, selector.path)
 			}
+			if includeStructural && candidate.structural {
+				structuralCandidates = append(structuralCandidates, candidate)
+			}
 			continue
 		}
 
 		binding, matched, err := databaseOwnershipFromConfig(selector, candidate, cfg)
 		if err != nil {
-			return nil, err
+			return zero, err
 		}
 		if !matched {
 			candidateErr := fmt.Errorf("%w: selector %q is not owned by workspace %q",
@@ -210,34 +261,58 @@ func resolveDatabaseOwnershipStrict(dbPath string, hints ...databaseWorkspaceHin
 		}
 		owners, err = appendDatabaseOwner(owners, *binding)
 		if err != nil {
-			return nil, err
+			return zero, err
 		}
 	}
 
 	if contradiction != nil {
-		return nil, contradiction
+		return zero, contradiction
 	}
+	// Binding-only callers preserve the legacy conditional-contradiction
+	// behavior even when detailed structural discovery could identify a nested
+	// workspace. Detailed callers also resolve persisted owners through this
+	// branch so a binding always wins over structural inspection.
+	if !includeStructural || len(owners) > 0 {
+		for _, candidate := range conditionalContradictions {
+			hasNestedOwner, err := databaseOwnershipHasNestedResolution(owners, nil, candidate.sourceResolved)
+			if err != nil {
+				return zero, err
+			}
+			if !hasNestedOwner {
+				return zero, candidate.err
+			}
+		}
+		if len(owners) == 0 {
+			return zero, nil
+		}
+		if len(owners) > 1 {
+			paths := make([]string, 0, len(owners))
+			for _, owner := range owners {
+				paths = append(paths, fmt.Sprintf("%q", owner.beadsDir))
+			}
+			sort.Strings(paths)
+			return zero, fmt.Errorf("%w: selector %q resolves to %s", errDatabaseOwnershipAmbiguous, selector.path, strings.Join(paths, ", "))
+		}
+		return databaseOwnershipResolution{binding: &owners[0]}, nil
+	}
+
+	structural, err := selectDatabaseStructuralWorkspace(structuralCandidates)
+	if err != nil {
+		return zero, err
+	}
+	// Detailed discovery may select a nested inspection-only candidate despite
+	// a conditional ancestor mismatch. Binding-only wrappers retain the legacy
+	// contradiction and never expose this structural policy.
 	for _, candidate := range conditionalContradictions {
-		hasNestedOwner, err := databaseOwnershipHasNestedOwner(owners, candidate.sourceResolved)
+		hasNestedOwner, err := databaseOwnershipHasNestedResolution(nil, structural, candidate.sourceResolved)
 		if err != nil {
-			return nil, err
+			return zero, err
 		}
 		if !hasNestedOwner {
-			return nil, candidate.err
+			return zero, candidate.err
 		}
 	}
-	if len(owners) == 0 {
-		return nil, nil
-	}
-	if len(owners) > 1 {
-		paths := make([]string, 0, len(owners))
-		for _, owner := range owners {
-			paths = append(paths, fmt.Sprintf("%q", owner.beadsDir))
-		}
-		sort.Strings(paths)
-		return nil, fmt.Errorf("%w: selector %q resolves to %s", errDatabaseOwnershipAmbiguous, selector.path, strings.Join(paths, ", "))
-	}
-	return &owners[0], nil
+	return databaseOwnershipResolution{structural: structural}, nil
 }
 
 func databasePathOwnershipCandidates(originalPath string, selector *resolvedDatabasePath) ([]databaseOwnershipCandidate, error) {
@@ -251,11 +326,12 @@ func databasePathOwnershipCandidates(originalPath string, selector *resolvedData
 	paths := []string{originalPath, selector.path}
 
 	var candidates []databaseOwnershipCandidate
-	add := func(path string, contradictionMode databaseOwnershipContradictionMode) error {
+	add := func(path string, contradictionMode databaseOwnershipContradictionMode, structural bool) error {
 		var err error
 		candidates, err = appendDatabaseOwnershipCandidate(candidates, selector, databaseOwnershipCandidate{
 			source:            path,
 			contradictionMode: contradictionMode,
+			structural:        structural,
 		})
 		return err
 	}
@@ -276,15 +352,15 @@ func databasePathOwnershipCandidates(originalPath string, selector *resolvedData
 		if observed.exists && observed.observed.Info.IsDir() {
 			// Compatibility supports workspace roots with names other than
 			// .beads and selectors that name the data directory itself.
-			if err := add(path, databaseOwnershipContradictUnlessNestedOwner); err != nil {
+			if err := add(path, databaseOwnershipContradictUnlessNestedOwner, false); err != nil {
 				return nil, err
 			}
-			if err := add(filepath.Dir(path), databaseOwnershipContradictUnlessNestedOwner); err != nil {
+			if err := add(filepath.Dir(path), databaseOwnershipContradictUnlessNestedOwner, false); err != nil {
 				return nil, err
 			}
 		} else {
 			start = filepath.Dir(path)
-			if err := add(start, databaseOwnershipContradictUnlessNestedOwner); err != nil {
+			if err := add(start, databaseOwnershipContradictUnlessNestedOwner, false); err != nil {
 				return nil, err
 			}
 		}
@@ -294,16 +370,25 @@ func databasePathOwnershipCandidates(originalPath string, selector *resolvedData
 				return nil, err
 			}
 			if structuralBeadsDir {
-				// Metadata in a .beads directory that physically encloses the
-				// selector is authoritative structural evidence.
-				if err := add(dir, databaseOwnershipAlwaysContradict); err != nil {
+				// A canonical path-derived .beads directory that contains the
+				// canonical selector may be retained for inspection-only
+				// discovery. It does not establish ownership or mutation authority.
+				resolvedSource, err := resolveCanonicalDatabasePath(dir)
+				if err != nil {
+					return nil, err
+				}
+				if err := add(
+					dir,
+					databaseOwnershipAlwaysContradict,
+					resolvedDatabasePathEqualOrDescendant(selector, resolvedSource),
+				); err != nil {
 					return nil, err
 				}
 			}
 			// Sibling candidates found while walking ancestors are possible
 			// owners, but a parent repository must not contradict a valid
 			// nested workspace merely because its own database differs.
-			if err := add(filepath.Join(dir, ".beads"), databaseOwnershipNoContradiction); err != nil {
+			if err := add(filepath.Join(dir, ".beads"), databaseOwnershipNoContradiction, false); err != nil {
 				return nil, err
 			}
 			parent := filepath.Dir(dir)
@@ -392,6 +477,7 @@ func appendDatabaseOwnershipCandidate(candidates []databaseOwnershipCandidate, s
 			candidates[index].contradictionMode = candidate.contradictionMode
 		}
 		candidates[index].workspaceRootSelected = candidates[index].workspaceRootSelected || candidate.workspaceRootSelected
+		candidates[index].structural = candidates[index].structural || candidate.structural
 		return candidates, nil
 	}
 	if len(candidates) >= maxDatabaseOwnershipCandidates {
@@ -473,6 +559,7 @@ func routeDatabaseOwnershipCandidatesWithDependencies(
 			routed[index].allowAuthoritativeEnvironmentDataDir = routed[index].allowAuthoritativeEnvironmentDataDir || candidate.allowAuthoritativeEnvironmentDataDir
 			routed[index].requireMetadata = routed[index].requireMetadata || candidate.requireMetadata
 			routed[index].workspaceRootSelected = routed[index].workspaceRootSelected || candidate.workspaceRootSelected
+			routed[index].structural = routed[index].structural || candidate.structural
 			merged = true
 			break
 		}
@@ -485,10 +572,12 @@ func routeDatabaseOwnershipCandidatesWithDependencies(
 			sources: []routedDatabaseOwnershipSource{{
 				resolved:          candidate.resolved,
 				contradictionMode: candidate.contradictionMode,
+				structural:        candidate.structural,
 			}},
 			allowAuthoritativeEnvironmentDataDir: candidate.allowAuthoritativeEnvironmentDataDir,
 			requireMetadata:                      candidate.requireMetadata,
 			workspaceRootSelected:                candidate.workspaceRootSelected,
+			structural:                           candidate.structural,
 		})
 	}
 	return routed, nil
@@ -523,11 +612,13 @@ func appendRoutedDatabaseOwnershipSource(sources []routedDatabaseOwnershipSource
 		if candidate.contradictionMode > sources[index].contradictionMode {
 			sources[index].contradictionMode = candidate.contradictionMode
 		}
+		sources[index].structural = sources[index].structural || candidate.structural
 		return sources, nil
 	}
 	return append(sources, routedDatabaseOwnershipSource{
 		resolved:          candidate.resolved,
 		contradictionMode: candidate.contradictionMode,
+		structural:        candidate.structural,
 	}), nil
 }
 
@@ -767,7 +858,81 @@ func appendDatabaseOwnershipSourceObservation(observations []*resolvedDatabasePa
 	return append(observations, candidate), nil
 }
 
-func databaseOwnershipHasNestedOwner(owners []databaseOwnershipBinding, candidateRoot *resolvedDatabasePath) (bool, error) {
+// selectDatabaseStructuralWorkspace chooses by selector-derived source
+// hierarchy, never by routed-target spelling. It is intentionally limited to
+// metadata-less candidates gathered only after all metadata and redirect
+// validation has completed.
+func selectDatabaseStructuralWorkspace(candidates []routedDatabaseOwnershipCandidate) (*databaseWorkspaceCandidate, error) {
+	var selected *databaseWorkspaceCandidate
+	for _, candidate := range candidates {
+		if !candidate.structural {
+			continue
+		}
+		if err := validateStructuralDatabaseWorkspaceObservation(candidate.resolved, candidate.beadsDir, "target"); err != nil {
+			return nil, err
+		}
+
+		foundStructuralSource := false
+		for _, source := range candidate.sources {
+			if !source.structural {
+				continue
+			}
+			foundStructuralSource = true
+			if err := validateStructuralDatabaseWorkspaceObservation(source.resolved, "", "source"); err != nil {
+				return nil, err
+			}
+			current := &databaseWorkspaceCandidate{
+				beadsDir:       candidate.beadsDir,
+				resolved:       candidate.resolved,
+				sourceResolved: source.resolved,
+			}
+			if selected == nil {
+				selected = current
+				continue
+			}
+			if resolvedDatabasePathEqual(current.sourceResolved, selected.sourceResolved) {
+				if !resolvedDatabasePathEqual(current.resolved, selected.resolved) {
+					paths := []string{current.beadsDir, selected.beadsDir}
+					sort.Strings(paths)
+					return nil, fmt.Errorf("%w: structural source %q routes to %q and %q",
+						errDatabaseOwnershipAmbiguous, current.sourceResolved.path, paths[0], paths[1])
+				}
+				continue
+			}
+			if resolvedDatabasePathEqualOrDescendant(current.sourceResolved, selected.sourceResolved) {
+				selected = current
+				continue
+			}
+			if resolvedDatabasePathEqualOrDescendant(selected.sourceResolved, current.sourceResolved) {
+				continue
+			}
+			paths := []string{current.sourceResolved.path, selected.sourceResolved.path}
+			sort.Strings(paths)
+			return nil, fmt.Errorf("%w: structural sources %q and %q are incomparable",
+				errDatabaseOwnershipAmbiguous, paths[0], paths[1])
+		}
+		if !foundStructuralSource {
+			return nil, errors.New("structural database workspace source provenance is missing")
+		}
+	}
+	return selected, nil
+}
+
+func validateStructuralDatabaseWorkspaceObservation(resolved *resolvedDatabasePath, path, description string) error {
+	if resolved == nil {
+		return fmt.Errorf("structural database workspace %s observation is incomplete", description)
+	}
+	if path == "" {
+		path = resolved.path
+	}
+	if path == "" || resolved.path != path || !resolved.exists ||
+		resolved.observed == nil || resolved.observed.Info == nil || !resolved.observed.Info.IsDir() {
+		return fmt.Errorf("structural database workspace %s observation is incomplete", description)
+	}
+	return nil
+}
+
+func databaseOwnershipHasNestedResolution(owners []databaseOwnershipBinding, structural *databaseWorkspaceCandidate, candidateRoot *resolvedDatabasePath) (bool, error) {
 	if candidateRoot == nil {
 		return false, errors.New("conditional database ownership source observation is missing")
 	}
@@ -783,6 +948,15 @@ func databaseOwnershipHasNestedOwner(owners []databaseOwnershipBinding, candidat
 				resolvedDatabasePathEqualOrDescendant(source, candidateRoot) {
 				return true, nil
 			}
+		}
+	}
+	if structural != nil {
+		if structural.sourceResolved == nil {
+			return false, errors.New("structural database workspace source observation is missing")
+		}
+		if !resolvedDatabasePathEqual(structural.sourceResolved, candidateRoot) &&
+			resolvedDatabasePathEqualOrDescendant(structural.sourceResolved, candidateRoot) {
+			return true, nil
 		}
 	}
 	return false, nil
