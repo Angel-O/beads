@@ -22,6 +22,16 @@ type LocalState struct {
 	Initialized bool
 }
 
+// EffectiveConfigInspection retains both the effective metadata copy and the
+// exact local evidence used to resolve the narrow legacy bare-SQLite
+// ambiguity. Local is nil when metadata was unambiguous and local evidence was
+// deliberately not inspected; a non-nil zero LocalState means inspection
+// verified that evidence was absent.
+type EffectiveConfigInspection struct {
+	Config configfile.Config
+	Local  *LocalState
+}
+
 // InspectLocal classifies bounded, read-only Dolt and SQLite initialization
 // evidence. Only verified absence returns an uninitialized state; malformed or
 // conflicting evidence fails closed.
@@ -49,24 +59,36 @@ func InspectLocal(beadsDir, configuredSQLitePath string) (LocalState, error) {
 	return LocalState{}, nil
 }
 
-// EffectiveConfig returns a copy of cfg with the narrow legacy bare-SQLite
-// ambiguity resolved. Current SQLite initialization persists sqlite_path; when
-// that positive marker is absent but live Dolt evidence exists, the old SQLite
-// backend value is stale rollout metadata and the effective backend is Dolt.
-func EffectiveConfig(beadsDir string, cfg *configfile.Config) (*configfile.Config, error) {
+// InspectEffectiveConfig returns a metadata copy together with any local state
+// needed to resolve it. Current SQLite initialization persists sqlite_path;
+// when that positive marker is absent but live Dolt evidence exists, the old
+// SQLite backend value is stale rollout metadata and the effective backend is
+// Dolt. Unambiguous metadata does not probe unrelated provider artifacts.
+func InspectEffectiveConfig(beadsDir string, cfg *configfile.Config) (EffectiveConfigInspection, error) {
 	if cfg == nil {
-		return nil, errors.New("effective workspace config requires metadata")
+		return EffectiveConfigInspection{}, errors.New("effective workspace config requires metadata")
 	}
-	effective := *cfg
-	if effective.Backend != configfile.BackendSQLite || effective.SQLitePath != "" {
-		return &effective, nil
+	inspection := EffectiveConfigInspection{Config: *cfg}
+	if inspection.Config.Backend != configfile.BackendSQLite || inspection.Config.SQLitePath != "" {
+		return inspection, nil
 	}
 	state, err := InspectLocal(beadsDir, "")
 	if err != nil {
+		return EffectiveConfigInspection{}, err
+	}
+	inspection.Local = &state
+	if state.Initialized && state.Backend == configfile.BackendDolt {
+		inspection.Config.Backend = configfile.BackendDolt
+	}
+	return inspection, nil
+}
+
+// EffectiveConfig is the compatibility view for callers that need only the
+// effective metadata copy.
+func EffectiveConfig(beadsDir string, cfg *configfile.Config) (*configfile.Config, error) {
+	inspection, err := InspectEffectiveConfig(beadsDir, cfg)
+	if err != nil {
 		return nil, err
 	}
-	if state.Initialized && state.Backend == configfile.BackendDolt {
-		effective.Backend = configfile.BackendDolt
-	}
-	return &effective, nil
+	return &inspection.Config, nil
 }

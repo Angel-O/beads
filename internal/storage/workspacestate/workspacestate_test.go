@@ -132,6 +132,128 @@ func TestInspectLocalPropagatesMalformedProviderEvidence(t *testing.T) {
 	}
 }
 
+func TestInspectEffectiveConfigRetainsLocalEvidenceDecision(t *testing.T) {
+	t.Run("unambiguous metadata skips unrelated evidence", func(t *testing.T) {
+		beadsDir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(beadsDir, "dolt"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte("not sqlite"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg := &configfile.Config{
+			Backend:        configfile.BackendPostgres,
+			PostgresDSN:    "postgres://example.invalid/beads",
+			PostgresSchema: "workspace",
+		}
+		before := *cfg
+
+		inspection, err := InspectEffectiveConfig(beadsDir, cfg)
+		if err != nil {
+			t.Fatalf("InspectEffectiveConfig: %v", err)
+		}
+		if inspection.Local != nil {
+			t.Fatalf("Local = %#v, want nil for deliberately uninspected evidence", inspection.Local)
+		}
+		if !reflect.DeepEqual(inspection.Config, before) {
+			t.Fatalf("Config = %#v, want %#v", inspection.Config, before)
+		}
+		if !reflect.DeepEqual(*cfg, before) {
+			t.Fatalf("InspectEffectiveConfig mutated input: got %#v, want %#v", *cfg, before)
+		}
+	})
+
+	for _, test := range []struct {
+		name        string
+		setup       func(*testing.T, string)
+		wantLocal   LocalState
+		wantBackend string
+	}{
+		{
+			name:        "verified absence",
+			setup:       func(*testing.T, string) {},
+			wantLocal:   LocalState{},
+			wantBackend: configfile.BackendSQLite,
+		},
+		{
+			name: "sole Dolt evidence",
+			setup: func(t *testing.T, beadsDir string) {
+				writeDoltEvidence(t, beadsDir)
+			},
+			wantLocal:   LocalState{Backend: configfile.BackendDolt, Initialized: true},
+			wantBackend: configfile.BackendDolt,
+		},
+		{
+			name: "sole SQLite evidence",
+			setup: func(t *testing.T, beadsDir string) {
+				writeSQLiteEvidence(t, filepath.Join(beadsDir, "beads.db"))
+			},
+			wantLocal:   LocalState{Backend: configfile.BackendSQLite, Initialized: true},
+			wantBackend: configfile.BackendSQLite,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			beadsDir := t.TempDir()
+			test.setup(t, beadsDir)
+			cfg := &configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite}
+			before := *cfg
+
+			inspection, err := InspectEffectiveConfig(beadsDir, cfg)
+			if err != nil {
+				t.Fatalf("InspectEffectiveConfig: %v", err)
+			}
+			if inspection.Local == nil || *inspection.Local != test.wantLocal {
+				t.Fatalf("Local = %#v, want %#v", inspection.Local, test.wantLocal)
+			}
+			if got := inspection.Config.GetBackend(); got != test.wantBackend {
+				t.Fatalf("effective backend = %q, want %q", got, test.wantBackend)
+			}
+			if !reflect.DeepEqual(*cfg, before) {
+				t.Fatalf("InspectEffectiveConfig mutated input: got %#v, want %#v", *cfg, before)
+			}
+		})
+	}
+}
+
+func TestInspectEffectiveConfigFailsClosedWithZeroResult(t *testing.T) {
+	t.Run("missing metadata", func(t *testing.T) {
+		got, err := InspectEffectiveConfig(t.TempDir(), nil)
+		if err == nil || got != (EffectiveConfigInspection{}) {
+			t.Fatalf("InspectEffectiveConfig = %#v, %v, want zero result and error", got, err)
+		}
+	})
+
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T, string)
+	}{
+		{
+			name: "conflicting evidence",
+			setup: func(t *testing.T, beadsDir string) {
+				writeDoltEvidence(t, beadsDir)
+				writeSQLiteEvidence(t, filepath.Join(beadsDir, "beads.db"))
+			},
+		},
+		{
+			name: "malformed evidence",
+			setup: func(t *testing.T, beadsDir string) {
+				if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte("not sqlite"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			beadsDir := t.TempDir()
+			test.setup(t, beadsDir)
+			got, err := InspectEffectiveConfig(beadsDir, &configfile.Config{Backend: configfile.BackendSQLite})
+			if err == nil || got != (EffectiveConfigInspection{}) {
+				t.Fatalf("InspectEffectiveConfig = %#v, %v, want zero result and error", got, err)
+			}
+		})
+	}
+}
+
 func TestEffectiveConfigNormalizesBareSQLiteMetadataWithLiveDolt(t *testing.T) {
 	beadsDir := t.TempDir()
 	writeDoltEvidence(t, beadsDir)
