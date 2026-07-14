@@ -48,6 +48,7 @@ func hasLocalInitializationEvidenceWithWorkspaceOpener(
 	}
 	defer workspace.finishBooleanResult(&exists, &err)
 
+	beadsDir = workspace.path
 	paths := []string{filepath.Join(beadsDir, defaultSQLitePath)}
 	if configuredPath != "" {
 		path := configuredPath
@@ -88,6 +89,7 @@ func openStableSQLiteWorkspaceRoot(
 	beadsDir string,
 	opener func(string) (*os.File, error),
 ) (*stableSQLiteWorkspaceRoot, bool, error) {
+	beadsDir = filepath.Clean(beadsDir)
 	if err := safefile.ValidateMetadataPath(beadsDir); err != nil {
 		return nil, false, safePathError("validate SQLite workspace root", beadsDir, err)
 	}
@@ -168,6 +170,7 @@ func sqliteDatabaseAtWithOpener(
 	path string,
 	opener func(string) (*os.File, error),
 ) (valid, present bool, err error) {
+	path = filepath.Clean(path)
 	if err := safefile.ValidateMetadataPath(path); err != nil {
 		return false, true, safePathError("validate SQLite path", path, err)
 	}

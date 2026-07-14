@@ -340,6 +340,31 @@ func TestSQLiteEvidenceClassifiesMissingWorkspaceAncestors(t *testing.T) {
 		}
 	})
 
+	t.Run("dangling final symlink syntax fails closed", func(t *testing.T) {
+		root := t.TempDir()
+		link := filepath.Join(root, "dangling")
+		if err := os.Symlink(filepath.Join(root, "missing-target"), link); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		for _, tt := range []struct {
+			name string
+			path string
+		}{
+			{name: "trailing separator", path: link + string(os.PathSeparator)},
+			{name: "dot suffix", path: link + string(os.PathSeparator) + "."},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				exists, err := HasLocalInitializationEvidence(tt.path, "")
+				if err == nil || exists {
+					t.Fatalf("got exists=%v err=%v, want dangling-final-symlink rejection", exists, err)
+				}
+				if errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("dangling-final-symlink error was misclassified as absence: %v", err)
+				}
+			})
+		}
+	})
+
 	t.Run("valid symlink ancestor is allowed", func(t *testing.T) {
 		target := t.TempDir()
 		ancestor := filepath.Join(t.TempDir(), "ancestor")
