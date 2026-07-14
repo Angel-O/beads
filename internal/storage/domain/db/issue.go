@@ -96,14 +96,14 @@ func (r *issueSQLRepositoryImpl) Update(ctx context.Context, id string, updates 
 	_, statusChanging := updates["status"]
 	_, assigneeChanging := updates["assignee"]
 
-	// When the status or assignee changes we need the prior row. Status drives
-	// the embedded lifecycle side effects (issueops.updateIssueInTx): closed_at
-	// is set on close and cleared on reopen, started_at is set on the
-	// in_progress transition, the audit event type is derived from the
-	// transition, and is_blocked is recomputed for neighbors. The old
-	// status+assignee also decide whether this write is an ownership transition
-	// (see issueops/fence.go). Read the full old issue once so every consumer
-	// uses the same snapshot; the ErrNoRows contract is preserved.
+	// When the status changes we need the prior row to reproduce the embedded
+	// lifecycle side effects (issueops.updateIssueInTx): closed_at is set on
+	// close and cleared on reopen, started_at is set on the in_progress
+	// transition, the audit event type is derived from the transition, and
+	// is_blocked is recomputed for neighbors. An assignee change needs the same
+	// snapshot so the ownership fence can distinguish a real transfer from a
+	// no-op rewrite. Read the full old issue once so every consumer sees the
+	// same snapshot; the ErrNoRows contract is preserved.
 	var oldIssue *types.Issue
 	if statusChanging || assigneeChanging {
 		var err error
@@ -143,8 +143,8 @@ func (r *issueSQLRepositoryImpl) Update(ctx context.Context, id string, updates 
 	// Ownership transitions bump the fence, paired with a row_lock rewrite in
 	// the same statement — the proxied path shares issueops' transition
 	// predicate so the two dispatch layers cannot drift (see issueops/fence.go).
-	// oldIssue is read above whenever the status or assignee changes, which
-	// covers every ownership transition (assignee change or reopen).
+	// oldIssue is non-nil whenever a status or assignee change is in flight,
+	// which is the only case IsOwnershipTransition can fire on.
 	rowLockRewritten := false
 	if oldIssue != nil && issueops.IsOwnershipTransition(oldIssue.Status, oldIssue.Assignee, updates) {
 		// A transition through the proxied path also clears holder_token when

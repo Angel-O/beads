@@ -63,9 +63,7 @@ func (s *Store) ClaimIssue(ctx context.Context, id string, actor string) error {
 }
 
 // UnclaimIssue releases a claim (clears assignee, returns to open) in a mutation
-// tx so the change and its is_blocked reprojection commit atomically. Unless
-// force is set, issueops enforces claim ownership: only the current holder may
-// release the claim.
+// tx so the change and its is_blocked reprojection commit atomically.
 func (s *Store) UnclaimIssue(ctx context.Context, id string, actor string, force bool) error {
 	return s.withMutationTx(ctx, func(tx *sql.Tx) error {
 		return issueops.UnclaimIssueInTx(ctx, tx, id, actor, force)
@@ -73,7 +71,7 @@ func (s *Store) UnclaimIssue(ctx context.Context, id string, actor string, force
 }
 
 // CountActiveClaimsByOwner counts in_progress claims held by owner across both
-// tiers (issues and wisps). Pure read: no write transaction.
+// tiers. Pure read: no write transaction.
 func (s *Store) CountActiveClaimsByOwner(ctx context.Context, owner string) (int, error) {
 	var n int
 	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
@@ -84,21 +82,24 @@ func (s *Store) CountActiveClaimsByOwner(ctx context.Context, owner string) (int
 	return n, err
 }
 
-// DisarmAutoLeases turns lease.auto off and clears every armed lease across both
-// tiers, repeating the clear-only sweep until it converges — a lease armed by a
-// racing claim between passes is caught on the next one. Returns the total
-// number of leases cleared.
+// DisarmAutoLeases flips lease.auto off and clears every armed lease across both
+// tiers, re-sweeping until it converges: a claim that read lease.auto before the
+// flip committed can still stamp a lease the first sweep never saw (disjoint
+// rows, so no serialization conflict forces them together). Clearing leases
+// cannot change blocked-ness, so each sweep runs on a plain write tx. Returns
+// the total number of leases cleared.
 func (s *Store) DisarmAutoLeases(ctx context.Context) (int64, error) {
+	disarmTables := []string{"issues", "wisps"}
 	sweep := func(flip bool) (int64, error) {
 		var swept int64
-		err := s.withMutationTx(ctx, func(tx *sql.Tx) error {
+		err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
 			swept = 0
 			if flip {
 				if err := issueops.DisarmLeaseConfigInTx(ctx, tx); err != nil {
 					return err
 				}
 			}
-			for _, table := range []string{"issues", "wisps"} {
+			for _, table := range disarmTables {
 				n, err := issueops.ClearArmedLeasesInTx(ctx, tx, table)
 				if err != nil {
 					return err
@@ -109,6 +110,7 @@ func (s *Store) DisarmAutoLeases(ctx context.Context) (int64, error) {
 		})
 		return swept, err
 	}
+
 	total, err := sweep(true)
 	if err != nil {
 		return 0, err
@@ -126,17 +128,20 @@ func (s *Store) DisarmAutoLeases(ctx context.Context) (int64, error) {
 	return total, nil
 }
 
-// RenewLeases extends the lease on each referenced claim by ttl in a single
-// mutation tx, returning a per-ref renewal outcome. Delegates the ownership and
-// liveness checks to issueops.
+// RenewLeases renews the given (id, fence) leases in one transaction. A renewal
+// only touches lease columns, so it cannot change blocked-ness and runs on a
+// plain write tx. See issueops.RenewLeasesInTx for the per-ref outcome semantics.
 func (s *Store) RenewLeases(ctx context.Context, refs []storage.LeaseRef, ttl time.Duration) ([]storage.LeaseRenewalResult, error) {
 	var out []storage.LeaseRenewalResult
-	err := s.withMutationTx(ctx, func(tx *sql.Tx) error {
+	err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
 		var err error
 		out, err = issueops.RenewLeasesInTx(ctx, tx, refs, ttl)
 		return err
 	})
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ClaimReadyIssue atomically claims the first ready issue matching filter, or
