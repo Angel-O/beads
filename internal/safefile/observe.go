@@ -20,6 +20,17 @@ type MetadataObservation struct {
 	LinkCountKnown       bool
 }
 
+// OpenedFileLinkCount returns the link count bound to an already-open file
+// handle and its FileInfo snapshot. The count is valid only when known is
+// true. Callers that use link count as a safety boundary must fail closed when
+// it is unavailable.
+func OpenedFileLinkCount(file *os.File, info os.FileInfo) (count uint64, known bool) {
+	if file == nil || info == nil {
+		return 0, false
+	}
+	return metadataLinkCount(file, info)
+}
+
 // ObserveMetadataNoFollow returns a single-handle metadata observation without
 // acquiring data-read access. Ancestor links remain followable; only the final
 // component is no-follow. Platforms without a canonical metadata-only
@@ -42,7 +53,7 @@ func observeOpenedMetadata(file *os.File, inspector metadataHandleInspector) (*M
 	linkCountKnown := false
 	var inspectErr error
 	if statErr == nil {
-		linkCount, linkCountKnown = metadataLinkCount(file, info)
+		linkCount, linkCountKnown = OpenedFileLinkCount(file, info)
 		canonicalPath, caseSensitive, caseSensitivityKnown, inspectErr = inspector(file, info)
 	}
 	closeErr := file.Close()

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/safefile"
 )
 
 func TestHasLocalInitializationEvidence(t *testing.T) {
@@ -71,6 +73,65 @@ func TestHasLocalInitializationEvidence(t *testing.T) {
 		exists, err := HasLocalInitializationEvidence(beadsDir, path)
 		if err != nil || !exists {
 			t.Fatalf("got exists=%v err=%v, want initialized", exists, err)
+		}
+	})
+
+	t.Run("valid hard-linked database fails closed", func(t *testing.T) {
+		beadsDir := t.TempDir()
+		path := filepath.Join(beadsDir, defaultSQLitePath)
+		store, err := Provision(t.Context(), path)
+		if err != nil {
+			t.Fatalf("provision SQLite evidence: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("close SQLite evidence: %v", err)
+		}
+		if err := os.Link(path, filepath.Join(beadsDir, "database-alias.db")); err != nil {
+			t.Skipf("hard links unavailable: %v", err)
+		}
+
+		exists, err := HasLocalInitializationEvidence(beadsDir, "")
+		if err == nil || exists || !strings.Contains(err.Error(), "hard links") {
+			t.Fatalf("got exists=%v err=%v, want hard-link rejection", exists, err)
+		}
+	})
+
+	t.Run("opened database must remain bound to its name", func(t *testing.T) {
+		beadsDir := t.TempDir()
+		path := filepath.Join(beadsDir, defaultSQLitePath)
+		store, err := Provision(t.Context(), path)
+		if err != nil {
+			t.Fatalf("provision SQLite evidence: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("close SQLite evidence: %v", err)
+		}
+
+		moved := path + ".moved"
+		var replacementErr error
+		opener := func(candidate string) (*os.File, error) {
+			file, err := safefile.OpenReadOnlyNoFollow(candidate)
+			if err != nil {
+				return nil, err
+			}
+			if err := os.Rename(candidate, moved); err != nil {
+				_ = file.Close()
+				return nil, err
+			}
+			if err := os.Symlink(moved, candidate); err != nil {
+				replacementErr = err
+				_ = file.Close()
+				return nil, err
+			}
+			return file, nil
+		}
+
+		valid, present, err := sqliteDatabaseAtWithOpener(path, opener)
+		if replacementErr != nil {
+			t.Skipf("symlink replacement unavailable: %v", replacementErr)
+		}
+		if err == nil || !present || valid {
+			t.Fatalf("got valid=%v present=%v err=%v, want replacement rejection", valid, present, err)
 		}
 	})
 
@@ -242,4 +303,103 @@ func TestHasLocalInitializationEvidence(t *testing.T) {
 			t.Fatalf("path error contains raw terminal-control characters: %q", err)
 		}
 	})
+}
+
+func TestSQLiteEvidenceClassifiesMissingWorkspaceAncestors(t *testing.T) {
+	t.Run("genuine absence is allowed", func(t *testing.T) {
+		beadsDir := filepath.Join(t.TempDir(), "missing", "workspace")
+		if exists, err := HasLocalInitializationEvidence(beadsDir, ""); err != nil || exists {
+			t.Fatalf("got exists=%v err=%v, want verified absence", exists, err)
+		}
+	})
+
+	t.Run("dangling symlink ancestor fails closed", func(t *testing.T) {
+		root := t.TempDir()
+		ancestor := filepath.Join(root, "dangling")
+		if err := os.Symlink(filepath.Join(root, "missing-target"), ancestor); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		beadsDir := filepath.Join(ancestor, "workspace")
+		exists, err := HasLocalInitializationEvidence(beadsDir, "")
+		if err == nil || exists {
+			t.Fatalf("got exists=%v err=%v, want dangling-ancestor rejection", exists, err)
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("dangling-ancestor error was misclassified as absence: %v", err)
+		}
+	})
+
+	t.Run("non-directory ancestor fails closed", func(t *testing.T) {
+		ancestor := filepath.Join(t.TempDir(), "regular-file")
+		if err := os.WriteFile(ancestor, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		beadsDir := filepath.Join(ancestor, "workspace")
+		if exists, err := HasLocalInitializationEvidence(beadsDir, ""); err == nil || exists {
+			t.Fatalf("got exists=%v err=%v, want non-directory-ancestor rejection", exists, err)
+		}
+	})
+
+	t.Run("valid symlink ancestor is allowed", func(t *testing.T) {
+		target := t.TempDir()
+		ancestor := filepath.Join(t.TempDir(), "ancestor")
+		if err := os.Symlink(target, ancestor); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		beadsDir := filepath.Join(ancestor, "workspace")
+		if exists, err := HasLocalInitializationEvidence(beadsDir, ""); err != nil || exists {
+			t.Fatalf("got exists=%v err=%v, want verified absence through valid ancestor", exists, err)
+		}
+	})
+}
+
+func TestSQLiteEvidenceKeepsWorkspaceRootBound(t *testing.T) {
+	parent := t.TempDir()
+	beadsDir := filepath.Join(parent, "workspace")
+	if err := os.Mkdir(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(beadsDir, defaultSQLitePath)
+	store, err := Provision(t.Context(), path)
+	if err != nil {
+		t.Fatalf("provision original SQLite evidence: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close original SQLite evidence: %v", err)
+	}
+
+	replacement := t.TempDir()
+	replacementStore, err := Provision(t.Context(), filepath.Join(replacement, defaultSQLitePath))
+	if err != nil {
+		t.Fatalf("provision replacement SQLite evidence: %v", err)
+	}
+	if err := replacementStore.Close(); err != nil {
+		t.Fatalf("close replacement SQLite evidence: %v", err)
+	}
+	moved := beadsDir + ".moved"
+	var replacementErr error
+	opener := func(candidate string) (*os.File, error) {
+		file, err := safefile.OpenReadOnlyNoFollow(candidate)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.Rename(candidate, moved); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		if err := os.Symlink(replacement, candidate); err != nil {
+			replacementErr = err
+			_ = file.Close()
+			return nil, err
+		}
+		return file, nil
+	}
+
+	exists, err := hasLocalInitializationEvidenceWithWorkspaceOpener(beadsDir, "", opener)
+	if replacementErr != nil {
+		t.Skipf("symlink replacement unavailable: %v", replacementErr)
+	}
+	if err == nil || exists {
+		t.Fatalf("got exists=%v err=%v, want workspace-root replacement rejection", exists, err)
+	}
 }
