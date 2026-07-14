@@ -8,6 +8,7 @@
 package beads
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,9 +34,21 @@ const CanonicalDatabaseName = "beads.db"
 // RedirectFileName is the name of the file that redirects to another .beads directory
 const RedirectFileName = "redirect"
 
-const maxRedirectFileBytes = 64 << 10
+const (
+	maxRedirectFileBytes  = 64 << 10
+	maxGitOutputBytes     = 1 << 20
+	maxGitWorktreeRecords = 4096
+	gitOutputWaitDelay    = time.Second
+)
 
-var errRedirectChanged = errors.New("redirect changed during inspection")
+var (
+	errRedirectChanged        = errors.New("redirect changed during inspection")
+	errGitOutputTooLarge      = errors.New("git output exceeds size limit")
+	errGitWorktreeRecordLimit = errors.New("git worktree record limit exceeded")
+)
+
+type redirectMetadataObserver func(string) (*safefile.MetadataObservation, error)
+type strictStableRedirectSelector func(string) string
 
 // SourceDatabaseInfo contains the dolt_database name from a source .beads/metadata.json,
 // preserved across a redirect so that the source directory's database identity is not
@@ -160,6 +173,14 @@ func FollowRedirectStrict(beadsDir string) (string, error) {
 }
 
 func followRedirectStrictWithOpener(beadsDir string, opener func(string) (*os.File, error)) (string, error) {
+	return followRedirectStrictWithOpenerAndObserver(beadsDir, opener, safefile.ObserveMetadataNoFollow)
+}
+
+func followRedirectStrictWithOpenerAndObserver(beadsDir string, opener func(string) (*os.File, error), observer redirectMetadataObserver) (string, error) {
+	return followRedirectStrictWithDependencies(beadsDir, opener, observer, preferStableBranchWorktreeBeadsDirStrict)
+}
+
+func followRedirectStrictWithDependencies(beadsDir string, opener func(string) (*os.File, error), observer redirectMetadataObserver, stableSelector strictStableRedirectSelector) (string, error) {
 	redirectFile := filepath.Join(beadsDir, RedirectFileName)
 	info, err := os.Lstat(redirectFile)
 	if os.IsNotExist(err) {
@@ -187,22 +208,68 @@ func followRedirectStrictWithOpener(beadsDir string, opener func(string) (*os.Fi
 		target = filepath.Join(filepath.Dir(beadsDir), target)
 	}
 	target = filepath.Clean(target)
-	if err := validateStrictRedirectDirectory(target); err != nil {
+	canonicalTarget, err := observeStrictRedirectDirectory(target, "redirect target", observer)
+	if err != nil {
 		return "", err
 	}
-	canonicalTarget := canonicalizeBeadsDirPath(target)
-	if canonicalTarget != target {
-		if err := validateStrictRedirectDirectory(canonicalTarget); err != nil {
-			return "", err
+	if err := validateNoStrictRedirectChain(canonicalTarget); err != nil {
+		return "", err
+	}
+	if stableSelector != nil {
+		stable := stableSelector(canonicalTarget)
+		if stable != "" && stable != canonicalTarget {
+			stableTarget, err := observeStrictRedirectDirectory(stable, "stable redirect target", observer)
+			if err != nil {
+				return "", err
+			}
+			if err := validateNoStrictRedirectChain(stableTarget); err != nil {
+				return "", err
+			}
+			canonicalTarget = stableTarget
 		}
 	}
-	target = canonicalTarget
-	if _, err := os.Lstat(filepath.Join(target, RedirectFileName)); err == nil {
-		return "", fmt.Errorf("redirect chains are not supported: %q", target)
-	} else if !os.IsNotExist(err) {
-		return "", safeRedirectPathError("inspect redirect chain", filepath.Join(target, RedirectFileName), err)
+	return canonicalTarget, nil
+}
+
+func observeStrictRedirectDirectory(path, description string, observer redirectMetadataObserver) (string, error) {
+	if err := safefile.ValidateMetadataPath(path); err != nil {
+		return "", safeRedirectPathError("validate "+description, path, err)
 	}
-	return target, nil
+	if err := validateStrictRedirectDirectory(path); err != nil {
+		return "", err
+	}
+	observation, err := observer(path)
+	if err != nil {
+		return "", stableRedirectOperationError("observe "+description, path, err)
+	}
+	if observation == nil || observation.Info == nil || observation.CanonicalPath == "" || !observation.Info.IsDir() {
+		return "", fmt.Errorf("observe %s %q: incomplete directory observation", description, path)
+	}
+	canonical := observation.CanonicalPath
+	if err := safefile.ValidateMetadataPath(canonical); err != nil {
+		return "", safeRedirectPathError("validate canonical "+description, canonical, err)
+	}
+	if err := validateStrictRedirectDirectory(canonical); err != nil {
+		return "", err
+	}
+	canonicalInfo, err := os.Lstat(canonical)
+	if err != nil {
+		return "", stableRedirectOperationError("reinspect canonical "+description, canonical, err)
+	}
+	if !os.SameFile(observation.Info, canonicalInfo) {
+		return "", redirectChangedError("validating canonical "+description, canonical)
+	}
+	return canonical, nil
+}
+
+func validateNoStrictRedirectChain(path string) error {
+	chainPath := filepath.Join(path, RedirectFileName)
+	if _, err := os.Lstat(chainPath); err == nil {
+		return fmt.Errorf("redirect chains are not supported: %q", path)
+	} else if !os.IsNotExist(err) {
+		return safeRedirectPathError("inspect redirect chain", chainPath, err)
+	}
+	return nil
 }
 
 func validateStrictRedirectDirectory(path string) error {
@@ -415,6 +482,54 @@ func preferStableBranchWorktreeBeadsDir(beadsDir string) string {
 	return ""
 }
 
+// preferStableBranchWorktreeBeadsDirStrict returns the exact lexical candidate
+// reported by Git. The strict redirect caller validates and observes that
+// candidate before using it; compatibility case recovery and symlink-following
+// probes are intentionally confined to preferStableBranchWorktreeBeadsDir.
+func preferStableBranchWorktreeBeadsDirStrict(beadsDir string) string {
+	if filepath.Base(beadsDir) != ".beads" {
+		return ""
+	}
+	repoRoot := filepath.Dir(beadsDir)
+	if !isDetachedCommitWorktreePath(repoRoot) {
+		return ""
+	}
+	branch, err := gitOutput(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil || branch != "HEAD" {
+		return ""
+	}
+	head, err := gitOutput(repoRoot, "rev-parse", "HEAD")
+	if err != nil || head == "" {
+		return ""
+	}
+	worktrees, err := listWorktrees(repoRoot)
+	if err != nil {
+		return ""
+	}
+	var candidates []worktreeInfo
+	for _, wt := range worktrees {
+		if wt.Bare || wt.Detached || wt.Branch == "" || wt.Head != head {
+			continue
+		}
+		if filepath.Clean(wt.Path) == filepath.Clean(repoRoot) {
+			continue
+		}
+		candidates = append(candidates, wt)
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		iStable := !isDetachedCommitWorktreePath(candidates[i].Path)
+		jStable := !isDetachedCommitWorktreePath(candidates[j].Path)
+		if iStable != jStable {
+			return iStable
+		}
+		return candidates[i].Path < candidates[j].Path
+	})
+	return filepath.Clean(filepath.Join(candidates[0].Path, ".beads"))
+}
+
 // isDetachedCommitWorktreePath checks if a path follows the megarepo convention
 // of placing detached worktrees under refs/commits/<sha>.
 func isDetachedCommitWorktreePath(path string) bool {
@@ -422,51 +537,129 @@ func isDetachedCommitWorktreePath(path string) bool {
 }
 
 func gitOutput(dir string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...) //nolint:gosec // args are internal, not user-supplied
-	output, err := cmd.Output()
+	output, err := gitOutputBytes(dir, args...)
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
 }
 
-func listWorktrees(repoRoot string) ([]worktreeInfo, error) {
-	output, err := gitOutput(repoRoot, "worktree", "list", "--porcelain")
+func gitOutputBytes(dir string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...) //nolint:gosec // args are internal, not user-supplied
+	return readGitOutputBounded(cmd, maxGitOutputBytes)
+}
+
+type boundedGitOutput struct {
+	buffer   bytes.Buffer
+	limit    int
+	exceeded bool
+}
+
+func (output *boundedGitOutput) Write(data []byte) (int, error) {
+	remaining := output.limit - output.buffer.Len()
+	if remaining > len(data) {
+		remaining = len(data)
+	}
+	if remaining > 0 {
+		_, _ = output.buffer.Write(data[:remaining])
+	}
+	if remaining < len(data) {
+		output.exceeded = true
+	}
+	// Continue draining after the cap so the child cannot block on a full pipe.
+	// The command context bounds runtime; WaitDelay closes pipes inherited by
+	// descendants after the direct child exits or cancellation begins.
+	return len(data), nil
+}
+
+func readGitOutputBounded(cmd *exec.Cmd, limit int) ([]byte, error) {
+	return readGitOutputBoundedWithWaitDelay(cmd, limit, gitOutputWaitDelay)
+}
+
+func readGitOutputBoundedWithWaitDelay(cmd *exec.Cmd, limit int, waitDelay time.Duration) ([]byte, error) {
+	if limit < 0 {
+		return nil, errors.New("git output limit is negative")
+	}
+	output := boundedGitOutput{limit: limit}
+	cmd.Stdout = &output
+	cmd.WaitDelay = waitDelay
+	err := cmd.Run()
+	if output.exceeded {
+		return nil, fmt.Errorf("%w: maximum is %d bytes", errGitOutputTooLarge, limit)
+	}
 	if err != nil {
 		return nil, err
 	}
+	return output.buffer.Bytes(), nil
+}
 
+func listWorktrees(repoRoot string) ([]worktreeInfo, error) {
+	output, err := gitOutputBytes(repoRoot, "worktree", "list", "--porcelain", "-z")
+	if err != nil {
+		return nil, err
+	}
+	return parseWorktreePorcelainZ(output)
+}
+
+func parseWorktreePorcelainZ(output []byte) ([]worktreeInfo, error) {
+	if len(output) == 0 {
+		return nil, nil
+	}
+	if len(output) > maxGitOutputBytes {
+		return nil, fmt.Errorf("%w: maximum is %d bytes", errGitOutputTooLarge, maxGitOutputBytes)
+	}
+	if !bytes.HasSuffix(output, []byte{0, 0}) {
+		return nil, errors.New("worktree list is missing its record terminator")
+	}
 	var worktrees []worktreeInfo
 	var current *worktreeInfo
-
-	for _, line := range strings.Split(output, "\n") {
-		switch {
-		case strings.HasPrefix(line, "worktree "):
+	for len(output) > 0 {
+		fieldEnd := bytes.IndexByte(output, 0)
+		if fieldEnd < 0 {
+			return nil, errors.New("worktree list is missing its field terminator")
+		}
+		rawField := output[:fieldEnd]
+		output = output[fieldEnd+1:]
+		if len(rawField) == 0 {
 			if current != nil {
+				if len(worktrees) >= maxGitWorktreeRecords {
+					return nil, fmt.Errorf("%w: maximum is %d", errGitWorktreeRecordLimit, maxGitWorktreeRecords)
+				}
 				worktrees = append(worktrees, *current)
+				current = nil
+			}
+			continue
+		}
+		field := string(rawField)
+		switch {
+		case strings.HasPrefix(field, "worktree "):
+			if current != nil {
+				return nil, errors.New("malformed NUL-delimited worktree list")
+			}
+			path := strings.TrimPrefix(field, "worktree ")
+			if path == "" {
+				return nil, errors.New("worktree list contains an empty path")
 			}
 			current = &worktreeInfo{
-				Path: strings.TrimPrefix(line, "worktree "),
+				Path: path,
 			}
 		case current == nil:
-			continue
-		case strings.HasPrefix(line, "HEAD "):
-			current.Head = strings.TrimPrefix(line, "HEAD ")
-		case strings.HasPrefix(line, "branch refs/heads/"):
-			current.Branch = strings.TrimPrefix(line, "branch refs/heads/")
-		case line == "detached":
+			return nil, errors.New("worktree list field precedes its path")
+		case strings.HasPrefix(field, "HEAD "):
+			current.Head = strings.TrimPrefix(field, "HEAD ")
+		case strings.HasPrefix(field, "branch refs/heads/"):
+			current.Branch = strings.TrimPrefix(field, "branch refs/heads/")
+		case field == "detached":
 			current.Detached = true
-		case line == "bare":
+		case field == "bare":
 			current.Bare = true
 		}
 	}
-
 	if current != nil {
-		worktrees = append(worktrees, *current)
+		return nil, errors.New("worktree list is missing its record terminator")
 	}
-
 	return worktrees, nil
 }
 

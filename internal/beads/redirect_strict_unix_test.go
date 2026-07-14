@@ -1,4 +1,4 @@
-//go:build aix || android || darwin || dragonfly || freebsd || illumos || ios || linux || netbsd || openbsd || solaris || zos
+//go:build aix || (darwin && !ios) || dragonfly || freebsd || illumos || (linux && !android) || netbsd || openbsd || solaris || zos
 
 package beads
 
@@ -34,6 +34,9 @@ func TestRedirectReadersDoNotBlockOnReplacementSpecialFiles(t *testing.T) {
 					mode = "strict"
 				}
 				t.Run(mode, func(t *testing.T) {
+					if strict {
+						requireStrictRedirectMetadataObservation(t)
+					}
 					source := t.TempDir()
 					target := t.TempDir()
 					path := filepath.Join(source, RedirectFileName)
@@ -101,6 +104,7 @@ func TestRedirectReadersDoNotBlockOnReplacementSpecialFiles(t *testing.T) {
 }
 
 func TestFollowRedirectStrictRejectsFIFOChainMarker(t *testing.T) {
+	requireStrictRedirectMetadataObservation(t)
 	source := t.TempDir()
 	target := t.TempDir()
 	if err := os.WriteFile(filepath.Join(source, RedirectFileName), []byte(target+"\n"), 0o600); err != nil {

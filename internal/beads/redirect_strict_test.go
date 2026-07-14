@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 )
 
 func TestFollowRedirectStrict(t *testing.T) {
+	requireStrictRedirectMetadataObservation(t)
 	t.Run("no redirect", func(t *testing.T) {
 		beadsDir := t.TempDir()
 		got, err := FollowRedirectStrict(beadsDir)
@@ -209,32 +211,182 @@ func TestFollowRedirectStrict(t *testing.T) {
 		}
 	})
 
-	t.Run("lenient discovery stays silent", func(t *testing.T) {
-		t.Setenv("BD_DEBUG_ROUTING", "")
-		capture := func(source string) []byte {
-			return captureRedirectStderr(t, func() { _ = FollowRedirect(source) })
-		}
+}
 
-		missingSource := t.TempDir()
-		if err := os.WriteFile(filepath.Join(missingSource, RedirectFileName), []byte("missing\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if got := capture(missingSource); len(got) != 0 {
-			t.Fatalf("invalid lenient redirect wrote stderr: %q", got)
-		}
+func TestFollowRedirectLenientInvalidRoutingStaysSilent(t *testing.T) {
+	t.Setenv("BD_DEBUG_ROUTING", "")
+	capture := func(source string) []byte {
+		return captureRedirectStderr(t, func() { _ = FollowRedirect(source) })
+	}
 
-		chainSource := t.TempDir()
-		chainTarget := t.TempDir()
-		if err := os.WriteFile(filepath.Join(chainSource, RedirectFileName), []byte(chainTarget+"\n"), 0o600); err != nil {
+	missingSource := t.TempDir()
+	if err := os.WriteFile(filepath.Join(missingSource, RedirectFileName), []byte("missing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := capture(missingSource); len(got) != 0 {
+		t.Fatalf("invalid lenient redirect wrote stderr: %q", got)
+	}
+
+	chainSource := t.TempDir()
+	chainTarget := t.TempDir()
+	if err := os.WriteFile(filepath.Join(chainSource, RedirectFileName), []byte(chainTarget+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(chainTarget, RedirectFileName), []byte("missing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := capture(chainSource); len(got) != 0 {
+		t.Fatalf("lenient redirect chain wrote stderr: %q", got)
+	}
+}
+
+func TestFollowRedirectStrictRequiresCanonicalMetadataObservation(t *testing.T) {
+	requireStrictRedirectMetadataObservation(t)
+	source := t.TempDir()
+	target := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, RedirectFileName), []byte(target+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("metadata observation failed")
+	got, err := followRedirectStrictWithOpenerAndObserver(
+		source,
+		safefile.OpenReadOnlyNoFollow,
+		func(string) (*safefile.MetadataObservation, error) { return nil, wantErr },
+	)
+	if got != "" || !errors.Is(err, wantErr) {
+		t.Fatalf("strict redirect got path=%q err=%v, want metadata-observation failure", got, err)
+	}
+}
+
+func TestFollowRedirectStrictRevalidatesCanonicalMetadataPath(t *testing.T) {
+	requireStrictRedirectMetadataObservation(t)
+	source := t.TempDir()
+	target := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, RedirectFileName), []byte(target+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := t.TempDir()
+	got, err := followRedirectStrictWithOpenerAndObserver(
+		source,
+		safefile.OpenReadOnlyNoFollow,
+		func(path string) (*safefile.MetadataObservation, error) {
+			observation, err := safefile.ObserveMetadataNoFollow(path)
+			if err == nil {
+				observation.CanonicalPath = unrelated
+			}
+			return observation, err
+		},
+	)
+	if got != "" || err == nil {
+		t.Fatalf("strict redirect got path=%q err=%v, want spoofed canonical-path rejection", got, err)
+	}
+}
+
+func TestFollowRedirectStrictRejectsIncompleteMetadataObservation(t *testing.T) {
+	requireStrictRedirectMetadataObservation(t)
+	source := t.TempDir()
+	target := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, RedirectFileName), []byte(target+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(filePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name        string
+		observation *safefile.MetadataObservation
+	}{
+		{name: "nil"},
+		{name: "missing info", observation: &safefile.MetadataObservation{CanonicalPath: target}},
+		{name: "missing path", observation: &safefile.MetadataObservation{Info: fileInfo}},
+		{name: "not directory", observation: &safefile.MetadataObservation{CanonicalPath: filePath, Info: fileInfo}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := followRedirectStrictWithOpenerAndObserver(
+				source,
+				safefile.OpenReadOnlyNoFollow,
+				func(string) (*safefile.MetadataObservation, error) { return test.observation, nil },
+			)
+			if got != "" || err == nil {
+				t.Fatalf("strict redirect got path=%q err=%v, want incomplete-observation rejection", got, err)
+			}
+		})
+	}
+}
+
+func TestFollowRedirectStrictStableCandidatePreservesExactCaseAndChains(t *testing.T) {
+	requireStrictRedirectMetadataObservation(t)
+	newFixture := func(t *testing.T) (source, direct, stable string) {
+		t.Helper()
+		root := t.TempDir()
+		stable = filepath.Join(root, "workspace")
+		if err := os.Mkdir(stable, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(chainTarget, RedirectFileName), []byte("missing\n"), 0o600); err != nil {
+		direct = t.TempDir()
+		source = t.TempDir()
+		if err := os.WriteFile(filepath.Join(source, RedirectFileName), []byte(direct+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if got := capture(chainSource); len(got) != 0 {
-			t.Fatalf("lenient redirect chain wrote stderr: %q", got)
+		return source, direct, stable
+	}
+
+	t.Run("exact candidate", func(t *testing.T) {
+		source, _, stable := newFixture(t)
+		got, err := followRedirectStrictWithDependencies(
+			source,
+			safefile.OpenReadOnlyNoFollow,
+			safefile.ObserveMetadataNoFollow,
+			func(string) string { return stable },
+		)
+		if err != nil || got != stable {
+			t.Fatalf("strict stable redirect = %q, err=%v, want exact candidate %q", got, err, stable)
 		}
 	})
+
+	t.Run("symlink candidate", func(t *testing.T) {
+		source, _, stable := newFixture(t)
+		link := filepath.Join(t.TempDir(), "stable-link")
+		if err := os.Symlink(stable, link); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		got, err := followRedirectStrictWithDependencies(
+			source,
+			safefile.OpenReadOnlyNoFollow,
+			safefile.ObserveMetadataNoFollow,
+			func(string) string { return link },
+		)
+		if got != "" || err == nil {
+			t.Fatalf("strict redirect got path=%q err=%v, want stable symlink rejection", got, err)
+		}
+	})
+
+	for _, marker := range []string{"direct", "stable"} {
+		t.Run(marker+" chain", func(t *testing.T) {
+			source, direct, stable := newFixture(t)
+			marked := direct
+			if marker == "stable" {
+				marked = stable
+			}
+			if err := os.WriteFile(filepath.Join(marked, RedirectFileName), []byte(t.TempDir()+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := followRedirectStrictWithDependencies(
+				source,
+				safefile.OpenReadOnlyNoFollow,
+				safefile.ObserveMetadataNoFollow,
+				func(string) string { return stable },
+			)
+			if got != "" || err == nil || !strings.Contains(err.Error(), "chains") {
+				t.Fatalf("strict redirect got path=%q err=%v, want %s chain rejection", got, err, marker)
+			}
+		})
+	}
 }
 
 func TestFollowRedirectCompatibility(t *testing.T) {
@@ -322,6 +474,7 @@ func TestFollowRedirectCompatibility(t *testing.T) {
 }
 
 func TestFollowRedirectStrictDetectsRedirectReplacement(t *testing.T) {
+	requireStrictRedirectMetadataObservation(t)
 	newSource := func(t *testing.T) (string, string, string) {
 		t.Helper()
 		source := t.TempDir()
@@ -404,6 +557,7 @@ func TestFollowRedirectStrictDetectsRedirectReplacement(t *testing.T) {
 }
 
 func TestStrictRedirectTargetDetectsDirectoryReplacement(t *testing.T) {
+	requireStrictRedirectMetadataObservation(t)
 	t.Run("different directory during open", func(t *testing.T) {
 		parent := t.TempDir()
 		target := filepath.Join(parent, "target")
@@ -498,4 +652,14 @@ func testCanonicalPath(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return resolved
+}
+
+func requireStrictRedirectMetadataObservation(t *testing.T) {
+	t.Helper()
+	switch runtime.GOOS {
+	case "android", "darwin", "ios", "linux", "windows":
+		return
+	default:
+		t.Skip("strict metadata observation is unsupported on this platform")
+	}
 }
