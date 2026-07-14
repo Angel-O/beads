@@ -13,7 +13,7 @@ import (
 func TestResolveDatabaseOwnershipStrictFindsOwnerThroughInwardLeafSymlink(t *testing.T) {
 	beadsDir := filepath.Join(t.TempDir(), ".beads")
 	databasePath := filepath.Join(beadsDir, "beads.db")
-	writeOwnershipMetadata(t, beadsDir, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite})
+	writeOwnershipMetadata(t, beadsDir, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite, SQLitePath: "beads.db"})
 	if err := os.WriteFile(databasePath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}

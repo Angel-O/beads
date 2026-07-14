@@ -57,7 +57,7 @@ func TestResolveDatabaseOwnershipStrictSupportsNonDotWorkspaceRoots(t *testing.T
 	}
 }
 
-func TestResolveDatabaseOwnershipStrictRejectsStaleProviderPathAtNonDotRoot(t *testing.T) {
+func TestResolveDatabaseOwnershipStrictFailsClosedOnPartialDoltEvidenceAtNonDotRoot(t *testing.T) {
 	beadsDir := filepath.Join(t.TempDir(), "beads-data")
 	dbPath := filepath.Join(beadsDir, "embeddeddolt")
 	if err := os.MkdirAll(dbPath, 0o700); err != nil {
@@ -66,20 +66,128 @@ func TestResolveDatabaseOwnershipStrictRejectsStaleProviderPathAtNonDotRoot(t *t
 	writeOwnershipMetadata(t, beadsDir, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite})
 
 	binding, err := resolveDatabaseOwnershipStrict(dbPath)
-	if binding != nil || !errors.Is(err, errDatabaseOwnershipContradiction) {
-		t.Fatalf("binding=%#v err=%v, want non-dot stale-provider contradiction", binding, err)
+	if binding != nil || err == nil || !strings.Contains(err.Error(), "embedded Dolt root is present but contains no repositories") {
+		t.Fatalf("binding=%#v err=%v, want partial Dolt evidence rejection", binding, err)
 	}
 }
 
 func TestResolveDatabaseOwnershipStrictLetsNestedRootOverrideDirectParent(t *testing.T) {
 	parentBeadsDir := filepath.Join(t.TempDir(), "parent-workspace")
 	nestedBeadsDir := filepath.Join(parentBeadsDir, "nested-workspace")
-	writeOwnershipMetadata(t, parentBeadsDir, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite})
+	writeOwnershipMetadata(t, parentBeadsDir, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite, SQLitePath: "beads.db"})
 	writeOwnershipMetadata(t, nestedBeadsDir, configfile.Config{Database: "dolt", Backend: configfile.BackendDolt})
 
 	binding, err := resolveDatabaseOwnershipStrict(nestedBeadsDir)
 	if err != nil || binding == nil || !databasePathsEqualForTest(t, binding.beadsDir, nestedBeadsDir) {
 		t.Fatalf("binding=%#v err=%v, want nested workspace %q", binding, err, nestedBeadsDir)
+	}
+}
+
+func TestResolveDatabaseOwnershipStrictUsesLiveDoltForBareSQLiteMetadata(t *testing.T) {
+	t.Setenv("BEADS_DIR", "")
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	databasePath := filepath.Join(beadsDir, "embeddeddolt", "beads")
+	writeOwnershipMetadata(t, beadsDir, configfile.Config{
+		Database: "beads.db",
+		Backend:  configfile.BackendSQLite,
+	})
+	if err := os.MkdirAll(filepath.Join(databasePath, ".dolt"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	binding, err := resolveDatabaseOwnershipStrict(databasePath)
+	if err != nil {
+		t.Fatalf("resolveDatabaseOwnershipStrict: %v", err)
+	}
+	if binding == nil {
+		t.Fatal("resolveDatabaseOwnershipStrict returned no owner")
+	}
+	if !databasePathsEqualForTest(t, binding.beadsDir, beadsDir) {
+		t.Fatalf("owner = %q, want %q", binding.beadsDir, beadsDir)
+	}
+	if binding.backend != configfile.BackendDolt {
+		t.Fatalf("backend = %q, want %q", binding.backend, configfile.BackendDolt)
+	}
+	if binding.scope != databaseOwnershipScopeDescendant {
+		t.Fatalf("scope = %v, want descendant scope", binding.scope)
+	}
+	wantOwnedPath := filepath.Join(beadsDir, "embeddeddolt")
+	if !databasePathsEqualForTest(t, binding.ownedPath, wantOwnedPath) {
+		t.Fatalf("owned path = %q, want %q", binding.ownedPath, wantOwnedPath)
+	}
+}
+
+func TestResolveDatabaseOwnershipStrictUsesDefaultSQLiteScopeForBareMetadata(t *testing.T) {
+	t.Setenv("BEADS_DIR", "")
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	databasePath := filepath.Join(beadsDir, "beads.db")
+	writeOwnershipMetadata(t, beadsDir, configfile.Config{
+		Database: "beads.db",
+		Backend:  configfile.BackendSQLite,
+	})
+
+	binding, err := resolveDatabaseOwnershipStrict(databasePath)
+	if err != nil {
+		t.Fatalf("resolveDatabaseOwnershipStrict: %v", err)
+	}
+	if binding == nil {
+		t.Fatal("resolveDatabaseOwnershipStrict returned no owner")
+	}
+	if binding.backend != configfile.BackendSQLite {
+		t.Fatalf("backend = %q, want %q", binding.backend, configfile.BackendSQLite)
+	}
+	if binding.scope != databaseOwnershipScopeExact {
+		t.Fatalf("scope = %v, want exact scope", binding.scope)
+	}
+	if !databasePathsEqualForTest(t, binding.ownedPath, databasePath) {
+		t.Fatalf("owned path = %q, want %q", binding.ownedPath, databasePath)
+	}
+}
+
+func TestResolveDatabaseOwnershipStrictSelectedRootProbesBareSQLiteEvidence(t *testing.T) {
+	t.Setenv("BEADS_DIR", "")
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	writeOwnershipMetadata(t, beadsDir, configfile.Config{
+		Database: "beads.db",
+		Backend:  configfile.BackendSQLite,
+	})
+	if err := os.Mkdir(filepath.Join(beadsDir, "embeddeddolt"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	binding, err := resolveDatabaseOwnershipStrict(beadsDir)
+	if binding != nil || err == nil || !strings.Contains(err.Error(), "embedded Dolt root is present but contains no repositories") {
+		t.Fatalf("binding=%#v err=%v, want selected-root evidence rejection", binding, err)
+	}
+}
+
+func TestResolveDatabaseOwnershipStrictSkipsIrrelevantBareSQLiteEvidenceProbe(t *testing.T) {
+	t.Setenv("BEADS_DIR", "")
+	root := t.TempDir()
+	parentBeadsDir := filepath.Join(root, ".beads")
+	nestedBeadsDir := filepath.Join(root, "nested", ".beads")
+	databasePath := filepath.Join(nestedBeadsDir, "embeddeddolt", "beads")
+	writeOwnershipMetadata(t, parentBeadsDir, configfile.Config{
+		Database: "beads.db",
+		Backend:  configfile.BackendSQLite,
+	})
+	if err := os.Mkdir(filepath.Join(parentBeadsDir, "embeddeddolt"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeOwnershipMetadata(t, nestedBeadsDir, configfile.Config{
+		Database: "dolt",
+		Backend:  configfile.BackendDolt,
+	})
+	if err := os.MkdirAll(filepath.Join(databasePath, ".dolt"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	binding, err := resolveDatabaseOwnershipStrict(databasePath)
+	if err != nil {
+		t.Fatalf("resolveDatabaseOwnershipStrict probed irrelevant parent evidence: %v", err)
+	}
+	if binding == nil || !databasePathsEqualForTest(t, binding.beadsDir, nestedBeadsDir) {
+		t.Fatalf("binding = %#v, want nested owner %q", binding, nestedBeadsDir)
 	}
 }
 
@@ -100,7 +208,7 @@ func TestResolveDatabaseOwnershipStrictPreservesSourceHierarchyAcrossRedirects(t
 		if err := os.WriteFile(filepath.Join(parentSource, "redirect"), []byte(parentTarget+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		writeOwnershipMetadata(t, parentTarget, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite})
+		writeOwnershipMetadata(t, parentTarget, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite, SQLitePath: "beads.db"})
 		writeOwnershipMetadata(t, nestedSource, configfile.Config{Database: "dolt", Backend: configfile.BackendDolt})
 
 		binding, err := resolveDatabaseOwnershipStrict(nestedSource)
@@ -120,7 +228,7 @@ func TestResolveDatabaseOwnershipStrictPreservesSourceHierarchyAcrossRedirects(t
 		if err := os.Mkdir(nestedTarget, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		writeOwnershipMetadata(t, parentSource, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite})
+		writeOwnershipMetadata(t, parentSource, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite, SQLitePath: "beads.db"})
 		if err := os.WriteFile(filepath.Join(nestedSource, "redirect"), []byte(nestedTarget+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -149,7 +257,7 @@ func TestResolveDatabaseOwnershipStrictPreservesSourceHierarchyAcrossRedirects(t
 		if err := os.WriteFile(filepath.Join(nestedSource, "redirect"), []byte(nestedTarget+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		writeOwnershipMetadata(t, parentTarget, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite})
+		writeOwnershipMetadata(t, parentTarget, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite, SQLitePath: "beads.db"})
 		writeOwnershipMetadata(t, nestedTarget, configfile.Config{Database: "dolt", Backend: configfile.BackendDolt})
 
 		binding, err := resolveDatabaseOwnershipStrict(nestedSource)
@@ -470,7 +578,7 @@ func TestResolveDatabaseOwnershipStrictRejectsContradictionAndAmbiguity(t *testi
 		}
 		wrong := filepath.Join(t.TempDir(), ".beads")
 		owner := filepath.Join(t.TempDir(), ".beads")
-		writeOwnershipMetadata(t, wrong, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite})
+		writeOwnershipMetadata(t, wrong, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite, SQLitePath: "beads.db"})
 		writeOwnershipMetadata(t, owner, configfile.Config{Database: "dolt", Backend: configfile.BackendDolt, DoltDataDir: filepath.Dir(dbPath)})
 		binding, err := resolveDatabaseOwnershipStrict(dbPath,
 			databaseWorkspaceHint{beadsDir: wrong, authoritative: true},
@@ -556,7 +664,7 @@ func TestResolveDatabaseOwnershipStrictProviderPaths(t *testing.T) {
 		},
 		{
 			name:        "sqlite default file",
-			cfg:         configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite},
+			cfg:         configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite, SQLitePath: "beads.db"},
 			selector:    func(dir string) string { return filepath.Join(dir, "beads.db") },
 			wantBackend: configfile.BackendSQLite,
 		},
@@ -616,7 +724,7 @@ func TestResolveDatabaseOwnershipStrictWorkspaceRootMayBindAnyProvider(t *testin
 		},
 		{
 			name:      "sqlite",
-			cfg:       configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite},
+			cfg:       configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite, SQLitePath: "beads.db"},
 			ownedPath: func(beadsDir string) string { return filepath.Join(beadsDir, "beads.db") },
 		},
 		{
@@ -660,7 +768,7 @@ func TestResolveDatabaseOwnershipStrictProviderPathBoundaries(t *testing.T) {
 		if err := os.MkdirAll(filepath.Dir(selector), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		writeOwnershipMetadata(t, beadsDir, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite})
+		writeOwnershipMetadata(t, beadsDir, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite, SQLitePath: "beads.db"})
 		binding, err := resolveDatabaseOwnershipStrict(selector, databaseWorkspaceHint{beadsDir: beadsDir})
 		if binding != nil || err == nil || !strings.Contains(err.Error(), "not a regular file") {
 			t.Fatalf("binding=%#v err=%v, want SQLite directory rejection", binding, err)
@@ -922,6 +1030,49 @@ func TestResolveDatabaseOwnershipStrictEnvironmentPolicyIsRetained(t *testing.T)
 	}
 }
 
+func TestResolveDatabaseOwnershipStrictUsesAuthorizedEnvironmentDoltScopeForBareSQLiteMetadata(t *testing.T) {
+	t.Setenv("BEADS_DIR", "")
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	writeOwnershipMetadata(t, beadsDir, configfile.Config{
+		Database: "beads.db",
+		Backend:  configfile.BackendSQLite,
+	})
+	if err := os.MkdirAll(filepath.Join(beadsDir, "embeddeddolt", "beads", ".dolt"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	environmentDataDir := "authorized-dolt"
+	ownedPath := filepath.Join(beadsDir, environmentDataDir)
+	selector := filepath.Join(ownedPath, "source")
+	if err := os.MkdirAll(selector, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DOLT_DATA_DIR", environmentDataDir)
+
+	binding, err := resolveDatabaseOwnershipStrict(selector, databaseWorkspaceHint{beadsDir: beadsDir})
+	if binding != nil || !errors.Is(err, errDatabaseOwnershipContradiction) {
+		t.Fatalf("unauthorized environment binding=%#v err=%v, want ownership contradiction", binding, err)
+	}
+
+	binding, err = resolveDatabaseOwnershipStrict(selector, databaseWorkspaceHint{
+		beadsDir:                beadsDir,
+		allowEnvironmentDataDir: true,
+		authoritative:           true,
+	})
+	if err != nil {
+		t.Fatalf("resolveDatabaseOwnershipStrict: %v", err)
+	}
+	if binding == nil {
+		t.Fatal("resolveDatabaseOwnershipStrict returned no owner")
+	}
+	if binding.backend != configfile.BackendDolt || binding.source != databaseOwnershipExplicitEnvironment {
+		t.Fatalf("binding backend/source = %q/%v, want Dolt explicit-environment ownership", binding.backend, binding.source)
+	}
+	if binding.scope != databaseOwnershipScopeDescendant || !databasePathsEqualForTest(t, binding.ownedPath, ownedPath) {
+		t.Fatalf("binding scope/path = %v/%q, want descendant scope at %q", binding.scope, binding.ownedPath, ownedPath)
+	}
+}
+
 func TestResolveDatabaseOwnershipStrictAuthoritativeHintSuppressesAmbientWorkspace(t *testing.T) {
 	root := t.TempDir()
 	selectedBeadsDir := filepath.Join(root, "selected", ".beads")
@@ -1151,7 +1302,7 @@ func TestResolveDatabaseOwnershipStrictDoesNotLetParentWorkspaceContradictNested
 	if err := os.MkdirAll(dbPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	writeOwnershipMetadata(t, parentBeadsDir, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite})
+	writeOwnershipMetadata(t, parentBeadsDir, configfile.Config{Database: "beads.db", Backend: configfile.BackendSQLite, SQLitePath: "beads.db"})
 	writeOwnershipMetadata(t, nestedBeadsDir, configfile.Config{Database: "dolt", Backend: configfile.BackendDolt})
 
 	binding, err := resolveDatabaseOwnershipStrict(dbPath)

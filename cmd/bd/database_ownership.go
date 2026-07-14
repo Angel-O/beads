@@ -10,6 +10,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage/workspacestate"
 )
 
 const (
@@ -547,8 +548,27 @@ func databaseOwnershipFromConfig(selector *resolvedDatabasePath, candidate route
 	if selector == nil || candidate.resolved == nil {
 		return nil, false, errors.New("database ownership observation is incomplete")
 	}
-	backend := cfg.GetBackend()
 	workspaceRootSelected := candidate.workspaceRootSelected || resolvedDatabasePathEqual(selector, candidate.resolved)
+	if !workspaceRootSelected && cfg != nil && cfg.Backend == configfile.BackendSQLite && cfg.SQLitePath == "" {
+		relevant, err := bareSQLiteDatabaseOwnershipRelevant(
+			selector,
+			candidate.beadsDir,
+			cfg,
+			candidate.allowAuthoritativeEnvironmentDataDir,
+		)
+		if err != nil {
+			return nil, false, err
+		}
+		if !relevant {
+			return nil, false, nil
+		}
+	}
+	effectiveConfig, err := workspacestate.EffectiveConfig(candidate.beadsDir, cfg)
+	if err != nil {
+		return nil, false, err
+	}
+	cfg = effectiveConfig
+	backend := cfg.GetBackend()
 	source := databaseOwnershipPersisted
 	scope := databaseOwnershipScopeWorkspace
 
@@ -565,7 +585,6 @@ func databaseOwnershipFromConfig(selector *resolvedDatabasePath, candidate route
 		if ownedPath == "" {
 			ownedPath = cfg.PersistedDoltDataPath(candidate.beadsDir)
 		}
-		var err error
 		ownedResolved, err = resolveCanonicalDatabasePath(ownedPath)
 		if err != nil {
 			return nil, false, err
@@ -586,7 +605,6 @@ func databaseOwnershipFromConfig(selector *resolvedDatabasePath, candidate route
 		if ownedPath == "" {
 			ownedPath = "beads.db"
 		}
-		var err error
 		ownedResolved, err = resolveCanonicalDatabasePath(databasePathRelativeToWorkspace(ownedPath, candidate.beadsDir))
 		if err != nil {
 			return nil, false, err
@@ -630,6 +648,42 @@ func databaseOwnershipFromConfig(selector *resolvedDatabasePath, candidate route
 		ownedResolved:  ownedResolved,
 		sourceResolved: sourceResolved,
 	}, true, nil
+}
+
+// bareSQLiteDatabaseOwnershipRelevant checks both possible path scopes before
+// provider evidence resolves legacy backend="sqlite" metadata without a
+// sqlite_path. Irrelevant candidates must not probe provider state merely
+// because an ancestor carries the ambiguous legacy marker.
+func bareSQLiteDatabaseOwnershipRelevant(
+	selector *resolvedDatabasePath,
+	beadsDir string,
+	cfg *configfile.Config,
+	allowAuthoritativeEnvironmentDataDir bool,
+) (bool, error) {
+	sqlitePath, err := resolveCanonicalDatabasePath(filepath.Join(beadsDir, "beads.db"))
+	if err != nil {
+		return false, err
+	}
+	if resolvedDatabasePathEqual(selector, sqlitePath) {
+		return true, nil
+	}
+
+	doltConfig := *cfg
+	doltConfig.Backend = configfile.BackendDolt
+	doltOwnedPath := ""
+	if allowAuthoritativeEnvironmentDataDir {
+		if environmentPath := os.Getenv("BEADS_DOLT_DATA_DIR"); environmentPath != "" {
+			doltOwnedPath = databasePathRelativeToWorkspace(environmentPath, beadsDir)
+		}
+	}
+	if doltOwnedPath == "" {
+		doltOwnedPath = doltConfig.PersistedDoltDataPath(beadsDir)
+	}
+	doltPath, err := resolveCanonicalDatabasePath(doltOwnedPath)
+	if err != nil {
+		return false, err
+	}
+	return resolvedDatabasePathEqualOrDescendant(selector, doltPath), nil
 }
 
 func databaseOwnershipSourceObservations(sources []routedDatabaseOwnershipSource) ([]*resolvedDatabasePath, error) {
