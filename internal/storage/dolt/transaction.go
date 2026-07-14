@@ -338,6 +338,10 @@ func (t *doltTransaction) SearchIssues(ctx context.Context, query string, filter
 		whereClauses = append(whereClauses, "LOWER(external_ref) LIKE ?")
 		args = append(args, "%"+strings.ToLower(filter.ExternalRefContains)+"%")
 	}
+	if filter.ExternalRef != nil {
+		whereClauses = append(whereClauses, "external_ref = ?")
+		args = append(args, *filter.ExternalRef)
+	}
 
 	// Status
 	if filter.Status != nil {
@@ -725,7 +729,7 @@ func (t *doltTransaction) AddDependencyWithOptions(ctx context.Context, dep *typ
 		}
 		opts.PrecheckedTarget = precheck
 		if !addOpts.SkipCycleCheck {
-			if err := t.checkCrossTierBlockingCycle(ctx, dep); err != nil {
+			if err := t.checkCrossTierSchedulingCycle(ctx, dep); err != nil {
 				return err
 			}
 			opts.SkipCycleCheck = true
@@ -782,12 +786,16 @@ func (t *doltTransaction) readDepTargetForPrecheck(ctx context.Context, targetTa
 	return &p, nil
 }
 
-// checkCrossTierBlockingCycle rejects a blocking edge that would close a
-// cycle, using the merged view of both sessions' dependency tables. The
-// in-tx cycle check scans both tables on the write tx and so misses edges
-// added on the other session earlier in this logical transaction.
-func (t *doltTransaction) checkCrossTierBlockingCycle(ctx context.Context, dep *types.Dependency) error {
-	if dep.Type != types.DepBlocks && dep.Type != types.DepConditionalBlocks {
+// checkCrossTierSchedulingCycle rejects a scheduling edge (blocks,
+// conditional-blocks, parent-child — the same set issueops.CheckDependencyCycleInTx
+// gates) that would close a cycle, using the merged view of both sessions'
+// dependency tables. The in-tx cycle check scans both tables on the write tx
+// and so misses edges added on the other session earlier in this logical
+// transaction.
+func (t *doltTransaction) checkCrossTierSchedulingCycle(ctx context.Context, dep *types.Dependency) error {
+	switch dep.Type {
+	case types.DepBlocks, types.DepConditionalBlocks, types.DepParentChild:
+	default:
 		return nil
 	}
 	cycle, err := t.CycleThroughEdges(ctx, [][2]string{{dep.IssueID, dep.DependsOnID}})
@@ -800,17 +808,17 @@ func (t *doltTransaction) checkCrossTierBlockingCycle(ctx context.Context, dep *
 	return nil
 }
 
-// CycleThroughEdges reports a blocking cycle through one of the new edges.
+// CycleThroughEdges reports a scheduling cycle through one of the new edges.
 // The graph merges the regular tx's dependencies with the ignored tx's
 // wisp_dependencies, so uncommitted writes on both sides are gated — the
 // previous DetectCycles ran only on the regular tx and let bulk wisp edges
-// commit blocking cycles (bd-578h9.9).
+// commit scheduling cycles (bd-578h9.9).
 func (t *doltTransaction) CycleThroughEdges(ctx context.Context, edges [][2]string) (string, error) {
 	graph := make(map[string][]string)
-	if err := issueops.AppendBlockingGraphInTx(ctx, t.txFor("dependencies"), []string{"dependencies"}, graph); err != nil {
+	if err := issueops.AppendSchedulingGraphInTx(ctx, t.txFor("dependencies"), []string{"dependencies"}, graph); err != nil {
 		return "", err
 	}
-	if err := issueops.AppendBlockingGraphInTx(ctx, t.txFor("wisp_dependencies"), []string{"wisp_dependencies"}, graph); err != nil {
+	if err := issueops.AppendSchedulingGraphInTx(ctx, t.txFor("wisp_dependencies"), []string{"wisp_dependencies"}, graph); err != nil {
 		return "", err
 	}
 	return issueops.CycleThroughEdgesInGraph(graph, edges), nil
