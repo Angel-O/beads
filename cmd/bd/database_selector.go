@@ -32,33 +32,49 @@ func validateDatabaseSelectorPath(path string) error {
 // Any operation that subsequently opens or creates the selector must repeat
 // its authoritative checks and hold the required lifetime fence (bd-3u1fs).
 func validatedDatabaseSelectorPath(path string) (string, error) {
-	return validatedDatabaseSelectorPathWithObserver(path, safefile.ObserveMetadataNoFollow)
+	resolved, err := validatedDatabaseSelector(path)
+	if err != nil {
+		return "", err
+	}
+	return resolved.path, nil
 }
 
 func validatedDatabaseSelectorPathWithObserver(path string, observer databaseMetadataObserver) (string, error) {
+	resolved, err := validatedDatabaseSelectorWithObserver(path, observer)
+	if err != nil {
+		return "", err
+	}
+	return resolved.path, nil
+}
+
+func validatedDatabaseSelector(path string) (*resolvedDatabasePath, error) {
+	return validatedDatabaseSelectorWithObserver(path, safefile.ObserveMetadataNoFollow)
+}
+
+func validatedDatabaseSelectorWithObserver(path string, observer databaseMetadataObserver) (*resolvedDatabasePath, error) {
 	if path == "" {
-		return "", errors.New("database selector is empty")
+		return nil, errors.New("database selector is empty")
 	}
 	resolved, err := resolveCanonicalDatabasePathWithObserver(path, observer)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if resolved.exists {
 		info := resolved.observed.Info
 		if !info.IsDir() && !info.Mode().IsRegular() {
-			return "", fmt.Errorf("database selector is not a directory or regular file: %q", resolved.path)
+			return nil, fmt.Errorf("database selector is not a directory or regular file: %q", resolved.path)
 		}
 		if info.Mode().IsRegular() {
 			if err := validateRegularDatabaseFileLinkCount("database selector", resolved.path, resolved.observed); err != nil {
-				return "", err
+				return nil, err
 			}
 		}
-		return resolved.path, nil
+		return resolved, nil
 	}
 	if !resolved.observed.Info.IsDir() {
-		return "", fmt.Errorf("database selector parent is not a directory: %q", filepath.Dir(resolved.path))
+		return nil, fmt.Errorf("database selector parent is not a directory: %q", filepath.Dir(resolved.path))
 	}
-	return resolved.path, nil
+	return resolved, nil
 }
 
 func validateRegularDatabaseFileLinkCount(description, path string, observation *safefile.MetadataObservation) error {
@@ -114,10 +130,7 @@ func databasePathEqualOrDescendant(path, root string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if canonicalDatabasePathEqualOrDescendant(canonicalPath.path, canonicalRoot.path) {
-		return true, nil
-	}
-	return equivalentCaseInsensitiveMissingDatabaseLeaf(canonicalPath, canonicalRoot), nil
+	return resolvedDatabasePathEqualOrDescendant(canonicalPath, canonicalRoot), nil
 }
 
 func databasePathEqual(left, right string) (bool, error) {
@@ -132,8 +145,20 @@ func databasePathEqual(left, right string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return canonicalLeft.path == canonicalRight.path ||
-		equivalentCaseInsensitiveMissingDatabaseLeaf(canonicalLeft, canonicalRight), nil
+	return resolvedDatabasePathEqual(canonicalLeft, canonicalRight), nil
+}
+
+func resolvedDatabasePathEqual(left, right *resolvedDatabasePath) bool {
+	return left != nil && right != nil && (left.path == right.path ||
+		equivalentCaseInsensitiveMissingDatabaseLeaf(left, right))
+}
+
+func resolvedDatabasePathEqualOrDescendant(path, root *resolvedDatabasePath) bool {
+	if path == nil || root == nil {
+		return false
+	}
+	return canonicalDatabasePathEqualOrDescendant(path.path, root.path) ||
+		equivalentCaseInsensitiveMissingDatabaseLeaf(path, root)
 }
 
 // canonicalDatabasePathEqualOrDescendant compares already-canonical absolute
