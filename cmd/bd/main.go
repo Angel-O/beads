@@ -693,7 +693,12 @@ var rootCmd = &cobra.Command{
 		// No subcommand - show help
 		_ = cmd.Help() // Help() always returns nil for cobra commands
 	},
-	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) (returnErr error) {
+		defer func() {
+			if cmd == initCmd {
+				clearInitBackendPreflightAfterError(cmd, &returnErr)
+			}
+		}()
 		// Initialize CommandContext to hold runtime state (replaces scattered globals)
 		initCommandContext()
 		if cmd == initCmd {

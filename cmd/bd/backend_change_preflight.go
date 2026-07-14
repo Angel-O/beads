@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/storage/workspacestate"
 	"github.com/steveyegge/beads/internal/utils"
+	"github.com/steveyegge/beads/internal/workspaceidentity"
 	"github.com/subosito/gotenv"
 )
 
@@ -76,6 +77,12 @@ type initBackendPreflight struct {
 	snapshot       *backendWorkspaceSnapshot
 	freshTarget    *initBackendFreshTargetSnapshot
 	sourceDatabase []initBackendSourceDatabaseSnapshot
+	witness        initBackendWorkspaceWitness
+}
+
+type initBackendWorkspaceWitness interface {
+	Revalidate() error
+	Close() error
 }
 
 type initBackendSourceDatabaseSnapshot struct {
@@ -110,10 +117,12 @@ type initBackendSelectorCandidates struct {
 }
 
 type initBackendPreflightDependencies struct {
-	resolveSelection   func(*cobra.Command) (initBackendSelection, error)
-	inspectWorkspace   func(string) (*backendWorkspaceSnapshot, error)
-	inspectFreshTarget func(string) (*initBackendFreshTargetSnapshot, error)
-	admit              func(string, *backendWorkspaceSnapshot) (string, error)
+	resolveSelection     func(*cobra.Command) (initBackendSelection, error)
+	inspectWorkspace     func(string) (*backendWorkspaceSnapshot, error)
+	inspectFreshTarget   func(string) (*initBackendFreshTargetSnapshot, error)
+	admit                func(string, *backendWorkspaceSnapshot) (string, error)
+	witnessSupported     func() bool
+	bindWorkspaceWitness func(string, int64) (initBackendWorkspaceWitness, error)
 }
 
 type initBackendPreflightContextKey struct{}
@@ -409,8 +418,10 @@ func prepareInitBackendPreflight(cmd *cobra.Command) error {
 	})
 }
 
-func prepareInitBackendPreflightWith(cmd *cobra.Command, deps initBackendPreflightDependencies) error {
-	clearInitBackendPreflight(cmd)
+func prepareInitBackendPreflightWith(cmd *cobra.Command, deps initBackendPreflightDependencies) (returnErr error) {
+	if err := clearInitBackendPreflight(cmd); err != nil {
+		return err
+	}
 	if cmd == nil {
 		return errInitBackendPreflightMissing
 	}
@@ -429,9 +440,58 @@ func prepareInitBackendPreflightWith(cmd *cobra.Command, deps initBackendPreflig
 	if err != nil {
 		return err
 	}
+	// The existing observation remains the compatibility-preserving eligibility
+	// probe. Only a direct initialized physical workspace receives the stronger
+	// retained-identity path below.
 	snapshot, err := deps.inspectWorkspace(selection.selector)
 	if err != nil {
 		return err
+	}
+	witnessSupported := workspaceidentity.Supported
+	if deps.witnessSupported != nil {
+		witnessSupported = deps.witnessSupported
+	}
+	bindWitness := func(path string, limit int64) (initBackendWorkspaceWitness, error) {
+		witness, _, bindErr := workspaceidentity.BindExisting(path, limit)
+		return witness, bindErr
+	}
+	if deps.bindWorkspaceWitness != nil {
+		bindWitness = deps.bindWorkspaceWitness
+	}
+	var witness initBackendWorkspaceWitness
+	defer func() {
+		if returnErr != nil && witness != nil {
+			if closeErr := witness.Close(); closeErr != nil {
+				returnErr = errors.Join(returnErr, closeErr)
+			}
+		}
+	}()
+	witnessEligible := witnessSupported() && initBackendWitnessEligible(selection, snapshot)
+	if witnessEligible {
+		witnessEligible, err = initBackendCurrentMetadataEligible(snapshot)
+		if err != nil {
+			return err
+		}
+	}
+	if witnessEligible {
+		witness, err = bindWitness(snapshot.route.target.path, workspaceidentity.MaxMetadataBytes)
+		if err != nil {
+			return classifyInitBackendWitnessError(err)
+		}
+		if err := witness.Revalidate(); err != nil {
+			return classifyInitBackendWitnessError(err)
+		}
+		witnessed, err := deps.inspectWorkspace(selection.selector)
+		if err != nil {
+			return err
+		}
+		if err := witness.Revalidate(); err != nil {
+			return classifyInitBackendWitnessError(err)
+		}
+		if !equalBackendWorkspaceSnapshots(snapshot, witnessed) {
+			return fmt.Errorf("%w: workspace snapshot changed", errInitBackendPreflightChanged)
+		}
+		snapshot = witnessed
 	}
 	var freshTarget *initBackendFreshTargetSnapshot
 	if snapshot == nil {
@@ -457,8 +517,58 @@ func prepareInitBackendPreflightWith(cmd *cobra.Command, deps initBackendPreflig
 		snapshot:       cloneBackendWorkspaceSnapshot(snapshot),
 		freshTarget:    cloneInitBackendFreshTargetSnapshot(freshTarget),
 		sourceDatabase: append([]initBackendSourceDatabaseSnapshot(nil), sourceDatabase...),
+		witness:        witness,
 	})
+	witness = nil // Ownership moved into the command-scoped preflight.
 	return nil
+}
+
+func initBackendWitnessEligible(selection initBackendSelection, snapshot *backendWorkspaceSnapshot) bool {
+	return !selection.source.isDatabase() && snapshot != nil && snapshot.state.initialized &&
+		snapshot.route.lane == backendWorkspaceLaneBinding && len(snapshot.route.bindingSources) == 1 &&
+		equalBackendPathFact(snapshot.route.bindingSources[0], snapshot.route.target) &&
+		utils.PathsEqual(selection.creationBeadsDir, snapshot.route.target.path)
+}
+
+func initBackendCurrentMetadataEligible(snapshot *backendWorkspaceSnapshot) (bool, error) {
+	if snapshot == nil || snapshot.route.target.path == "" {
+		return false, nil
+	}
+	currentPath := configfile.ConfigPath(snapshot.route.target.path)
+	if _, err := os.Lstat(currentPath); err == nil {
+		return true, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, databasePathOperationError("inspect current metadata eligibility", currentPath, err)
+	}
+
+	// Read the metadata selection again only when the current file is absent.
+	// A stable legacy-only workspace compares equal and keeps the Slice 1 path;
+	// a current file that disappeared after the probe compares different and is
+	// treated as drift rather than being mistaken for legacy compatibility.
+	_, observed, err := configfile.LoadReadOnlySnapshot(snapshot.route.target.path)
+	if err != nil {
+		return false, err
+	}
+	if !snapshot.metadata.Equal(observed) {
+		return false, classifyInitBackendWitnessError(workspaceidentity.ErrChanged)
+	}
+	if _, err := os.Lstat(currentPath); err == nil {
+		return true, nil
+	} else if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	} else {
+		return false, databasePathOperationError("reinspect current metadata eligibility", currentPath, err)
+	}
+}
+
+func classifyInitBackendWitnessError(err error) error {
+	if errors.Is(err, workspaceidentity.ErrIneligible) {
+		err = errors.Join(workspaceidentity.ErrChanged, err)
+	}
+	if errors.Is(err, workspaceidentity.ErrChanged) {
+		return fmt.Errorf("%w: workspace identity changed: %w", errInitBackendPreflightChanged, err)
+	}
+	return err
 }
 
 func consumeInitBackendPreflight(cmd *cobra.Command) (initBackendAdmission, error) {
@@ -470,11 +580,22 @@ func consumeInitBackendPreflight(cmd *cobra.Command) (initBackendAdmission, erro
 	})
 }
 
-func consumeInitBackendPreflightWith(cmd *cobra.Command, deps initBackendPreflightDependencies) (initBackendAdmission, error) {
+func consumeInitBackendPreflightWith(cmd *cobra.Command, deps initBackendPreflightDependencies) (result initBackendAdmission, returnErr error) {
 	preflight := takeInitBackendPreflight(cmd)
 	if preflight == nil {
 		return initBackendAdmission{}, errInitBackendPreflightMissing
 	}
+	defer func() {
+		if preflight.witness == nil {
+			return
+		}
+		closeErr := preflight.witness.Close()
+		preflight.witness = nil
+		if closeErr != nil {
+			result = initBackendAdmission{}
+			returnErr = errors.Join(returnErr, closeErr)
+		}
+	}()
 	if deps.resolveSelection == nil || deps.inspectWorkspace == nil || deps.inspectFreshTarget == nil || deps.admit == nil {
 		return initBackendAdmission{}, errors.New("init backend admission dependencies are incomplete")
 	}
@@ -486,9 +607,19 @@ func consumeInitBackendPreflightWith(cmd *cobra.Command, deps initBackendPreflig
 	if err != nil {
 		return initBackendAdmission{}, err
 	}
+	if preflight.witness != nil {
+		if err := preflight.witness.Revalidate(); err != nil {
+			return initBackendAdmission{}, classifyInitBackendWitnessError(err)
+		}
+	}
 	snapshot, err := deps.inspectWorkspace(selection.selector)
 	if err != nil {
 		return initBackendAdmission{}, err
+	}
+	if preflight.witness != nil {
+		if err := preflight.witness.Revalidate(); err != nil {
+			return initBackendAdmission{}, classifyInitBackendWitnessError(err)
+		}
 	}
 	// Re-run admission on the second workspace observation before any drift
 	// branch below. Fresh-target validation is additional authority checking;
@@ -531,7 +662,7 @@ func consumeInitBackendPreflightWith(cmd *cobra.Command, deps initBackendPreflig
 	if admitted != preflight.requested {
 		return initBackendAdmission{}, fmt.Errorf("%w: requested backend changed", errInitBackendPreflightChanged)
 	}
-	result, err := buildInitBackendAdmission(admitted, selection, snapshot)
+	result, err = buildInitBackendAdmission(admitted, selection, snapshot)
 	if err != nil {
 		return initBackendAdmission{}, err
 	}
@@ -749,12 +880,28 @@ func takeInitBackendPreflight(cmd *cobra.Command) *initBackendPreflight {
 	return preflight
 }
 
-func clearInitBackendPreflight(cmd *cobra.Command) {
+func clearInitBackendPreflight(cmd *cobra.Command) error {
 	if cmd == nil || cmd.Context() == nil {
-		return
+		return nil
 	}
 	if state, _ := cmd.Context().Value(initBackendPreflightContextKey{}).(*initBackendPreflightContextState); state != nil {
+		preflight := state.preflight
 		state.preflight = nil
+		if preflight != nil && preflight.witness != nil {
+			err := preflight.witness.Close()
+			preflight.witness = nil
+			return err
+		}
+	}
+	return nil
+}
+
+func clearInitBackendPreflightAfterError(cmd *cobra.Command, returnErr *error) {
+	if returnErr == nil || *returnErr == nil {
+		return
+	}
+	if clearErr := clearInitBackendPreflight(cmd); clearErr != nil {
+		*returnErr = errors.Join(*returnErr, clearErr)
 	}
 }
 

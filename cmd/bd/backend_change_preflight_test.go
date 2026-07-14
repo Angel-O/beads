@@ -17,6 +17,7 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/workspaceidentity"
 )
 
 func TestSelectInitBackendSelectionPrecedence(t *testing.T) {
@@ -464,6 +465,506 @@ func TestInitBackendPreflightStableLifecycle(t *testing.T) {
 	if _, err := consumeInitBackendPreflightWith(cmd, deps); !errors.Is(err, errInitBackendPreflightMissing) {
 		t.Fatalf("second consume error = %v, want missing-preflight sentinel", err)
 	}
+}
+
+func TestPrepareInitBackendPreflightWitnessRejectsPostEligibilityReplacement(t *testing.T) {
+	if !workspaceidentity.Supported() {
+		return
+	}
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	writeOwnershipMetadata(t, beadsDir, configfile.Config{Backend: configfile.BackendDolt})
+	writeBackendObserverDolt(t, beadsDir)
+	selection := initBackendSelection{
+		source: initBackendSelectionBeadsDir, selector: beadsDir, creationBeadsDir: beadsDir,
+	}
+	eligibility, err := inspectBackendWorkspaceSnapshot(beadsDir)
+	if err != nil || !initBackendWitnessEligible(selection, eligibility) {
+		t.Fatalf("eligibility = %#v, %v; want direct initialized workspace", eligibility, err)
+	}
+	originalMetadata, err := os.ReadFile(configfile.ConfigPath(beadsDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspectCalls := 0
+	deps := initBackendPreflightDependencies{
+		resolveSelection: func(*cobra.Command) (initBackendSelection, error) { return selection, nil },
+		inspectWorkspace: func(string) (*backendWorkspaceSnapshot, error) {
+			inspectCalls++
+			if inspectCalls == 2 {
+				if err := os.Rename(beadsDir, beadsDir+"-original"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(beadsDir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(configfile.ConfigPath(beadsDir), originalMetadata, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return cloneBackendWorkspaceSnapshot(eligibility), nil
+		},
+		inspectFreshTarget: inspectInitBackendFreshTarget,
+		admit:              admitInitBackend,
+	}
+	err = prepareInitBackendPreflightWith(newInitBackendPreflightTestCommand(t, configfile.BackendDolt), deps)
+	if !errors.Is(err, workspaceidentity.ErrChanged) || !errors.Is(err, errInitBackendPreflightChanged) {
+		t.Fatalf("prepare replacement error = %v, want witness and existing changed classifications", err)
+	}
+	if inspectCalls != 2 {
+		t.Fatalf("workspace inspections = %d, want eligibility plus witnessed inspection", inspectCalls)
+	}
+	decoyMetadata, readErr := os.ReadFile(configfile.ConfigPath(beadsDir))
+	if readErr != nil || string(decoyMetadata) != string(originalMetadata) {
+		t.Fatalf("replacement metadata changed after refusal: %q, %v", decoyMetadata, readErr)
+	}
+}
+
+func TestPrepareInitBackendPreflightLegacyMetadataPreservesMigrationRefusal(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyPath := filepath.Join(beadsDir, "config.json")
+	legacyBytes := []byte(`{"database":"dolt","backend":"dolt"}`)
+	if err := os.WriteFile(legacyPath, legacyBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeBackendObserverDolt(t, beadsDir)
+	selection := initBackendSelection{
+		source: initBackendSelectionBeadsDir, selector: beadsDir, creationBeadsDir: beadsDir,
+	}
+	inspections, admissions, binds := 0, 0, 0
+	deps := initBackendPreflightDependencies{
+		resolveSelection: func(*cobra.Command) (initBackendSelection, error) { return selection, nil },
+		inspectWorkspace: func(selector string) (*backendWorkspaceSnapshot, error) {
+			inspections++
+			return inspectBackendWorkspaceSnapshot(selector)
+		},
+		inspectFreshTarget: inspectInitBackendFreshTarget,
+		admit: func(requested string, snapshot *backendWorkspaceSnapshot) (string, error) {
+			admissions++
+			return admitInitBackend(requested, snapshot)
+		},
+		witnessSupported: func() bool { return true },
+		bindWorkspaceWitness: func(string, int64) (initBackendWorkspaceWitness, error) {
+			binds++
+			return nil, workspaceidentity.ErrIneligible
+		},
+	}
+
+	cmd := newInitBackendPreflightTestCommand(t, configfile.BackendPostgres)
+	err := prepareInitBackendPreflightWith(cmd, deps)
+	if !errors.Is(err, errBackendChangeRequiresMigration) || errors.Is(err, errInitBackendPreflightChanged) {
+		t.Fatalf("legacy migration refusal = %v, want unchanged migration-required error", err)
+	}
+	if inspections != 1 || admissions != 1 || binds != 0 {
+		t.Fatalf("legacy callbacks inspections=%d admissions=%d binds=%d, want 1/1/0", inspections, admissions, binds)
+	}
+	if takeInitBackendPreflight(cmd) != nil {
+		t.Fatal("failed legacy prepare retained a preflight")
+	}
+	if after, readErr := os.ReadFile(legacyPath); readErr != nil || string(after) != string(legacyBytes) {
+		t.Fatalf("legacy metadata changed after refusal: %q, %v", after, readErr)
+	}
+	if _, statErr := os.Lstat(configfile.ConfigPath(beadsDir)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("legacy refusal created current metadata: %v", statErr)
+	}
+}
+
+func TestPrepareInitBackendPreflightCurrentMetadataDisappearanceIsChanged(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	writeOwnershipMetadata(t, beadsDir, configfile.Config{Backend: configfile.BackendDolt})
+	writeBackendObserverDolt(t, beadsDir)
+	selection := initBackendSelection{
+		source: initBackendSelectionBeadsDir, selector: beadsDir, creationBeadsDir: beadsDir,
+	}
+	inspections, admissions, binds := 0, 0, 0
+	deps := initBackendPreflightDependencies{
+		resolveSelection: func(*cobra.Command) (initBackendSelection, error) { return selection, nil },
+		inspectWorkspace: func(selector string) (*backendWorkspaceSnapshot, error) {
+			inspections++
+			snapshot, err := inspectBackendWorkspaceSnapshot(selector)
+			if err != nil {
+				return nil, err
+			}
+			if err := os.Rename(configfile.ConfigPath(beadsDir), filepath.Join(beadsDir, "config.json")); err != nil {
+				t.Fatal(err)
+			}
+			return snapshot, nil
+		},
+		inspectFreshTarget: inspectInitBackendFreshTarget,
+		admit: func(requested string, snapshot *backendWorkspaceSnapshot) (string, error) {
+			admissions++
+			return admitInitBackend(requested, snapshot)
+		},
+		witnessSupported: func() bool { return true },
+		bindWorkspaceWitness: func(string, int64) (initBackendWorkspaceWitness, error) {
+			binds++
+			return &countingInitBackendWitness{}, nil
+		},
+	}
+
+	cmd := newInitBackendPreflightTestCommand(t, configfile.BackendDolt)
+	err := prepareInitBackendPreflightWith(cmd, deps)
+	if !errors.Is(err, workspaceidentity.ErrChanged) || !errors.Is(err, errInitBackendPreflightChanged) {
+		t.Fatalf("current metadata disappearance = %v, want both changed classifications", err)
+	}
+	if inspections != 1 || admissions != 0 || binds != 0 {
+		t.Fatalf("current disappearance callbacks inspections=%d admissions=%d binds=%d, want 1/0/0", inspections, admissions, binds)
+	}
+	if takeInitBackendPreflight(cmd) != nil {
+		t.Fatal("current metadata disappearance retained a preflight")
+	}
+	if _, statErr := os.Lstat(configfile.ConfigPath(beadsDir)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("current metadata reappeared after refusal: %v", statErr)
+	}
+}
+
+type countingInitBackendWitness struct {
+	revalidates int
+	closes      int
+	revalidate  error
+	close       error
+}
+
+func (w *countingInitBackendWitness) Revalidate() error { w.revalidates++; return w.revalidate }
+func (w *countingInitBackendWitness) Close() error      { w.closes++; return w.close }
+
+func TestInitBackendPreflightWitnessLifecycleAndEligibility(t *testing.T) {
+	directSnapshot := func(t *testing.T) *backendWorkspaceSnapshot {
+		t.Helper()
+		snapshot := newBackendStabilizerSnapshot(t)
+		snapshot.route.target = snapshot.route.bindingSources[0]
+		cfg := configfile.Config{Backend: configfile.BackendSQLite, SQLitePath: "beads.db"}
+		if err := cfg.Save(snapshot.route.target.path); err != nil {
+			t.Fatal(err)
+		}
+		_, metadata, err := configfile.LoadReadOnlySnapshot(snapshot.route.target.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot.metadata = metadata
+		return snapshot
+	}
+
+	t.Run("stable direct witness closes after consume", func(t *testing.T) {
+		snapshot := directSnapshot(t)
+		selection := initBackendSelection{source: initBackendSelectionBeadsDir, selector: snapshot.selector, creationBeadsDir: snapshot.route.target.path}
+		witness := &countingInitBackendWitness{}
+		inspections, binds := 0, 0
+		deps := initBackendPreflightDependencies{
+			resolveSelection: func(*cobra.Command) (initBackendSelection, error) { return selection, nil },
+			inspectWorkspace: func(string) (*backendWorkspaceSnapshot, error) {
+				inspections++
+				return cloneBackendWorkspaceSnapshot(snapshot), nil
+			},
+			inspectFreshTarget: inspectInitBackendFreshTarget,
+			admit:              admitInitBackend,
+			witnessSupported:   func() bool { return true },
+			bindWorkspaceWitness: func(string, int64) (initBackendWorkspaceWitness, error) {
+				binds++
+				return witness, nil
+			},
+		}
+		cmd := newInitBackendPreflightTestCommand(t, configfile.BackendSQLite)
+		if err := prepareInitBackendPreflightWith(cmd, deps); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := consumeInitBackendPreflightWith(cmd, deps); err != nil {
+			t.Fatal(err)
+		}
+		if binds != 1 || inspections != 3 || witness.revalidates != 4 || witness.closes != 1 {
+			t.Fatalf("binds=%d inspections=%d revalidates=%d closes=%d, want 1/3/4/1", binds, inspections, witness.revalidates, witness.closes)
+		}
+	})
+
+	t.Run("prepare failure closes witness without replacing the primary error", func(t *testing.T) {
+		snapshot := directSnapshot(t)
+		selection := initBackendSelection{source: initBackendSelectionBeadsDir, selector: snapshot.selector, creationBeadsDir: snapshot.route.target.path}
+		primaryErr := errors.New("prepare revalidation failed")
+		witness := &countingInitBackendWitness{revalidate: primaryErr}
+		deps := initBackendPreflightDependencies{
+			resolveSelection:     func(*cobra.Command) (initBackendSelection, error) { return selection, nil },
+			inspectWorkspace:     func(string) (*backendWorkspaceSnapshot, error) { return cloneBackendWorkspaceSnapshot(snapshot), nil },
+			inspectFreshTarget:   inspectInitBackendFreshTarget,
+			admit:                admitInitBackend,
+			witnessSupported:     func() bool { return true },
+			bindWorkspaceWitness: func(string, int64) (initBackendWorkspaceWitness, error) { return witness, nil },
+		}
+		cmd := newInitBackendPreflightTestCommand(t, configfile.BackendSQLite)
+		err := prepareInitBackendPreflightWith(cmd, deps)
+		if err != primaryErr {
+			t.Fatalf("prepare error = %#v, want unchanged primary error %#v", err, primaryErr)
+		}
+		if witness.closes != 1 || witness.revalidates != 1 {
+			t.Fatalf("prepare failure revalidates=%d closes=%d, want 1/1", witness.revalidates, witness.closes)
+		}
+		if takeInitBackendPreflight(cmd) != nil {
+			t.Fatal("prepare failure retained command-scoped preflight")
+		}
+	})
+
+	t.Run("consume drift closes witness and preserves both classifications", func(t *testing.T) {
+		snapshot := directSnapshot(t)
+		selection := initBackendSelection{source: initBackendSelectionBeadsDir, selector: snapshot.selector, creationBeadsDir: snapshot.route.target.path}
+		witness := &countingInitBackendWitness{}
+		deps := initBackendPreflightDependencies{
+			resolveSelection:     func(*cobra.Command) (initBackendSelection, error) { return selection, nil },
+			inspectWorkspace:     func(string) (*backendWorkspaceSnapshot, error) { return cloneBackendWorkspaceSnapshot(snapshot), nil },
+			inspectFreshTarget:   inspectInitBackendFreshTarget,
+			admit:                admitInitBackend,
+			witnessSupported:     func() bool { return true },
+			bindWorkspaceWitness: func(string, int64) (initBackendWorkspaceWitness, error) { return witness, nil },
+		}
+		cmd := newInitBackendPreflightTestCommand(t, configfile.BackendSQLite)
+		if err := prepareInitBackendPreflightWith(cmd, deps); err != nil {
+			t.Fatal(err)
+		}
+		witness.revalidate = workspaceidentity.ErrChanged
+		admission, err := consumeInitBackendPreflightWith(cmd, deps)
+		if admission != (initBackendAdmission{}) || !errors.Is(err, workspaceidentity.ErrChanged) || !errors.Is(err, errInitBackendPreflightChanged) {
+			t.Fatalf("consume drift = %#v, %v; want empty admission and both changed classifications", admission, err)
+		}
+		if witness.revalidates != 3 || witness.closes != 1 {
+			t.Fatalf("consume drift revalidates=%d closes=%d, want 3/1", witness.revalidates, witness.closes)
+		}
+	})
+
+	t.Run("close failure clears successful admission", func(t *testing.T) {
+		snapshot := directSnapshot(t)
+		selection := initBackendSelection{source: initBackendSelectionBeadsDir, selector: snapshot.selector, creationBeadsDir: snapshot.route.target.path}
+		closeErr := errors.New("close retained witness")
+		witness := &countingInitBackendWitness{close: closeErr}
+		deps := initBackendPreflightDependencies{
+			resolveSelection:     func(*cobra.Command) (initBackendSelection, error) { return selection, nil },
+			inspectWorkspace:     func(string) (*backendWorkspaceSnapshot, error) { return cloneBackendWorkspaceSnapshot(snapshot), nil },
+			inspectFreshTarget:   inspectInitBackendFreshTarget,
+			admit:                admitInitBackend,
+			witnessSupported:     func() bool { return true },
+			bindWorkspaceWitness: func(string, int64) (initBackendWorkspaceWitness, error) { return witness, nil },
+		}
+		cmd := newInitBackendPreflightTestCommand(t, configfile.BackendSQLite)
+		if err := prepareInitBackendPreflightWith(cmd, deps); err != nil {
+			t.Fatal(err)
+		}
+		admission, err := consumeInitBackendPreflightWith(cmd, deps)
+		if admission != (initBackendAdmission{}) || !errors.Is(err, closeErr) {
+			t.Fatalf("consume close failure = %#v, %v; want empty admission and close error", admission, err)
+		}
+		if witness.revalidates != 4 || witness.closes != 1 {
+			t.Fatalf("close failure revalidates=%d closes=%d, want 4/1", witness.revalidates, witness.closes)
+		}
+	})
+
+	t.Run("replacement and clear each close prior witness once", func(t *testing.T) {
+		snapshot := directSnapshot(t)
+		selection := initBackendSelection{source: initBackendSelectionBeadsDir, selector: snapshot.selector, creationBeadsDir: snapshot.route.target.path}
+		witnesses := []*countingInitBackendWitness{{}, {}}
+		binds := 0
+		deps := initBackendPreflightDependencies{
+			resolveSelection:   func(*cobra.Command) (initBackendSelection, error) { return selection, nil },
+			inspectWorkspace:   func(string) (*backendWorkspaceSnapshot, error) { return cloneBackendWorkspaceSnapshot(snapshot), nil },
+			inspectFreshTarget: inspectInitBackendFreshTarget,
+			admit:              admitInitBackend,
+			witnessSupported:   func() bool { return true },
+			bindWorkspaceWitness: func(string, int64) (initBackendWorkspaceWitness, error) {
+				witness := witnesses[binds]
+				binds++
+				return witness, nil
+			},
+		}
+		cmd := newInitBackendPreflightTestCommand(t, configfile.BackendSQLite)
+		if err := prepareInitBackendPreflightWith(cmd, deps); err != nil {
+			t.Fatal(err)
+		}
+		if err := prepareInitBackendPreflightWith(cmd, deps); err != nil {
+			t.Fatal(err)
+		}
+		if witnesses[0].closes != 1 || witnesses[1].closes != 0 {
+			t.Fatalf("closes after replacement = %d/%d, want 1/0", witnesses[0].closes, witnesses[1].closes)
+		}
+		if err := clearInitBackendPreflight(cmd); err != nil {
+			t.Fatal(err)
+		}
+		if witnesses[0].closes != 1 || witnesses[1].closes != 1 {
+			t.Fatalf("closes after clear = %d/%d, want 1/1", witnesses[0].closes, witnesses[1].closes)
+		}
+	})
+
+	t.Run("bind-time disappearance maps to both changed classifications", func(t *testing.T) {
+		snapshot := directSnapshot(t)
+		selection := initBackendSelection{source: initBackendSelectionBeadsDir, selector: snapshot.selector, creationBeadsDir: snapshot.route.target.path}
+		binds, inspections := 0, 0
+		deps := initBackendPreflightDependencies{
+			resolveSelection: func(*cobra.Command) (initBackendSelection, error) { return selection, nil },
+			inspectWorkspace: func(string) (*backendWorkspaceSnapshot, error) {
+				inspections++
+				return cloneBackendWorkspaceSnapshot(snapshot), nil
+			},
+			inspectFreshTarget: inspectInitBackendFreshTarget,
+			admit:              admitInitBackend,
+			witnessSupported:   func() bool { return true },
+			bindWorkspaceWitness: func(string, int64) (initBackendWorkspaceWitness, error) {
+				binds++
+				return nil, workspaceidentity.ErrIneligible
+			},
+		}
+		err := prepareInitBackendPreflightWith(newInitBackendPreflightTestCommand(t, configfile.BackendSQLite), deps)
+		if !errors.Is(err, workspaceidentity.ErrIneligible) || !errors.Is(err, workspaceidentity.ErrChanged) || !errors.Is(err, errInitBackendPreflightChanged) {
+			t.Fatalf("bind-time disappearance = %v, want ineligible plus both changed classifications", err)
+		}
+		if binds != 1 || inspections != 1 {
+			t.Fatalf("bind-time disappearance binds=%d inspections=%d, want 1/1", binds, inspections)
+		}
+	})
+
+	for _, test := range []struct {
+		name      string
+		supported bool
+		selection func(*backendWorkspaceSnapshot) initBackendSelection
+		mutate    func(*backendWorkspaceSnapshot) *backendWorkspaceSnapshot
+	}{
+		{name: "unsupported platform", selection: func(s *backendWorkspaceSnapshot) initBackendSelection {
+			return initBackendSelection{source: initBackendSelectionBeadsDir, selector: s.selector, creationBeadsDir: s.route.target.path}
+		}, mutate: func(s *backendWorkspaceSnapshot) *backendWorkspaceSnapshot {
+			s.route.target = s.route.bindingSources[0]
+			return s
+		}},
+		{name: "database selector", supported: true, selection: func(s *backendWorkspaceSnapshot) initBackendSelection {
+			return initBackendSelection{source: initBackendSelectionExplicitDB, selector: s.selector, creationBeadsDir: s.route.target.path}
+		}, mutate: func(s *backendWorkspaceSnapshot) *backendWorkspaceSnapshot {
+			s.route.target = s.route.bindingSources[0]
+			return s
+		}},
+		{name: "indirect binding", supported: true, selection: func(s *backendWorkspaceSnapshot) initBackendSelection {
+			return initBackendSelection{source: initBackendSelectionBeadsDir, selector: s.selector, creationBeadsDir: s.selector}
+		}},
+		{name: "structural", supported: true, selection: func(s *backendWorkspaceSnapshot) initBackendSelection {
+			return initBackendSelection{source: initBackendSelectionBeadsDir, selector: s.selector, creationBeadsDir: s.selector}
+		}, mutate: func(s *backendWorkspaceSnapshot) *backendWorkspaceSnapshot {
+			s.route.lane = backendWorkspaceLaneStructural
+			return s
+		}},
+		{name: "uninitialized", supported: true, selection: func(s *backendWorkspaceSnapshot) initBackendSelection {
+			return initBackendSelection{source: initBackendSelectionBeadsDir, selector: s.selector, creationBeadsDir: s.route.target.path}
+		}, mutate: func(s *backendWorkspaceSnapshot) *backendWorkspaceSnapshot {
+			s.route.target = s.route.bindingSources[0]
+			s.state.initialized = false
+			return s
+		}},
+	} {
+		t.Run(test.name+" does not bind", func(t *testing.T) {
+			snapshot := newBackendStabilizerSnapshot(t)
+			if test.mutate != nil {
+				snapshot = test.mutate(snapshot)
+			}
+			selection := test.selection(snapshot)
+			binds, inspections := 0, 0
+			deps := initBackendPreflightDependencies{
+				resolveSelection:   func(*cobra.Command) (initBackendSelection, error) { return selection, nil },
+				inspectWorkspace:   func(string) (*backendWorkspaceSnapshot, error) { inspections++; return snapshot, nil },
+				inspectFreshTarget: inspectInitBackendFreshTarget,
+				admit:              func(requested string, _ *backendWorkspaceSnapshot) (string, error) { return requested, nil },
+				witnessSupported:   func() bool { return test.supported },
+				bindWorkspaceWitness: func(string, int64) (initBackendWorkspaceWitness, error) {
+					binds++
+					return &countingInitBackendWitness{}, nil
+				},
+			}
+			cmd := newInitBackendPreflightTestCommand(t, configfile.BackendSQLite)
+			if err := prepareInitBackendPreflightWith(cmd, deps); err != nil {
+				t.Fatal(err)
+			}
+			if binds != 0 || inspections != 1 {
+				t.Fatalf("binds=%d inspections=%d, want original 0/1", binds, inspections)
+			}
+			if err := clearInitBackendPreflight(cmd); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+
+	t.Run("fresh workspace does not bind", func(t *testing.T) {
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		selection := initBackendSelection{source: initBackendSelectionBeadsDir, selector: beadsDir, creationBeadsDir: beadsDir}
+		binds, inspections := 0, 0
+		deps := initBackendPreflightDependencies{
+			resolveSelection: func(*cobra.Command) (initBackendSelection, error) { return selection, nil },
+			inspectWorkspace: func(string) (*backendWorkspaceSnapshot, error) {
+				inspections++
+				return nil, nil
+			},
+			inspectFreshTarget: inspectInitBackendFreshTarget,
+			admit:              admitInitBackend,
+			witnessSupported:   func() bool { return true },
+			bindWorkspaceWitness: func(string, int64) (initBackendWorkspaceWitness, error) {
+				binds++
+				return &countingInitBackendWitness{}, nil
+			},
+		}
+		cmd := newInitBackendPreflightTestCommand(t, configfile.BackendDolt)
+		if err := prepareInitBackendPreflightWith(cmd, deps); err != nil {
+			t.Fatal(err)
+		}
+		if binds != 0 || inspections != 1 {
+			t.Fatalf("fresh workspace binds=%d inspections=%d, want 0/1", binds, inspections)
+		}
+		if err := clearInitBackendPreflight(cmd); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestClearInitBackendPreflightAfterPersistentPreRunError(t *testing.T) {
+	t.Run("primary error is unchanged when close succeeds", func(t *testing.T) {
+		cmd := newInitBackendPreflightTestCommand(t, configfile.BackendDolt)
+		witness := &countingInitBackendWitness{}
+		setInitBackendPreflight(cmd, &initBackendPreflight{witness: witness})
+		primaryErr := errors.New("later persistent pre-run failure")
+		returnErr := error(primaryErr)
+		clearInitBackendPreflightAfterError(cmd, &returnErr)
+		if returnErr != primaryErr {
+			t.Fatalf("cleanup error = %#v, want unchanged primary error %#v", returnErr, primaryErr)
+		}
+		remaining := takeInitBackendPreflight(cmd)
+		if witness.closes != 1 || remaining != nil {
+			t.Fatalf("cleanup closes=%d preflight=%#v, want 1 and nil", witness.closes, remaining)
+		}
+	})
+
+	t.Run("close failure joins the primary error", func(t *testing.T) {
+		cmd := newInitBackendPreflightTestCommand(t, configfile.BackendDolt)
+		primaryErr := errors.New("later persistent pre-run failure")
+		closeErr := errors.New("close prepared witness")
+		witness := &countingInitBackendWitness{close: closeErr}
+		setInitBackendPreflight(cmd, &initBackendPreflight{witness: witness})
+		returnErr := error(primaryErr)
+		clearInitBackendPreflightAfterError(cmd, &returnErr)
+		if !errors.Is(returnErr, primaryErr) || !errors.Is(returnErr, closeErr) {
+			t.Fatalf("cleanup error = %v, want primary and close errors", returnErr)
+		}
+		remaining := takeInitBackendPreflight(cmd)
+		if witness.closes != 1 || remaining != nil {
+			t.Fatalf("cleanup closes=%d preflight=%#v, want 1 and nil", witness.closes, remaining)
+		}
+	})
+
+	t.Run("successful persistent pre-run retains witness for RunE", func(t *testing.T) {
+		cmd := newInitBackendPreflightTestCommand(t, configfile.BackendDolt)
+		witness := &countingInitBackendWitness{}
+		setInitBackendPreflight(cmd, &initBackendPreflight{witness: witness})
+		var returnErr error
+		clearInitBackendPreflightAfterError(cmd, &returnErr)
+		if witness.closes != 0 {
+			t.Fatalf("successful pre-run closes=%d, want 0", witness.closes)
+		}
+		if err := clearInitBackendPreflight(cmd); err != nil {
+			t.Fatal(err)
+		}
+		if witness.closes != 1 {
+			t.Fatalf("final cleanup closes=%d, want 1", witness.closes)
+		}
+	})
 }
 
 func TestInitBackendPreflightStateIsIsolatedByCommandContext(t *testing.T) {
@@ -993,6 +1494,7 @@ func TestInitBackendPreflightRejectsBypassesAndDrift(t *testing.T) {
 func TestRootInitPreflightRejectsBeforeRuntimeSetup(t *testing.T) {
 	beadsDir := filepath.Join(t.TempDir(), ".beads")
 	writeOwnershipMetadata(t, beadsDir, configfile.Config{Backend: configfile.BackendSQLite, SQLitePath: "beads.db"})
+	writeBackendObserverSQLite(t, filepath.Join(beadsDir, "beads.db"))
 	sentinelPath := filepath.Join(beadsDir, "sentinel")
 	if err := os.WriteFile(sentinelPath, []byte("unchanged"), 0o600); err != nil {
 		t.Fatal(err)
@@ -1034,7 +1536,9 @@ func TestRootInitPreflightRejectsBeforeRuntimeSetup(t *testing.T) {
 		rootCtx, rootCancel = oldRootCtx, oldRootCancel
 		changeDirEnvSnapshot = oldChangeDirSnapshot
 		rootCmd.SetArgs(nil)
-		clearInitBackendPreflight(initCmd)
+		if err := clearInitBackendPreflight(initCmd); err != nil {
+			t.Errorf("clear init backend preflight: %v", err)
+		}
 		resetCommandContext()
 	})
 	dbPath, changeDir = "", ""
@@ -1058,17 +1562,40 @@ func TestRootInitPreflightRejectsBeforeRuntimeSetup(t *testing.T) {
 	changeDirEnvSnapshot = nil
 	rootCmd.SetArgs([]string{"init", "--backend=dolt", "--force", "--reinit-local", "--init-if-missing", "--quiet"})
 
-	var execErr error
-	stderr := captureStderr(t, func() { execErr = rootCmd.Execute() })
-	err = execErr
-	if !errors.Is(err, errBackendChangeRequiresMigration) {
-		t.Fatalf("Execute error = %v, want migration refusal", err)
+	countWorkspaceDescriptors := func() int {
+		if !workspaceidentity.Supported() {
+			return -1
+		}
+		entries, readErr := os.ReadDir("/proc/self/fd")
+		if readErr != nil {
+			return -1
+		}
+		count := 0
+		for _, entry := range entries {
+			target, readErr := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+			if readErr == nil && strings.HasPrefix(strings.TrimSuffix(target, " (deleted)"), beadsDir) {
+				count++
+			}
+		}
+		return count
 	}
-	if rootCtx != nil || rootCancel != nil || cmdCtx == nil || cmdCtx.RootCtx != nil {
-		t.Fatalf("runtime initialized before refusal: root=%v cancel=%v context=%#v", rootCtx, rootCancel, cmdCtx)
-	}
-	if strings.Contains(stderr, "DeprecationWarning") || strings.Contains(stderr, "Skipping init") {
-		t.Fatalf("destructive/idempotent flag output preceded refusal: %q", stderr)
+	descriptorsBefore := countWorkspaceDescriptors()
+	for run := 1; run <= 2; run++ {
+		var execErr error
+		stderr := captureStderr(t, func() { execErr = rootCmd.Execute() })
+		err = execErr
+		if !errors.Is(err, errBackendChangeRequiresMigration) {
+			t.Fatalf("Execute run %d error = %v, want migration refusal", run, err)
+		}
+		if rootCtx != nil || rootCancel != nil || cmdCtx == nil || cmdCtx.RootCtx != nil {
+			t.Fatalf("run %d initialized runtime before refusal: root=%v cancel=%v context=%#v", run, rootCtx, rootCancel, cmdCtx)
+		}
+		if strings.Contains(stderr, "DeprecationWarning") || strings.Contains(stderr, "Skipping init") {
+			t.Fatalf("run %d destructive/idempotent flag output preceded refusal: %q", run, stderr)
+		}
+		if descriptorsAfter := countWorkspaceDescriptors(); descriptorsBefore >= 0 && descriptorsAfter != descriptorsBefore {
+			t.Fatalf("run %d workspace descriptors = %d, want %d", run, descriptorsAfter, descriptorsBefore)
+		}
 	}
 	metadataAfter, err := os.ReadFile(configfile.ConfigPath(beadsDir))
 	if err != nil || string(metadataAfter) != string(metadataBefore) {
@@ -1161,7 +1688,9 @@ func TestInitRunERevalidatesBeforeEffectsAndRestoresChangeDir(t *testing.T) {
 	}
 	rootCtx, rootCancel = nil, nil
 	changeDirEnvSnapshot = nil
-	clearInitBackendPreflight(initCmd)
+	if err := clearInitBackendPreflight(initCmd); err != nil {
+		t.Fatal(err)
+	}
 
 	var treeAtRunE [sha256.Size]byte
 	mutated := false
