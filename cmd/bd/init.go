@@ -80,6 +80,20 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
   • --contributor and --team flags are rejected (wizards require interaction)
   Also auto-detected when stdin is not a terminal or CI=true is set.`,
 	RunE: func(cmd *cobra.Command, _ []string) (retErr error) {
+		admission, err := consumeInitBackendPreflight(cmd)
+		if err != nil {
+			restoreChangeDirSelection()
+			return err
+		}
+		defer func() {
+			if retErr != nil {
+				restoreChangeDirSelection()
+			}
+		}()
+		if err := prepareInitContextAfterBackendPreflight(cmd, admission); err != nil {
+			return err
+		}
+		backendFlag := admission.backend
 		prefix, _ := cmd.Flags().GetString("prefix")
 		quiet, _ := cmd.Flags().GetBool("quiet")
 		contributor, _ := cmd.Flags().GetBool("contributor")
@@ -97,7 +111,6 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		initRemote, _ := cmd.Flags().GetString("remote")
 		initRemoteChanged := cmd.Flags().Changed("remote")
 		// Dolt server connection flags
-		backendFlag, _ := cmd.Flags().GetString("backend")
 		initServerMode, _ := cmd.Flags().GetBool("server")
 		serverHost, _ := cmd.Flags().GetString("server-host")
 		serverPort, _ := cmd.Flags().GetInt("server-port")
@@ -111,6 +124,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		mysqlURL, _ := cmd.Flags().GetString("mysql-url")
 		mysqlDatabase, _ := cmd.Flags().GetString("mysql-database")
 		sqlitePath, _ := cmd.Flags().GetString("sqlite-path")
+		sqlitePathChanged := cmd.Flags().Changed("sqlite-path")
 
 		// --force is a deprecated alias for --reinit-local. They share
 		// semantics for the local data-safety guard; both refuse remote
@@ -290,6 +304,12 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				return fmt.Errorf("bd init --backend=%s does not support %s (a non-Dolt SQL backend is a plain local workspace: no Dolt server, sync, remote, or wizard)", backendFlag, strings.Join(rejected, ", "))
 			}
 		}
+		if isSQLite {
+			sqlitePath, err = resolveAdmittedInitSQLitePath(admission, sqlitePath, sqlitePathChanged)
+			if err != nil {
+				return err
+			}
+		}
 
 		// Validate --database format early, before any side effects.
 		if database != "" {
@@ -387,9 +407,9 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			_ = os.Setenv("BEADS_DOLT_DEBUG", "1")
 		}
 
-		// Initialize config (PersistentPreRun doesn't run for init command).
-		// This must happen before validation that depends on server/embedded
-		// mode so dolt.mode from config.yaml is treated like --server.
+		// Reinitialize config after the admitted workspace has been bound. This
+		// must happen before validation that depends on server/embedded mode so
+		// dolt.mode from config.yaml is treated like --server.
 		if err := config.Initialize(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to initialize config: %v\n", err)
 			// Non-fatal - continue with defaults
@@ -440,6 +460,68 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 					"  Embedded mode has no host/port — these settings require server mode.\n"+
 					"  Set dolt.mode: server in %s or pass --server to bd init.",
 					detail, hostSource, config.UserConfigYamlPath())
+			}
+		}
+
+		// Resolve and normalize the prefix before inspecting any local store. The
+		// remote-history gate needs it for the destroy token and must run before
+		// countExistingIssues can open or create provider state.
+		remoteSafetyPrefix := prefix
+		if remoteSafetyPrefix == "" {
+			remoteSafetyPrefix = config.GetString("issue-prefix")
+		}
+		if remoteSafetyPrefix == "" {
+			cwd, err := os.Getwd()
+			if err != nil {
+				return fmt.Errorf("failed to get current directory: %v", err)
+			}
+			remoteSafetyPrefix = filepath.Base(cwd)
+		}
+		remoteSafetyPrefix = normalizeIssuePrefix(remoteSafetyPrefix)
+		remoteDivergenceConfirmed := false
+
+		// Cross-boundary safety (bd-q83 / ADR 0002): check remote state
+		// BEFORE any local-store inspection or filesystem side-effect.
+		{
+			var earlySyncURL string
+			earlyRemoteSource := initSyncRemoteNone
+			earlyRemoteHasDoltData := false
+			earlySyncURL, earlyRemoteSource = resolveInitConfiguredSyncRemote(initRemote, initRemoteChanged, resolveSyncRemote)
+			if earlyRemoteSource == initSyncRemoteExplicit {
+				if fromJSONL {
+					earlyRemoteHasDoltData = gitRemoteHasDoltDataRef(earlySyncURL)
+				}
+			} else if earlyRemoteSource == initSyncRemoteConfigured {
+				earlyRemoteHasDoltData = true
+			} else if earlyRemoteSource == initSyncRemoteNone && !stealth && isGitRepo() && !isBareGitRepo() {
+				if originURL, err := gitOriginGetURL(); err == nil && originURL != "" {
+					earlySyncURL = normalizeRemoteURL(originURL)
+					earlyRemoteHasDoltData = gitOriginHasDoltDataRef()
+				}
+			}
+			if earlySyncURL != "" {
+				earlyDecision := CheckRemoteSafety(RemoteSafetyInput{
+					Force:             force,
+					ReinitLocal:       reinitLocal,
+					FromJSONL:         fromJSONL,
+					DiscardRemote:     discardRemote,
+					DestroyToken:      destroyToken,
+					ExpectedToken:     FormatDestroyToken(remoteSafetyPrefix),
+					RemoteHasDoltData: earlyRemoteHasDoltData,
+					IsInteractive:     term.IsTerminal(int(os.Stdin.Fd())),
+				})
+				if _, err := handleRemoteSafetyDecision(earlyDecision, remoteSafetyPrefix, earlySyncURL, destroyToken, func() bool {
+					switch earlyRemoteSource {
+					case initSyncRemoteExplicit:
+						return gitRemoteHasDoltDataRef(earlySyncURL)
+					case initSyncRemoteConfigured:
+						return earlyRemoteHasDoltData
+					default:
+						return gitOriginHasDoltDataRef()
+					}
+				}, earlyRemoteHasDoltData, &remoteDivergenceConfirmed); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -535,93 +617,20 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			skipHooks = true
 		}
 
-		// Check BEADS_DB environment variable if --db flag not set
-		// (PersistentPreRun doesn't run for init command)
-		if dbPath == "" {
-			if envDB := os.Getenv("BEADS_DB"); envDB != "" {
-				dbPath = envDB
-			}
-		}
-
-		// Determine prefix with precedence: flag > config > auto-detect from git > auto-detect from directory name
+		// Determine prefix with precedence: flag > config > auto-detect from directory name.
 		if prefix == "" {
-			// Try to get from config file
 			prefix = config.GetString("issue-prefix")
 		}
-
-		// auto-detect prefix from directory name
 		if prefix == "" {
-			// Auto-detect from directory name
 			cwd, err := os.Getwd()
 			if err != nil {
 				return fmt.Errorf("failed to get current directory: %v", err)
 			}
 			prefix = filepath.Base(cwd)
 		}
-
-		// Normalize prefix before storing it in config or deriving the Dolt
-		// database name. Dots are not valid in issue prefixes and must match the
-		// underscore form used for DoltDatabase/metadata.json. Leading dots
-		// produce invalid names (e.g. ".claude" -> "claude"), the trailing
-		// hyphen is added automatically during ID generation, and a leading
-		// non-letter is prefixed with "bd_" so the derived MySQL identifier is
-		// valid (directory names like "001" are common in temp dirs).
+		// Dots are not valid in issue prefixes; keep the stored prefix and
+		// derived Dolt database name in the same normalized form.
 		prefix = normalizeIssuePrefix(prefix)
-		remoteDivergenceConfirmed := false
-
-		// Cross-boundary safety (bd-q83 / ADR 0002): check remote state
-		// BEFORE any filesystem side-effects so a refusal exits cleanly.
-		// We only refuse here; bootstrap decisions happen later once
-		// beadsDir is computed. See CheckRemoteSafety in init_safety.go.
-		{
-			var earlySyncURL string
-			earlyRemoteSource := initSyncRemoteNone
-			earlyRemoteHasDoltData := false
-			earlySyncURL, earlyRemoteSource = resolveInitConfiguredSyncRemote(initRemote, initRemoteChanged, resolveSyncRemote)
-			if earlyRemoteSource == initSyncRemoteExplicit {
-				// An explicit --remote is intent to bootstrap or wire that URL,
-				// but it is not proof that the remote already contains Dolt
-				// history. --from-jsonl is the exception: it selects a local
-				// source and skips cloning, so we must probe now rather than
-				// silently wiring a populated remote to orphan local history.
-				if fromJSONL {
-					earlyRemoteHasDoltData = gitRemoteHasDoltDataRef(earlySyncURL)
-				}
-			} else if earlyRemoteSource == initSyncRemoteConfigured {
-				earlyRemoteHasDoltData = true // sync.remote configured = user intends bootstrap
-			} else if earlyRemoteSource == initSyncRemoteNone && !stealth && isGitRepo() && !isBareGitRepo() {
-				if originURL, err := gitOriginGetURL(); err == nil && originURL != "" {
-					earlySyncURL = normalizeRemoteURL(originURL)
-					earlyRemoteHasDoltData = gitOriginHasDoltDataRef()
-				}
-			}
-			if earlySyncURL != "" {
-				earlyDecision := CheckRemoteSafety(RemoteSafetyInput{
-					Force:             force,
-					ReinitLocal:       reinitLocal,
-					FromJSONL:         fromJSONL,
-					DiscardRemote:     discardRemote,
-					DestroyToken:      destroyToken,
-					ExpectedToken:     FormatDestroyToken(prefix),
-					RemoteHasDoltData: earlyRemoteHasDoltData,
-					IsInteractive:     term.IsTerminal(int(os.Stdin.Fd())),
-				})
-				if _, err := handleRemoteSafetyDecision(earlyDecision, prefix, earlySyncURL, destroyToken, func() bool {
-					switch earlyRemoteSource {
-					case initSyncRemoteExplicit:
-						return gitRemoteHasDoltDataRef(earlySyncURL)
-					case initSyncRemoteConfigured:
-						return earlyRemoteHasDoltData
-					default:
-						return gitOriginHasDoltDataRef()
-					}
-				}, earlyRemoteHasDoltData, &remoteDivergenceConfirmed); err != nil {
-					// The early guard refuses and confirms only; bootstrap
-					// selection happens later after beadsDir/dbName are known.
-					return err
-				}
-			}
-		}
 
 		// Determine beadsDir first (used for all storage path calculations).
 		// BEADS_DIR takes precedence, otherwise use CWD/.beads (with redirect support).
@@ -643,7 +652,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		//
 		// Precedence: --db > BEADS_DIR > default (.beads/dolt)
 		// If there's a redirect file, use the redirect target (GH#bd-0qel)
-		initDBPath := dbPath
+		initDBPath := resolveAdmittedInitDoltPath(admission, dbPath)
 		if initDBPath == "" {
 			// Dolt backend: respect dolt_data_dir config / BEADS_DOLT_DATA_DIR env
 			initDBPath = doltserver.ResolveDoltDir(beadsDirForInit)
@@ -850,7 +859,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		}
 
 		// Create Dolt storage backend
-		storagePath := doltserver.ResolveDoltDir(beadsDir)
+		storagePath := resolveAdmittedInitDoltPath(admission, doltserver.ResolveDoltDir(beadsDir))
 		// Respect existing config's database name to avoid creating phantom catalog
 		// entries when a user has renamed their database (GH#2051).
 		dbName := ""
@@ -1253,7 +1262,9 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			// Metadata.json.database should point to the Dolt directory (not beads.db).
 			// Backward-compat: older dolt setups left this as "beads.db", which is misleading.
 			if backend == configfile.BackendDolt {
-				if cfg.Database == "" || cfg.Database == beads.CanonicalDatabaseName {
+				if admission.selection.source.isDatabase() && !admission.initialized && admission.providerPath != "" {
+					cfg.Database = admission.providerPath
+				} else if cfg.Database == "" || cfg.Database == beads.CanonicalDatabaseName {
 					cfg.Database = "dolt"
 				}
 
@@ -2052,6 +2063,14 @@ func runInitSQLite(ctx context.Context, in initSQLiteInput) error {
 	dbPath := relPath
 	if !filepath.IsAbs(dbPath) {
 		dbPath = filepath.Join(in.beadsDir, dbPath)
+	}
+	dbPath, err := absoluteCleanDatabasePath(dbPath)
+	if err != nil {
+		return fmt.Errorf("resolve SQLite database path: %w", err)
+	}
+	dbDir := filepath.Dir(dbPath)
+	if err := os.MkdirAll(dbDir, config.BeadsDirPerm); err != nil {
+		return databasePathOperationError("create SQLite database directory", dbDir, err)
 	}
 
 	store, err := beadssqlite.Provision(ctx, dbPath)

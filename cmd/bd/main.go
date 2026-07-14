@@ -696,6 +696,14 @@ var rootCmd = &cobra.Command{
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		// Initialize CommandContext to hold runtime state (replaces scattered globals)
 		initCommandContext()
+		if cmd == initCmd {
+			if err := checkBlockedEnvVars(); err != nil {
+				return HandleError("%v", err)
+			}
+			if err := prepareInitBackendPreflight(cmd); err != nil {
+				return err
+			}
+		}
 
 		// Reset per-command write tracking (used by Dolt auto-commit).
 		commandDidWrite.Store(false)
@@ -760,7 +768,9 @@ var rootCmd = &cobra.Command{
 			return HandleError("%v", err)
 		}
 
-		loadSelectionEnvironment()
+		if cmd != initCmd {
+			loadSelectionEnvironment()
+		}
 
 		// Apply viper configuration if flags weren't explicitly set
 		// Priority: flags > viper (config file + env vars) > defaults
@@ -921,7 +931,7 @@ var rootCmd = &cobra.Command{
 		// setup before they inspect server mode or per-project Dolt settings.
 		// Rebind them to the selected workspace so explicit --db / BEADS_DB
 		// targets behave consistently across doctor/bootstrap/context/dolt.
-		if skipsStoreInit {
+		if skipsStoreInit && cmd != initCmd {
 			prepareSelectedNoDBContext(selectedNoDBBeadsDir(cmd))
 			refreshBoundCommandConfig(cmd)
 			if beadsDir := os.Getenv("BEADS_DIR"); beadsDir == "" {
