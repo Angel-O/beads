@@ -161,6 +161,69 @@ func TestDatabaseSelectorValidation(t *testing.T) {
 	})
 }
 
+func TestDatabaseSelectorRejectsHardLinkedRegularFiles(t *testing.T) {
+	root := t.TempDir()
+	databasePath := filepath.Join(root, "beads.db")
+	if err := os.WriteFile(databasePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	aliasPath := filepath.Join(root, "beads-alias.db")
+	if err := os.Link(databasePath, aliasPath); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+
+	for _, path := range []string{databasePath, aliasPath} {
+		got, err := validatedDatabaseSelectorPath(path)
+		if got != "" || err == nil || !strings.Contains(err.Error(), "hard links") {
+			t.Fatalf("hard-linked selector %q = %q, err=%v, want rejection", path, got, err)
+		}
+	}
+
+	if err := os.Remove(aliasPath); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := validatedDatabaseSelectorPath(databasePath); err != nil || got != resolvedTestPath(t, databasePath) {
+		t.Fatalf("single-link selector after alias removal = %q, err=%v", got, err)
+	}
+}
+
+func TestDatabaseSelectorRejectsUnsafeRegularFileLinkCountEvidence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "beads.db")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalPath := resolvedTestPath(t, path)
+
+	for _, test := range []struct {
+		name      string
+		count     uint64
+		known     bool
+		wantError string
+	}{
+		{name: "unknown", wantError: "unavailable"},
+		{name: "zero", count: 0, known: true, wantError: "exactly one"},
+		{name: "multiple", count: 2, known: true, wantError: "exactly one"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := validatedDatabaseSelectorPathWithObserver(path, func(string) (*safefile.MetadataObservation, error) {
+				return &safefile.MetadataObservation{
+					CanonicalPath:  canonicalPath,
+					Info:           info,
+					LinkCount:      test.count,
+					LinkCountKnown: test.known,
+				}, nil
+			})
+			if got != "" || err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("selector with %s link evidence = %q, err=%v, want %q rejection", test.name, got, err, test.wantError)
+			}
+		})
+	}
+}
+
 func resolvedTestPath(t *testing.T, path string) string {
 	t.Helper()
 	resolved, err := filepath.EvalSymlinks(path)

@@ -48,12 +48,30 @@ func validatedDatabaseSelectorPathWithObserver(path string, observer databaseMet
 		if !info.IsDir() && !info.Mode().IsRegular() {
 			return "", fmt.Errorf("database selector is not a directory or regular file: %q", resolved.path)
 		}
+		if info.Mode().IsRegular() {
+			if err := validateRegularDatabaseFileLinkCount("database selector", resolved.path, resolved.observed); err != nil {
+				return "", err
+			}
+		}
 		return resolved.path, nil
 	}
 	if !resolved.observed.Info.IsDir() {
 		return "", fmt.Errorf("database selector parent is not a directory: %q", filepath.Dir(resolved.path))
 	}
 	return resolved.path, nil
+}
+
+func validateRegularDatabaseFileLinkCount(description, path string, observation *safefile.MetadataObservation) error {
+	if observation == nil || observation.Info == nil || !observation.Info.Mode().IsRegular() {
+		return fmt.Errorf("%s regular-file observation is incomplete: %q", description, path)
+	}
+	if !observation.LinkCountKnown {
+		return fmt.Errorf("%s hard-link count is unavailable: %q", description, path)
+	}
+	if observation.LinkCount != 1 {
+		return fmt.Errorf("%s has %d hard links; exactly one is required: %q", description, observation.LinkCount, path)
+	}
+	return nil
 }
 
 // validateDatabaseWorkspaceDirectory performs point-in-time fail-fast

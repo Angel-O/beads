@@ -8,13 +8,16 @@ import (
 // MetadataObservation binds object metadata and canonical stored-case path to
 // one no-follow handle. Case sensitivity describes child lookup when Info is a
 // directory, allowing a caller to append and compare one unobserved missing
-// leaf; callers must treat an unknown value as case-sensitive. The observation
-// pins neither the pathname nor its ancestors after return.
+// leaf; callers must treat an unknown value as case-sensitive. LinkCount is
+// derived from the same handle and is valid only when LinkCountKnown is true.
+// The observation pins neither the pathname nor its ancestors after return.
 type MetadataObservation struct {
 	CanonicalPath        string
 	Info                 os.FileInfo
 	CaseSensitive        bool
 	CaseSensitivityKnown bool
+	LinkCount            uint64
+	LinkCountKnown       bool
 }
 
 // ObserveMetadataNoFollow returns a single-handle metadata observation without
@@ -35,8 +38,11 @@ func observeOpenedMetadata(file *os.File, inspector metadataHandleInspector) (*M
 	var canonicalPath string
 	caseSensitive := true
 	caseSensitivityKnown := false
+	linkCount := uint64(0)
+	linkCountKnown := false
 	var inspectErr error
 	if statErr == nil {
+		linkCount, linkCountKnown = metadataLinkCount(file, info)
 		canonicalPath, caseSensitive, caseSensitivityKnown, inspectErr = inspector(file, info)
 	}
 	closeErr := file.Close()
@@ -55,6 +61,8 @@ func observeOpenedMetadata(file *os.File, inspector metadataHandleInspector) (*M
 			Info:                 info,
 			CaseSensitive:        caseSensitive,
 			CaseSensitivityKnown: caseSensitivityKnown,
+			LinkCount:            linkCount,
+			LinkCountKnown:       linkCountKnown,
 		}, nil
 	}
 }

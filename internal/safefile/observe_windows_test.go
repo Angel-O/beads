@@ -103,3 +103,21 @@ func TestWindowsCanonicalMetadataPathResizesBoundedly(t *testing.T) {
 		t.Fatalf("bounded canonical path = %q, err=%v, calls=%d", got, err, calls)
 	}
 }
+
+func TestWindowsMetadataLinkCountWithGetter(t *testing.T) {
+	getter := func(_ windows.Handle, info *windows.ByHandleFileInformation) error {
+		info.NumberOfLinks = 7
+		return nil
+	}
+	count, known := windowsMetadataLinkCountWithGetter(0, getter)
+	if !known || count != 7 {
+		t.Fatalf("Windows link count known=%v count=%d, want known count 7", known, count)
+	}
+
+	count, known = windowsMetadataLinkCountWithGetter(0, func(windows.Handle, *windows.ByHandleFileInformation) error {
+		return errors.New("link count unavailable")
+	})
+	if known || count != 0 {
+		t.Fatalf("failed Windows link count known=%v count=%d, want unknown zero", known, count)
+	}
+}
