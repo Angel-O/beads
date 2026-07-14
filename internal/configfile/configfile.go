@@ -3,6 +3,7 @@ package configfile
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,42 @@ var (
 	errStrictConfigAbsent = errors.New("strict config metadata is absent")
 	errConfigChanged      = errors.New("config changed during inspection")
 )
+
+type readOnlyMetadataKind uint8
+
+const (
+	readOnlyMetadataAbsent readOnlyMetadataKind = iota
+	readOnlyMetadataCurrent
+	readOnlyMetadataLegacy
+)
+
+// ReadOnlySnapshot is an opaque, point-in-time identity for workspace
+// metadata returned by LoadReadOnlySnapshot. It does not pin the metadata file,
+// workspace root, or ancestor pathnames after the load returns.
+type ReadOnlySnapshot struct {
+	kind     readOnlyMetadataKind
+	digest   [sha256.Size]byte
+	identity os.FileInfo
+}
+
+// Equal reports whether two successful read-only loads selected the same
+// current-or-legacy metadata object with the same bytes. Two absent snapshots
+// are equal.
+func (s ReadOnlySnapshot) Equal(other ReadOnlySnapshot) bool {
+	if s.kind != other.kind || s.digest != other.digest {
+		return false
+	}
+	if !s.Present() {
+		return true
+	}
+	return s.identity != nil && other.identity != nil && os.SameFile(s.identity, other.identity)
+}
+
+// Present reports whether the successful read-only load selected a current or
+// legacy metadata file.
+func (s ReadOnlySnapshot) Present() bool {
+	return s.kind != readOnlyMetadataAbsent
+}
 
 type Config struct {
 	Database string `json:"database"`
@@ -140,12 +177,42 @@ func loadConfig(
 // when both metadata files were absent at their initial lookups; disappearance
 // after validation and platforms without a safe opener return errors.
 func LoadReadOnly(beadsDir string) (*Config, error) {
+	cfg, _, err := LoadReadOnlySnapshot(beadsDir)
+	return cfg, err
+}
+
+// LoadReadOnlySnapshot applies the same strict, side-effect-free load as
+// LoadReadOnly and also returns an opaque snapshot suitable for later
+// point-in-time revalidation. The snapshot is valid only when err is nil.
+func LoadReadOnlySnapshot(beadsDir string) (*Config, ReadOnlySnapshot, error) {
 	exists, err := validateReadOnlyConfigRoot(beadsDir)
 	if err != nil || !exists {
-		return nil, err
+		return nil, ReadOnlySnapshot{}, err
 	}
-	cfg, _, err := loadConfig(beadsDir, readStableConfigFile, decodeConfigStrict, isStrictConfigAbsent)
-	return cfg, err
+
+	var selected stableConfigFile
+	readFile := func(path string) ([]byte, error) {
+		observed, err := readStableConfigFileObserved(path, safefile.OpenReadOnlyNoFollow)
+		if err != nil {
+			return nil, err
+		}
+		selected = observed
+		return observed.data, nil
+	}
+	cfg, legacy, err := loadConfig(beadsDir, readFile, decodeConfigStrict, isStrictConfigAbsent)
+	if err != nil || cfg == nil {
+		return cfg, ReadOnlySnapshot{}, err
+	}
+
+	kind := readOnlyMetadataCurrent
+	if legacy {
+		kind = readOnlyMetadataLegacy
+	}
+	return cfg, ReadOnlySnapshot{
+		kind:     kind,
+		digest:   sha256.Sum256(selected.data),
+		identity: selected.identity,
+	}, nil
 }
 
 func Load(beadsDir string) (*Config, error) {
@@ -308,54 +375,64 @@ func readStableConfigFile(path string) ([]byte, error) {
 }
 
 func readStableConfigFileWithOpener(path string, opener func(string) (*os.File, error)) ([]byte, error) {
+	observed, err := readStableConfigFileObserved(path, opener)
+	return observed.data, err
+}
+
+type stableConfigFile struct {
+	data     []byte
+	identity os.FileInfo
+}
+
+func readStableConfigFileObserved(path string, opener func(string) (*os.File, error)) (stableConfigFile, error) {
 	namedInfo, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("%w: %w", errStrictConfigAbsent, safeConfigPathError("inspect config", path, err))
+			return stableConfigFile{}, fmt.Errorf("%w: %w", errStrictConfigAbsent, safeConfigPathError("inspect config", path, err))
 		}
-		return nil, safeConfigPathError("inspect config", path, err)
+		return stableConfigFile{}, safeConfigPathError("inspect config", path, err)
 	}
 	if !namedInfo.Mode().IsRegular() {
-		return nil, fmt.Errorf("config is not a regular file: %q", path)
+		return stableConfigFile{}, fmt.Errorf("config is not a regular file: %q", path)
 	}
 	if namedInfo.Size() > maxReadOnlyConfigFileBytes {
-		return nil, fmt.Errorf("config %q exceeds %d bytes", path, maxReadOnlyConfigFileBytes)
+		return stableConfigFile{}, fmt.Errorf("config %q exceeds %d bytes", path, maxReadOnlyConfigFileBytes)
 	}
 
 	file, err := opener(path)
 	if err != nil {
-		return nil, stableConfigOperationError("open config", path, err)
+		return stableConfigFile{}, stableConfigOperationError("open config", path, err)
 	}
 	defer file.Close() //nolint:errcheck // read-only metadata descriptor
 	openedInfo, err := file.Stat()
 	if err != nil {
-		return nil, stableConfigOperationError("inspect opened config", path, err)
+		return stableConfigFile{}, stableConfigOperationError("inspect opened config", path, err)
 	}
 	if !openedInfo.Mode().IsRegular() || !os.SameFile(namedInfo, openedInfo) {
-		return nil, configChangedError("opening config", path)
+		return stableConfigFile{}, configChangedError("opening config", path)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(file, maxReadOnlyConfigFileBytes+1))
 	if err != nil {
-		return nil, stableConfigOperationError("read config", path, err)
+		return stableConfigFile{}, stableConfigOperationError("read config", path, err)
 	}
 	if len(data) > maxReadOnlyConfigFileBytes {
-		return nil, fmt.Errorf("config %q exceeds %d bytes", path, maxReadOnlyConfigFileBytes)
+		return stableConfigFile{}, fmt.Errorf("config %q exceeds %d bytes", path, maxReadOnlyConfigFileBytes)
 	}
 	afterInfo, err := file.Stat()
 	if err != nil {
-		return nil, stableConfigOperationError("reinspect config", path, err)
+		return stableConfigFile{}, stableConfigOperationError("reinspect config", path, err)
 	}
 	namedAfter, err := os.Lstat(path)
 	if err != nil {
-		return nil, stableConfigOperationError("reinspect config name", path, err)
+		return stableConfigFile{}, stableConfigOperationError("reinspect config name", path, err)
 	}
 	if !namedAfter.Mode().IsRegular() || !os.SameFile(openedInfo, afterInfo) ||
 		!os.SameFile(openedInfo, namedAfter) || openedInfo.Size() != afterInfo.Size() ||
 		!openedInfo.ModTime().Equal(afterInfo.ModTime()) {
-		return nil, configChangedError("reading config", path)
+		return stableConfigFile{}, configChangedError("reading config", path)
 	}
-	return data, nil
+	return stableConfigFile{data: data, identity: openedInfo}, nil
 }
 
 func stableConfigOperationError(operation, path string, err error) error {

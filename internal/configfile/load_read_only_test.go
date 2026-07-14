@@ -66,6 +66,175 @@ func TestLoadReadOnlyPrefersCurrentMetadataWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestReadOnlySnapshotEqualWhenMetadataIsUnchanged(t *testing.T) {
+	beadsDir := t.TempDir()
+	if err := os.WriteFile(ConfigPath(beadsDir), []byte(`{"database":"dolt","backend":"dolt"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	firstConfig, first, err := LoadReadOnlySnapshot(beadsDir)
+	if err != nil {
+		t.Fatalf("first LoadReadOnlySnapshot: %v", err)
+	}
+	secondConfig, second, err := LoadReadOnlySnapshot(beadsDir)
+	if err != nil {
+		t.Fatalf("second LoadReadOnlySnapshot: %v", err)
+	}
+	if firstConfig == nil || secondConfig == nil {
+		t.Fatalf("loaded configs = %#v, %#v, want present metadata", firstConfig, secondConfig)
+	}
+	if !first.Present() || !second.Present() {
+		t.Fatalf("snapshot presence = %v, %v, want both present", first.Present(), second.Present())
+	}
+	if !first.Equal(second) || !second.Equal(first) {
+		t.Fatal("unchanged metadata snapshots are not equal in both directions")
+	}
+}
+
+func TestReadOnlySnapshotDetectsByteChangeOnSameFile(t *testing.T) {
+	beadsDir := t.TempDir()
+	configPath := ConfigPath(beadsDir)
+	initial := []byte(`{"database":"dolt","backend":"dolt","project_id":"first1"}`)
+	changed := []byte(`{"database":"dolt","backend":"dolt","project_id":"second"}`)
+	if len(initial) != len(changed) {
+		t.Fatalf("test metadata lengths differ: %d != %d", len(initial), len(changed))
+	}
+	if err := os.WriteFile(configPath, initial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeInfo, err := os.Lstat(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, before, err := LoadReadOnlySnapshot(beadsDir)
+	if err != nil {
+		t.Fatalf("LoadReadOnlySnapshot before byte change: %v", err)
+	}
+
+	file, err := os.OpenFile(configPath, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(changed); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	afterInfo, err := os.Lstat(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(beforeInfo, afterInfo) {
+		t.Fatal("test setup replaced metadata identity instead of changing bytes in place")
+	}
+
+	_, after, err := LoadReadOnlySnapshot(beadsDir)
+	if err != nil {
+		t.Fatalf("LoadReadOnlySnapshot after byte change: %v", err)
+	}
+	if before.Equal(after) || after.Equal(before) {
+		t.Fatal("same-file byte change produced equal snapshots")
+	}
+}
+
+func TestReadOnlySnapshotDetectsSameByteFileReplacement(t *testing.T) {
+	beadsDir := t.TempDir()
+	configPath := ConfigPath(beadsDir)
+	replacementPath := filepath.Join(beadsDir, "replacement.json")
+	metadata := []byte(`{"database":"dolt","backend":"dolt"}`)
+	if err := os.WriteFile(configPath, metadata, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeInfo, err := os.Lstat(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, before, err := LoadReadOnlySnapshot(beadsDir)
+	if err != nil {
+		t.Fatalf("LoadReadOnlySnapshot before replacement: %v", err)
+	}
+
+	if err := os.WriteFile(replacementPath, metadata, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacementPath, configPath); err != nil {
+		t.Fatal(err)
+	}
+	afterInfo, err := os.Lstat(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(beforeInfo, afterInfo) {
+		t.Fatal("test setup did not replace metadata identity")
+	}
+
+	_, after, err := LoadReadOnlySnapshot(beadsDir)
+	if err != nil {
+		t.Fatalf("LoadReadOnlySnapshot after replacement: %v", err)
+	}
+	if before.Equal(after) || after.Equal(before) {
+		t.Fatal("same-byte metadata replacement produced equal snapshots")
+	}
+}
+
+func TestReadOnlySnapshotDetectsCurrentLegacyPrecedenceChange(t *testing.T) {
+	beadsDir := t.TempDir()
+	legacyPath := filepath.Join(beadsDir, "config.json")
+	currentPath := ConfigPath(beadsDir)
+	metadata := []byte(`{"database":"dolt","backend":"dolt"}`)
+	if err := os.WriteFile(legacyPath, metadata, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeInfo, err := os.Lstat(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, legacy, err := LoadReadOnlySnapshot(beadsDir)
+	if err != nil {
+		t.Fatalf("LoadReadOnlySnapshot for legacy metadata: %v", err)
+	}
+
+	if err := os.Rename(legacyPath, currentPath); err != nil {
+		t.Fatal(err)
+	}
+	afterInfo, err := os.Lstat(currentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(beforeInfo, afterInfo) {
+		t.Fatal("test setup changed identity while changing metadata precedence")
+	}
+	_, current, err := LoadReadOnlySnapshot(beadsDir)
+	if err != nil {
+		t.Fatalf("LoadReadOnlySnapshot for current metadata: %v", err)
+	}
+	if legacy.Equal(current) || current.Equal(legacy) {
+		t.Fatal("current-versus-legacy precedence change produced equal snapshots")
+	}
+}
+
+func TestReadOnlySnapshotAbsentValuesAreEqual(t *testing.T) {
+	firstConfig, first, err := LoadReadOnlySnapshot(t.TempDir())
+	if err != nil {
+		t.Fatalf("first LoadReadOnlySnapshot: %v", err)
+	}
+	secondConfig, second, err := LoadReadOnlySnapshot(t.TempDir())
+	if err != nil {
+		t.Fatalf("second LoadReadOnlySnapshot: %v", err)
+	}
+	if firstConfig != nil || secondConfig != nil {
+		t.Fatalf("absent configs = %#v, %#v, want nil", firstConfig, secondConfig)
+	}
+	if first.Present() || second.Present() {
+		t.Fatalf("absent snapshot presence = %v, %v, want false", first.Present(), second.Present())
+	}
+	if !first.Equal(second) || !second.Equal(first) {
+		t.Fatal("absent snapshots are not equal in both directions")
+	}
+}
+
 func TestLoadReadOnlyDoesNotBypassMalformedCurrentMetadata(t *testing.T) {
 	beadsDir := t.TempDir()
 	if err := os.WriteFile(ConfigPath(beadsDir), []byte(`{"database":"dolt"} {}`), 0o600); err != nil {
