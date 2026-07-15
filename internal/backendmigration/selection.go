@@ -56,6 +56,8 @@ const (
 	CodePlatformUnsupported       RefusalCode = "backend_migration_platform_unsupported"
 	CodeWorkspaceChanged          RefusalCode = "backend_migration_workspace_changed"
 	CodeWorkspaceUnverifiable     RefusalCode = "backend_migration_workspace_unverifiable"
+	CodeCredentialInLocator       RefusalCode = "backend_migration_credential_in_locator"
+	CodeCredentialsRequired       RefusalCode = "backend_migration_credentials_required"
 )
 
 // RefusalReason is an allowlisted explanation category with no dynamic text.
@@ -89,6 +91,14 @@ const (
 	ReasonPlatformProbe                RefusalReason = "platform_probe"
 	ReasonFilesystemProbe              RefusalReason = "filesystem_probe"
 	ReasonCleanup                      RefusalReason = "cleanup"
+	ReasonTargetLocatorSource          RefusalReason = "target_locator_source"
+	ReasonTargetSchemaSource           RefusalReason = "target_schema_source"
+	ReasonTargetLocator                RefusalReason = "target_locator"
+	ReasonTargetCredential             RefusalReason = "target_credential"
+	ReasonTargetTransport              RefusalReason = "target_transport"
+	ReasonTargetOptions                RefusalReason = "target_options"
+	ReasonTargetSchema                 RefusalReason = "target_schema"
+	ReasonBindingClosed                RefusalReason = "binding_closed"
 )
 
 const effectNone = "none"
@@ -173,6 +183,19 @@ type selectionDependencies struct {
 	qualifiedFS   func(workspaceidentity.FilesystemSnapshot) bool
 }
 
+// retainedSourceAdmission is the private successful state shared by W2 and W3.
+// W2 never requests retention; W3 takes ownership of the still-live witness.
+type retainedSourceAdmission struct {
+	witness    sourceWitness
+	workspace  string
+	database   string
+	shape      shapeObservation
+	filesystem workspaceidentity.FilesystemSnapshot
+	observe    func(string) (shapeObservation, error)
+	inspectFS  func(sourceWitness) (workspaceidentity.FilesystemSnapshot, error)
+	equalFS    func(workspaceidentity.FilesystemSnapshot, workspaceidentity.FilesystemSnapshot) bool
+}
+
 func productionSelectionDependencies() selectionDependencies {
 	return selectionDependencies{
 		platform:      probeNativeLinux,
@@ -199,6 +222,17 @@ func InspectSourceShape(request SelectionRequest) (SourceShapeCandidate, error) 
 }
 
 func inspectSourceShapeWith(request SelectionRequest, deps selectionDependencies) (SourceShapeCandidate, error) {
+	return inspectSourceShapeRetainedWith(request, deps, nil)
+}
+
+func inspectSourceShapeRetainedWith(
+	request SelectionRequest,
+	deps selectionDependencies,
+	retained **retainedSourceAdmission,
+) (SourceShapeCandidate, error) {
+	if retained != nil {
+		*retained = nil
+	}
 	if request.TargetBackend != configfile.BackendPostgres {
 		return refuse(CodePairUnsupported, ReasonTargetBackend, nil)
 	}
@@ -263,7 +297,7 @@ func inspectSourceShapeWith(request SelectionRequest, deps selectionDependencies
 	if witness == nil {
 		return refuse(CodeWorkspaceUnverifiable, ReasonMetadata, nil)
 	}
-	return inspectBoundSource(request, deps, witness, metadata, initial)
+	return inspectBoundSource(request, deps, witness, metadata, initial, retained)
 }
 
 func inspectBoundSource(
@@ -272,8 +306,13 @@ func inspectBoundSource(
 	witness sourceWitness,
 	metadata []byte,
 	initial shapeObservation,
+	retained **retainedSourceAdmission,
 ) (candidate SourceShapeCandidate, returnErr error) {
+	owned := true
 	defer func() {
+		if !owned {
+			return
+		}
 		if closeErr := witness.Close(); closeErr != nil {
 			candidate = SourceShapeCandidate{}
 			returnErr = cleanupRefusal(returnErr, closeErr)
@@ -331,7 +370,21 @@ func inspectBoundSource(
 	if !deps.qualifiedFS(secondFilesystem) {
 		return refuse(CodePlatformUnsupported, ReasonFilesystem, nil)
 	}
-	return SourceShapeCandidate{SourceBackend: configfile.BackendDolt, TargetBackend: configfile.BackendPostgres}, nil
+	candidate = SourceShapeCandidate{SourceBackend: configfile.BackendDolt, TargetBackend: configfile.BackendPostgres}
+	if retained != nil {
+		*retained = &retainedSourceAdmission{
+			witness:    witness,
+			workspace:  request.Workspace,
+			database:   cfg.DoltDatabase,
+			shape:      finalShape,
+			filesystem: secondFilesystem,
+			observe:    deps.observe,
+			inspectFS:  deps.inspectFS,
+			equalFS:    deps.equalFS,
+		}
+		owned = false
+	}
+	return candidate, nil
 }
 
 func stabilizeBoundResult(
