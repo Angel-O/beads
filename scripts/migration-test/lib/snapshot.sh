@@ -149,7 +149,7 @@ strict_snapshot_has_expected_fixture() {
     local snapshot="$2"
 
     case "$version" in
-        v0.49.6|v0.55.4|v0.57.0)
+        v0.49.6|v0.55.4|v0.57.0|v0.63.3)
             local epic_id="${DATASET_IDS[epic]:-}"
             local standalone_id="${DATASET_IDS[standalone]:-}"
             local closed_id="${DATASET_IDS[closed]:-}"

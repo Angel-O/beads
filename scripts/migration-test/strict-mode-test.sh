@@ -45,6 +45,16 @@ sha=$(strict_release_sha256 v0.57.0 linux amd64) || fail "missing v0.57.0 releas
 [ "$(strict_required_dolt_sha256 v0.57.0 linux amd64)" = \
     "f66318f08ed66e409fc39363ae0fff8ce6fbf6dba9f5bac632b91527b9632a74" ] ||
     fail "unexpected v0.57.0 Dolt runtime checksum"
+
+asset=$(strict_release_asset v0.63.3 linux amd64) || fail "missing v0.63.3 release asset"
+[ "$asset" = "beads_0.63.3_linux_amd64.tar.gz" ] || fail "unexpected v0.63.3 release asset"
+sha=$(strict_release_sha256 v0.63.3 linux amd64) || fail "missing v0.63.3 release checksum"
+[ "$sha" = "5f4efd2e010209b3f381dbcd783b2a3a652f50ea72f40ef04c8ba434d408bf9e" ] ||
+    fail "unexpected v0.63.3 release checksum"
+[ "$(strict_expected_status v0.63.3)" = "AUTO" ] || fail "unexpected v0.63.3 status"
+[ "$(strict_expected_recipe v0.63.3)" = "" ] || fail "unexpected v0.63.3 recipe"
+[ "$(strict_expected_features v0.63.3)" = "epic task bug dependency standalone closed label comment" ] ||
+    fail "unexpected v0.63.3 source features"
 [ "${LEGACY_DOLT_ROLLBACK_FILES[*]}" = "metadata.json config.json config.yaml issues.jsonl" ] ||
     fail "unexpected legacy Dolt rollback file inventory"
 
@@ -369,6 +379,9 @@ fi
 if OS=linux ARCH=amd64 verify_release_archive v0.57.0 "$tmp/archive.tar.gz" >/dev/null 2>&1; then
     fail "tampered v0.57.0 release archive was accepted"
 fi
+if OS=linux ARCH=amd64 verify_release_archive v0.63.3 "$tmp/archive.tar.gz" >/dev/null 2>&1; then
+    fail "tampered v0.63.3 release archive was accepted"
+fi
 
 strict_fixture_has_expected_features v0.49.6 epic task bug dependency standalone closed label comment ||
     fail "complete source fixture was rejected"
@@ -376,6 +389,8 @@ strict_fixture_has_expected_features v0.55.4 epic task bug dependency standalone
     fail "complete v0.55.4 source fixture was rejected"
 strict_fixture_has_expected_features v0.57.0 epic task bug dependency standalone closed label comment ||
     fail "complete v0.57.0 source fixture was rejected"
+strict_fixture_has_expected_features v0.63.3 epic task bug dependency standalone closed label comment ||
+    fail "complete v0.63.3 source fixture was rejected"
 if strict_fixture_has_expected_features v0.49.6 epic task bug standalone closed label >/dev/null 2>&1; then
     fail "source fixture without dependency was accepted"
 fi
@@ -403,22 +418,24 @@ strict_snapshot_has_expected_fixture v0.55.4 "$tmp/fixture.json" ||
     fail "exact v0.55.4 source fixture was rejected"
 strict_snapshot_has_expected_fixture v0.57.0 "$tmp/fixture.json" ||
     fail "exact v0.57.0 source fixture was rejected"
+strict_snapshot_has_expected_fixture v0.63.3 "$tmp/fixture.json" ||
+    fail "exact v0.63.3 source fixture was rejected"
 jq 'map(select(.id != "old-epic"))' "$tmp/fixture.json" > "$tmp/fixture-four-items.json"
-for version in v0.49.6 v0.55.4 v0.57.0; do
+for version in v0.49.6 v0.55.4 v0.57.0 v0.63.3; do
     if strict_snapshot_has_expected_fixture "$version" "$tmp/fixture-four-items.json" >/dev/null 2>&1; then
         fail "$version source fixture with four items was accepted"
     fi
 done
 jq '. + [{"id":"old-extra","title":"Unexpected extra issue"}]' \
     "$tmp/fixture.json" > "$tmp/fixture-six-items.json"
-for version in v0.49.6 v0.55.4 v0.57.0; do
+for version in v0.49.6 v0.55.4 v0.57.0 v0.63.3; do
     if strict_snapshot_has_expected_fixture "$version" "$tmp/fixture-six-items.json" >/dev/null 2>&1; then
         fail "$version source fixture with six items was accepted"
     fi
 done
 jq 'map(if .id == "old-epic" then .issue_type = "task" else . end)' \
     "$tmp/fixture.json" > "$tmp/fixture-wrong-epic.json"
-for version in v0.49.6 v0.55.4 v0.57.0; do
+for version in v0.49.6 v0.55.4 v0.57.0 v0.63.3; do
     if strict_snapshot_has_expected_fixture "$version" "$tmp/fixture-wrong-epic.json" >/dev/null 2>&1; then
         fail "$version source fixture with an inexact epic was accepted"
     fi
@@ -434,6 +451,9 @@ fi
 if strict_snapshot_has_expected_fixture v0.57.0 "$tmp/fixture-missing-rich-field.json" >/dev/null 2>&1; then
     fail "v0.57.0 source fixture without the exact rich fields was accepted"
 fi
+if strict_snapshot_has_expected_fixture v0.63.3 "$tmp/fixture-missing-rich-field.json" >/dev/null 2>&1; then
+    fail "v0.63.3 source fixture without the exact rich fields was accepted"
+fi
 jq 'map(if .id == "old-task" then .labels = [] else . end)' \
     "$tmp/fixture.json" > "$tmp/fixture-missing-label.json"
 if strict_snapshot_has_expected_fixture v0.49.6 "$tmp/fixture-missing-label.json" >/dev/null 2>&1; then
@@ -445,6 +465,9 @@ fi
 if strict_snapshot_has_expected_fixture v0.57.0 "$tmp/fixture-missing-label.json" >/dev/null 2>&1; then
     fail "v0.57.0 source fixture without the exact label was accepted"
 fi
+if strict_snapshot_has_expected_fixture v0.63.3 "$tmp/fixture-missing-label.json" >/dev/null 2>&1; then
+    fail "v0.63.3 source fixture without the exact label was accepted"
+fi
 jq 'map(if .id == "old-bug" then .dependencies = [] else . end)' \
     "$tmp/fixture.json" > "$tmp/fixture-missing-dependency.json"
 if strict_snapshot_has_expected_fixture v0.49.6 "$tmp/fixture-missing-dependency.json" >/dev/null 2>&1; then
@@ -455,6 +478,9 @@ if strict_snapshot_has_expected_fixture v0.55.4 "$tmp/fixture-missing-dependency
 fi
 if strict_snapshot_has_expected_fixture v0.57.0 "$tmp/fixture-missing-dependency.json" >/dev/null 2>&1; then
     fail "v0.57.0 source fixture without the exact dependency was accepted"
+fi
+if strict_snapshot_has_expected_fixture v0.63.3 "$tmp/fixture-missing-dependency.json" >/dev/null 2>&1; then
+    fail "v0.63.3 source fixture without the exact dependency was accepted"
 fi
 
 mkdir -p "$tmp/source/.beads"

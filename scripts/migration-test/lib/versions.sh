@@ -46,26 +46,31 @@ declare -Ar STRICT_RELEASE_ASSETS=(
     ["v0.49.6|linux|amd64"]="beads_0.49.6_linux_amd64.tar.gz"
     ["v0.55.4|linux|amd64"]="beads_0.55.4_linux_amd64.tar.gz"
     ["v0.57.0|linux|amd64"]="beads_0.57.0_linux_amd64.tar.gz"
+    ["v0.63.3|linux|amd64"]="beads_0.63.3_linux_amd64.tar.gz"
 )
 declare -Ar STRICT_RELEASE_SHA256=(
     ["v0.49.6|linux|amd64"]="8546dc9a47e11dc31ac2bc9a0224a9c690975e91850932cbb62623053fbb7db8"
     ["v0.55.4|linux|amd64"]="e0fa25456dd82890230eef17653448a0bf995104c78864be91c5ed84426a5f49"
     ["v0.57.0|linux|amd64"]="f8629d5627bed7d25f06f92334addc171d679f9aed9d08c5d42a9684205dc04b"
+    ["v0.63.3|linux|amd64"]="5f4efd2e010209b3f381dbcd783b2a3a652f50ea72f40ef04c8ba434d408bf9e"
 )
 declare -Ar STRICT_EXPECTED_STATUSES=(
     ["v0.49.6"]="MANUAL"
     ["v0.55.4"]="MANUAL"
     ["v0.57.0"]="MANUAL"
+    ["v0.63.3"]="AUTO"
 )
 declare -Ar STRICT_EXPECTED_RECIPES=(
     ["v0.49.6"]="sqlite_to_current"
     ["v0.55.4"]="server_to_embedded"
     ["v0.57.0"]="server_to_embedded"
+    ["v0.63.3"]=""
 )
 declare -Ar STRICT_EXPECTED_FEATURES=(
     ["v0.49.6"]="epic task bug dependency standalone closed label comment"
     ["v0.55.4"]="epic task bug dependency standalone closed label comment"
     ["v0.57.0"]="epic task bug dependency standalone closed label comment"
+    ["v0.63.3"]="epic task bug dependency standalone closed label comment"
 )
 declare -Ar SERVER_BRIDGE_STRATEGIES=(
     ["v0.55.4"]="native_export"
@@ -97,9 +102,9 @@ strict_expected_status() {
 }
 
 strict_expected_recipe() {
-    local value="${STRICT_EXPECTED_RECIPES[$1]:-}"
-    [ -n "$value" ] || return 1
-    printf '%s\n' "$value"
+    local key="$1"
+    [[ ${STRICT_EXPECTED_RECIPES["$key"]+present} == present ]] || return 1
+    printf '%s\n' "${STRICT_EXPECTED_RECIPES["$key"]}"
 }
 
 strict_expected_features() {

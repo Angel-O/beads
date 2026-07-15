@@ -35,8 +35,9 @@ jobs:
   historical-upgrades:
     name: ${{ matrix.qualification }} upgrade qualification
     if: ${{ github.event_name == 'pull_request' }}
-    # v0.55.4 is dynamically linked against the ICU version shipped here.
-    # Pin the image so a runner alias update cannot invalidate the fixture.
+    # v0.55.4 and v0.63.3 are dynamically linked against ICU 74.
+    # Pin the image and install that runtime explicitly so a runner alias
+    # update cannot invalidate either historical fixture.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -55,6 +56,10 @@ jobs:
             version: v0.57.0
             expected: MANUAL
             cache-identity: legacy-dolt-v0.57.0-f8629d5627bed7d25f06f92334addc171d679f9aed9d08c5d42a9684205dc04b
+          - qualification: Embedded Dolt v0.63.3
+            version: v0.63.3
+            expected: AUTO
+            cache-identity: embedded-dolt-v0.63.3-5f4efd2e010209b3f381dbcd783b2a3a652f50ea72f40ef04c8ba434d408bf9e
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
@@ -66,7 +71,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq sqlite3
+          sudo apt-get install -y jq sqlite3 libicu74
 
       - name: Install pinned Dolt runtime for v0.57.0
         if: matrix.version == 'v0.57.0'
