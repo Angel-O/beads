@@ -27,6 +27,7 @@ var (
 	ErrChanged      = errors.New("workspace identity changed")
 	ErrUnverifiable = errors.New("workspace identity is unverifiable")
 	ErrClosed       = errors.New("workspace identity witness is closed")
+	ErrCleanup      = errors.New("workspace identity cleanup failed")
 )
 
 var errMetadataExceedsLimit = errors.New("metadata exceeds the size limit")
@@ -42,6 +43,28 @@ type Witness struct {
 	metadataDigest                 [sha256.Size]byte
 	metadataLimit                  int64
 	closed                         bool
+}
+
+// FilesystemSnapshot is an opaque, point-in-time qualification of the
+// retained workspace, metadata, and canonical embedded-Dolt provider root.
+// It is observation evidence only and retains no descriptor or path.
+type FilesystemSnapshot struct {
+	valid, qualified bool
+
+	rootMountID, metadataMountID, providerMountID uint64
+	rootType, metadataType, providerType          int64
+	mountinfoType                                 string
+	providerDevice, providerInode                 uint64
+}
+
+// Qualified reports whether this nonzero snapshot matched the narrow local
+// ext4/XFS qualification contract.
+func (s FilesystemSnapshot) Qualified() bool { return s.valid && s.qualified }
+
+// Equal reports whether two valid snapshots captured identical private facts.
+// Zero or failed snapshots are deliberately never equal.
+func (s FilesystemSnapshot) Equal(other FilesystemSnapshot) bool {
+	return s.valid && other.valid && s == other
 }
 
 // Supported reports whether this build can retain a workspace witness.
@@ -178,6 +201,10 @@ func (w *Witness) Revalidate() error {
 	if w.closed {
 		return ErrClosed
 	}
+	return w.revalidateLocked()
+}
+
+func (w *Witness) revalidateLocked() error {
 	rootInfo, err := w.root.Stat()
 	if err != nil {
 		return witnessError(ErrUnverifiable, "inspect retained workspace", w.rootPath, err)
@@ -300,15 +327,29 @@ func closeRetained(root, metadata *os.File, rootPath, metadataPath string) error
 	var errs []error
 	if metadata != nil {
 		if err := metadata.Close(); err != nil {
-			errs = append(errs, witnessError(ErrUnverifiable, "close metadata", metadataPath, err))
+			errs = append(errs, markCleanup(witnessError(ErrUnverifiable, "close metadata", metadataPath, err)))
 		}
 	}
 	if root != nil {
 		if err := root.Close(); err != nil {
-			errs = append(errs, witnessError(ErrUnverifiable, "close workspace", rootPath, err))
+			errs = append(errs, markCleanup(witnessError(ErrUnverifiable, "close workspace", rootPath, err)))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+type cleanupError struct{ cause error }
+
+func (e *cleanupError) Error() string { return e.cause.Error() }
+func (e *cleanupError) Unwrap() []error {
+	return []error{ErrCleanup, e.cause}
+}
+
+func markCleanup(err error) error {
+	if err == nil || errors.Is(err, ErrCleanup) {
+		return err
+	}
+	return &cleanupError{cause: err}
 }
 
 func openErrorClass(err error) error {
@@ -325,7 +366,7 @@ func witnessError(class error, operation, path string, cause error) error {
 	if cause == nil {
 		return fmt.Errorf("%w: %s %q", class, operation, path)
 	}
-	return fmt.Errorf("%w: %s %q: %v", class, operation, path, stripPathErrors(cause))
+	return fmt.Errorf("%w: %s %q: %w", class, operation, path, stripPathErrors(cause))
 }
 
 func stripPathErrors(err error) error {

@@ -441,6 +441,35 @@ func TestLoadReadOnlyAcceptsExactSizeLimit(t *testing.T) {
 	}
 }
 
+func TestParseReadOnlyMetadataStrictBoundedBytes(t *testing.T) {
+	prefix := []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"EmBeDdEd"}`)
+	exact := append(append([]byte(nil), prefix...), bytes.Repeat([]byte(" "), maxReadOnlyConfigFileBytes-len(prefix))...)
+	cfg, err := ParseReadOnlyMetadata(exact)
+	if err != nil {
+		t.Fatalf("exact-limit parse: %v", err)
+	}
+	if cfg.Backend != BackendDolt || cfg.DoltMode != "EmBeDdEd" {
+		t.Fatalf("raw parsed values = backend %q mode %q", cfg.Backend, cfg.DoltMode)
+	}
+
+	for _, test := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "over limit", data: append(exact, ' ')},
+		{name: "duplicate", data: []byte(`{"backend":"dolt","backend":"dolt"}`)},
+		{name: "case variant", data: []byte(`{"backend":"dolt","Backend":"dolt"}`)},
+		{name: "unknown", data: []byte(`{"backend":"dolt","unknown":true}`)},
+		{name: "trailing", data: []byte(`{"backend":"dolt"} {}`)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got, parseErr := ParseReadOnlyMetadata(test.data); parseErr == nil || got != nil {
+				t.Fatalf("ParseReadOnlyMetadata got config=%#v err=%v, want strict error", got, parseErr)
+			}
+		})
+	}
+}
+
 func TestLoadReadOnlyRejectsAmbiguousMetadata(t *testing.T) {
 	for _, data := range []string{
 		`{"database":"dolt","database":"other"}`,

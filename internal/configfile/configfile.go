@@ -181,6 +181,19 @@ func LoadReadOnly(beadsDir string) (*Config, error) {
 	return cfg, err
 }
 
+// ParseReadOnlyMetadata strictly decodes already-witnessed current metadata.
+// It performs no filesystem, environment, compatibility, or migration lookup.
+func ParseReadOnlyMetadata(data []byte) (*Config, error) {
+	if len(data) > maxReadOnlyConfigFileBytes {
+		return nil, fmt.Errorf("metadata exceeds %d bytes", maxReadOnlyConfigFileBytes)
+	}
+	var cfg Config
+	if err := decodeConfigStrict(data, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
 // LoadReadOnlySnapshot applies the same strict, side-effect-free load as
 // LoadReadOnly and also returns an opaque snapshot suitable for later
 // point-in-time revalidation. The snapshot is valid only when err is nil.
