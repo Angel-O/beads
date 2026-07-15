@@ -960,6 +960,14 @@ func TestBindingProductionSourceFence(t *testing.T) {
 		"PostgreSQLTargetConfiguration":     true,
 		"EmbeddedDoltReadOnlyConfiguration": true,
 	}
+	allowedProductionConsumers := map[string]map[string]bool{
+		filepath.Join("internal", "backendmigration", "binding.go"): productionSymbols,
+		filepath.Join("internal", "backendmigration", "lifecycle.go"): {
+			"BindProviderConfiguration":    true,
+			"ProviderConfigurationRequest": true,
+			"BoundProviderConfiguration":   true,
+		},
+	}
 	repositoryRoot := filepath.Clean(filepath.Join("..", ".."))
 	err = filepath.WalkDir(repositoryRoot, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -989,8 +997,8 @@ func TestBindingProductionSourceFence(t *testing.T) {
 					t.Errorf("production source %s calls identity-only BaseDSN", relative)
 				}
 			}
-			if relative != filepath.Join("internal", "backendmigration", "binding.go") {
-				if identifier, ok := node.(*ast.Ident); ok && productionSymbols[identifier.Name] {
+			if identifier, ok := node.(*ast.Ident); ok && productionSymbols[identifier.Name] {
+				if !allowedProductionConsumers[relative][identifier.Name] {
 					t.Errorf("production source %s consumes W3 binding symbol %s", relative, identifier.Name)
 				}
 			}
