@@ -30,7 +30,10 @@ candidate_probe_source_is_unchanged() {
     local stage="$3"
     local actual_fingerprint
 
-    stop_dolt_server "$ws"
+    if ! stop_dolt_server "$ws"; then
+        DIRECT_PROBE_FAILURE_DETAIL="could not prove the historical server stopped after candidate $stage"
+        return 1
+    fi
     if ! actual_fingerprint=$(source_artifact_fingerprint "$ws/.beads"); then
         DIRECT_PROBE_FAILURE_DETAIL="could not fingerprint historical source tree after candidate $stage"
         return 1
