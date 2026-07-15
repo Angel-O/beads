@@ -32,6 +32,133 @@ import (
 	"golang.org/x/term"
 )
 
+// applyInitGatewayCredential routes the hand-built init Dolt config through the
+// gateway credential machinery. When BEADS_DOLT_CREDENTIAL_COMMAND is configured,
+// its short-lived token becomes the connection username, the config is marked as
+// targeting an authenticating gateway server (so the store skips schema init and
+// the SHOW/CREATE DATABASE probe), and local auto-start is disabled — a gateway
+// server is externally managed, and spawning a local dolt server would shadow it.
+//
+// It runs only when the config targets a server (ServerMode). An embedded init
+// never presents a username, so an ambient credential command must not run — or
+// fail — an embedded open. This mirrors the canonical open path
+// (internal/storage/dolt/open.go), which gates the command on
+// IsDoltServerMode()||IsSharedServerMode(). Without this gate, a plain embedded
+// `bd init` on a host that exports BEADS_DOLT_CREDENTIAL_COMMAND would drag the
+// gateway machinery into an ordinary local init and abort it with a misleading
+// provisioning-contract error, leaving a half-initialized .beads/. Gateway init
+// always reaches here with ServerMode set: init forces server mode for a shared
+// server and hard-fails a remote dolt host that lacks server mode.
+//
+// The main command path applies this via applyResolvedConfig; init builds its own
+// config and must mirror the behavior. Within server mode it is still a no-op when
+// no command is configured or when a --server-user flag already preset the
+// username. It fails closed: a configured-but-failing command aborts init.
+func applyInitGatewayCredential(ctx context.Context, beadsDir string, doltCfg *dolt.Config) error {
+	if !doltCfg.ServerMode {
+		return nil
+	}
+	fileCfg, _ := configfile.Load(beadsDir)
+	if fileCfg == nil {
+		fileCfg = configfile.DefaultConfig()
+	}
+	applied, err := dolt.ApplyGatewayCredential(ctx, fileCfg, doltCfg)
+	if err != nil {
+		return err
+	}
+	if applied {
+		// ApplyGatewayCredential sets DisableAutoStart, but the hand-built init
+		// config path never runs ApplyCLIAutoStart to translate that into the
+		// AutoStart field the store's auto-start block actually consults.
+		doltCfg.AutoStart = false
+	}
+	return nil
+}
+
+// resolveInitIssuePrefix decides how init sets the issue_prefix. readErr is the
+// error (if any) from reading the current issue_prefix out of the database.
+//
+// Non-gateway (legacy, unchanged): if none is configured yet, set the sanitized
+// prefix (dots -> underscores so issue IDs stay valid identifiers); if one exists,
+// leave it (avoid clobbering a shared database). readErr is ignored here, exactly
+// as legacy init ignored it. Gateway: the prefix is server-provisioned, so an
+// existing value is adopted (no write). A missing value is a provisioning-contract
+// violation — bd will not choose a prefix for a hosted database — but only when the
+// read genuinely succeeded and returned empty: a read error means we could not
+// consult the server, so it is surfaced as the transient failure it is rather than
+// misdiagnosed as an unprovisioned database.
+func resolveInitIssuePrefix(gateway bool, existing, dbName, prefix string, readErr error) (value string, write bool, err error) {
+	if existing != "" {
+		return "", false, nil
+	}
+	if gateway {
+		if readErr != nil {
+			return "", false, fmt.Errorf(
+				"reading issue_prefix from hosted database %q: %w", dbName, readErr)
+		}
+		return "", false, fmt.Errorf(
+			"hosted database %q has no issue_prefix -- provisioning-contract violation; "+
+				"bd will not choose one for a hosted database (re-provision server-side, then re-run init)",
+			dbName)
+	}
+	return strings.ReplaceAll(prefix, ".", "_"), true, nil
+}
+
+// resolveInitProjectID decides init's project identity. adoptedFromDB is the
+// _project_id read from the database (empty when absent or not consulted); readErr
+// is the error (if any) from that read.
+//
+// An adopted id always wins (another rig — or the hosted server — already chose
+// it; minting a new one would break cross-project verification). Otherwise:
+// non-gateway generates a fresh identity (legacy behavior, readErr ignored exactly
+// as before); gateway refuses — a hosted database's identity is server-authoritative
+// and its absence is a provisioning-contract violation, not something bd may mint
+// over. That violation is reported only when the read genuinely succeeded and found
+// nothing: a read error is surfaced as the transient failure it is, so a flaky
+// connection is not misdiagnosed as an unprovisioned database.
+func resolveInitProjectID(gateway bool, adoptedFromDB, dbName string, readErr error) (string, error) {
+	if adoptedFromDB != "" {
+		return adoptedFromDB, nil
+	}
+	if gateway {
+		if readErr != nil {
+			return "", fmt.Errorf(
+				"reading project identity (_project_id) from hosted database %q: %w", dbName, readErr)
+		}
+		return "", fmt.Errorf(
+			"hosted database %q has no provisioned project identity (_project_id) -- "+
+				"provisioning-contract violation; bd will not mint an identity for a hosted database",
+			dbName)
+	}
+	return configfile.GenerateProjectID(), nil
+}
+
+// shouldWriteProjectIDLocally reports whether init should write _project_id back
+// to the database. Non-gateway writes it for cross-project verification; gateway
+// does not — the identity is server-authoritative, and the credential may be
+// read-only.
+func shouldWriteProjectIDLocally(gateway bool, projectID string) bool {
+	return !gateway && projectID != ""
+}
+
+// shouldWriteInitStateToDB reports whether init may write clone-local tracking
+// state into the database — the bd_version / repo_id / clone_id / last_import_time
+// metadata and the initial-state Dolt commit.
+//
+// Non-gateway (legacy, unchanged): true — these writes give diagnostics accurate
+// data and leave a clean, committed working set.
+//
+// Gateway: false. The database is a shared, server-owned store: repo_id and
+// clone_id are per-clone fingerprints that cross-project verification (doctor,
+// migrate) reads back, so a last-init-wins overwrite there produces false mismatch
+// diagnostics for every other clone; and the credential may be read-only, in which
+// case each write and the DOLT_COMMIT would merely spew per-init warnings. In
+// gateway mode bd adopts and verifies server state instead of writing it, exactly
+// as shouldWriteProjectIDLocally already suppresses the _project_id write-back.
+func shouldWriteInitStateToDB(gateway bool) bool {
+	return !gateway
+}
+
 var initCmd = &cobra.Command{
 	Use:           "init",
 	GroupID:       "setup",
@@ -966,6 +1093,15 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			doltCfg.ServerUser = serverUser
 		}
 
+		// Route through the gateway credential machinery: when a credential
+		// command is configured, its token becomes the connection username and
+		// gateway semantics (no schema init, no CREATE DATABASE, no auto-start)
+		// apply. No-op — and byte-identical to legacy init — when unconfigured.
+		if err := applyInitGatewayCredential(ctx, beadsDir, doltCfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: resolving dolt credential command: %v\n", err)
+			return &exitError{Code: 1}
+		}
+
 		initLock, err := acquireEmbeddedLock(beadsDir, initServerMode || initProxiedServer)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -1083,11 +1219,18 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 
 		// Set the issue prefix in config (only if not already configured —
 		// avoid clobbering when multiple rigs share the same Dolt database)
-		existing, _ := store.GetConfig(ctx, "issue_prefix")
-		if existing == "" {
-			// Sanitize dots to underscores so issue IDs (e.g. "GPUPolynomials_jl-1")
-			// remain valid identifiers. Must match DoltDatabase sanitization above.
-			issuePrefix := strings.ReplaceAll(prefix, ".", "_")
+		existing, existingErr := store.GetConfig(ctx, "issue_prefix")
+		// Sanitize dots to underscores so issue IDs (e.g. "GPUPolynomials_jl-1")
+		// remain valid identifiers. Must match DoltDatabase sanitization above.
+		// In gateway mode the prefix is server-provisioned: adopt an existing one,
+		// refuse to invent a missing one. A read error is surfaced as a transient
+		// failure rather than misread as an unprovisioned (contract-violating) db.
+		issuePrefix, writePrefix, err := resolveInitIssuePrefix(doltCfg.Gateway, existing, dbName, prefix, existingErr)
+		if err != nil {
+			_ = store.Close()
+			return err
+		}
+		if writePrefix {
 			if err := store.SetConfig(ctx, "issue_prefix", issuePrefix); err != nil {
 				_ = store.Close()
 				return fmt.Errorf("failed to set issue prefix: %v", err)
@@ -1099,32 +1242,39 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// but the system works without it. Failures here degrade gracefully - we warn but continue.
 		// Belt-and-suspenders: write then verify read-back for each field.
 
-		// Store bd version in clone-local metadata (dolt-ignored, no merge conflicts)
-		if err := store.SetLocalMetadata(ctx, "bd_version", Version); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to write bd_version local metadata: %v\n", err)
-		}
+		// Tracking metadata (bd_version, repo_id, clone_id) is clone-local state.
+		// In gateway mode it must not be written into the shared, server-owned
+		// database: repo_id/clone_id are per-clone fingerprints and a last-init-wins
+		// overwrite feeds false cross-project mismatch diagnostics, while a read-only
+		// credential would only warn per field.
+		if shouldWriteInitStateToDB(doltCfg.Gateway) {
+			// Store bd version in clone-local metadata (dolt-ignored, no merge conflicts)
+			if err := store.SetLocalMetadata(ctx, "bd_version", Version); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to write bd_version local metadata: %v\n", err)
+			}
 
-		// Compute and store repository fingerprint (FR-015)
-		repoID, err := beads.ComputeRepoID()
-		if err != nil {
-			if !quiet {
-				fmt.Fprintf(os.Stderr, "Warning: could not compute repository ID: %v\n", err)
+			// Compute and store repository fingerprint (FR-015)
+			repoID, err := beads.ComputeRepoID()
+			if err != nil {
+				if !quiet {
+					fmt.Fprintf(os.Stderr, "Warning: could not compute repository ID: %v\n", err)
+				}
+			} else {
+				if verifyMetadata(ctx, store, "repo_id", repoID) && !quiet {
+					fmt.Printf("  Repository ID: %s\n", repoID[:8])
+				}
 			}
-		} else {
-			if verifyMetadata(ctx, store, "repo_id", repoID) && !quiet {
-				fmt.Printf("  Repository ID: %s\n", repoID[:8])
-			}
-		}
 
-		// Compute and store clone-specific ID (FR-016: skip on failure)
-		cloneID, err := beads.GetCloneID()
-		if err != nil {
-			if !quiet {
-				fmt.Fprintf(os.Stderr, "Warning: could not compute clone ID: %v\n", err)
-			}
-		} else {
-			if verifyMetadata(ctx, store, "clone_id", cloneID) && !quiet {
-				fmt.Printf("  Clone ID: %s\n", cloneID)
+			// Compute and store clone-specific ID (FR-016: skip on failure)
+			cloneID, err := beads.GetCloneID()
+			if err != nil {
+				if !quiet {
+					fmt.Fprintf(os.Stderr, "Warning: could not compute clone ID: %v\n", err)
+				}
+			} else {
+				if verifyMetadata(ctx, store, "clone_id", cloneID) && !quiet {
+					fmt.Printf("  Clone ID: %s\n", cloneID)
+				}
 			}
 		}
 
@@ -1152,23 +1302,34 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			//   - --database is set and the database already exists on a
 			//     shared remote Dolt server (GH#2922), or
 			//   - we just bootstrapped from a remote whose Dolt history
-			//     already carried a _project_id.
-			// In both cases another rig has already chosen an identity;
-			// minting a new one and writing it back would overwrite the
-			// source identity and cause cross-project verification to
-			// fail on subsequent pulls.
+			//     already carried a _project_id, or
+			//   - we are connected to an authenticating gateway server, whose
+			//     database identity is provisioned server-side.
+			// In all cases another rig — or the hosted server — has already
+			// chosen an identity; minting a new one and writing it back would
+			// overwrite the source identity and cause cross-project verification
+			// to fail on subsequent pulls. In gateway mode bd refuses to mint
+			// one at all: a missing identity is a provisioning-contract violation.
 			if cfg.ProjectID == "" {
-				if store != nil && (database != "" || bootstrappedFromRemote) {
-					if existingID, err := store.GetMetadata(ctx, "_project_id"); err == nil && existingID != "" {
-						cfg.ProjectID = existingID
-						if !quiet {
-							fmt.Printf("  %s Adopted project identity from existing database\n", ui.RenderPass("✓"))
-						}
+				adoptedFromDB := ""
+				var adoptReadErr error
+				if store != nil && (database != "" || bootstrappedFromRemote || doltCfg.Gateway) {
+					existingID, err := store.GetMetadata(ctx, "_project_id")
+					if err != nil {
+						adoptReadErr = err
+					} else if existingID != "" {
+						adoptedFromDB = existingID
 					}
 				}
-				if cfg.ProjectID == "" {
-					cfg.ProjectID = configfile.GenerateProjectID()
+				resolvedID, err := resolveInitProjectID(doltCfg.Gateway, adoptedFromDB, dbName, adoptReadErr)
+				if err != nil {
+					_ = store.Close()
+					return err
 				}
+				if adoptedFromDB != "" && !quiet {
+					fmt.Printf("  %s Adopted project identity from existing database\n", ui.RenderPass("✓"))
+				}
+				cfg.ProjectID = resolvedID
 			}
 
 			// Always store backend explicitly in metadata.json
@@ -1232,8 +1393,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				// Non-fatal - continue anyway
 			}
 
-			// Write project identity to database for cross-project verification (GH#2372)
-			if cfg.ProjectID != "" && store != nil {
+			// Write project identity to database for cross-project verification (GH#2372).
+			// Skip in gateway mode: the identity is server-authoritative and the
+			// credential may be read-only, so bd must not write it back.
+			if store != nil && shouldWriteProjectIDLocally(doltCfg.Gateway, cfg.ProjectID) {
 				if err := store.SetMetadata(ctx, "_project_id", cfg.ProjectID); err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: failed to write project ID to database: %v\n", err)
 				}
@@ -1295,10 +1458,13 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// Initialize last_import_time metadata to mark the database as synced.
 		// This prevents bd doctor from reporting "No last_import_time recorded in database"
 		// after init completes. Sets the metadata to current time in RFC3339 format.
-		// (mybd-9gw: sync divergence fix)
-		if err := store.SetMetadata(ctx, "last_import_time", time.Now().Format(time.RFC3339)); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to initialize last_import_time: %v\n", err)
-			// Non-fatal - continue anyway
+		// (mybd-9gw: sync divergence fix). Skipped in gateway mode: this is client-local
+		// sync state that must not be written into the shared, server-owned database.
+		if shouldWriteInitStateToDB(doltCfg.Gateway) {
+			if err := store.SetMetadata(ctx, "last_import_time", time.Now().Format(time.RFC3339)); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to initialize last_import_time: %v\n", err)
+				// Non-fatal - continue anyway
+			}
 		}
 
 		// Import from local JSONL if requested (GH#2023).
@@ -1423,11 +1589,15 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		}
 
 		// Auto-commit Dolt state so bd doctor doesn't warn about uncommitted
-		// changes and users don't need a separate "bd vc commit" step.
-		if err := store.Commit(ctx, "bd init"); err != nil {
-			// Non-fatal: some setups (e.g. no tables yet) may have nothing to commit
-			if !strings.Contains(err.Error(), "nothing to commit") {
-				fmt.Fprintf(os.Stderr, "Warning: failed to commit initial state: %v\n", err)
+		// changes and users don't need a separate "bd vc commit" step. Skipped in
+		// gateway mode: the shared server owns its own history and the credential
+		// may be read-only, so bd must not issue DOLT_ADD/DOLT_COMMIT against it.
+		if shouldWriteInitStateToDB(doltCfg.Gateway) {
+			if err := store.Commit(ctx, "bd init"); err != nil {
+				// Non-fatal: some setups (e.g. no tables yet) may have nothing to commit
+				if !strings.Contains(err.Error(), "nothing to commit") {
+					fmt.Fprintf(os.Stderr, "Warning: failed to commit initial state: %v\n", err)
+				}
 			}
 		}
 
