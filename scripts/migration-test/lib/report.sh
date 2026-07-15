@@ -142,3 +142,36 @@ print_summary_line() {
     fi
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
+
+# strict_results_match enforces the single-path release-gate contract after a
+# run has populated the result arrays. Human output remains unchanged; strict
+# callers get a nonzero exit for every unqualified outcome.
+strict_results_match() {
+    local expected_status="$1"
+    local expected_recipe="$2"
+
+    if [ "${#RESULT_STATUSES[@]}" -ne 1 ]; then
+        echo "STRICT: expected exactly one result, got ${#RESULT_STATUSES[@]}" >&2
+        return 1
+    fi
+
+    local status="${RESULT_STATUSES[0]}"
+    local recipe="${RESULT_RECIPES[0]}"
+    local violations="${RESULT_VIOLATIONS[0]}"
+    if [ "$status" = "SKIP" ] || [ "$status" = "BLOCKED" ]; then
+        echo "STRICT: unqualified result status $status" >&2
+        return 1
+    fi
+    if ! [[ "$violations" =~ ^[0-9]+$ ]] || [ "$violations" -ne 0 ]; then
+        echo "STRICT: fidelity/blocker violations=$violations" >&2
+        return 1
+    fi
+    if [ "$status" != "$expected_status" ]; then
+        echo "STRICT: outcome drifted from $expected_status to $status" >&2
+        return 1
+    fi
+    if [ "$recipe" != "$expected_recipe" ]; then
+        echo "STRICT: recipe drifted from $expected_recipe to ${recipe:-none}" >&2
+        return 1
+    fi
+}

@@ -23,6 +23,7 @@ set -uo pipefail
 #   ./scripts/migration-test/run.sh --direct-only      # only direct paths
 #   ./scripts/migration-test/run.sh --stepping-only    # only stepping-stone paths
 #   ./scripts/migration-test/run.sh --self-test        # candidate → candidate (harness validation)
+#   ./scripts/migration-test/run.sh --strict --expect MANUAL v0.49.6
 #   ./scripts/migration-test/run.sh v0.49.6            # single version
 #   CANDIDATE_BIN=./bd ./scripts/migration-test/run.sh # prebuilt candidate
 #
@@ -34,8 +35,8 @@ set -uo pipefail
 #   DOWNLOAD_TIMEOUT   Timeout in seconds for binary downloads (default: 60)
 #
 # Exit codes:
-#   0  No BLOCKED paths (AUTO and MANUAL are both acceptable)
-#   1  One or more paths are BLOCKED (data loss risk)
+#   0  No BLOCKED paths (or the exact qualified result in strict mode)
+#   1  A path is BLOCKED, or strict qualification fails
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -43,9 +44,9 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Source library modules
 source "$SCRIPT_DIR/lib/report.sh"      # colors + result tracking (must be first for color vars)
+source "$SCRIPT_DIR/lib/versions.sh"    # release manifest, ERAS, DIRECT_PATHS, get_era
 source "$SCRIPT_DIR/lib/binary.sh"      # download_binary, build_candidate
 source "$SCRIPT_DIR/lib/workspace.sh"   # new_workspace, bd_in, bd_create, cleanup_workspace
-source "$SCRIPT_DIR/lib/versions.sh"    # ERAS, DIRECT_PATHS, version_lte, get_era
 source "$SCRIPT_DIR/lib/features.sh"    # create_dataset, try_feature
 source "$SCRIPT_DIR/lib/snapshot.sh"    # capture_snapshot, check_fidelity
 
@@ -53,6 +54,29 @@ source "$SCRIPT_DIR/lib/snapshot.sh"    # capture_snapshot, check_fidelity
 source "$SCRIPT_DIR/recipes/sqlite_to_current.sh"
 source "$SCRIPT_DIR/recipes/server_to_embedded.sh"
 source "$SCRIPT_DIR/recipes/fix_dash_prefix.sh"
+
+source_artifact_fingerprint() {
+    local beads_dir="$1"
+    [ -d "$beads_dir" ] || return 1
+    (
+        cd "$beads_dir" || exit 1
+        while IFS= read -r -d '' path; do
+            if [ -L "$path" ]; then
+                printf 'link\0%s\0%s\0' "$path" "$(readlink "$path")"
+            elif [ -d "$path" ]; then
+                printf 'directory\0%s\0%s\0' "$path" "$(stat -c '%a' "$path")"
+            elif [ -f "$path" ]; then
+                printf 'file\0%s\0%s\0%s\0' "$path" "$(stat -c '%a' "$path")" "$(sha256_file "$path")"
+            else
+                printf 'other\0%s\0' "$path"
+            fi
+        done < <(find . -mindepth 1 -print0 | sort -z)
+    ) | if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    else
+        shasum -a 256 | awk '{print $1}'
+    fi
+}
 
 # Ensure jq is available
 if ! command -v jq >/dev/null 2>&1; then
@@ -75,11 +99,19 @@ test_direct_path() {
 
     # Download source binary
     local src_bin
-    src_bin=$(download_binary "$version" 2>/dev/null) || {
-        record_result "$path_label" "SKIP" "no binary for ${OS}/${ARCH}"
-        echo -e "  ${YELLOW}SKIP: no binary for ${OS}/${ARCH}${NC}"
-        return 0
-    }
+    if $STRICT_MODE; then
+        src_bin=$(download_binary "$version") || {
+            record_result "$path_label" "BLOCKED" "verified release unavailable for ${OS}/${ARCH}"
+            echo -e "  ${RED}BLOCKED: verified release unavailable for ${OS}/${ARCH}${NC}"
+            return 0
+        }
+    else
+        src_bin=$(download_binary "$version" 2>/dev/null) || {
+            record_result "$path_label" "SKIP" "no binary for ${OS}/${ARCH}"
+            echo -e "  ${YELLOW}SKIP: no binary for ${OS}/${ARCH}${NC}"
+            return 0
+        }
+    fi
 
     local WS
     WS=$(new_workspace)
@@ -120,15 +152,61 @@ test_direct_path() {
         echo -e "  ${RED}BLOCKED: could not create test data${NC}"
         return 0
     fi
+    if $STRICT_MODE && ! strict_fixture_has_expected_features "$version" "${DATASET_FEATURES[@]}"; then
+        cleanup_workspace "$WS"
+        rm -rf "$SNAPSHOTS_DIR"
+        record_result "$path_label" "BLOCKED" "source fixture is missing required features"
+        echo -e "  ${RED}BLOCKED: source fixture is missing required features${NC}"
+        return 0
+    fi
 
     # Step 3: Capture before-snapshot
-    capture_snapshot "$WS" "$src_bin" > "$SNAPSHOTS_DIR/before.json"
+    if ! capture_snapshot "$WS" "$src_bin" > "$SNAPSHOTS_DIR/before.json"; then
+        if $STRICT_MODE; then
+            cleanup_workspace "$WS"
+            rm -rf "$SNAPSHOTS_DIR"
+            record_result "$path_label" "BLOCKED" "could not capture the complete source snapshot"
+            echo -e "  ${RED}BLOCKED: could not capture the complete source snapshot${NC}"
+            return 0
+        fi
+    fi
     local before_count
     before_count=$(jq 'length' "$SNAPSHOTS_DIR/before.json" 2>/dev/null) || before_count=0
     echo "  before-snapshot: $before_count items"
+    if $STRICT_MODE && [ "$before_count" -eq 0 ]; then
+        cleanup_workspace "$WS"
+        rm -rf "$SNAPSHOTS_DIR"
+        record_result "$path_label" "BLOCKED" "source snapshot is empty"
+        echo -e "  ${RED}BLOCKED: source snapshot is empty${NC}"
+        return 0
+    fi
+    if $STRICT_MODE && ! strict_snapshot_has_expected_fixture "$version" "$SNAPSHOTS_DIR/before.json"; then
+        cleanup_workspace "$WS"
+        rm -rf "$SNAPSHOTS_DIR"
+        record_result "$path_label" "BLOCKED" "source snapshot does not match the exact fixture contract"
+        echo -e "  ${RED}BLOCKED: source snapshot does not match the exact fixture contract${NC}"
+        return 0
+    fi
 
     # Stop source server before upgrade
     stop_dolt_server "$WS"
+
+    local source_fingerprint=""
+    local source_sqlite_manifest=""
+    if $STRICT_MODE && [ "$(get_era "$version")" = "sqlite" ]; then
+        source_fingerprint=$(source_artifact_fingerprint "$WS/.beads") || {
+            cleanup_workspace "$WS"
+            rm -rf "$SNAPSHOTS_DIR"
+            record_result "$path_label" "BLOCKED" "could not fingerprint classic SQLite source"
+            return 0
+        }
+        source_sqlite_manifest=$(classic_sqlite_artifact_manifest "$WS/.beads") || {
+            cleanup_workspace "$WS"
+            rm -rf "$SNAPSHOTS_DIR"
+            record_result "$path_label" "BLOCKED" "could not inventory classic SQLite rollback source"
+            return 0
+        }
+    fi
 
     # Step 4: Try direct upgrade with candidate
     echo "  upgrading to candidate..."
@@ -148,6 +226,21 @@ test_direct_path() {
         if [ -n "$list_out" ] && [ "$list_out" != "[]" ] && [ "$list_out" != "null" ]; then
             upgrade_ok=true
         fi
+    fi
+
+    if $STRICT_MODE && ! $upgrade_ok && [ -n "$source_fingerprint" ]; then
+        local after_probe_fingerprint
+        stop_dolt_server "$WS"
+        after_probe_fingerprint=$(source_artifact_fingerprint "$WS/.beads") || after_probe_fingerprint="unreadable"
+        if [ "$after_probe_fingerprint" != "$source_fingerprint" ]; then
+            stop_dolt_server "$WS"
+            cleanup_workspace "$WS"
+            rm -rf "$SNAPSHOTS_DIR"
+            record_result "$path_label" "BLOCKED" "candidate probe mutated the classic SQLite source"
+            echo -e "  ${RED}BLOCKED: candidate probe mutated the classic SQLite source${NC}"
+            return 0
+        fi
+        echo -e "  ${GREEN}SOURCE-CHECK: failed direct probe left classic SQLite artifacts unchanged${NC}"
     fi
 
     if $upgrade_ok; then
@@ -214,6 +307,16 @@ test_direct_path() {
     esac
 
     if $recipe_worked; then
+        if $STRICT_MODE && [ -n "$source_sqlite_manifest" ] && \
+            ! verify_retained_sqlite_source "$WS/.beads" "$source_sqlite_manifest"; then
+            stop_dolt_server "$WS"
+            cleanup_workspace "$WS"
+            rm -rf "$SNAPSHOTS_DIR"
+            record_result "$path_label" "BLOCKED" "manual bridge mutated the retained classic SQLite database"
+            echo -e "  ${RED}BLOCKED: manual bridge mutated the retained classic SQLite database${NC}"
+            return 0
+        fi
+
         # Re-capture and check fidelity after recipe
         capture_snapshot "$WS" "$cand_bin" > "$SNAPSHOTS_DIR/after.json"
         local after_count
@@ -228,6 +331,15 @@ test_direct_path() {
         violations=$((violations + blocker_violations))
 
         stop_dolt_server "$WS"
+
+        if $STRICT_MODE && [ -n "$source_sqlite_manifest" ] && \
+            ! verify_retained_sqlite_source "$WS/.beads" "$source_sqlite_manifest"; then
+            cleanup_workspace "$WS"
+            rm -rf "$SNAPSHOTS_DIR"
+            record_result "$path_label" "BLOCKED" "post-upgrade commands mutated the retained SQLite rollback source"
+            echo -e "  ${RED}BLOCKED: post-upgrade commands mutated the retained SQLite rollback source${NC}"
+            return 0
+        fi
 
         cleanup_workspace "$WS"
         rm -rf "$SNAPSHOTS_DIR"
@@ -404,6 +516,9 @@ test_stepping_stone_path() {
 RUN_DIRECT=true
 RUN_STEPPING=true
 SELF_TEST=false
+STRICT_MODE=false
+EXPECTED_STATUS=""
+EXPECTED_RECIPE=""
 SPECIFIC_VERSIONS=()
 
 while [ $# -gt 0 ]; do
@@ -422,6 +537,22 @@ while [ $# -gt 0 ]; do
             RUN_STEPPING=false
             shift
             ;;
+        --strict)
+            STRICT_MODE=true
+            shift
+            ;;
+        --expect)
+            if [ $# -lt 2 ]; then
+                echo "ERROR: --expect requires AUTO or MANUAL" >&2
+                exit 1
+            fi
+            EXPECTED_STATUS="$2"
+            shift 2
+            ;;
+        --expect=*)
+            EXPECTED_STATUS="${1#--expect=}"
+            shift
+            ;;
         --help|-h)
             head -30 "$0" | grep '^#' | sed 's/^# \?//'
             exit 0
@@ -433,6 +564,29 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+if $STRICT_MODE; then
+    if $SELF_TEST || ! $RUN_DIRECT || $RUN_STEPPING || [ "${#SPECIFIC_VERSIONS[@]}" -ne 1 ]; then
+        echo "ERROR: --strict requires exactly one direct historical version" >&2
+        exit 1
+    fi
+    if [ "$EXPECTED_STATUS" != "AUTO" ] && [ "$EXPECTED_STATUS" != "MANUAL" ]; then
+        echo "ERROR: --strict requires --expect AUTO or --expect MANUAL" >&2
+        exit 1
+    fi
+    manifest_status=$(strict_expected_status "${SPECIFIC_VERSIONS[0]}") || {
+        echo "ERROR: ${SPECIFIC_VERSIONS[0]} has no strict qualification manifest" >&2
+        exit 1
+    }
+    if [ "$EXPECTED_STATUS" != "$manifest_status" ]; then
+        echo "ERROR: --expect $EXPECTED_STATUS disagrees with manifest outcome $manifest_status" >&2
+        exit 1
+    fi
+    EXPECTED_RECIPE=$(strict_expected_recipe "${SPECIFIC_VERSIONS[0]}") || {
+        echo "ERROR: ${SPECIFIC_VERSIONS[0]} has no strict recipe manifest" >&2
+        exit 1
+    }
+fi
 
 # ---------------------------------------------------------------------------
 # Main
@@ -540,6 +694,10 @@ if [ -z "${CANDIDATE_BIN:-}" ] && [ -f "$CAND_BIN" ]; then
 fi
 
 # Exit with failure only if any path is BLOCKED
+if $STRICT_MODE; then
+    strict_results_match "$EXPECTED_STATUS" "$EXPECTED_RECIPE" || exit 1
+    exit 0
+fi
 for status in "${RESULT_STATUSES[@]}"; do
     if [ "$status" = "BLOCKED" ]; then
         exit 1
