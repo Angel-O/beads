@@ -49,33 +49,32 @@ source "$SCRIPT_DIR/lib/binary.sh"      # download_binary, build_candidate
 source "$SCRIPT_DIR/lib/workspace.sh"   # new_workspace, bd_in, bd_create, cleanup_workspace
 source "$SCRIPT_DIR/lib/features.sh"    # create_dataset, try_feature
 source "$SCRIPT_DIR/lib/snapshot.sh"    # capture_snapshot, check_fidelity
+source "$SCRIPT_DIR/lib/direct_probe.sh" # fail-closed candidate probing
 
 # Source recipe scripts
 source "$SCRIPT_DIR/recipes/sqlite_to_current.sh"
 source "$SCRIPT_DIR/recipes/server_to_embedded.sh"
 source "$SCRIPT_DIR/recipes/fix_dash_prefix.sh"
 
-source_artifact_fingerprint() {
-    local beads_dir="$1"
-    [ -d "$beads_dir" ] || return 1
-    (
-        cd "$beads_dir" || exit 1
-        while IFS= read -r -d '' path; do
-            if [ -L "$path" ]; then
-                printf 'link\0%s\0%s\0' "$path" "$(readlink "$path")"
-            elif [ -d "$path" ]; then
-                printf 'directory\0%s\0%s\0' "$path" "$(stat -c '%a' "$path")"
-            elif [ -f "$path" ]; then
-                printf 'file\0%s\0%s\0%s\0' "$path" "$(stat -c '%a' "$path")" "$(sha256_file "$path")"
-            else
-                printf 'other\0%s\0' "$path"
-            fi
-        done < <(find . -mindepth 1 -print0 | sort -z)
-    ) | if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum | awk '{print $1}'
-    else
-        shasum -a 256 | awk '{print $1}'
-    fi
+verify_strict_retained_source() {
+    local ws="$1"
+    local era="$2"
+    local sqlite_manifest="$3"
+    local legacy_dolt_manifest="$4"
+
+    case "$era" in
+        sqlite)
+            [ -n "$sqlite_manifest" ] && \
+                verify_retained_sqlite_source "$ws/.beads" "$sqlite_manifest"
+            ;;
+        dolt_server)
+            [ -n "$legacy_dolt_manifest" ] && \
+                verify_retained_legacy_dolt_source "$ws/.beads" "$legacy_dolt_manifest"
+            ;;
+        *)
+            return 0
+            ;;
+    esac
 }
 
 # Ensure jq is available
@@ -191,61 +190,70 @@ test_direct_path() {
     # Stop source server before upgrade
     stop_dolt_server "$WS"
 
+    local source_era
+    source_era=$(get_era "$version")
     local source_fingerprint=""
     local source_sqlite_manifest=""
-    if $STRICT_MODE && [ "$(get_era "$version")" = "sqlite" ]; then
+    local source_legacy_dolt_manifest=""
+    if $STRICT_MODE; then
         source_fingerprint=$(source_artifact_fingerprint "$WS/.beads") || {
             cleanup_workspace "$WS"
             rm -rf "$SNAPSHOTS_DIR"
-            record_result "$path_label" "BLOCKED" "could not fingerprint classic SQLite source"
+            record_result "$path_label" "BLOCKED" "could not fingerprint historical source tree"
             return 0
         }
-        source_sqlite_manifest=$(classic_sqlite_artifact_manifest "$WS/.beads") || {
-            cleanup_workspace "$WS"
-            rm -rf "$SNAPSHOTS_DIR"
-            record_result "$path_label" "BLOCKED" "could not inventory classic SQLite rollback source"
-            return 0
-        }
+        case "$source_era" in
+            sqlite)
+                source_sqlite_manifest=$(classic_sqlite_artifact_manifest "$WS/.beads") || {
+                    cleanup_workspace "$WS"
+                    rm -rf "$SNAPSHOTS_DIR"
+                    record_result "$path_label" "BLOCKED" "could not inventory classic SQLite rollback source"
+                    return 0
+                }
+                ;;
+            dolt_server)
+                source_legacy_dolt_manifest=$(legacy_dolt_artifact_manifest "$WS/.beads") || {
+                    cleanup_workspace "$WS"
+                    rm -rf "$SNAPSHOTS_DIR"
+                    record_result "$path_label" "BLOCKED" "could not inventory legacy Dolt rollback source"
+                    return 0
+                }
+                ;;
+        esac
     fi
 
     # Step 4: Try direct upgrade with candidate
     echo "  upgrading to candidate..."
     local upgrade_ok=false
-
-    # First try: just use candidate directly (auto-detect + migrate)
-    local list_out
-    list_out=$(bd_in "$WS" "$cand_bin" list --json -n 0 --all 2>/dev/null) || true
-    if [ -n "$list_out" ] && [ "$list_out" != "[]" ] && [ "$list_out" != "null" ]; then
+    local probe_status=0
+    probe_candidate_direct_upgrade \
+        "$WS" "$cand_bin" "$source_fingerprint" "$STRICT_MODE" || probe_status=$?
+    if [ "$probe_status" -eq 0 ]; then
         upgrade_ok=true
     fi
 
-    # Second try: run candidate init
-    if ! $upgrade_ok; then
-        bd_in "$WS" "$cand_bin" init --quiet --non-interactive --prefix smoke </dev/null >/dev/null 2>&1 || true
-        list_out=$(bd_in "$WS" "$cand_bin" list --json -n 0 --all 2>/dev/null) || true
-        if [ -n "$list_out" ] && [ "$list_out" != "[]" ] && [ "$list_out" != "null" ]; then
-            upgrade_ok=true
-        fi
-    fi
-
-    if $STRICT_MODE && ! $upgrade_ok && [ -n "$source_fingerprint" ]; then
-        local after_probe_fingerprint
+    if [ "$probe_status" -eq 2 ]; then
         stop_dolt_server "$WS"
-        after_probe_fingerprint=$(source_artifact_fingerprint "$WS/.beads") || after_probe_fingerprint="unreadable"
-        if [ "$after_probe_fingerprint" != "$source_fingerprint" ]; then
-            stop_dolt_server "$WS"
-            cleanup_workspace "$WS"
-            rm -rf "$SNAPSHOTS_DIR"
-            record_result "$path_label" "BLOCKED" "candidate probe mutated the classic SQLite source"
-            echo -e "  ${RED}BLOCKED: candidate probe mutated the classic SQLite source${NC}"
-            return 0
-        fi
-        echo -e "  ${GREEN}SOURCE-CHECK: failed direct probe left classic SQLite artifacts unchanged${NC}"
+        cleanup_workspace "$WS"
+        rm -rf "$SNAPSHOTS_DIR"
+        record_result "$path_label" "BLOCKED" "$DIRECT_PROBE_FAILURE_DETAIL"
+        echo -e "  ${RED}BLOCKED: $DIRECT_PROBE_FAILURE_DETAIL${NC}"
+        return 0
+    fi
+    if $STRICT_MODE && ! $upgrade_ok; then
+        echo -e "  ${GREEN}SOURCE-CHECK: failed direct probe left historical source artifacts unchanged${NC}"
     fi
 
     if $upgrade_ok; then
         # Capture after-snapshot and check fidelity
-        capture_snapshot "$WS" "$cand_bin" > "$SNAPSHOTS_DIR/after.json"
+        if ! capture_snapshot "$WS" "$cand_bin" > "$SNAPSHOTS_DIR/after.json"; then
+            stop_dolt_server "$WS"
+            cleanup_workspace "$WS"
+            rm -rf "$SNAPSHOTS_DIR"
+            record_result "$path_label" "BLOCKED" "could not capture the complete candidate snapshot"
+            echo -e "  ${RED}BLOCKED: could not capture the complete candidate snapshot${NC}"
+            return 0
+        fi
         local after_count
         after_count=$(jq 'length' "$SNAPSHOTS_DIR/after.json" 2>/dev/null) || after_count=0
         echo "  after-snapshot: $after_count items"
@@ -273,8 +281,7 @@ test_direct_path() {
     stop_dolt_server "$WS"
     echo "  direct upgrade failed, trying recipes..."
 
-    local era
-    era=$(get_era "$version")
+    local era="$source_era"
     local recipe_worked=false
     local recipe_name=""
 
@@ -286,7 +293,8 @@ test_direct_path() {
             fi
             ;;
         dolt_server)
-            if recipe_server_to_embedded "$WS" "$src_bin" "$cand_bin" "$version"; then
+            if recipe_server_to_embedded \
+                "$WS" "$src_bin" "$cand_bin" "$version" "$SNAPSHOTS_DIR/before.json"; then
                 recipe_worked=true
                 recipe_name="server_to_embedded"
             fi
@@ -298,7 +306,8 @@ test_direct_path() {
             fi
             # Also try server recipe if prefix fix didn't help
             if ! $recipe_worked; then
-                if recipe_server_to_embedded "$WS" "$src_bin" "$cand_bin" "$version"; then
+                if recipe_server_to_embedded \
+                    "$WS" "$src_bin" "$cand_bin" "$version" "$SNAPSHOTS_DIR/before.json"; then
                     recipe_worked=true
                     recipe_name="server_to_embedded"
                 fi
@@ -307,18 +316,25 @@ test_direct_path() {
     esac
 
     if $recipe_worked; then
-        if $STRICT_MODE && [ -n "$source_sqlite_manifest" ] && \
-            ! verify_retained_sqlite_source "$WS/.beads" "$source_sqlite_manifest"; then
+        if $STRICT_MODE && ! verify_strict_retained_source \
+            "$WS" "$era" "$source_sqlite_manifest" "$source_legacy_dolt_manifest"; then
             stop_dolt_server "$WS"
             cleanup_workspace "$WS"
             rm -rf "$SNAPSHOTS_DIR"
-            record_result "$path_label" "BLOCKED" "manual bridge mutated the retained classic SQLite database"
-            echo -e "  ${RED}BLOCKED: manual bridge mutated the retained classic SQLite database${NC}"
+            record_result "$path_label" "BLOCKED" "manual bridge mutated the retained historical rollback source"
+            echo -e "  ${RED}BLOCKED: manual bridge mutated the retained historical rollback source${NC}"
             return 0
         fi
 
         # Re-capture and check fidelity after recipe
-        capture_snapshot "$WS" "$cand_bin" > "$SNAPSHOTS_DIR/after.json"
+        if ! capture_snapshot "$WS" "$cand_bin" > "$SNAPSHOTS_DIR/after.json"; then
+            stop_dolt_server "$WS"
+            cleanup_workspace "$WS"
+            rm -rf "$SNAPSHOTS_DIR"
+            record_result "$path_label" "BLOCKED" "could not capture the complete candidate snapshot after recipe"
+            echo -e "  ${RED}BLOCKED: could not capture the complete candidate snapshot after recipe${NC}"
+            return 0
+        fi
         local after_count
         after_count=$(jq 'length' "$SNAPSHOTS_DIR/after.json" 2>/dev/null) || after_count=0
         echo "  after-recipe snapshot: $after_count items"
@@ -332,12 +348,12 @@ test_direct_path() {
 
         stop_dolt_server "$WS"
 
-        if $STRICT_MODE && [ -n "$source_sqlite_manifest" ] && \
-            ! verify_retained_sqlite_source "$WS/.beads" "$source_sqlite_manifest"; then
+        if $STRICT_MODE && ! verify_strict_retained_source \
+            "$WS" "$era" "$source_sqlite_manifest" "$source_legacy_dolt_manifest"; then
             cleanup_workspace "$WS"
             rm -rf "$SNAPSHOTS_DIR"
-            record_result "$path_label" "BLOCKED" "post-upgrade commands mutated the retained SQLite rollback source"
-            echo -e "  ${RED}BLOCKED: post-upgrade commands mutated the retained SQLite rollback source${NC}"
+            record_result "$path_label" "BLOCKED" "post-upgrade commands mutated the retained historical rollback source"
+            echo -e "  ${RED}BLOCKED: post-upgrade commands mutated the retained historical rollback source${NC}"
             return 0
         fi
 
