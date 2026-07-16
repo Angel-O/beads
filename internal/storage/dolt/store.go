@@ -367,6 +367,34 @@ func fsckTimeoutDuration() time.Duration {
 	return fsckTimeout
 }
 
+// Env-tunable dolt sql-server wire timeouts. Defaults preserve today's behavior; each
+// override is a positive integer number of seconds (mirroring BEADS_DOLT_READY_TIMEOUT).
+const (
+	envServerConnectTimeout = "BEADS_DOLT_SERVER_CONNECT_TIMEOUT"
+	envServerReadTimeout    = "BEADS_DOLT_SERVER_READ_TIMEOUT"
+	envServerWriteTimeout   = "BEADS_DOLT_SERVER_WRITE_TIMEOUT"
+
+	defaultServerConnectTimeout = 5 * time.Second
+	defaultServerReadTimeout    = 10 * time.Second
+	defaultServerWriteTimeout   = 10 * time.Second
+)
+
+// serverWireTimeout returns the configured wire timeout for env, falling back to def.
+// The value is a positive integer number of seconds; an unset value is silent, an
+// invalid one warns once to stderr and uses def (the BEADS_DOLT_READY_TIMEOUT pattern).
+func serverWireTimeout(env string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(env))
+	if v == "" {
+		return def
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs < 1 {
+		fmt.Fprintf(os.Stderr, "Warning: %s=%q is not a positive integer number of seconds; using default %s\n", env, v, def)
+		return def
+	}
+	return time.Duration(secs) * time.Second
+}
+
 // Retry configuration for transient connection errors (stale pool connections,
 // brief network issues, server restarts).
 const serverRetryMaxElapsed = 30 * time.Second
@@ -1414,7 +1442,8 @@ const credSentinelUser = "token-per-dial" //nolint:gosec // G101: a redaction pl
 
 // buildServerDSN constructs a MySQL DSN for connecting to a Dolt server.
 // If database is empty, connects without selecting a database (for init operations).
-// Adds ReadTimeout/WriteTimeout for long-lived connection pools.
+// Adds ReadTimeout/WriteTimeout for long-lived connection pools. The connect, read, and
+// write timeouts are overridable via BEADS_DOLT_SERVER_{CONNECT,READ,WRITE}_TIMEOUT.
 func buildServerDSN(cfg *Config, database string) string {
 	// On the credential path the token is stamped per-dial by the connector; keep it
 	// out of the baked DSN string so nothing that retains or prints the DSN leaks it.
@@ -1430,14 +1459,15 @@ func buildServerDSN(cfg *Config, database string) string {
 		Password: cfg.ServerPassword,
 		Database: database,
 		TLS:      cfg.ServerTLS,
+		Timeout:  serverWireTimeout(envServerConnectTimeout, defaultServerConnectTimeout),
 	}
 	// Parse the base DSN and add pool-specific timeouts.
 	parsed, err := mysql.ParseDSN(base.String())
 	if err != nil {
 		return base.String()
 	}
-	parsed.ReadTimeout = 10 * time.Second
-	parsed.WriteTimeout = 10 * time.Second
+	parsed.ReadTimeout = serverWireTimeout(envServerReadTimeout, defaultServerReadTimeout)
+	parsed.WriteTimeout = serverWireTimeout(envServerWriteTimeout, defaultServerWriteTimeout)
 	return parsed.FormatDSN()
 }
 
@@ -1454,6 +1484,10 @@ func (s *DoltStore) execWithLongTimeout(ctx context.Context, query string, args 
 	if err != nil {
 		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
+	// Read timeout is deliberately fixed at 5m for network-bound git push/pull/merge
+	// I/O and is exempt from BEADS_DOLT_SERVER_READ_TIMEOUT — a small override would
+	// abort a legitimate long transfer. The connect and write timeouts ride through
+	// unchanged from s.connStr (built by buildServerDSN with their env overrides).
 	cfg.ReadTimeout = 5 * time.Minute
 	db, err := openSQLDB(cfg.FormatDSN(), s.credentialSource)
 	if err != nil {
@@ -1481,6 +1515,10 @@ func (s *DoltStore) execWithLongTimeoutNoTx(ctx context.Context, query string, a
 	if err != nil {
 		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
+	// Read timeout is deliberately fixed at 5m for network-bound git push/pull/merge
+	// I/O and is exempt from BEADS_DOLT_SERVER_READ_TIMEOUT — a small override would
+	// abort a legitimate long transfer. The connect and write timeouts ride through
+	// unchanged from s.connStr (built by buildServerDSN with their env overrides).
 	cfg.ReadTimeout = 5 * time.Minute
 	db, err := openSQLDB(cfg.FormatDSN(), s.credentialSource)
 	if err != nil {
@@ -1815,6 +1853,9 @@ func (s *DoltStore) openMigrationDB() (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse DSN for migration connection: %w", err)
 	}
+	// Migrations must never be interrupted mid-DDL, so both wire timeouts are pinned to
+	// unlimited here and are exempt from BEADS_DOLT_SERVER_{READ,WRITE}_TIMEOUT; the
+	// connect timeout still rides through from s.connStr.
 	cfg.ReadTimeout = 0
 	cfg.WriteTimeout = 0
 	db, err := openSQLDB(cfg.FormatDSN(), s.credentialSource)
@@ -2842,6 +2883,10 @@ func (s *DoltStore) openLongTimeoutConn() (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
+	// Read timeout is deliberately fixed at 5m for network-bound git push/pull/merge
+	// I/O and is exempt from BEADS_DOLT_SERVER_READ_TIMEOUT — a small override would
+	// abort a legitimate long transfer. The connect and write timeouts ride through
+	// unchanged from s.connStr (built by buildServerDSN with their env overrides).
 	cfg.ReadTimeout = 5 * time.Minute
 	db, err := openSQLDB(cfg.FormatDSN(), s.credentialSource)
 	if err != nil {
