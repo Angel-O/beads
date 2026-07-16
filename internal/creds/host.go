@@ -17,12 +17,13 @@ import (
 //
 // The algorithm is:
 //  1. Reject empty input or input containing whitespace.
-//  2. Strip a single surrounding pair of brackets. If the result parses as an IP,
-//     return the Go-normalized form (a v4-mapped IPv6 collapses to a dotted quad,
-//     an IPv6 address is lowercased and compressed).
-//  3. Otherwise treat it as a hostname: strip exactly one trailing dot and convert
-//     to ASCII via IDNA (the Lookup profile, which case-folds), rejecting any
-//     input IDNA cannot encode.
+//  2. Strip a single surrounding pair of brackets. If nothing remains, reject. If the
+//     result parses as an IP, return the Go-normalized form (a v4-mapped IPv6 collapses
+//     to a dotted quad, an IPv6 address is lowercased and compressed).
+//  3. Otherwise treat it as a hostname: strip exactly one trailing dot and convert to
+//     ASCII via IDNA (the Lookup profile, which case-folds), rejecting any input IDNA
+//     cannot encode; then strip any trailing dot IDNA re-introduced (keeping the function
+//     idempotent) and reject an empty result.
 func CanonicalHost(host string) (string, error) {
 	if host == "" {
 		return "", fmt.Errorf("canonical host: empty host")
@@ -35,6 +36,9 @@ func CanonicalHost(host string) (string, error) {
 	if len(h) >= 2 && h[0] == '[' && h[len(h)-1] == ']' {
 		h = h[1 : len(h)-1]
 	}
+	if h == "" {
+		return "", fmt.Errorf("canonical host: %q has no host after stripping brackets", host)
+	}
 	if ip := net.ParseIP(h); ip != nil {
 		return ip.String(), nil
 	}
@@ -43,6 +47,15 @@ func CanonicalHost(host string) (string, error) {
 	ascii, err := idna.Lookup.ToASCII(h)
 	if err != nil {
 		return "", fmt.Errorf("canonical host: %q is not a valid hostname: %w", host, err)
+	}
+	// IDNA maps fullwidth/ideographic separators (U+3002/U+FF61/U+FF0E) to '.',
+	// re-introducing a trailing dot the pre-IDNA TrimSuffix already stripped. Strip
+	// again so canonicalization is idempotent (canon(canon(x)) == canon(x)) — the
+	// byte-exact cross-repo allowlist match depends on it — and reject an empty result
+	// (inputs like "." or "[]" collapse to nothing and must not become the "" host).
+	ascii = strings.TrimRight(ascii, ".")
+	if ascii == "" {
+		return "", fmt.Errorf("canonical host: %q has no host label", host)
 	}
 	return ascii, nil
 }
