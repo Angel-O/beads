@@ -34,6 +34,25 @@ func TestServerWireTimeoutParsing(t *testing.T) {
 			t.Fatalf("got %s, want default %s", got, def)
 		}
 	})
+	t.Run("overflowing seconds falls back to a positive default", func(t *testing.T) {
+		// 1e10 seconds * time.Second overflows int64 nanoseconds to a negative/zero
+		// Duration, which the driver reads as NO deadline — silently disabling the
+		// very hang protection this tunable exists to tighten.
+		t.Setenv(env, "10000000000")
+		got := serverWireTimeout(env, def)
+		if got != def {
+			t.Fatalf("got %s, want default %s", got, def)
+		}
+		if got <= 0 {
+			t.Fatalf("timeout must stay positive and bounded, got %s", got)
+		}
+	})
+	t.Run("absurdly large but non-overflowing seconds is capped to default", func(t *testing.T) {
+		t.Setenv(env, "100000") // ~27h, above the 1-day cap
+		if got := serverWireTimeout(env, def); got != def {
+			t.Fatalf("got %s, want default %s", got, def)
+		}
+	})
 }
 
 // The overrides reach the baked DSN; defaults preserve today's values.

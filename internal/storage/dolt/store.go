@@ -377,19 +377,27 @@ const (
 	defaultServerConnectTimeout = 5 * time.Second
 	defaultServerReadTimeout    = 10 * time.Second
 	defaultServerWriteTimeout   = 10 * time.Second
+
+	// maxServerWireTimeoutSecs caps the override well above any real wire timeout (1
+	// day) and far below the point where secs*time.Second overflows int64 nanoseconds.
+	// Without an upper bound a huge value (e.g. a nanosecond count pasted as seconds)
+	// overflows to a negative/zero Duration that the driver reads as NO deadline —
+	// silently disabling the very hang protection this tunable exists to tighten.
+	maxServerWireTimeoutSecs = 86400
 )
 
 // serverWireTimeout returns the configured wire timeout for env, falling back to def.
-// The value is a positive integer number of seconds; an unset value is silent, an
-// invalid one warns once to stderr and uses def (the BEADS_DOLT_READY_TIMEOUT pattern).
+// The value is an integer number of seconds in [1, maxServerWireTimeoutSecs]; an unset
+// value is silent, an out-of-range or non-numeric one warns once to stderr and uses
+// def (the BEADS_DOLT_READY_TIMEOUT pattern).
 func serverWireTimeout(env string, def time.Duration) time.Duration {
 	v := strings.TrimSpace(os.Getenv(env))
 	if v == "" {
 		return def
 	}
 	secs, err := strconv.Atoi(v)
-	if err != nil || secs < 1 {
-		fmt.Fprintf(os.Stderr, "Warning: %s=%q is not a positive integer number of seconds; using default %s\n", env, v, def)
+	if err != nil || secs < 1 || secs > maxServerWireTimeoutSecs {
+		fmt.Fprintf(os.Stderr, "Warning: %s=%q is not an integer number of seconds in [1, %d]; using default %s\n", env, v, maxServerWireTimeoutSecs, def)
 		return def
 	}
 	return time.Duration(secs) * time.Second
