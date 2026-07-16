@@ -32,9 +32,9 @@ import (
 	"github.com/steveyegge/beads/internal/remotecache"
 	"github.com/steveyegge/beads/internal/routing"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/backends"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/schema"
-	sqlitestore "github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/storage/uow"
 	"github.com/steveyegge/beads/internal/telemetry"
 	"github.com/steveyegge/beads/internal/ui"
@@ -990,12 +990,14 @@ var rootCmd = &cobra.Command{
 		if dbPath == "" {
 			if bd := beads.FindBeadsDir(); bd != "" {
 				cfg, cfgErr := configfile.Load(bd)
-				if cfgErr != nil || cfg != nil && (cfg.IsDoltProxiedServerMode() || cfg.GetBackend() == configfile.BackendSQLite || !configfile.IsSupportedBackend(cfg.Backend)) {
-					// SQLite, proxied-server, and removed-backend workspaces may have no
-					// local Dolt database file. Invalid or unknown metadata likewise must
-					// reach config validation instead of becoming a generic "no database"
-					// result. metadata.json identifies the workspace so store selection can
-					// route or reject it explicitly.
+				if cfgErr != nil || cfg != nil && (cfg.IsDoltProxiedServerMode() || registeredBackendWorkspaceIsBeadsDir(cfg) || !configfile.IsSupportedBackend(cfg.Backend)) {
+					// Registered backends whose workspace IS the .beads directory
+					// (e.g. SQLite), proxied-server, and removed-backend workspaces
+					// may have no local Dolt database file. Invalid or unknown
+					// metadata likewise must reach config validation instead of
+					// becoming a generic "no database" result. metadata.json
+					// identifies the workspace so store selection can route or
+					// reject it explicitly.
 					dbPath = bd
 				}
 			}
@@ -1282,9 +1284,17 @@ var rootCmd = &cobra.Command{
 		// Removing them WILL cause unrecoverable data corruption and data loss.
 		// Dolt manages these files itself; external interference is never safe.
 
-		if cfg != nil && cfg.GetBackend() == configfile.BackendSQLite {
-			// SQLite backend: pure-Go file-based SQL-family bundle.
-			store, err = sqlitestore.NewFromConfig(rootCtx, beadsDir)
+		if backend, ok := backends.Lookup(cfg.GetBackend()); ok {
+			// Registered backend (e.g. SQLite): the registry owns this open.
+			// The Dolt family stays literal — embedded and server modes go
+			// through newDoltStore below, and proxied-server already
+			// short-circuited to the UOW provider above — because the
+			// registry is for storage.DoltStorage-returning backends only.
+			if useReadOnly {
+				store, err = backend.OpenReadOnly(rootCtx, beadsDir)
+			} else {
+				store, err = backend.Open(rootCtx, beadsDir)
+			}
 		} else {
 			store, err = newDoltStore(rootCtx, doltCfg)
 		}
