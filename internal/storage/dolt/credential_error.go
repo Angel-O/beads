@@ -1,6 +1,10 @@
 package dolt
 
-import "github.com/steveyegge/beads/internal/creds"
+import (
+	"strings"
+
+	"github.com/steveyegge/beads/internal/creds"
+)
 
 // redactedError wraps a credential-path error whose message may carry live token
 // material. Error() returns the scrubbed text (cached tokens replaced by the
@@ -16,6 +20,26 @@ type redactedError struct {
 func (e *redactedError) Error() string { return e.scrubbed }
 
 func (e *redactedError) Unwrap() error { return e.err }
+
+// redactErrorToken scrubs the exact per-dial token out of err's message. redactingConnector
+// captures the token stamped on THIS dial (never a cache snapshot), so the scrub is
+// race-free: a concurrent creds.Invalidate cannot evict the needle between the failing
+// dial and the redaction. Tokens are long, unique values, so exact-substring replacement
+// is safe and locale-independent. If the token is empty or absent from the message the
+// original error is returned unchanged, preserving its identity; otherwise redactedError
+// keeps errors.As reaching the inner *mysql.MySQLError so isAuthError and the circuit
+// breaker keep classifying on the preserved 1045 number. Safe on a nil error.
+func redactErrorToken(err error, token string) error {
+	if err == nil || token == "" {
+		return err
+	}
+	msg := err.Error()
+	scrubbed := strings.ReplaceAll(msg, token, creds.RedactedTokenSentinel)
+	if scrubbed == msg {
+		return err
+	}
+	return &redactedError{scrubbed: scrubbed, err: err}
+}
 
 // redactCredentialError scrubs live token material out of err's message before it can
 // surface to stderr, logs, or telemetry. The gateway reads the minted identity token
