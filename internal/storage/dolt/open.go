@@ -52,12 +52,18 @@ func ApplyCLIAutoStart(beadsDir string, cfg *Config) {
 // factory and interpreting another backend's workspace as Dolt. Removed backend
 // identifiers deliberately remain recognizable in metadata so this check can fail
 // closed instead of opening a new, empty Dolt database.
+//
+// Supported non-Dolt backends — built-in or registered at runtime — are
+// rejected below as well: a Dolt open of another backend's workspace is
+// always wrong. The supported-name check runs first so that a registered
+// name gets the plain non-Dolt rejection rather than a stale removed-name
+// tombstone (registration wins over the tombstone list).
 func requireDoltBackend(fileCfg *configfile.Config) error {
-	switch fileCfg.Backend {
-	case configfile.BackendPostgres, configfile.BackendMySQL:
-		return fmt.Errorf("configured storage backend %q is no longer supported and cannot be opened as Dolt: %s", fileCfg.Backend, configfile.RemovedBackendDetail(fileCfg.Backend))
-	}
 	if !configfile.IsSupportedBackend(fileCfg.Backend) {
+		switch fileCfg.Backend {
+		case configfile.BackendPostgres, configfile.BackendMySQL:
+			return fmt.Errorf("configured storage backend %q is no longer supported and cannot be opened as Dolt: %s", fileCfg.Backend, configfile.RemovedBackendDetail(fileCfg.Backend))
+		}
 		return fmt.Errorf("configured storage backend %q in metadata.json is not recognized and cannot be opened as Dolt; %s", fileCfg.Backend, configfile.BackendNotOpenedGuarantee)
 	}
 	backend := fileCfg.GetBackend()

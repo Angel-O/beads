@@ -248,6 +248,14 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			}
 			return fmt.Errorf("unknown backend %q: supported backends are \"dolt\" (default) and \"sqlite\"", backendFlag)
 		}
+		if backendFlag != "" && backendFlag != configfile.BackendDolt && !isSQLite {
+			// The name passed IsSupportedBackend above, so it is a backend
+			// registered at runtime — openable, but bd init's provisioning
+			// arms are per-backend and this build has none for it. Refuse
+			// rather than silently provisioning a Dolt workspace under a
+			// non-Dolt backend name.
+			return fmt.Errorf("bd init cannot provision storage backend %q in this build; provision the workspace with the tooling that registers %q, or use --backend=dolt or --backend=sqlite", backendFlag, backendFlag)
+		}
 		for _, legacyFlag := range removedServerBackendInitFlags {
 			if cmd.Flags().Changed(legacyFlag.name) {
 				return fmt.Errorf("--%s belonged to the removed PostgreSQL/MySQL initialization paths: %s; use --backend=dolt or --backend=sqlite", legacyFlag.name, configfile.RemovedBackendRationale)

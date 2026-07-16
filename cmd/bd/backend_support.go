@@ -21,11 +21,15 @@ func validateConfiguredBackend(cfg *configfile.Config) error {
 	if cfg == nil {
 		return nil
 	}
+	// Supported means built-in or registered; the registry consult wins over
+	// the removed-name tombstones (see configfile.IsSupportedBackend). The
+	// tombstone rejection below fires only for names nobody registered.
+	if configfile.IsSupportedBackend(cfg.Backend) {
+		return nil
+	}
 	switch cfg.Backend {
 	case configfile.BackendPostgres, configfile.BackendMySQL:
 		return configfile.RemovedBackendError(cfg.Backend)
-	case "", configfile.BackendDolt, configfile.BackendSQLite:
-		return nil
 	default:
 		return configfile.UnknownBackendError(cfg.Backend)
 	}
