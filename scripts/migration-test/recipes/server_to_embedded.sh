@@ -3,8 +3,10 @@
 #
 # Each server-era release needs an explicit extraction strategy. v0.55.4 has
 # a lossless native export for the qualified fixture. v0.57.0 needs its native
-# export enriched with comment bodies from one-item show queries. v0.56.1 and
-# v0.58.0 remain unqualified.
+# export enriched with comment bodies from one-item show queries. v0.62.0 uses
+# the same bridge after normalizing the three derived epic counters that its
+# show command adds but its export command omits. v0.56.1 and v0.58.0 remain
+# unqualified.
 #
 # Strategy:
 #   1. Stop any running Dolt server
@@ -13,9 +15,10 @@
 #   4. If candidate DB is empty, reimport from JSONL export
 #
 # User-facing instructions:
-#   Use the pinned migration harness for qualified v0.55.4 and v0.57.0 core
-#   fixtures. It stops the historical server, retains a byte-verified rollback
-#   tree, extracts and validates JSONL, and only then initializes the candidate.
+#   Use the pinned migration harness for qualified v0.55.4, v0.57.0, and
+#   v0.62.0 core fixtures. It stops the historical server, retains a
+#   byte-verified rollback tree, extracts and validates JSONL, and only then
+#   initializes the candidate.
 
 publish_legacy_dolt_rollback() {
     mv --no-target-directory --no-clobber --no-copy -- "$1" "$2"
@@ -102,12 +105,19 @@ migration_jsonl_is_snapshot_subset() {
 v057_export_matches_snapshot() {
     local export_path="$1"
     local before_snapshot="$2"
+    local version="$3"
 
     jq -en \
         --slurpfile exports "$export_path" \
-        --slurpfile before "$before_snapshot" '
+        --slurpfile before "$before_snapshot" \
+        --arg version "$version" '
         def by_id: map({key: .id, value: .}) | from_entries;
+        def normalize_version_derived_fields:
+            if $version == "v0.62.0" then
+                del(.epic_closeable, .epic_closed_children, .epic_total_children)
+            else . end;
         def core:
+            normalize_version_derived_fields |
             del(
                 .labels,
                 .dependencies,
@@ -179,12 +189,18 @@ v057_export_and_show_comments_agree() {
     local export_path="$1"
     local show_path="$2"
     local before_snapshot="$3"
+    local version="$4"
 
     jq -en \
         --slurpfile exports "$export_path" \
         --slurpfile shows "$show_path" \
-        --slurpfile before "$before_snapshot" '
+        --slurpfile before "$before_snapshot" \
+        --arg version "$version" '
         def by_id: map({key: .id, value: .}) | from_entries;
+        def normalize_version_derived_fields:
+            if $version == "v0.62.0" then
+                del(.epic_closeable, .epic_closed_children, .epic_total_children)
+            else . end;
         ($exports | by_id) as $export |
         ($shows | by_id) as $show |
         ($before[0] | by_id) as $expected |
@@ -200,7 +216,8 @@ v057_export_and_show_comments_agree() {
             (($comments | type) == "array") and
             ($count == ($comments | length)) and
             ($comments == $expected_comments) and
-            ($show[$id] == $expected[$id])
+            (($show[$id] | normalize_version_derived_fields) ==
+                ($expected[$id] | normalize_version_derived_fields))
         ] | all)
     ' >/dev/null 2>&1
 }
@@ -211,6 +228,7 @@ enrich_v057_export_comments() {
     local export_path="$3"
     local before_snapshot="$4"
     local enriched_path="$5"
+    local version="$6"
     local show_path ids encoded_id id show_json show_record
     local extraction_ok=true
 
@@ -218,7 +236,7 @@ enrich_v057_export_comments() {
     [ -f "$before_snapshot" ] && [ ! -L "$before_snapshot" ] || return 1
     [ -f "$enriched_path" ] && [ ! -L "$enriched_path" ] || return 1
     migration_jsonl_matches_snapshot "$export_path" "$before_snapshot" || return 1
-    v057_export_matches_snapshot "$export_path" "$before_snapshot" || return 1
+    v057_export_matches_snapshot "$export_path" "$before_snapshot" "$version" || return 1
 
     show_path=$(mktemp "$ws/.beads/.issues.jsonl.show.tmp.XXXXXX") || return 1
     ids=$(jq -ce '.[] | .id' "$before_snapshot" 2>/dev/null) || extraction_ok=false
@@ -257,7 +275,7 @@ enrich_v057_export_comments() {
     if $extraction_ok && \
         migration_jsonl_matches_snapshot "$show_path" "$before_snapshot" && \
         v057_export_and_show_comments_agree \
-            "$export_path" "$show_path" "$before_snapshot"; then
+            "$export_path" "$show_path" "$before_snapshot" "$version"; then
         if ! jq -cn \
             --slurpfile exports "$export_path" \
             --slurpfile shows "$show_path" '
@@ -411,6 +429,25 @@ recipe_server_to_embedded() {
     }
     preserve_legacy_dolt_source "$ws" "$rollback_manifest" || return 1
 
+    # v0.62 cannot reliably auto-start its historical server on a loaded host.
+    # Its workspace marker keeps auto-start disabled, so restart the qualified,
+    # harness-owned server against the still-active source before extraction.
+    local bootstrap_strategy=""
+    bootstrap_strategy=$(server_bootstrap_strategy "$version" 2>/dev/null) || true
+    case "$bootstrap_strategy" in
+        "") ;;
+        prestarted_server)
+            if ! start_owned_migration_dolt_server "$ws"; then
+                echo "  FAILED: could not restart the qualified historical Dolt server"
+                return 1
+            fi
+            ;;
+        *)
+            echo "  FAILED: unsupported server bootstrap strategy for $version"
+            return 1
+            ;;
+    esac
+
     # Step 2: Export data via old binary BEFORE clearing metadata.
     # The old binary needs metadata.json to know it's in server mode and
     # to auto-start its Dolt server. Removing metadata first (as was done
@@ -437,7 +474,7 @@ recipe_server_to_embedded() {
                 if [ -n "$enriched_tmp" ] && \
                     enrich_v057_export_comments \
                         "$ws" "$old_bin" "$export_tmp" \
-                        "$before_snapshot" "$enriched_tmp"; then
+                        "$before_snapshot" "$enriched_tmp" "$version"; then
                     export_publish_source="$enriched_tmp"
                     historical_export_ok=true
                 fi

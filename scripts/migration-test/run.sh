@@ -39,7 +39,7 @@ set -uo pipefail
 #   1  A path is BLOCKED, or strict qualification fails
 # =============================================================================
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Source library modules
@@ -77,12 +77,150 @@ verify_strict_retained_source() {
     esac
 }
 
+verify_v062_prestarted_source() {
+    local ws="$1"
+    local reserved_port="$2"
+    local metadata="$ws/.beads/metadata.json"
+    local local_version="$ws/.beads/.local_version"
+    local schema_json=""
+
+    [[ "$reserved_port" =~ ^2[0-9]{4}$ ]] || {
+        echo "reserved server port is invalid"
+        return 1
+    }
+    if [ ! -f "$metadata" ] || [ -L "$metadata" ]; then
+        echo "v0.62.0 init did not create authentic metadata"
+        return 1
+    fi
+    if ! jq -e --argjson reserved_port "$reserved_port" '
+        type == "object" and
+        .backend == "dolt" and
+        .database == "dolt" and
+        .dolt_mode == "server" and
+        .dolt_server_host == "127.0.0.1" and
+        (.dolt_server_port | type == "number") and
+        .dolt_server_port == $reserved_port and
+        .dolt_database == "smoke" and
+        (.project_id | type == "string" and length > 0)
+    ' "$metadata" >/dev/null; then
+        echo "v0.62.0 init metadata does not match the server fixture contract"
+        return 1
+    fi
+    if [ ! -f "$local_version" ] || [ -L "$local_version" ] ||
+        ! printf '0.62.0\n' | cmp -s - "$local_version"; then
+        echo "v0.62.0 init did not write the exact historical version marker"
+        return 1
+    fi
+    if [ ! -d "$ws/.beads/dolt" ] || [ -L "$ws/.beads/dolt" ] ||
+        [ ! -d "$ws/.beads/dolt/.dolt" ] || [ -L "$ws/.beads/dolt/.dolt" ] ||
+        [ ! -d "$ws/.beads/dolt/smoke" ] || [ -L "$ws/.beads/dolt/smoke" ] ||
+        [ ! -d "$ws/.beads/dolt/smoke/.dolt" ] || [ -L "$ws/.beads/dolt/smoke/.dolt" ]; then
+        echo "v0.62.0 init did not create the local Dolt catalog and smoke database"
+        return 1
+    fi
+    schema_json=$(migration_owned_dolt_sql \
+        "$ws" smoke \
+        "SELECT value AS schema_version FROM config WHERE \`key\` = 'schema_version'") || {
+        echo "could not query the v0.62.0 source schema"
+        return 1
+    }
+    if ! jq -e '
+        type == "object" and
+        (.rows | type == "array" and length == 1) and
+        (.rows[0] |
+            type == "object" and
+            (.schema_version | type == "string") and
+            .schema_version == "9")
+    ' <<< "$schema_json" >/dev/null; then
+        echo "v0.62.0 source schema version is not exactly string 9"
+        return 1
+    fi
+}
+
+block_source_initialization() {
+    local ws="$1"
+    local snapshots_dir="$2"
+    local path_label="$3"
+    local detail="$4"
+
+    migration_run_record_result_after_cleanup \
+        "$ws" "$snapshots_dir" "$path_label" "BLOCKED" "$detail" || true
+    echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
+}
+
+MIGRATION_RUN_ACTIVE_WORKSPACE=""
+MIGRATION_RUN_ACTIVE_SNAPSHOTS=""
+
+migration_run_activate_workspace() {
+    MIGRATION_RUN_ACTIVE_WORKSPACE="$1"
+    MIGRATION_RUN_ACTIVE_SNAPSHOTS="${2:-}"
+}
+
+migration_run_forget_workspace() {
+    local ws="$1"
+
+    if [ "$MIGRATION_RUN_ACTIVE_WORKSPACE" = "$ws" ]; then
+        MIGRATION_RUN_ACTIVE_WORKSPACE=""
+        MIGRATION_RUN_ACTIVE_SNAPSHOTS=""
+    fi
+}
+
+migration_run_cleanup_active_workspace() {
+    local ws="$MIGRATION_RUN_ACTIVE_WORKSPACE"
+    local snapshots="$MIGRATION_RUN_ACTIVE_SNAPSHOTS"
+
+    [ -n "$ws" ] || return 0
+    migration_run_forget_workspace "$ws"
+    if [ ! -e "$ws" ] && [ ! -L "$ws" ]; then
+        [ -z "$snapshots" ] || rm -rf -- "$snapshots"
+        return 0
+    fi
+    if cleanup_workspace "$ws"; then
+        [ -z "$snapshots" ] || rm -rf -- "$snapshots"
+        return 0
+    fi
+    echo "could not prove isolated workspace cleanup; preserved at $ws" >&2
+    return 1
+}
+
+migration_run_install_cleanup_traps() {
+    trap 'migration_run_cleanup_active_workspace' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+migration_run_record_result_after_cleanup() {
+    local ws="$1"
+    local snapshots="$2"
+    local path="$3"
+    local status="$4"
+    local detail="$5"
+    local recipe="${6:-}"
+    local violations="${7:-0}"
+
+    if ! cleanup_workspace "$ws"; then
+        migration_run_forget_workspace "$ws"
+        record_result "$path" "BLOCKED" \
+            "could not prove isolated workspace cleanup; preserved at $ws" "" "$violations"
+        return 1
+    fi
+    migration_run_forget_workspace "$ws"
+    [ -z "$snapshots" ] || rm -rf -- "$snapshots"
+    record_result "$path" "$status" "$detail" "$recipe" "$violations"
+}
+
+if [ "${MIGRATION_TEST_RUN_LIBRARY_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 # Ensure jq is available
 if ! command -v jq >/dev/null 2>&1; then
     echo -e "${RED}ERROR: jq is required but not installed.${NC}"
     echo "Install with: sudo apt install jq / brew install jq"
     exit 1
 fi
+migration_run_install_cleanup_traps
 
 # ---------------------------------------------------------------------------
 # Test a direct upgrade path: source_version → candidate
@@ -127,68 +265,125 @@ test_direct_path() {
         echo -e "  ${RED}BLOCKED: could not create isolated workspace${NC}"
         return 0
     fi
+    migration_run_activate_workspace "$WS" ""
     local SNAPSHOTS_DIR=""
     if ! SNAPSHOTS_DIR=$(mktemp -d /tmp/bd-snapshots-XXXXXX); then
-        record_result_after_workspace_cleanup \
-            "$WS" "$path_label" "BLOCKED" "could not create isolated snapshot directory" || true
+        migration_run_record_result_after_cleanup \
+            "$WS" "" "$path_label" "BLOCKED" \
+            "could not create isolated snapshot directory" || true
         echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
         return 0
     fi
+    migration_run_activate_workspace "$WS" "$SNAPSHOTS_DIR"
 
     # Step 1: Init with source binary
     local init_ok=false
-    if bd_in "$WS" "$src_bin" init --quiet --non-interactive --prefix smoke </dev/null >/dev/null 2>&1; then
-        init_ok=true
-    elif bd_in "$WS" "$src_bin" init --quiet --prefix smoke </dev/null >/dev/null 2>&1; then
-        init_ok=true
-    fi
+    if [ "$version" = "v0.62.0" ]; then
+        local bootstrap_strategy=""
+        local init_output=""
+        local init_port=""
+        local verification_detail=""
 
-    if ! $init_ok; then
-        local init_err init_status init_detail
-        init_err=$(bd_in "$WS" "$src_bin" init --quiet --prefix smoke </dev/null 2>&1 | head -1 || true)
+        bootstrap_strategy=$(server_bootstrap_strategy "$version" 2>/dev/null) || true
+        if [ "$bootstrap_strategy" != "prestarted_server" ]; then
+            block_source_initialization \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" \
+                "v0.62.0 server bootstrap contract is unavailable"
+            return 0
+        fi
+        if ! start_owned_migration_dolt_server "$WS"; then
+            block_source_initialization \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" \
+                "could not start the owned v0.62.0 Dolt server"
+            return 0
+        fi
+        if [ ! -f "$WS/.git/bd-migration-server-port" ] ||
+            [ -L "$WS/.git/bd-migration-server-port" ]; then
+            block_source_initialization \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" \
+                "owned v0.62.0 Dolt server has no reserved port"
+            return 0
+        fi
+        init_port=$(cat "$WS/.git/bd-migration-server-port") || init_port=""
+        if ! [[ "$init_port" =~ ^2[0-9]{4}$ ]]; then
+            block_source_initialization \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" \
+                "owned v0.62.0 Dolt server has an invalid reserved port"
+            return 0
+        fi
 
-        if echo "$init_err" | grep -qi "CGO"; then
-            init_status="SKIP"
-            init_detail="binary built without CGO"
-        elif echo "$init_err" | grep -qi "dolt.*server\|unreachable\|auto-start"; then
-            init_status="SKIP"
-            init_detail="needs dolt server"
+        if init_output=$(bd_in "$WS" "$src_bin" init \
+            --quiet \
+            --server-host 127.0.0.1 --server-port "$init_port" \
+            --database smoke --prefix smoke </dev/null 2>&1); then
+            init_ok=true
         else
-            init_status="BLOCKED"
-            init_detail="init failed: ${init_err}"
+            local init_first_line=""
+            init_first_line=$(head -1 <<< "$init_output")
+            block_source_initialization \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" \
+                "v0.62.0 one-shot init failed: ${init_first_line:-no error output}"
+            return 0
         fi
-        if record_result_after_workspace_cleanup \
-            "$WS" "$path_label" "$init_status" "$init_detail"; then
-            rm -rf "$SNAPSHOTS_DIR"
+
+        verification_detail=$(verify_v062_prestarted_source "$WS" "$init_port") || {
+            block_source_initialization \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" "$verification_detail"
+            return 0
+        }
+    else
+        if bd_in "$WS" "$src_bin" init --quiet --non-interactive --prefix smoke </dev/null >/dev/null 2>&1; then
+            init_ok=true
+        elif bd_in "$WS" "$src_bin" init --quiet --prefix smoke </dev/null >/dev/null 2>&1; then
+            init_ok=true
         fi
-        echo -e "  ${RESULT_STATUSES[-1]}: ${RESULT_DETAILS[-1]}"
-        return 0
+
+        if ! $init_ok; then
+            local init_err init_status init_detail
+            init_err=$(bd_in "$WS" "$src_bin" init --quiet --prefix smoke </dev/null 2>&1 | head -1 || true)
+
+            if echo "$init_err" | grep -qi "CGO"; then
+                init_status="SKIP"
+                init_detail="binary built without CGO"
+            elif echo "$init_err" | grep -qi "dolt.*server\|unreachable\|auto-start"; then
+                init_status="SKIP"
+                init_detail="needs dolt server"
+            else
+                init_status="BLOCKED"
+                init_detail="init failed: ${init_err}"
+            fi
+            migration_run_record_result_after_cleanup \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" \
+                "$init_status" "$init_detail" || true
+            echo -e "  ${RESULT_STATUSES[-1]}: ${RESULT_DETAILS[-1]}"
+            return 0
+        fi
     fi
     git -C "$WS" config beads.role maintainer 2>/dev/null || true
 
     # Step 2: Create rich dataset with source binary
     if ! create_dataset "$WS" "$src_bin" "$version"; then
-        cleanup_workspace "$WS"
-        rm -rf "$SNAPSHOTS_DIR"
-        record_result "$path_label" "BLOCKED" "could not create test data"
-        echo -e "  ${RED}BLOCKED: could not create test data${NC}"
+        migration_run_record_result_after_cleanup \
+            "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+            "could not create test data" || true
+        echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
         return 0
     fi
     if $STRICT_MODE && ! strict_fixture_has_expected_features "$version" "${DATASET_FEATURES[@]}"; then
-        cleanup_workspace "$WS"
-        rm -rf "$SNAPSHOTS_DIR"
-        record_result "$path_label" "BLOCKED" "source fixture is missing required features"
-        echo -e "  ${RED}BLOCKED: source fixture is missing required features${NC}"
+        migration_run_record_result_after_cleanup \
+            "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+            "source fixture is missing required features" || true
+        echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
         return 0
     fi
 
     # Step 3: Capture before-snapshot
     if ! capture_snapshot "$WS" "$src_bin" > "$SNAPSHOTS_DIR/before.json"; then
         if $STRICT_MODE; then
-            cleanup_workspace "$WS"
-            rm -rf "$SNAPSHOTS_DIR"
-            record_result "$path_label" "BLOCKED" "could not capture the complete source snapshot"
-            echo -e "  ${RED}BLOCKED: could not capture the complete source snapshot${NC}"
+            migration_run_record_result_after_cleanup \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                "could not capture the complete source snapshot" || true
+            echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
             return 0
         fi
     fi
@@ -196,22 +391,23 @@ test_direct_path() {
     before_count=$(jq 'length' "$SNAPSHOTS_DIR/before.json" 2>/dev/null) || before_count=0
     echo "  before-snapshot: $before_count items"
     if $STRICT_MODE && [ "$before_count" -eq 0 ]; then
-        cleanup_workspace "$WS"
-        rm -rf "$SNAPSHOTS_DIR"
-        record_result "$path_label" "BLOCKED" "source snapshot is empty"
-        echo -e "  ${RED}BLOCKED: source snapshot is empty${NC}"
+        migration_run_record_result_after_cleanup \
+            "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+            "source snapshot is empty" || true
+        echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
         return 0
     fi
     if $STRICT_MODE && ! strict_snapshot_has_expected_fixture "$version" "$SNAPSHOTS_DIR/before.json"; then
-        cleanup_workspace "$WS"
-        rm -rf "$SNAPSHOTS_DIR"
-        record_result "$path_label" "BLOCKED" "source snapshot does not match the exact fixture contract"
-        echo -e "  ${RED}BLOCKED: source snapshot does not match the exact fixture contract${NC}"
+        migration_run_record_result_after_cleanup \
+            "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+            "source snapshot does not match the exact fixture contract" || true
+        echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
         return 0
     fi
 
     # Stop source server before upgrade
     if ! stop_dolt_server "$WS"; then
+        migration_run_forget_workspace "$WS"
         record_result "$path_label" "BLOCKED" \
             "could not prove the historical server stopped before upgrade; preserved at $WS"
         echo -e "  ${RED}BLOCKED: could not prove the historical server stopped before upgrade${NC}"
@@ -225,25 +421,25 @@ test_direct_path() {
     local source_legacy_dolt_manifest=""
     if $STRICT_MODE; then
         source_fingerprint=$(source_artifact_fingerprint "$WS/.beads") || {
-            cleanup_workspace "$WS"
-            rm -rf "$SNAPSHOTS_DIR"
-            record_result "$path_label" "BLOCKED" "could not fingerprint historical source tree"
+            migration_run_record_result_after_cleanup \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                "could not fingerprint historical source tree" || true
             return 0
         }
         case "$source_era" in
             sqlite)
                 source_sqlite_manifest=$(classic_sqlite_artifact_manifest "$WS/.beads") || {
-                    cleanup_workspace "$WS"
-                    rm -rf "$SNAPSHOTS_DIR"
-                    record_result "$path_label" "BLOCKED" "could not inventory classic SQLite rollback source"
+                    migration_run_record_result_after_cleanup \
+                        "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                        "could not inventory classic SQLite rollback source" || true
                     return 0
                 }
                 ;;
             dolt_server)
                 source_legacy_dolt_manifest=$(legacy_dolt_artifact_manifest "$WS/.beads") || {
-                    cleanup_workspace "$WS"
-                    rm -rf "$SNAPSHOTS_DIR"
-                    record_result "$path_label" "BLOCKED" "could not inventory legacy Dolt rollback source"
+                    migration_run_record_result_after_cleanup \
+                        "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                        "could not inventory legacy Dolt rollback source" || true
                     return 0
                 }
                 ;;
@@ -261,10 +457,10 @@ test_direct_path() {
     fi
 
     if [ "$probe_status" -eq 2 ]; then
-        cleanup_workspace "$WS"
-        rm -rf "$SNAPSHOTS_DIR"
-        record_result "$path_label" "BLOCKED" "$DIRECT_PROBE_FAILURE_DETAIL"
-        echo -e "  ${RED}BLOCKED: $DIRECT_PROBE_FAILURE_DETAIL${NC}"
+        migration_run_record_result_after_cleanup \
+            "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+            "$DIRECT_PROBE_FAILURE_DETAIL" || true
+        echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
         return 0
     fi
     if $STRICT_MODE && ! $upgrade_ok; then
@@ -274,10 +470,10 @@ test_direct_path() {
     if $upgrade_ok; then
         # Capture after-snapshot and check fidelity
         if ! capture_snapshot "$WS" "$cand_bin" > "$SNAPSHOTS_DIR/after.json"; then
-            cleanup_workspace "$WS"
-            rm -rf "$SNAPSHOTS_DIR"
-            record_result "$path_label" "BLOCKED" "could not capture the complete candidate snapshot"
-            echo -e "  ${RED}BLOCKED: could not capture the complete candidate snapshot${NC}"
+            migration_run_record_result_after_cleanup \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                "could not capture the complete candidate snapshot" || true
+            echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
             return 0
         fi
         local after_count
@@ -299,10 +495,9 @@ test_direct_path() {
             direct_status="AUTO"
             direct_detail="direct upgrade, $violations fidelity violations"
         fi
-        if record_result_after_workspace_cleanup \
-            "$WS" "$path_label" "$direct_status" "$direct_detail" "" "$violations"; then
-            rm -rf "$SNAPSHOTS_DIR"
-        else
+        if ! migration_run_record_result_after_cleanup \
+            "$WS" "$SNAPSHOTS_DIR" "$path_label" \
+            "$direct_status" "$direct_detail" "" "$violations"; then
             echo -e "  ${RED}BLOCKED: could not prove isolated workspace cleanup${NC}"
         fi
         return 0
@@ -310,6 +505,7 @@ test_direct_path() {
 
     # Step 5: Direct upgrade failed — try recipes
     if ! stop_dolt_server "$WS"; then
+        migration_run_forget_workspace "$WS"
         record_result "$path_label" "BLOCKED" \
             "could not prove the direct-probe server stopped before migration recipes; preserved at $WS"
         echo -e "  ${RED}BLOCKED: could not prove the direct-probe server stopped before migration recipes${NC}"
@@ -354,19 +550,19 @@ test_direct_path() {
     if $recipe_worked; then
         if $STRICT_MODE && ! verify_strict_retained_source \
             "$WS" "$era" "$source_sqlite_manifest" "$source_legacy_dolt_manifest"; then
-            cleanup_workspace "$WS"
-            rm -rf "$SNAPSHOTS_DIR"
-            record_result "$path_label" "BLOCKED" "manual bridge mutated the retained historical rollback source"
-            echo -e "  ${RED}BLOCKED: manual bridge mutated the retained historical rollback source${NC}"
+            migration_run_record_result_after_cleanup \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                "manual bridge mutated the retained historical rollback source" || true
+            echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
             return 0
         fi
 
         # Re-capture and check fidelity after recipe
         if ! capture_snapshot "$WS" "$cand_bin" > "$SNAPSHOTS_DIR/after.json"; then
-            cleanup_workspace "$WS"
-            rm -rf "$SNAPSHOTS_DIR"
-            record_result "$path_label" "BLOCKED" "could not capture the complete candidate snapshot after recipe"
-            echo -e "  ${RED}BLOCKED: could not capture the complete candidate snapshot after recipe${NC}"
+            migration_run_record_result_after_cleanup \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                "could not capture the complete candidate snapshot after recipe" || true
+            echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
             return 0
         fi
         local after_count
@@ -381,6 +577,7 @@ test_direct_path() {
         violations=$((violations + blocker_violations))
 
         if ! stop_dolt_server "$WS"; then
+            migration_run_forget_workspace "$WS"
             record_result "$path_label" "BLOCKED" \
                 "could not prove the candidate server stopped before rollback verification; preserved at $WS"
             echo -e "  ${RED}BLOCKED: could not prove the candidate server stopped before rollback verification${NC}"
@@ -389,10 +586,10 @@ test_direct_path() {
 
         if $STRICT_MODE && ! verify_strict_retained_source \
             "$WS" "$era" "$source_sqlite_manifest" "$source_legacy_dolt_manifest"; then
-            cleanup_workspace "$WS"
-            rm -rf "$SNAPSHOTS_DIR"
-            record_result "$path_label" "BLOCKED" "post-upgrade commands mutated the retained historical rollback source"
-            echo -e "  ${RED}BLOCKED: post-upgrade commands mutated the retained historical rollback source${NC}"
+            migration_run_record_result_after_cleanup \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                "post-upgrade commands mutated the retained historical rollback source" || true
+            echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
             return 0
         fi
 
@@ -404,21 +601,19 @@ test_direct_path() {
             recipe_status="MANUAL"
             recipe_detail="recipe: $recipe_name, $violations fidelity violations"
         fi
-        if record_result_after_workspace_cleanup \
-            "$WS" "$path_label" "$recipe_status" "$recipe_detail" "$recipe_name" "$violations"; then
-            rm -rf "$SNAPSHOTS_DIR"
-        else
+        if ! migration_run_record_result_after_cleanup \
+            "$WS" "$SNAPSHOTS_DIR" "$path_label" \
+            "$recipe_status" "$recipe_detail" "$recipe_name" "$violations"; then
             echo -e "  ${RED}BLOCKED: could not prove isolated workspace cleanup${NC}"
         fi
         return 0
     fi
 
     # All recipes failed
-    if cleanup_workspace "$WS"; then
-        rm -rf "$SNAPSHOTS_DIR"
-    fi
-    record_result "$path_label" "BLOCKED" "no working upgrade path found"
-    echo -e "  ${RED}BLOCKED: no working upgrade path${NC}"
+    migration_run_record_result_after_cleanup \
+        "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+        "no working upgrade path found" || true
+    echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
 }
 
 # ---------------------------------------------------------------------------
@@ -455,13 +650,16 @@ test_stepping_stone_path() {
         echo -e "  ${RED}BLOCKED: could not create isolated workspace${NC}"
         return 0
     fi
+    migration_run_activate_workspace "$WS" ""
     local SNAPSHOTS_DIR=""
     if ! SNAPSHOTS_DIR=$(mktemp -d /tmp/bd-snapshots-XXXXXX); then
-        record_result_after_workspace_cleanup \
-            "$WS" "$path_label" "BLOCKED" "could not create isolated snapshot directory" || true
+        migration_run_record_result_after_cleanup \
+            "$WS" "" "$path_label" "BLOCKED" \
+            "could not create isolated snapshot directory" || true
         echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
         return 0
     fi
+    migration_run_activate_workspace "$WS" "$SNAPSHOTS_DIR"
 
     # Init with first version
     local first_bin="${bins[0]}"
@@ -475,10 +673,9 @@ test_stepping_stone_path() {
     fi
 
     if ! $init_ok; then
-        if record_result_after_workspace_cleanup \
-            "$WS" "$path_label" "SKIP" "could not init with $first_ver"; then
-            rm -rf "$SNAPSHOTS_DIR"
-        fi
+        migration_run_record_result_after_cleanup \
+            "$WS" "$SNAPSHOTS_DIR" "$path_label" "SKIP" \
+            "could not init with $first_ver" || true
         echo -e "  ${RESULT_STATUSES[-1]}: ${RESULT_DETAILS[-1]}"
         return 0
     fi
@@ -486,15 +683,16 @@ test_stepping_stone_path() {
 
     # Create dataset with first version
     if ! create_dataset "$WS" "$first_bin" "$first_ver"; then
-        cleanup_workspace "$WS"
-        rm -rf "$SNAPSHOTS_DIR"
-        record_result "$path_label" "BLOCKED" "could not create test data with $first_ver"
+        migration_run_record_result_after_cleanup \
+            "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+            "could not create test data with $first_ver" || true
         return 0
     fi
 
     # Capture initial snapshot
     capture_snapshot "$WS" "$first_bin" > "$SNAPSHOTS_DIR/before.json"
     if ! stop_dolt_server "$WS"; then
+        migration_run_forget_workspace "$WS"
         record_result "$path_label" "BLOCKED" \
             "could not prove the first historical server stopped before stepping; preserved at $WS"
         echo -e "  ${RED}BLOCKED: could not prove the first historical server stopped before stepping${NC}"
@@ -525,9 +723,11 @@ test_stepping_stone_path() {
         fi
 
         if ! stop_dolt_server "$WS"; then
-            step_failed=true
-            failed_at="$step_ver (server stop unverified)"
-            break
+            migration_run_forget_workspace "$WS"
+            record_result "$path_label" "BLOCKED" \
+                "could not prove the $step_ver server stopped; preserved at $WS"
+            echo -e "  ${RED}BLOCKED: $step_ver server stop unverified${NC}"
+            return 0
         fi
 
         if ! $step_ok; then
@@ -539,9 +739,9 @@ test_stepping_stone_path() {
     done
 
     if $step_failed; then
-        cleanup_workspace "$WS"
-        rm -rf "$SNAPSHOTS_DIR"
-        record_result "$path_label" "BLOCKED" "failed at step $failed_at"
+        migration_run_record_result_after_cleanup \
+            "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+            "failed at step $failed_at" || true
         echo -e "  ${RED}BLOCKED at $failed_at${NC}"
         return 0
     fi
@@ -563,9 +763,9 @@ test_stepping_stone_path() {
     fi
 
     if ! $upgrade_ok; then
-        cleanup_workspace "$WS"
-        rm -rf "$SNAPSHOTS_DIR"
-        record_result "$path_label" "BLOCKED" "final step to candidate failed"
+        migration_run_record_result_after_cleanup \
+            "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+            "final step to candidate failed" || true
         echo -e "  ${RED}BLOCKED at final step${NC}"
         return 0
     fi
@@ -587,10 +787,9 @@ test_stepping_stone_path() {
         step_status="AUTO"
         step_detail="all steps passed, $violations fidelity violations"
     fi
-    if record_result_after_workspace_cleanup \
-        "$WS" "$path_label" "$step_status" "$step_detail" "" "$violations"; then
-        rm -rf "$SNAPSHOTS_DIR"
-    else
+    if ! migration_run_record_result_after_cleanup \
+        "$WS" "$SNAPSHOTS_DIR" "$path_label" \
+        "$step_status" "$step_detail" "" "$violations"; then
         echo -e "  ${RED}BLOCKED: could not prove isolated workspace cleanup${NC}"
     fi
 }
@@ -695,20 +894,24 @@ if $SELF_TEST; then
         echo -e "  ${RED}BLOCKED: could not create isolated workspace${NC}"
         record_result "candidate → candidate" "BLOCKED" "could not create isolated workspace"
     else
+        migration_run_activate_workspace "$WS" ""
         SNAPSHOTS_DIR=""
         if ! SNAPSHOTS_DIR=$(mktemp -d /tmp/bd-snapshots-XXXXXX); then
-            record_result_after_workspace_cleanup \
-                "$WS" "candidate → candidate" "BLOCKED" \
+            migration_run_record_result_after_cleanup \
+                "$WS" "" "candidate → candidate" "BLOCKED" \
                 "could not create isolated snapshot directory" || true
             echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
         # Init with candidate
-        elif ! bd_in "$WS" "$CAND_BIN" init --quiet --non-interactive --prefix smoke </dev/null >/dev/null 2>&1; then
-            if record_result_after_workspace_cleanup \
-                "$WS" "candidate → candidate" "BLOCKED" "init failed"; then
-                rm -rf "$SNAPSHOTS_DIR"
-            fi
-            echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
         else
+            migration_run_activate_workspace "$WS" "$SNAPSHOTS_DIR"
+        fi
+        if [ -n "$SNAPSHOTS_DIR" ] &&
+            ! bd_in "$WS" "$CAND_BIN" init --quiet --non-interactive --prefix smoke </dev/null >/dev/null 2>&1; then
+            migration_run_record_result_after_cleanup \
+                "$WS" "$SNAPSHOTS_DIR" "candidate → candidate" \
+                "BLOCKED" "init failed" || true
+            echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
+        elif [ -n "$SNAPSHOTS_DIR" ]; then
             git -C "$WS" config beads.role maintainer 2>/dev/null || true
             self_status="BLOCKED"
             self_detail="could not create test data"
@@ -739,10 +942,9 @@ if $SELF_TEST; then
                     self_detail="self-test, $violations fidelity violations"
                 fi
             fi
-            if record_result_after_workspace_cleanup \
-                "$WS" "candidate → candidate" "$self_status" "$self_detail" "" "$self_violations"; then
-                rm -rf "$SNAPSHOTS_DIR"
-            else
+            if ! migration_run_record_result_after_cleanup \
+                "$WS" "$SNAPSHOTS_DIR" "candidate → candidate" \
+                "$self_status" "$self_detail" "" "$self_violations"; then
                 echo -e "  ${RED}BLOCKED: could not prove isolated workspace cleanup${NC}"
             fi
         fi

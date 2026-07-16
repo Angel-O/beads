@@ -5,8 +5,7 @@
 # Format: era_name|representative_version|storage_dir|description
 ERAS=(
     "sqlite|v0.49.6|beads.db|SQLite era (pre-Dolt)"
-    "dolt_server|v0.57.0|dolt|Dolt server mode"
-    "embedded_old|v0.62.0|dolt|Old embedded Dolt (in-process)"
+    "dolt_server|v0.62.0|dolt|Dolt server mode"
     "embedded_current|v0.63.3|embeddeddolt|Current embedded Dolt"
 )
 
@@ -46,41 +45,52 @@ declare -Ar STRICT_RELEASE_ASSETS=(
     ["v0.49.6|linux|amd64"]="beads_0.49.6_linux_amd64.tar.gz"
     ["v0.55.4|linux|amd64"]="beads_0.55.4_linux_amd64.tar.gz"
     ["v0.57.0|linux|amd64"]="beads_0.57.0_linux_amd64.tar.gz"
+    ["v0.62.0|linux|amd64"]="beads_0.62.0_linux_amd64.tar.gz"
     ["v0.63.3|linux|amd64"]="beads_0.63.3_linux_amd64.tar.gz"
 )
 declare -Ar STRICT_RELEASE_SHA256=(
     ["v0.49.6|linux|amd64"]="8546dc9a47e11dc31ac2bc9a0224a9c690975e91850932cbb62623053fbb7db8"
     ["v0.55.4|linux|amd64"]="e0fa25456dd82890230eef17653448a0bf995104c78864be91c5ed84426a5f49"
     ["v0.57.0|linux|amd64"]="f8629d5627bed7d25f06f92334addc171d679f9aed9d08c5d42a9684205dc04b"
+    ["v0.62.0|linux|amd64"]="4cca7265b22e5c3ca8d62ab0b9752bec31f68b7f5fa636282a4c7e5454c35535"
     ["v0.63.3|linux|amd64"]="5f4efd2e010209b3f381dbcd783b2a3a652f50ea72f40ef04c8ba434d408bf9e"
 )
 declare -Ar STRICT_EXPECTED_STATUSES=(
     ["v0.49.6"]="MANUAL"
     ["v0.55.4"]="MANUAL"
     ["v0.57.0"]="MANUAL"
+    ["v0.62.0"]="MANUAL"
     ["v0.63.3"]="AUTO"
 )
 declare -Ar STRICT_EXPECTED_RECIPES=(
     ["v0.49.6"]="sqlite_to_current"
     ["v0.55.4"]="server_to_embedded"
     ["v0.57.0"]="server_to_embedded"
+    ["v0.62.0"]="server_to_embedded"
     ["v0.63.3"]=""
 )
 declare -Ar STRICT_EXPECTED_FEATURES=(
     ["v0.49.6"]="epic task bug dependency standalone closed label comment"
     ["v0.55.4"]="epic task bug dependency standalone closed label comment"
     ["v0.57.0"]="epic task bug dependency standalone closed label comment"
+    ["v0.62.0"]="epic task bug dependency standalone closed label comment"
     ["v0.63.3"]="epic task bug dependency standalone closed label comment"
 )
 declare -Ar SERVER_BRIDGE_STRATEGIES=(
     ["v0.55.4"]="native_export"
     ["v0.57.0"]="native_export_show_comments"
+    ["v0.62.0"]="native_export_show_comments"
+)
+declare -Ar SERVER_BOOTSTRAP_STRATEGIES=(
+    ["v0.62.0"]="prestarted_server"
 )
 declare -Ar STRICT_REQUIRED_DOLT_VERSIONS=(
     ["v0.57.0"]="2.1.8"
+    ["v0.62.0"]="1.84.0"
 )
 declare -Ar STRICT_REQUIRED_DOLT_SHA256=(
     ["v0.57.0|linux|amd64"]="f66318f08ed66e409fc39363ae0fff8ce6fbf6dba9f5bac632b91527b9632a74"
+    ["v0.62.0|linux|amd64"]="afcdaa9530ae0b4f317ed6041a41d20096e156b2556eb0e03c7c57a624ccc0b3"
 )
 
 strict_release_asset() {
@@ -115,6 +125,12 @@ strict_expected_features() {
 
 server_bridge_strategy() {
     local value="${SERVER_BRIDGE_STRATEGIES[$1]:-}"
+    [ -n "$value" ] || return 1
+    printf '%s\n' "$value"
+}
+
+server_bootstrap_strategy() {
+    local value="${SERVER_BOOTSTRAP_STRATEGIES[$1]:-}"
     [ -n "$value" ] || return 1
     printf '%s\n' "$value"
 }
@@ -185,10 +201,8 @@ get_era() {
     local version="$1"
     if version_lt "$version" "v0.50.0"; then
         echo "sqlite"
-    elif version_lt "$version" "v0.59.0"; then
-        echo "dolt_server"
     elif version_lt "$version" "v0.63.3"; then
-        echo "embedded_old"
+        echo "dolt_server"
     else
         echo "embedded_current"
     fi
