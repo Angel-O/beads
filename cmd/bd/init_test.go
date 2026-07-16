@@ -2490,7 +2490,9 @@ func TestInitBackendFlag(t *testing.T) {
 	})
 
 	t.Run("backend_opt_malformed", func(t *testing.T) {
-		for _, opt := range []string{"path", "=x.db", "path=a=b"} {
+		// "path=a=b" is NOT malformed: values may contain '=' (DSNs with
+		// query parameters); parsing splits at the first '=' only.
+		for _, opt := range []string{"path", "=x.db"} {
 			_, _, out, err := initSQLite(t, "--backend-opt", opt)
 			if err == nil || !strings.Contains(string(out), "--backend-opt") {
 				t.Errorf("malformed --backend-opt %q: err = %v, want parse error, got: %s", opt, err, out)
