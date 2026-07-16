@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -20,12 +21,29 @@ import (
 // Kind is fixed at construction from the config slot, so the resolved value's role is
 // never ambiguous.
 //
-// The result is cached per-command until near expiry so repeated opens don't
-// re-spawn the helper; the cache lives for the process and dies with it.
+// When DialHost is set (the authenticating-gateway path), the source tells the helper
+// where bd is about to send the credential by exporting BEADS_EXEC_INFO into the
+// helper's environment, and the (canonical) host becomes part of the cache key so a
+// token minted for one destination is never served for a dial to another. DialHost is
+// left empty by the password-slot backends, which present no destination and inherit
+// the parent environment unchanged.
+//
+// The result is cached per (command, canonical dial host) until near expiry so
+// repeated opens don't re-spawn the helper; the cache lives for the process and dies
+// with it.
 type CommandSource struct {
 	Command string
 	Kind    Kind
 	Label   string // provenance slug (the config-slot name); defaults to "credential-command"
+
+	// DialHost/DialPort/Database describe the destination bd is about to dial.
+	// When DialHost is non-empty they are surfaced to the helper via BEADS_EXEC_INFO
+	// and the canonical host joins the cache key. All empty (the password-command
+	// backends) means "no destination context": no BEADS_EXEC_INFO is injected and
+	// the helper inherits the parent environment unchanged.
+	DialHost string
+	DialPort int
+	Database string
 }
 
 // Name returns the provenance slug.
@@ -43,11 +61,69 @@ func (s CommandSource) Resolve(ctx context.Context) (Credential, bool, error) {
 	if s.Command == "" {
 		return Credential{}, false, nil
 	}
-	tok, user, expiry, err := resolveCredentialToken(ctx, s.Command)
+	host, execInfo, err := s.dialContext()
+	if err != nil {
+		return Credential{}, true, err
+	}
+	tok, user, expiry, err := resolveCredentialToken(ctx, s.Command, host, execInfo)
 	if err != nil {
 		return Credential{}, true, err
 	}
 	return Credential{Value: tok, Username: user, Kind: s.Kind, Expiry: expiry, Source: s.Name()}, true, nil
+}
+
+// dialContext returns the canonical cache-key host and the BEADS_EXEC_INFO value for
+// this source's destination. An empty DialHost (the password-command backends) yields
+// ("", "", nil): no destination context, so the helper inherits the parent environment
+// unchanged and the cache key carries no host dimension.
+func (s CommandSource) dialContext() (canonHost, execInfo string, err error) {
+	if s.DialHost == "" {
+		return "", "", nil
+	}
+	canonHost, err = CanonicalHost(s.DialHost)
+	if err != nil {
+		return "", "", fmt.Errorf("%s: %w", s.Name(), err)
+	}
+	execInfo, err = buildExecInfo(canonHost, s.DialPort, s.Database)
+	if err != nil {
+		return "", "", err
+	}
+	return canonHost, execInfo, nil
+}
+
+// ResolveForDial re-resolves src for a specific dial destination, honoring the
+// per-(command, host) cache. The connector calls it inside the driver's BeforeConnect
+// hook with the host/port/database derived from the literal dial target, so the value
+// reported to the helper is structurally the value bd dials. Only a CommandSource can
+// be re-resolved per dial; any other source is a programming error on this path.
+func ResolveForDial(ctx context.Context, src Source, host string, port int, database string) (Credential, error) {
+	cs, ok := src.(CommandSource)
+	if !ok {
+		return Credential{}, fmt.Errorf("credential source %s does not support per-dial resolution", src.Name())
+	}
+	cs.DialHost = host
+	cs.DialPort = port
+	cs.Database = database
+	cred, _, err := cs.Resolve(ctx)
+	return cred, err
+}
+
+// Invalidate drops any cached token for src's (command, canonical dial host) so the
+// next resolution re-runs the helper. Called when a server rejects a presented token
+// before its recorded expiry (a rotating credential revoked mid-life). A non-command
+// source has nothing to invalidate.
+func Invalidate(src Source) {
+	cs, ok := src.(CommandSource)
+	if !ok {
+		return
+	}
+	host := ""
+	if cs.DialHost != "" {
+		if h, err := CanonicalHost(cs.DialHost); err == nil {
+			host = h
+		}
+	}
+	invalidateCredentialToken(cs.Command, host)
 }
 
 const (
@@ -74,12 +150,25 @@ type cachedCred struct {
 	expires  time.Time
 }
 
+// credCacheKey keys the process-level token cache. The host dimension is a SECURITY
+// control, not an optimization: the cache is consulted before the helper runs, so
+// keying by command alone would let a token minted for a trusted destination be served
+// for a later dial to a different host with the same command — the helper's
+// destination gate would never execute. host is the canonical dial host (see
+// CanonicalHost), empty for password-command sources that present no destination.
+type credCacheKey struct {
+	command string
+	host    string
+}
+
 var (
 	credCacheMu sync.Mutex
-	credCache   = map[string]cachedCred{}
+	credCache   = map[credCacheKey]cachedCred{}
 
 	// credRunner runs the helper; a package var so tests can stub it without a shell.
-	credRunner = func(ctx context.Context, command string) ([]byte, error) {
+	// execInfo, when non-empty, is exported as BEADS_EXEC_INFO into the helper's
+	// environment (see runHelper); an empty execInfo leaves the environment untouched.
+	credRunner = func(ctx context.Context, command, execInfo string) ([]byte, error) {
 		// POSIX shells parse the helper command; native Windows has no `sh`, so
 		// dispatch through cmd.exe there so a bare Windows bd does not hard-fail
 		// every *_PASSWORD_COMMAND / CREDENTIAL_COMMAND in the fail-closed ladder.
@@ -88,6 +177,14 @@ var (
 			cmd = exec.CommandContext(ctx, "cmd.exe", "/C", command)
 		} else {
 			cmd = exec.CommandContext(ctx, "sh", "-c", command)
+		}
+		// Only when we have a destination to report do we set cmd.Env, and then we
+		// preserve the full parent environment (the helper needs its own inputs) and
+		// replace only any inherited BEADS_EXEC_INFO with bd's own — a narrow,
+		// exact-name filter, never a broad BEADS_*/"sensitive-key" filter. With no
+		// destination the child inherits the parent environment unchanged.
+		if execInfo != "" {
+			cmd.Env = append(strippedEnv(), ExecInfoEnvVar+"="+execInfo)
 		}
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
@@ -102,14 +199,31 @@ var (
 	}
 )
 
+// strippedEnv returns the parent environment with any pre-existing BEADS_EXEC_INFO
+// removed, so bd's own value (appended by the caller) is the only one the helper sees.
+// A hostile parent must not be able to pre-seed a destination bd never dials.
+func strippedEnv() []string {
+	parent := os.Environ()
+	out := make([]string, 0, len(parent))
+	for _, kv := range parent {
+		if strings.HasPrefix(kv, ExecInfoEnvVar+"=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 // resolveCredentialToken returns the token (and any username/expiry) for the given
-// helper command, using a process-level cache keyed by the command so repeated opens
-// don't re-spawn the helper until the token is near expiry. It is concurrency-safe.
-func resolveCredentialToken(ctx context.Context, command string) (token, username string, expiry time.Time, err error) {
+// helper command dialing host, using a process-level cache keyed by (command, host) so
+// repeated opens don't re-spawn the helper until the token is near expiry. execInfo, if
+// set, is exported to the helper as BEADS_EXEC_INFO. It is concurrency-safe.
+func resolveCredentialToken(ctx context.Context, command, host, execInfo string) (token, username string, expiry time.Time, err error) {
 	now := time.Now()
+	key := credCacheKey{command: command, host: host}
 
 	credCacheMu.Lock()
-	if c, ok := credCache[command]; ok && now.Before(c.expires.Add(-credExpirySkew)) {
+	if c, ok := credCache[key]; ok && now.Before(c.expires.Add(-credExpirySkew)) {
 		tok, user, exp := c.token, c.username, c.expires
 		credCacheMu.Unlock()
 		return tok, user, exp, nil
@@ -118,7 +232,7 @@ func resolveCredentialToken(ctx context.Context, command string) (token, usernam
 
 	runCtx, cancel := context.WithTimeout(ctx, credCommandTimeout)
 	defer cancel()
-	raw, err := credRunner(runCtx, command)
+	raw, err := credRunner(runCtx, command, execInfo)
 	if err != nil {
 		return "", "", time.Time{}, fmt.Errorf("credential command failed: %w", err)
 	}
@@ -131,9 +245,17 @@ func resolveCredentialToken(ctx context.Context, command string) (token, usernam
 	}
 
 	credCacheMu.Lock()
-	credCache[command] = cachedCred{token: token, username: username, expires: expiry}
+	credCache[key] = cachedCred{token: token, username: username, expires: expiry}
 	credCacheMu.Unlock()
 	return token, username, expiry, nil
+}
+
+// invalidateCredentialToken drops any cached token for (command, host). No-op if
+// nothing is cached.
+func invalidateCredentialToken(command, host string) {
+	credCacheMu.Lock()
+	delete(credCache, credCacheKey{command: command, host: host})
+	credCacheMu.Unlock()
 }
 
 // parseCredential extracts the token (and any username/expiry) from a helper's

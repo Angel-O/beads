@@ -58,29 +58,29 @@ func TestParseCredential(t *testing.T) {
 func resetCache(t *testing.T) {
 	t.Helper()
 	credCacheMu.Lock()
-	credCache = map[string]cachedCred{}
+	credCache = map[credCacheKey]cachedCred{}
 	credCacheMu.Unlock()
 	orig := credRunner
 	t.Cleanup(func() { credRunner = orig })
 }
 
-// resolveCredentialToken caches by command until near expiry, then re-runs the helper.
+// resolveCredentialToken caches by (command, host) until near expiry, then re-runs.
 func TestResolveCredentialTokenCachesUntilExpiry(t *testing.T) {
 	resetCache(t)
 
 	var calls int
-	credRunner = func(_ context.Context, _ string) ([]byte, error) {
+	credRunner = func(_ context.Context, _, _ string) ([]byte, error) {
 		calls++
 		// Long-lived expiry so the cache holds across the second call.
 		return []byte(fmt.Sprintf(`{"token":"tok-%d","expirationTimestamp":%q}`, calls,
 			time.Now().Add(time.Hour).Format(time.RFC3339))), nil
 	}
 
-	tok1, _, _, err := resolveCredentialToken(context.Background(), "helper --x")
+	tok1, _, _, err := resolveCredentialToken(context.Background(), "helper --x", "", "")
 	if err != nil {
 		t.Fatalf("first resolve: %v", err)
 	}
-	tok2, _, _, err := resolveCredentialToken(context.Background(), "helper --x")
+	tok2, _, _, err := resolveCredentialToken(context.Background(), "helper --x", "", "")
 	if err != nil {
 		t.Fatalf("second resolve: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestResolveCredentialTokenCachesUntilExpiry(t *testing.T) {
 	}
 
 	// A different command is a different cache key -> a fresh run.
-	if _, _, _, err := resolveCredentialToken(context.Background(), "helper --y"); err != nil {
+	if _, _, _, err := resolveCredentialToken(context.Background(), "helper --y", "", ""); err != nil {
 		t.Fatalf("third resolve: %v", err)
 	}
 	if calls != 2 {
@@ -99,10 +99,10 @@ func TestResolveCredentialTokenCachesUntilExpiry(t *testing.T) {
 
 func TestResolveCredentialTokenPropagatesHelperError(t *testing.T) {
 	resetCache(t)
-	credRunner = func(_ context.Context, _ string) ([]byte, error) {
+	credRunner = func(_ context.Context, _, _ string) ([]byte, error) {
 		return nil, fmt.Errorf("boom")
 	}
-	if _, _, _, err := resolveCredentialToken(context.Background(), "broken-helper"); err == nil {
+	if _, _, _, err := resolveCredentialToken(context.Background(), "broken-helper", "", ""); err == nil {
 		t.Fatal("expected an error when the helper fails")
 	}
 }
