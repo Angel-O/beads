@@ -26,10 +26,10 @@ import (
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/backends"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/proxy"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/schema"
-	beadssqlite "github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/templates/agents"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -1806,9 +1806,9 @@ type initSQLiteInput struct {
 }
 
 // runInitSQLite finalizes a SQLite-backed workspace: it provisions the database file
-// (default beads.db inside the beads dir), seeds the issue prefix and project identity,
-// and writes metadata.json. SQLite is file-based and embedded (pure-Go), so there is no
-// server, DSN, or password.
+// (default beads.db inside the beads dir) through the backend registry's provision
+// hook, seeds the issue prefix and project identity, and writes metadata.json. SQLite
+// is file-based and embedded (pure-Go), so there is no server, DSN, or password.
 func runInitSQLite(ctx context.Context, in initSQLiteInput) error {
 	relPath := in.sqlitePath
 	if relPath == "" {
@@ -1819,7 +1819,11 @@ func runInitSQLite(ctx context.Context, in initSQLiteInput) error {
 		dbPath = filepath.Join(in.beadsDir, dbPath)
 	}
 
-	store, err := beadssqlite.Provision(ctx, dbPath)
+	backend, ok := backends.Lookup(configfile.BackendSQLite)
+	if !ok || backend.Provision == nil {
+		return fmt.Errorf("SQLite backend is not registered in this build (see cmd/bd/backends_builtin.go)")
+	}
+	store, err := backend.Provision(ctx, dbPath)
 	if err != nil {
 		return fmt.Errorf("failed to initialize SQLite workspace: %w", err)
 	}
