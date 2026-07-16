@@ -31,11 +31,20 @@ func ApplyGatewayCredential(ctx context.Context, fileCfg *configfile.Config, cfg
 	if cfg.ServerUser != "" {
 		return false, nil
 	}
-	cred, ok, err := creds.ResolveLadder(ctx, creds.CommandSource{
-		Command: fileCfg.GetDoltCredentialCommand(),
-		Kind:    creds.KindIdentity,
-		Label:   "BEADS_DOLT_CREDENTIAL_COMMAND",
-	})
+	// Read the dial destination at the mint choke — cfg.ServerHost/Port/Database are
+	// resolved before this runs and are exactly what buildServerDSN bakes and dials, so
+	// the host reported to the helper is the host bd dials. The connector re-derives the
+	// host per dial from the driver Config; retaining these on the source lets the eager
+	// mint report the same destination and warm the (command, host) cache.
+	src := creds.CommandSource{
+		Command:  fileCfg.GetDoltCredentialCommand(),
+		Kind:     creds.KindIdentity,
+		Label:    "BEADS_DOLT_CREDENTIAL_COMMAND",
+		DialHost: cfg.ServerHost,
+		DialPort: cfg.ServerPort,
+		Database: cfg.Database,
+	}
+	cred, ok, err := creds.ResolveLadder(ctx, src)
 	if err != nil {
 		return false, err
 	}
@@ -58,5 +67,9 @@ func ApplyGatewayCredential(ctx context.Context, fileCfg *configfile.Config, cfg
 	cfg.ServerUser = cred.Value
 	cfg.Gateway = true
 	cfg.DisableAutoStart = true
+	// Retain the source so every physical dial re-mints via the connector and a 1045
+	// mid-life rotation invalidates and re-mints. The baked username is redacted to a
+	// sentinel in buildServerDSN; the connector overwrites it per dial.
+	cfg.CredentialSource = src
 	return true, nil
 }

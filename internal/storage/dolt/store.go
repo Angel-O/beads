@@ -39,6 +39,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/creds"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
@@ -157,12 +158,19 @@ var _ storage.ExternalRefHistoryQuerier = (*DoltStore)(nil)
 
 // DoltStore implements the Storage interface using Dolt
 type DoltStore struct {
-	db            *sql.DB
-	dbPath        string       // Path to Dolt data directory (server root, e.g. .beads/dolt/)
-	beadsDir      string       // Path to .beads directory (parent of dbPath)
-	database      string       // Database name (subdirectory under dbPath)
-	closed        atomic.Bool  // Tracks whether Close() has been called
-	connStr       string       // Connection string for reconnection
+	db       *sql.DB
+	dbPath   string      // Path to Dolt data directory (server root, e.g. .beads/dolt/)
+	beadsDir string      // Path to .beads directory (parent of dbPath)
+	database string      // Database name (subdirectory under dbPath)
+	closed   atomic.Bool // Tracks whether Close() has been called
+	connStr  string      // Connection string for reconnection
+
+	// credentialSource is retained from the gateway mint (nil for static/local
+	// stores). When set, every physical dial re-mints a fresh token via the
+	// connector's BeforeConnect hook, and withRetry/withRetryTx invalidate it on a
+	// 1045 so a token rotated mid-life is re-minted rather than re-presented dead.
+	credentialSource creds.Source
+
 	mu            sync.RWMutex // Protects concurrent access
 	readOnly      bool         // True if opened in read-only mode
 	credentialKey []byte       // Random encryption key for federation credentials
@@ -260,6 +268,14 @@ type Config struct {
 	// CREATE DATABASE or schema DDL (drift check only, like ReadOnly). Set by
 	// ApplyGatewayCredential, never by hand.
 	Gateway bool
+
+	// CredentialSource, when non-nil, is the resolved credential source retained from
+	// the eager gateway mint so every subsequent physical dial can re-mint a fresh
+	// short-lived token via the connector's BeforeConnect hook (the eager token is a
+	// 90s EIA; a pooled connection outlives it). Set by ApplyGatewayCredential, never
+	// by hand. Its presence also redacts the baked DSN username (see buildServerDSN)
+	// and enables the 1045-invalidate retry.
+	CredentialSource creds.Source
 
 	// AutoStart enables transparent server auto-start when connection fails.
 	// When true and the host is localhost, bd will start a dolt sql-server
@@ -1195,6 +1211,7 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 		beadsDir:             beadsDir,
 		database:             cfg.Database,
 		connStr:              connStr,
+		credentialSource:     cfg.CredentialSource,
 		breaker:              breaker,
 		committerName:        cfg.CommitterName,
 		committerEmail:       cfg.CommitterEmail,
@@ -1342,15 +1359,28 @@ func isLocalHost(host string) bool {
 	return false
 }
 
+// credSentinelUser is baked into the DSN username slot in place of the real token
+// whenever a CredentialSource is present. The connector's BeforeConnect hook stamps a
+// fresh token onto every dial, so this placeholder is never actually presented; it
+// exists so the retained connStr (re-parsed by the push/pull/migration paths, and a
+// candidate for logs and error strings) never carries token material.
+const credSentinelUser = "token-per-dial" //nolint:gosec // G101: a redaction placeholder that replaces the token in the baked DSN, not a credential
+
 // buildServerDSN constructs a MySQL DSN for connecting to a Dolt server.
 // If database is empty, connects without selecting a database (for init operations).
 // Adds ReadTimeout/WriteTimeout for long-lived connection pools.
 func buildServerDSN(cfg *Config, database string) string {
+	// On the credential path the token is stamped per-dial by the connector; keep it
+	// out of the baked DSN string so nothing that retains or prints the DSN leaks it.
+	user := cfg.ServerUser
+	if cfg.CredentialSource != nil {
+		user = credSentinelUser
+	}
 	base := doltutil.ServerDSN{
 		Socket:   cfg.ServerSocket,
 		Host:     cfg.ServerHost,
 		Port:     cfg.ServerPort,
-		User:     cfg.ServerUser,
+		User:     user,
 		Password: cfg.ServerPassword,
 		Database: database,
 		TLS:      cfg.ServerTLS,
@@ -1379,7 +1409,7 @@ func (s *DoltStore) execWithLongTimeout(ctx context.Context, query string, args 
 		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
 	cfg.ReadTimeout = 5 * time.Minute
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := openSQLDB(cfg.FormatDSN(), s.credentialSource)
 	if err != nil {
 		return fmt.Errorf("failed to open long-timeout connection: %w", err)
 	}
@@ -1406,7 +1436,7 @@ func (s *DoltStore) execWithLongTimeoutNoTx(ctx context.Context, query string, a
 		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
 	cfg.ReadTimeout = 5 * time.Minute
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := openSQLDB(cfg.FormatDSN(), s.credentialSource)
 	if err != nil {
 		return fmt.Errorf("failed to open long-timeout connection: %w", err)
 	}
@@ -1459,7 +1489,7 @@ func applyPoolLimits(db *sql.DB, cfg *Config) {
 func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, error) {
 	connStr := buildServerDSN(cfg, cfg.Database)
 
-	db, err := sql.Open("mysql", connStr)
+	db, err := openSQLDB(connStr, cfg.CredentialSource)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to open Dolt server connection: %w", err)
 	}
@@ -1496,7 +1526,7 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, er
 	// Ensure database exists (may need to create it)
 	// First connect without database to create it
 	initConnStr := buildServerDSN(cfg, "")
-	initDB, err := sql.Open("mysql", initConnStr)
+	initDB, err := openSQLDB(initConnStr, cfg.CredentialSource)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to open init connection: %w", err)
 	}
@@ -1741,7 +1771,7 @@ func (s *DoltStore) openMigrationDB() (*sql.DB, error) {
 	}
 	cfg.ReadTimeout = 0
 	cfg.WriteTimeout = 0
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := openSQLDB(cfg.FormatDSN(), s.credentialSource)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open migration connection: %w", err)
 	}
@@ -2767,7 +2797,7 @@ func (s *DoltStore) openLongTimeoutConn() (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
 	cfg.ReadTimeout = 5 * time.Minute
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := openSQLDB(cfg.FormatDSN(), s.credentialSource)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open long-timeout connection: %w", err)
 	}

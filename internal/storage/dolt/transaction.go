@@ -144,7 +144,11 @@ func (s *DoltStore) beginIgnoredTxOnBranch(ctx context.Context, branch string) (
 	// its own active branch. This intentionally pays one extra connection setup
 	// for mixed regular/ignored writes so the ignored transaction can be checked
 	// out to the regular transaction's branch before writes.
-	db, err := sql.Open("mysql", s.connStr)
+	//
+	// Converted to the credential connector: this dials the baked DSN fresh, so on the
+	// gateway path the stale eager token would 1045 every write after a rotation
+	// without the per-dial re-mint.
+	db, err := openSQLDB(s.connStr, s.credentialSource)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to open ignored tx connection: %w", err)
 	}
