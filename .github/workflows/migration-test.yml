@@ -244,6 +244,12 @@ jobs:
         if: steps.selection.outputs.selected == 'true'
         run: make build
 
+      - name: Verify public v0.62 migration bridge
+        if: steps.selection.outputs.selected == 'true' && matrix.version == 'v0.62.0'
+        env:
+          PUBLIC_V062_REAL_TARGET_BD: ./bd
+        run: ./scripts/migration-test/public-v062-bridge-test.sh
+
       - name: Verify strict harness guards
         if: steps.selection.outputs.selected == 'true'
         run: ./scripts/migration-test/strict-mode-test.sh
