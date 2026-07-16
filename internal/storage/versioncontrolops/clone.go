@@ -29,7 +29,7 @@ func DoltClone(ctx context.Context, conn DBConn, remoteURL, database, user strin
 func sanitizeURL(raw string) string {
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return raw
+		return "configured remote"
 	}
 	parsed.User = nil
 	parsed.RawQuery = ""

@@ -139,6 +139,70 @@ bd migrate
 bd migrate --yes
 ```
 
+### Change an embedded Dolt workspace to SQLite
+
+Backend migration is separate from the schema migration commands above. Use it
+when an existing workspace should keep its current issue-tracker state but no
+longer needs Dolt version-control features.
+
+Do not use `bd init --reinit-local --backend=sqlite` for this job. That command
+reinitializes destructively and transfers neither current issue state nor Dolt
+history; `bd migrate backend --to=sqlite` is the state-preserving path.
+
+Start with a preview. Preview is the default and has no persistent effect:
+
+```bash
+bd migrate backend --to=sqlite
+
+# Optional: choose a different file under .beads/
+bd migrate backend --to=sqlite --sqlite-path=issues.db
+```
+
+The target must be a lowercase workspace-local basename ending in `.db`.
+Existing targets and SQLite sidecars are never overwritten; choose another
+basename if the requested name is already present.
+
+Apply the reviewed plan interactively:
+
+```bash
+bd migrate backend --to=sqlite --apply
+```
+
+The confirmation prompt requires you to type the exact target basename. JSON
+and non-interactive runs cannot prompt and therefore require explicit consent:
+
+```bash
+bd migrate backend --to=sqlite --apply --yes --json
+```
+
+On success, `bd` copies and verifies the complete current issue-tracker state,
+then changes `.beads/metadata.json` to select SQLite. The original
+`.beads/embeddeddolt/` directory is never deleted. Dolt history remains
+available in that preserved source, but history is not transferred into the
+SQLite database.
+
+The workspace is immediately usable through SQLite after cutover. For example:
+
+```bash
+bd status
+bd show <issue-id>
+bd blocked
+bd create "SQLite is active"
+```
+
+The apply path records durable recovery state before creating the target. If a
+process or machine stops mid-migration, ordinary workspace commands refuse to
+run until recovery finishes. Re-run the exact command shown on the `Retry:`
+line; for JSON or non-interactive recovery, add `--yes`. Recovery verifies
+which store is authoritative and preserves the Dolt source in every case.
+
+This migration currently runs on Linux and macOS and accepts only the standard
+workspace-local embedded Dolt source. Server-backed Dolt, shared-server
+selection, custom Dolt data directories, redirected workspaces, and storage
+selection or schema-skew overrides are refused before any migration effect.
+Windows and FreeBSD builds remain usable, but this operation fails safely
+there.
+
 ### Remote-backed databases and multiple clones
 
 `bd` refuses to silently apply pending schema migrations to a database that has
@@ -308,6 +372,10 @@ bd list --all
 ### From v0.30–v0.50 (SQLite era)
 
 The old binary stored data in SQLite. The new binary uses Dolt.
+
+This legacy SQLite-to-Dolt path is the reverse of
+`bd migrate backend --to=sqlite`, which moves a current embedded-Dolt workspace
+to SQLite.
 
 **Recommended: use the migration script** (requires `sqlite3` and `jq`):
 

@@ -87,7 +87,11 @@ Rules of thumb:
 
 ## Getting Started
 
-The backend is chosen once, at `bd init` time, and recorded in `.beads/metadata.json`. Every later `bd` command reads it from there — no per-command flags.
+The initial backend is chosen at `bd init` time and recorded in
+`.beads/metadata.json`. Every later `bd` command reads it from there — there
+are no per-command backend flags. An existing embedded-Dolt workspace can later
+move to SQLite through the explicit migration flow below; other backend changes
+are not currently supported.
 
 ### Dolt (default)
 
@@ -107,6 +111,74 @@ bd init --backend=sqlite --sqlite-path=issues.db --prefix myproj
 ```
 
 That's it — no server, no credentials. Foreign keys and immediate-transaction locking are configured automatically.
+
+### Change an existing embedded Dolt workspace to SQLite
+
+This is the only state-preserving backend change. Do not use
+`bd init --reinit-local --backend=sqlite` as a migration: reinitialization is
+destructive and transfers neither current issue state nor Dolt history.
+
+On Linux or macOS, preview the current supported backend change with:
+
+```bash
+bd migrate backend --to=sqlite
+```
+
+Preview is static and has no persistent effect. To apply the plan, either use
+the interactive confirmation or provide explicit automation consent:
+
+```bash
+# Interactive: type the exact target basename when prompted
+bd migrate backend --to=sqlite --apply
+
+# JSON or another non-interactive environment
+bd migrate backend --to=sqlite --apply --yes --json
+```
+
+Use `--sqlite-path=issues.db` to select another lowercase `.db` basename under
+`.beads/`. The migration never replaces an existing database or any of its
+SQLite sidecars.
+
+Apply takes one consistent snapshot of the current embedded-Dolt issue-tracker
+state, restores and verifies it in a fresh SQLite database, and then changes
+the backend recorded in metadata. Issues, dependencies, labels, comments,
+events, config, counters, and their NULL-versus-empty distinctions are retained.
+Derived readiness state is recomputed from the migrated dependency graph.
+
+After cutover, normal commands including `status`, `show`, `blocked`, comments,
+config, and `create` immediately use SQLite. The source directory
+`.beads/embeddeddolt/` is preserved. Dolt history stays in that source; SQLite
+receives current state, not historical commits.
+
+If apply is interrupted, a durable marker gates ordinary commands and the next
+apply resumes or safely restarts the attempt. Follow the emitted `Retry:`
+command. Recovery reports its current authority (`dolt_source`, `sqlite`, or
+`unknown`) and never resolves uncertainty by deleting the source.
+
+The current slice deliberately accepts only the standard workspace-local
+embedded Dolt layout. It refuses server mode, shared-server selection, custom
+Dolt data directories, redirects, storage-selection overrides, and schema-skew
+bypasses. Windows and FreeBSD compile normally but refuse this migration before
+effects because the required filesystem guarantees are not available in this
+implementation.
+
+#### Filesystem safety model
+
+This is an owner-controlled local migration, not a privilege boundary against
+another malicious process running as the same OS user. Admission requires a
+real `.beads` directory that is not group- or world-writable. Control files,
+attempt workspaces, and SQLite artifacts are identity-checked; symlinks,
+hard-linked targets, unexpected cleanup entries, pre-existing targets, and
+replacements observed at those checks cause a safe refusal instead of an
+overwrite or deletion.
+
+The remaining pathname limitation is the authority of another same-user
+process to keep renaming parent-directory entries after validation. Such a
+process can force migration or automatic recovery to stop. When ownership or
+identity cannot be proved, `bd` preserves the source, target, and recovery
+evidence for manual inspection rather than guessing.
+
+For an upgrade-focused walkthrough, see [Upgrading](/getting-started/upgrading#change-an-embedded-dolt-workspace-to-sqlite).
 
 ### Postgres
 

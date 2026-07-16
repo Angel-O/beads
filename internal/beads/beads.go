@@ -10,6 +10,7 @@ package beads
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -613,6 +614,14 @@ func FindBeadsDirFrom(startDir string) string {
 // Returns false for directories that only contain legacy registry files.
 // This prevents FindBeadsDir from returning ~/.beads/ which only has registry.json.
 func hasBeadsProjectFiles(beadsDir string) bool {
+	// A durable backend-migration marker is itself workspace evidence. This
+	// keeps recovery gating active even if metadata or the database is missing
+	// or temporarily unavailable; treating the directory as fresh would let
+	// init/bootstrap overwrite recovery state before they can refuse safely.
+	if err := configfile.RejectPendingBackendMigration(beadsDir); errors.Is(err, configfile.ErrBackendMigrationPending) {
+		return true
+	}
+
 	// Check for project configuration files
 	if _, err := os.Stat(filepath.Join(beadsDir, "metadata.json")); err == nil {
 		return true

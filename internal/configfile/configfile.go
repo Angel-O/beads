@@ -1,19 +1,38 @@
 package configfile
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
+	backendmigrationcontrol "github.com/steveyegge/beads/internal/backendmigration/control"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/safefile"
 )
 
-const ConfigFileName = "metadata.json"
+const (
+	ConfigFileName = "metadata.json"
+	// The .lock suffix is intentionally covered by every historical
+	// .beads/.gitignore, including workspaces created before this feature.
+	BackendMigrationStateFileName = backendmigrationcontrol.StateFileName
+	maxBackendMigrationMetadata   = 1 << 20
+)
+
+var (
+	ErrBackendMigrationPending         = backendmigrationcontrol.ErrRecoveryPending
+	ErrConfigChanged                   = errors.New("config changed since it was loaded")
+	ErrBackendTransitionRequiresReinit = errors.New("backend changes require an explicitly authorized reinitialization or migration")
+	configSaveCheckpoint               func(string)
+)
 
 type Config struct {
 	Database string `json:"database"`
@@ -66,6 +85,12 @@ type Config struct {
 	// upgrade notifications firing after git operations reset metadata.json.
 	// bd-tok: This field is kept for backwards compatibility when reading old configs.
 	LastBdVersion string `json:"last_bd_version,omitempty"`
+
+	// These optimistic witnesses are populated by reads and successful saves.
+	// They keep stale writers from replacing a migration cutover or a newer
+	// metadata update without changing the serialized config contract.
+	sourcePath  string `json:"-"`
+	sourceBytes []byte `json:"-"`
 }
 
 func DefaultConfig() *Config {
@@ -79,6 +104,90 @@ func ConfigPath(beadsDir string) string {
 }
 
 func Load(beadsDir string) (*Config, error) {
+	if err := RejectPendingBackendMigration(beadsDir); err != nil {
+		return nil, err
+	}
+	return loadCompatible(beadsDir)
+}
+
+// LoadReadOnly reads metadata.json or legacy config.json without performing
+// compatibility writes. It is intended for admission and cleanup preflights
+// that must remain effect-free.
+func LoadReadOnly(beadsDir string) (*Config, error) {
+	if err := RejectPendingBackendMigration(beadsDir); err != nil {
+		return nil, err
+	}
+	configPath := ConfigPath(beadsDir)
+	sourcePath := configPath
+	readIfPresent := func(path string) ([]byte, bool, error) {
+		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		} else if err != nil {
+			return nil, false, err
+		}
+		data, err := safefile.ReadRegularFile(path, maxBackendMigrationMetadata)
+		return data, true, err
+	}
+	data, present, err := readIfPresent(configPath)
+	if !present && err == nil {
+		sourcePath = filepath.Join(beadsDir, "config.json")
+		data, present, err = readIfPresent(sourcePath)
+	}
+	if !present && err == nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading config: %w", err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parsing config: %w", err)
+	}
+	cfg.setSource(sourcePath, data)
+	return &cfg, nil
+}
+
+// LoadAuthoritativeReadOnly reads metadata.json, or legacy config.json when
+// metadata is absent, without compatibility writes. Unlike LoadReadOnly it
+// uses the strict backend-migration parser so ambiguous storage authority is
+// rejected instead of being interpreted through compatibility defaults.
+func LoadAuthoritativeReadOnly(beadsDir string) (*Config, error) {
+	if err := RejectPendingBackendMigration(beadsDir); err != nil {
+		return nil, err
+	}
+	for _, path := range []string{ConfigPath(beadsDir), filepath.Join(beadsDir, "config.json")} {
+		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return nil, fmt.Errorf("inspect config: %w", err)
+		}
+		data, err := safefile.ReadRegularFile(path, maxBackendMigrationMetadata)
+		if err != nil {
+			return nil, fmt.Errorf("reading config: %w", err)
+		}
+		cfg, err := ParseForBackendMigration(data)
+		if err != nil {
+			return nil, err
+		}
+		cfg.setSource(path, data)
+		return cfg, nil
+	}
+	return nil, nil
+}
+
+// RejectPendingBackendMigration prevents commands from observing or mutating a
+// workspace while a durable backend migration attempt requires recovery.
+func RejectPendingBackendMigration(beadsDir string) error {
+	return backendmigrationcontrol.RejectPending(beadsDir)
+}
+
+// BackendMigrationCleanupMarkers lists durable cleanup-marker paths without
+// interpreting workspace path bytes as a glob pattern.
+func BackendMigrationCleanupMarkers(beadsDir string) ([]string, error) {
+	return backendmigrationcontrol.CleanupMarkers(beadsDir)
+}
+
+func loadCompatible(beadsDir string) (*Config, error) {
 	configPath := ConfigPath(beadsDir)
 
 	data, err := os.ReadFile(configPath) // #nosec G304 - controlled path from config
@@ -98,6 +207,7 @@ func Load(beadsDir string) (*Config, error) {
 		if err := json.Unmarshal(data, &cfg); err != nil {
 			return nil, fmt.Errorf("parsing legacy config: %w", err)
 		}
+		cfg.setSource(legacyPath, data)
 
 		// Save to new location
 		if err := cfg.Save(beadsDir); err != nil {
@@ -117,11 +227,175 @@ func Load(beadsDir string) (*Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
+	cfg.setSource(configPath, data)
 
 	return &cfg, nil
 }
 
+// ReadForBackendMigration reads current metadata without compatibility writes,
+// rejects links/special files and schema ambiguity, and returns the exact bytes
+// used as the pre-cutover authority witness.
+func ReadForBackendMigration(beadsDir string) ([]byte, *Config, error) {
+	data, err := safefile.ReadRegularFile(ConfigPath(beadsDir), maxBackendMigrationMetadata)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read migration metadata: %w", err)
+	}
+	cfg, err := ParseForBackendMigration(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	cfg.setSource(ConfigPath(beadsDir), data)
+	return data, cfg, nil
+}
+
+// ParseForBackendMigration strictly decodes an exact metadata witness without
+// consulting or mutating the filesystem.
+func ParseForBackendMigration(data []byte) (*Config, error) {
+	if len(data) == 0 || len(data) > maxBackendMigrationMetadata {
+		return nil, errors.New("parse migration metadata: metadata size is invalid")
+	}
+	var cfg Config
+	if err := decodeBackendMigrationMetadata(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse migration metadata: %w", err)
+	}
+	return &cfg, nil
+}
+
+func MarshalForBackendMigration(c *Config) ([]byte, error) {
+	if c == nil {
+		return nil, errors.New("migration metadata is nil")
+	}
+	saved := *c
+	if filepath.IsAbs(saved.DoltDataDir) {
+		saved.DoltDataDir = ""
+	}
+	data, err := json.MarshalIndent(&saved, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal migration metadata: %w", err)
+	}
+	return data, nil
+}
+
+func decodeBackendMigrationMetadata(data []byte, cfg *Config) error {
+	allowed := make(map[string]struct{})
+	typ := reflect.TypeOf(Config{})
+	for index := 0; index < typ.NumField(); index++ {
+		name := strings.Split(typ.Field(index).Tag.Get("json"), ",")[0]
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = typ.Field(index).Name
+		}
+		allowed[name] = struct{}{}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return errors.New("metadata must be one JSON object")
+	}
+	seen := make(map[string]string)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return errors.New("metadata key is not a string")
+		}
+		folded := strings.ToLower(key)
+		if prior, duplicate := seen[folded]; duplicate {
+			return fmt.Errorf("duplicate or case-variant metadata keys %q and %q", prior, key)
+		}
+		seen[folded] = key
+		if _, present := allowed[key]; !present {
+			return fmt.Errorf("unknown or noncanonical metadata field %q", key)
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return err
+		}
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return fmt.Errorf("metadata field %q must not be null", key)
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("metadata contains trailing JSON")
+		}
+		return err
+	}
+	decoder = json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(cfg); err != nil {
+		return err
+	}
+	switch cfg.Backend {
+	case "", BackendDolt, BackendPostgres, BackendMySQL, BackendSQLite:
+	default:
+		return fmt.Errorf("unsupported backend %q", cfg.Backend)
+	}
+	switch strings.ToLower(cfg.DoltMode) {
+	case "", DoltModeEmbedded, DoltModeServer, DoltModeProxiedServer:
+	default:
+		return fmt.Errorf("unsupported dolt_mode %q", cfg.DoltMode)
+	}
+	return nil
+}
+
 func (c *Config) Save(beadsDir string) error {
+	return c.save(beadsDir, false)
+}
+
+// SaveAfterBackendReinitialization permits bd init to publish a different
+// backend only after its destructive --reinit-local checks have passed and the
+// replacement backend has been provisioned successfully. Ordinary metadata
+// writers must use Save, which rejects backend transitions.
+func (c *Config) SaveAfterBackendReinitialization(beadsDir string) error {
+	return c.save(beadsDir, true)
+}
+
+func (c *Config) save(beadsDir string, allowBackendTransition bool) (err error) {
+	// A marker-only refusal must not create even the stable control file. The
+	// repeated check under the guard closes the race with marker publication.
+	if err := RejectPendingBackendMigration(beadsDir); err != nil {
+		return err
+	}
+	guard, err := backendmigrationcontrol.TryAcquire(beadsDir)
+	if err != nil {
+		return fmt.Errorf("acquire metadata workspace control: %w", err)
+	}
+	defer func() {
+		err = errors.Join(err, guard.Close())
+	}()
+
+	if err := RejectPendingBackendMigration(beadsDir); err != nil {
+		return err
+	}
+	absBeadsDir, absErr := filepath.Abs(beadsDir)
+	if absErr != nil {
+		return fmt.Errorf("resolve config workspace: %w", absErr)
+	}
+	if c.sourcePath != "" && filepath.Clean(filepath.Dir(c.sourcePath)) == filepath.Clean(absBeadsDir) {
+		current, readErr := os.ReadFile(c.sourcePath) // #nosec G304 - witnessed config path in this workspace
+		if readErr != nil || !bytes.Equal(current, c.sourceBytes) {
+			return errors.Join(ErrConfigChanged, readErr)
+		}
+	}
+	existing, readErr := LoadReadOnly(beadsDir)
+	if readErr != nil {
+		return fmt.Errorf("inspect existing config backend: %w", readErr)
+	}
+	if existing != nil && existing.GetBackend() != c.GetBackend() && !allowBackendTransition {
+		return ErrBackendTransitionRequiresReinit
+	}
 	configPath := ConfigPath(beadsDir)
 
 	saved := *c
@@ -133,6 +407,9 @@ func (c *Config) Save(beadsDir string) error {
 	if err != nil {
 		return fmt.Errorf("marshaling config: %w", err)
 	}
+	if configSaveCheckpoint != nil {
+		configSaveCheckpoint("guarded")
+	}
 
 	// Write-temp-then-rename: a plain os.WriteFile truncates in place, so a
 	// concurrent Load can observe an empty or partial metadata.json and feed
@@ -141,8 +418,17 @@ func (c *Config) Save(beadsDir string) error {
 	if err := writeFileAtomic(configPath, data, 0o600); err != nil {
 		return fmt.Errorf("writing config: %w", err)
 	}
+	c.setSource(configPath, data)
 
 	return nil
+}
+
+func (c *Config) setSource(path string, data []byte) {
+	if absolute, err := filepath.Abs(path); err == nil {
+		path = absolute
+	}
+	c.sourcePath = filepath.Clean(path)
+	c.sourceBytes = bytes.Clone(data)
 }
 
 // writeFileAtomic writes data to a temp file in path's directory and renames
@@ -249,10 +535,9 @@ func (c *Config) GetCapabilities() BackendCapabilities {
 	return CapabilitiesForBackend(backend)
 }
 
-// GetBackend returns the configured storage backend. Only the explicitly-allowlisted
-// non-default backends ("postgres", "mysql") are honored; "", "dolt", and any legacy
-// or unknown value resolve to dolt so the default path stays byte-identical and a
-// typo fails safe to Dolt.
+// GetBackend returns the configured storage backend. Only explicitly allowlisted
+// non-default backends are honored; "", "dolt", and any legacy or unknown value
+// resolve to Dolt so the default path stays byte-identical and a typo fails safe.
 func (c *Config) GetBackend() string {
 	if c != nil {
 		switch c.Backend {

@@ -31,6 +31,7 @@ import (
 	"github.com/steveyegge/beads/internal/molecules"
 	"github.com/steveyegge/beads/internal/remotecache"
 	"github.com/steveyegge/beads/internal/routing"
+	"github.com/steveyegge/beads/internal/safefile"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	mysqlstore "github.com/steveyegge/beads/internal/storage/mysql"
@@ -472,7 +473,7 @@ func prepareSelectedCommandContext(beadsDir string, loadEnv bool) {
 		fmt.Fprintf(os.Stderr, "Warning: failed to reinitialize config for selected beads dir: %v\n", err)
 	}
 	config.CheckBeadsDirPermissions(beadsDir)
-	if err := loadServerModeFromBeadsDir(beadsDir); err != nil {
+	if err := loadServerModeFromBeadsDir(beadsDir); shouldWarnNoStoreConfigError(err) {
 		// Warn, don't fatal: this context also serves no-DB commands —
 		// doctor, init, bootstrap, config — which are exactly the repair
 		// paths for a corrupt metadata.json. Data commands stay protected
@@ -483,6 +484,51 @@ func prepareSelectedCommandContext(beadsDir string, loadEnv bool) {
 
 func prepareSelectedNoDBContext(beadsDir string) {
 	prepareSelectedCommandContext(beadsDir, true)
+}
+
+// prepareBackendMigrationCommandContext binds config and .env selection
+// without calling configfile.Load. The migration command must not trigger the
+// legacy config.json compatibility rewrite before its strict, effect-free
+// admission checks run.
+func prepareBackendMigrationCommandContext(beadsDir string) error {
+	if beadsDir == "" {
+		return nil
+	}
+	selector, err := backendMigrationEnvFileSelection(beadsDir)
+	if err != nil {
+		return err
+	}
+	if selector != "" {
+		return fmt.Errorf("backend migration does not accept %s in .beads/.env; remove it and run from the physical workspace being migrated", selector)
+	}
+	_ = os.Setenv("BEADS_DIR", beadsDir)
+	if err := config.Initialize(); err != nil {
+		return errors.New("backend migration could not safely read workspace configuration; run bd doctor to repair it before retrying")
+	}
+	return nil
+}
+
+func backendMigrationEnvFileSelection(beadsDir string) (string, error) {
+	envPath := filepath.Join(beadsDir, ".env")
+	if _, err := os.Lstat(envPath); errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	} else if err != nil {
+		return "", errors.New("backend migration could not safely inspect .beads/.env")
+	}
+	data, err := safefile.ReadRegularFile(envPath, 1<<20)
+	if err != nil {
+		return "", errors.New("backend migration requires .beads/.env to be a bounded regular file")
+	}
+	pairs, err := gotenv.Unmarshal(string(data))
+	if err != nil {
+		return "", errors.New("backend migration could not parse .beads/.env")
+	}
+	for _, key := range backendMigrationStorageSelectionEnvKeys {
+		if strings.TrimSpace(pairs[key]) != "" {
+			return key, nil
+		}
+	}
+	return "", nil
 }
 
 // refreshBoundCommandConfig reapplies config-backed defaults after the command
@@ -599,7 +645,11 @@ func getOwner() string {
 func init() {
 	// Initialize viper configuration
 	if err := config.Initialize(); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to initialize config: %v\n", err)
+		// Migration has a strict, path-free admission error below. Avoid
+		// corrupting its machine-readable output before Cobra has parsed --json.
+		if !rawInvocationIsBackendMigration(os.Args[1:]) {
+			fmt.Fprintf(os.Stderr, "Warning: failed to initialize config: %v\n", err)
+		}
 	}
 
 	// Register persistent flags
@@ -662,20 +712,89 @@ func resolveChangeDirBeadsDir(path string) (string, error) {
 }
 
 func applyChangeDirSelection() error {
+	return applyChangeDirSelectionForCommand(nil)
+}
+
+func applyChangeDirSelectionForCommand(cmd *cobra.Command) error {
 	if strings.TrimSpace(changeDir) == "" {
 		return nil
 	}
-	beadsDir, err := resolveChangeDirBeadsDir(changeDir)
-	if err != nil {
-		return HandleError("%v", err)
+	beadsDir := ""
+	if cmd == migrateBackendCmd {
+		beadsDir = physicalChangeDirBeadsDir(changeDir)
+		if beadsDir == "" {
+			return errors.New("backend migration -C must select a workspace that owns a physical .beads directory")
+		}
+		if _, err := os.Lstat(filepath.Join(beadsDir, beads.RedirectFileName)); !errors.Is(err, os.ErrNotExist) {
+			return errors.New("backend migration cannot use -C with a redirected workspace; select the repository that physically owns the backend")
+		}
+	} else {
+		var err error
+		beadsDir, err = resolveChangeDirBeadsDir(changeDir)
+		if err != nil {
+			return err
+		}
 	}
 	changeDirEnvSnapshot = make(map[string]envSnapshotValue, 3)
 	for _, key := range []string{"BEADS_DIR", "BEADS_DB", "BD_DB"} {
 		value, ok := os.LookupEnv(key)
 		changeDirEnvSnapshot[key] = envSnapshotValue{value: value, ok: ok}
 	}
+	_ = os.Unsetenv("BEADS_DB")
+	_ = os.Unsetenv("BD_DB")
 	_ = os.Setenv("BEADS_DIR", beadsDir)
 	return nil
+}
+
+var errBackendMigrationNonOwningWorkspace = errors.New("workspace does not physically own its backend")
+
+func physicalChangeDirBeadsDir(path string) string {
+	beadsDir, _ := physicalChangeDirBeadsDirStatus(path)
+	return beadsDir
+}
+
+func physicalChangeDirBeadsDirStatus(path string) (string, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", nil
+	}
+	if resolved, err := filepath.EvalSymlinks(absPath); err == nil {
+		absPath = resolved
+	}
+	if info, err := os.Stat(absPath); err != nil || !info.IsDir() {
+		return "", nil
+	}
+	for dir := filepath.Clean(absPath); ; dir = filepath.Dir(dir) {
+		candidate := filepath.Join(dir, ".beads")
+		if filepath.Base(dir) == ".beads" {
+			candidate = dir
+		}
+		if info, err := os.Lstat(candidate); err == nil {
+			if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+				ownerRoot := dir
+				if filepath.Base(dir) == ".beads" {
+					ownerRoot = filepath.Dir(dir)
+				}
+				// A linked worktree may contain git-tracked metadata while its
+				// embedded database lives only in the main checkout. Accept the
+				// worktree only when it physically owns the supported source.
+				if gitEntry, gitErr := os.Lstat(filepath.Join(ownerRoot, ".git")); gitErr == nil && gitEntry.Mode().IsRegular() {
+					source, sourceErr := os.Lstat(filepath.Join(candidate, "embeddeddolt"))
+					if sourceErr != nil || !source.IsDir() || source.Mode()&os.ModeSymlink != 0 {
+						return "", errBackendMigrationNonOwningWorkspace
+					}
+				}
+				return filepath.Clean(candidate), nil
+			}
+			return "", errBackendMigrationNonOwningWorkspace
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", nil
+		}
+	}
 }
 
 func restoreChangeDirSelection() {
@@ -706,6 +825,7 @@ var rootCmd = &cobra.Command{
 		_ = cmd.Help() // Help() always returns nil for cobra commands
 	},
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		captureBackendMigrationAmbientSelection(cmd)
 		applyNoColorFlag()
 
 		// Initialize CommandContext to hold runtime state (replaces scattered globals)
@@ -764,17 +884,36 @@ var rootCmd = &cobra.Command{
 		// Apply verbosity flags early (before any output)
 		debug.SetVerbose(verboseFlag)
 		debug.SetQuiet(quietFlag)
+		// Bind the explicit JSON alias before admission checks so even an
+		// invalid -C or blocked selector returns one JSON document.
+		if cmd.Root().PersistentFlags().Changed("format") {
+			format, _ := cmd.Root().PersistentFlags().GetString("format")
+			if strings.EqualFold(format, "json") {
+				jsonOutput = true
+			}
+		}
 
-		if err := applyChangeDirSelection(); err != nil {
-			return err
+		if err := applyChangeDirSelectionForCommand(cmd); err != nil {
+			if cmd == migrateBackendCmd {
+				return HandleErrorRespectJSON("backend migration could not use the requested -C workspace; -C must select the repository that physically owns the backend")
+			}
+			return HandleError("%v", err)
 		}
 
 		// Block dangerous env var overrides that could cause data fragmentation (bd-hevyw).
 		if err := checkBlockedEnvVars(); err != nil {
+			if cmd == migrateBackendCmd {
+				return HandleErrorRespectJSON("%v", err)
+			}
 			return HandleError("%v", err)
 		}
 
-		loadSelectionEnvironment()
+		// Backend migration must bind to the physical workspace. Selector keys
+		// from that workspace's .env are loaded later only so RunE can reject
+		// them; they must never redirect discovery before admission.
+		if cmd != migrateBackendCmd {
+			loadSelectionEnvironment()
+		}
 
 		// Apply viper configuration if flags weren't explicitly set
 		// Priority: flags > viper (config file + env vars) > defaults
@@ -786,13 +925,6 @@ var rootCmd = &cobra.Command{
 			WasSet bool
 		})
 
-		// Handle --format json alias (desire-path from GH#2612)
-		if cmd.Root().PersistentFlags().Changed("format") {
-			format, _ := cmd.Root().PersistentFlags().GetString("format")
-			if strings.EqualFold(format, "json") {
-				jsonOutput = true
-			}
-		}
 		// If flag wasn't explicitly set, use viper value
 		if !cmd.Root().PersistentFlags().Changed("json") && !cmd.Root().PersistentFlags().Changed("format") {
 			jsonOutput = config.GetBool("json")
@@ -894,7 +1026,7 @@ var rootCmd = &cobra.Command{
 		// silently skipped if "remote" were ever added to noDbCommands.
 		needsStoreDoltGrandchildren := []string{"remote"}
 
-		skipStoreMigrateSubcommands := []string{"from-server-to-proxied-server", "from-proxied-server-to-server", "from-shared-server-to-proxied-server", "from-proxied-server-to-shared-server"}
+		skipStoreMigrateSubcommands := []string{"backend", "from-server-to-proxied-server", "from-proxied-server-to-server", "from-shared-server-to-proxied-server", "from-proxied-server-to-shared-server"}
 
 		// Check both the command name and parent command name for subcommands
 		cmdName := cmd.Name()
@@ -933,18 +1065,55 @@ var rootCmd = &cobra.Command{
 		// it can read the real output mode and command identity — that is how it
 		// stays suppressed in JSON/hook/protocol/quiet/stealth contexts and never
 		// corrupts machine-readable output. No-op after the first run.
-		maybeShowMetricsFirstRunNotice(cmd)
+		if cmd != migrateBackendCmd {
+			maybeShowMetricsFirstRunNotice(cmd)
+		}
 
 		// Commands that skip store initialization still need early config/env
 		// setup before they inspect server mode or per-project Dolt settings.
 		// Rebind them to the selected workspace so explicit --db / BEADS_DB
 		// targets behave consistently across doctor/bootstrap/context/dolt.
 		if skipsStoreInit {
-			prepareSelectedNoDBContext(selectedNoDBBeadsDir(cmd))
+			selectedBeadsDir := selectedNoDBBeadsDir(cmd)
+			if cmd == migrateBackendCmd {
+				if strings.TrimSpace(changeDir) != "" {
+					selectedBeadsDir = strings.TrimSpace(os.Getenv("BEADS_DIR"))
+				} else if cwd, err := os.Getwd(); err == nil {
+					var selectionErr error
+					selectedBeadsDir, selectionErr = physicalChangeDirBeadsDirStatus(cwd)
+					if errors.Is(selectionErr, errBackendMigrationNonOwningWorkspace) {
+						return HandleErrorRespectJSON("backend migration must run from the repository that physically owns the backend")
+					}
+				}
+			}
+			if cmd == doctorCmd && len(args) > 0 {
+				_, doctorBeadsDir, err := resolveDoctorTarget(args)
+				if err != nil {
+					return HandleError("failed to resolve path: %v", err)
+				}
+				selectedBeadsDir = doctorBeadsDir
+			}
+			if !commandCanRunDuringPendingBackendMigration(cmd) {
+				if err := rejectPendingBackendMigrationForCommand(selectedBeadsDir); err != nil {
+					return err
+				}
+			}
+			if cmd == bootstrapCmd {
+				if err := rejectBootstrapNonDoltBackend(selectedBeadsDir); err != nil {
+					return err
+				}
+			}
+			if cmd == migrateBackendCmd {
+				if err := prepareBackendMigrationCommandContext(selectedBeadsDir); err != nil {
+					return HandleErrorRespectJSON("%v", err)
+				}
+			} else {
+				prepareSelectedNoDBContext(selectedBeadsDir)
+			}
 			refreshBoundCommandConfig(cmd)
 			if beadsDir := os.Getenv("BEADS_DIR"); beadsDir == "" {
 				loadEnvironment()
-				if err := loadServerModeFromConfig(); err != nil {
+				if err := loadServerModeFromConfig(); shouldWarnNoStoreConfigError(err) {
 					// Warn, don't fatal: skipsStoreInit commands (doctor,
 					// init, bootstrap, version, ...) never select a store,
 					// and several of them are the repair path for the very
@@ -952,26 +1121,15 @@ var rootCmd = &cobra.Command{
 					fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 				}
 			}
-			if _, err := getDoltAutoCommitMode(); err != nil {
-				return HandleError("%v", err)
+			if cmd != migrateBackendCmd {
+				if _, err := getDoltAutoCommitMode(); err != nil {
+					return HandleError("%v", err)
+				}
 			}
 		}
 
 		if skipsStoreInit {
 			return nil
-		}
-
-		// Performance profiling setup
-		if profileEnabled {
-			timestamp := time.Now().Format("20060102-150405")
-			if f, _ := os.Create(fmt.Sprintf("bd-profile-%s-%s.prof", cmd.Name(), timestamp)); f != nil {
-				profileFile = f
-				_ = pprof.StartCPUProfile(f) // Best effort: profiling is a debug tool, failure is non-fatal
-			}
-			if f, _ := os.Create(fmt.Sprintf("bd-trace-%s-%s.out", cmd.Name(), timestamp)); f != nil {
-				traceFile = f
-				_ = trace.Start(f) // Best effort: profiling is a debug tool, failure is non-fatal
-			}
 		}
 
 		// Auto-detect sandboxed environment (Phase 2 for GH #353)
@@ -1012,6 +1170,9 @@ var rootCmd = &cobra.Command{
 				// - config subcommands that operate on config.yaml, git config,
 				//   or best-effort diagnostics only (GH#536, bd-934, bd-omc, bd-3rw)
 				if configCommandCanRunWithoutStore(cmd, args) {
+					if err := rejectPendingBackendMigrationForCommand(selectedNoDBBeadsDir(cmd)); err != nil {
+						return err
+					}
 					// When --db is provided, resolve BEADS_DIR so yaml-only
 					// config writes target the correct directory (GH#3348).
 					if dbPath != "" {
@@ -1070,6 +1231,23 @@ var rootCmd = &cobra.Command{
 		}
 
 		beadsDir := resolveCommandBeadsDir(dbPath)
+		if err := rejectPendingBackendMigrationForCommand(beadsDir); err != nil {
+			return err
+		}
+
+		// Profiling creates files in the caller's working directory, so it must
+		// start only after the resolved workspace passes recovery gating.
+		if profileEnabled {
+			timestamp := time.Now().Format("20060102-150405")
+			if f, _ := os.Create(fmt.Sprintf("bd-profile-%s-%s.prof", cmd.Name(), timestamp)); f != nil {
+				profileFile = f
+				_ = pprof.StartCPUProfile(f) // Best effort: profiling is a debug tool, failure is non-fatal
+			}
+			if f, _ := os.Create(fmt.Sprintf("bd-trace-%s-%s.out", cmd.Name(), timestamp)); f != nil {
+				traceFile = f
+				_ = trace.Start(f) // Best effort: profiling is a debug tool, failure is non-fatal
+			}
+		}
 		prepareSelectedCommandContext(beadsDir, true)
 		refreshBoundCommandConfig(cmd)
 		if _, err := getDoltAutoCommitMode(); err != nil {
@@ -1136,6 +1314,9 @@ var rootCmd = &cobra.Command{
 		// the fresh-repo embedded default below.
 		cfg, cfgErr := configfile.Load(beadsDir)
 		if cfgErr != nil {
+			if errors.Is(cfgErr, configfile.ErrBackendMigrationPending) {
+				return handlePendingBackendMigration(beadsDir)
+			}
 			return HandleError("failed to load beads config from %s: %v (refusing to fall back to the embedded store; fix or restore metadata.json and retry)", beadsDir, cfgErr)
 		}
 		if cfg != nil {
@@ -1496,6 +1677,42 @@ var rootCmd = &cobra.Command{
 	},
 }
 
+func shouldWarnNoStoreConfigError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return !errors.Is(err, configfile.ErrBackendMigrationPending)
+}
+
+// commandCanRunDuringPendingBackendMigration identifies commands that cannot
+// inspect or mutate workspace backend state. Every other no-store command is
+// held behind the same recovery gate as store-backed commands.
+func commandCanRunDuringPendingBackendMigration(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return true
+	}
+	if cmd == migrateBackendCmd {
+		return true
+	}
+	if cmd.Parent() == nil && cmd.Name() == cmd.Use {
+		return true
+	}
+	if root := cmd.Root(); root != nil {
+		if version, _ := root.Flags().GetBool("version"); version {
+			return true
+		}
+	}
+	if cmd.Name() == "metrics" || (cmd.Parent() != nil && cmd.Parent().Name() == "metrics") {
+		return true
+	}
+	switch cmd.Name() {
+	case "__complete", "__completeNoDesc", "bash", "completion", "fish", "help", "powershell", "version", "zsh", metrics.SendMetricsSubcommand:
+		return true
+	default:
+		return false
+	}
+}
+
 func shouldRunPostCommandAutoExport(cmd *cobra.Command) bool {
 	if cmd == nil {
 		return true
@@ -1572,10 +1789,23 @@ func checkBlockedEnvVars() error {
 	for _, name := range blockedEnvVars {
 		if os.Getenv(name) != "" {
 			return fmt.Errorf("%s env var is not supported and has been removed to prevent data fragmentation.\n"+
-				"The storage backend is set in .beads/metadata.json. To change it, use: bd migrate dolt", name)
+				"The storage backend is set in .beads/metadata.json. To change it, use: bd migrate backend --to=sqlite", name)
 		}
 	}
 	return nil
+}
+
+func rawInvocationIsBackendMigration(args []string) bool {
+	seenMigrate := false
+	for _, arg := range args {
+		switch {
+		case arg == "migrate":
+			seenMigrate = true
+		case seenMigrate && arg == "backend":
+			return true
+		}
+	}
+	return false
 }
 
 // setupGracefulShutdown creates a context that cancels on SIGINT/SIGTERM/SIGHUP.

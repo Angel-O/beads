@@ -821,12 +821,13 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// shared setup above (.beads/, .gitignore, git init) already ran.
 		if isPostgres {
 			return runInitPostgres(ctx, initPostgresInput{
-				beadsDir:   beadsDir,
-				prefix:     prefix,
-				pgURL:      pgURL,
-				pgSchema:   pgSchema,
-				quiet:      quiet,
-				jsonOutput: jsonOutput,
+				beadsDir:    beadsDir,
+				prefix:      prefix,
+				pgURL:       pgURL,
+				pgSchema:    pgSchema,
+				reinitLocal: reinitLocal,
+				quiet:       quiet,
+				jsonOutput:  jsonOutput,
 			})
 		}
 		if isMySQL {
@@ -835,17 +836,19 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				prefix:        prefix,
 				mysqlURL:      mysqlURL,
 				mysqlDatabase: mysqlDatabase,
+				reinitLocal:   reinitLocal,
 				quiet:         quiet,
 				jsonOutput:    jsonOutput,
 			})
 		}
 		if isSQLite {
 			return runInitSQLite(ctx, initSQLiteInput{
-				beadsDir:   beadsDir,
-				prefix:     prefix,
-				sqlitePath: sqlitePath,
-				quiet:      quiet,
-				jsonOutput: jsonOutput,
+				beadsDir:    beadsDir,
+				prefix:      prefix,
+				sqlitePath:  sqlitePath,
+				reinitLocal: reinitLocal,
+				quiet:       quiet,
+				jsonOutput:  jsonOutput,
 			})
 		}
 
@@ -1127,7 +1130,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				if jsonOutput {
 					handleRemoteMigrateGateJSON(gateErr)
 				} else if bootstrappedFromRemote {
-					printBootstrapRemoteBehindGuidance(os.Stderr, gateErr, syncURL, "bd init")
+					printBootstrapRemoteBehindGuidance(os.Stderr, gateErr, "bd init")
 				} else {
 					fmt.Fprint(os.Stderr, gateErr.UserMessage())
 				}
@@ -1304,7 +1307,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 
 			}
 
-			if err := cfg.Save(beadsDir); err != nil {
+			if err := saveInitializedBackendConfig(cfg, beadsDir, reinitLocal); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to create metadata.json: %v\n", err)
 				// Non-fatal - continue anyway
 			}
@@ -1831,12 +1834,13 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 // initPostgresInput carries the resolved inputs the Postgres init arm needs from
 // the shared prologue of the init command.
 type initPostgresInput struct {
-	beadsDir   string
-	prefix     string
-	pgURL      string
-	pgSchema   string
-	quiet      bool
-	jsonOutput bool
+	beadsDir    string
+	prefix      string
+	pgURL       string
+	pgSchema    string
+	reinitLocal bool
+	quiet       bool
+	jsonOutput  bool
 }
 
 // runInitPostgres finalizes a Postgres-backed workspace. It is the Postgres analog
@@ -1911,7 +1915,7 @@ func runInitPostgres(ctx context.Context, in initPostgresInput) error {
 	cfg.PostgresDSN = persistDSN
 	cfg.PostgresSchema = schema
 	cfg.ProjectID = projectID
-	if err := cfg.Save(in.beadsDir); err != nil {
+	if err := saveInitializedBackendConfig(cfg, in.beadsDir, in.reinitLocal); err != nil {
 		return fmt.Errorf("failed to write metadata.json: %w", err)
 	}
 
@@ -1942,6 +1946,7 @@ type initMySQLInput struct {
 	prefix        string
 	mysqlURL      string
 	mysqlDatabase string
+	reinitLocal   bool
 	quiet         bool
 	jsonOutput    bool
 }
@@ -2007,7 +2012,7 @@ func runInitMySQL(ctx context.Context, in initMySQLInput) error {
 	cfg.MySQLDSN = persistDSN
 	cfg.MySQLDatabase = database
 	cfg.ProjectID = projectID
-	if err := cfg.Save(in.beadsDir); err != nil {
+	if err := saveInitializedBackendConfig(cfg, in.beadsDir, in.reinitLocal); err != nil {
 		return fmt.Errorf("failed to write metadata.json: %w", err)
 	}
 
@@ -2034,11 +2039,12 @@ func runInitMySQL(ctx context.Context, in initMySQLInput) error {
 
 // initSQLiteInput carries the resolved inputs the SQLite init arm needs.
 type initSQLiteInput struct {
-	beadsDir   string
-	prefix     string
-	sqlitePath string
-	quiet      bool
-	jsonOutput bool
+	beadsDir    string
+	prefix      string
+	sqlitePath  string
+	reinitLocal bool
+	quiet       bool
+	jsonOutput  bool
 }
 
 // runInitSQLite finalizes a SQLite-backed workspace: it provisions the database file
@@ -2090,7 +2096,7 @@ func runInitSQLite(ctx context.Context, in initSQLiteInput) error {
 	cfg.Backend = configfile.BackendSQLite
 	cfg.SQLitePath = relPath
 	cfg.ProjectID = projectID
-	if err := cfg.Save(in.beadsDir); err != nil {
+	if err := saveInitializedBackendConfig(cfg, in.beadsDir, in.reinitLocal); err != nil {
 		return fmt.Errorf("failed to write metadata.json: %w", err)
 	}
 
@@ -2113,6 +2119,13 @@ func runInitSQLite(ctx context.Context, in initSQLiteInput) error {
 		fmt.Println("  History:  not tracked (SQLite backend has no version control; use Dolt for history)")
 	}
 	return nil
+}
+
+func saveInitializedBackendConfig(cfg *configfile.Config, beadsDir string, reinitLocal bool) error {
+	if reinitLocal {
+		return cfg.SaveAfterBackendReinitialization(beadsDir)
+	}
+	return cfg.Save(beadsDir)
 }
 
 func init() {

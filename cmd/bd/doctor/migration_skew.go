@@ -1,13 +1,16 @@
 package doctor
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
+	backendmigrationcontrol "github.com/steveyegge/beads/internal/backendmigration/control"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
@@ -29,10 +32,14 @@ const migrationContentSkewCheckName = "Migration Content Skew"
 // directly — embedded mode is what #4259 was reported against, and without
 // the fallback the detection half of the guard never ran there (bd-578h9.13).
 func CheckMigrationContentSkew(ss *SharedStore) DoctorCheck {
+	beadsDir := sharedStoreBeadsDir(ss)
+	if check, doltAuthority := migrationSkewBackendCheck(beadsDir); !doltAuthority {
+		return check
+	}
 	if store := ss.Store(); store != nil {
 		return checkMigrationContentSkew(context.Background(), store.DB(), store.RemoteName())
 	}
-	if check, ok := checkMigrationContentSkewEmbedded(context.Background(), sharedStoreBeadsDir(ss)); ok {
+	if check, ok := checkMigrationContentSkewEmbedded(context.Background(), beadsDir); ok {
 		return check
 	}
 	return DoctorCheck{
@@ -43,11 +50,51 @@ func CheckMigrationContentSkew(ss *SharedStore) DoctorCheck {
 	}
 }
 
+type embeddedDoltSQLOpener func(context.Context, string, string, string) (*sql.DB, func() error, error)
+
+func migrationSkewBackendCheck(beadsDir string) (DoctorCheck, bool) {
+	if beadsDir == "" {
+		return DoctorCheck{}, true
+	}
+	cfg, err := configfile.LoadAuthoritativeReadOnly(beadsDir)
+	if err != nil {
+		return DoctorCheck{
+			Name:     migrationContentSkewCheckName,
+			Status:   StatusWarning,
+			Message:  fmt.Sprintf("Could not classify backend for migration content skew: %v", err),
+			Detail:   "The retained storage provider was not opened. Repair workspace metadata, then re-run `bd doctor`.",
+			Category: CategoryData,
+		}, false
+	}
+	if cfg == nil {
+		return DoctorCheck{
+			Name:     migrationContentSkewCheckName,
+			Status:   StatusWarning,
+			Message:  "Could not classify backend for migration content skew: authoritative metadata is missing",
+			Detail:   "The retained storage provider was not opened. Restore workspace metadata, then re-run `bd doctor`.",
+			Category: CategoryData,
+		}, false
+	}
+	if cfg != nil && cfg.GetBackend() != configfile.BackendDolt {
+		return DoctorCheck{
+			Name:     migrationContentSkewCheckName,
+			Status:   StatusOK,
+			Message:  fmt.Sprintf("N/A (backend %s)", cfg.GetBackend()),
+			Category: CategoryData,
+		}, false
+	}
+	return DoctorCheck{}, true
+}
+
 // checkMigrationContentSkewEmbedded opens the workspace's embedded Dolt
 // database (read-only diagnostic queries only; nothing is written) and runs
 // the skew comparison on it. Returns ok=false when there is no embedded
 // database to inspect.
 func checkMigrationContentSkewEmbedded(ctx context.Context, beadsDir string) (DoctorCheck, bool) {
+	return checkMigrationContentSkewEmbeddedWithOpener(ctx, beadsDir, embeddeddolt.OpenSQL)
+}
+
+func checkMigrationContentSkewEmbeddedWithOpener(ctx context.Context, beadsDir string, opener embeddedDoltSQLOpener) (DoctorCheck, bool) {
 	if beadsDir == "" {
 		return DoctorCheck{}, false
 	}
@@ -55,11 +102,42 @@ func checkMigrationContentSkewEmbedded(ctx context.Context, beadsDir string) (Do
 	if _, err := os.Stat(dataDir); err != nil {
 		return DoctorCheck{}, false
 	}
-	database := configfile.DefaultDoltDatabase
-	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil {
-		database = cfg.GetDoltDatabase()
+	controlWarning := func(reason string) (DoctorCheck, bool) {
+		return DoctorCheck{
+			Name:     migrationContentSkewCheckName,
+			Status:   StatusWarning,
+			Message:  "Could not check migration content skew because the workspace backend may be changing",
+			Detail:   reason + ". The retained storage provider was not opened; re-run `bd doctor` after the backend operation finishes.",
+			Category: CategoryData,
+		}, true
 	}
-	db, cleanup, err := embeddeddolt.OpenSQL(ctx, dataDir, database, "")
+	if err := backendmigrationcontrol.RejectPending(beadsDir); err != nil {
+		return controlWarning("Backend migration recovery is pending")
+	}
+	guard, err := backendmigrationcontrol.TryAcquire(beadsDir)
+	if err != nil {
+		return controlWarning("Backend migration workspace control is unavailable")
+	}
+	defer func() { _ = guard.Close() }()
+	if err := backendmigrationcontrol.RejectPending(beadsDir); err != nil {
+		return controlWarning("Backend migration recovery became pending")
+	}
+	if check, doltAuthority := migrationSkewBackendCheck(beadsDir); !doltAuthority {
+		return check, true
+	}
+	beforeCfg, err := configfile.LoadAuthoritativeReadOnly(beadsDir)
+	if err != nil {
+		return controlWarning("Backend authority could not be revalidated")
+	}
+	beforeAuthority, err := json.Marshal(beforeCfg)
+	if err != nil {
+		return controlWarning("Backend authority could not be recorded")
+	}
+	database := configfile.DefaultDoltDatabase
+	if beforeCfg != nil {
+		database = beforeCfg.GetDoltDatabase()
+	}
+	db, cleanup, err := opener(ctx, dataDir, database, "")
 	if err != nil {
 		return DoctorCheck{
 			Name:     migrationContentSkewCheckName,
@@ -70,6 +148,17 @@ func checkMigrationContentSkewEmbedded(ctx context.Context, beadsDir string) (Do
 		}, true
 	}
 	defer func() { _ = cleanup() }()
+	afterCfg, authorityErr := configfile.LoadAuthoritativeReadOnly(beadsDir)
+	afterAuthority, marshalErr := json.Marshal(afterCfg)
+	if authorityErr != nil || marshalErr != nil || (afterCfg != nil && afterCfg.GetBackend() != configfile.BackendDolt) || !bytes.Equal(beforeAuthority, afterAuthority) {
+		return DoctorCheck{
+			Name:     migrationContentSkewCheckName,
+			Status:   StatusWarning,
+			Message:  "Could not check migration content skew because backend authority changed while opening the database",
+			Detail:   "The retained storage provider was closed without running diagnostic queries. Re-run `bd doctor`.",
+			Category: CategoryData,
+		}, true
+	}
 	return checkMigrationContentSkew(ctx, db, ""), true
 }
 

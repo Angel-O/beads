@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/schema"
@@ -40,12 +41,14 @@ var _ storage.ExternalRefHistoryQuerier = (*EmbeddedDoltStore)(nil)
 // The dolthub/driver/v2 handles its own concurrency internally. File-level locking
 // is only used during bd init to protect one-time initialization steps.
 type EmbeddedDoltStore struct {
-	dataDir       string
-	beadsDir      string
-	database      string
-	branch        string
-	credentialKey []byte
-	closed        atomic.Bool
+	dataDir          string
+	beadsDir         string
+	database         string
+	branch           string
+	credentialKey    []byte
+	closed           atomic.Bool
+	migrationDB      *sql.DB
+	migrationCleanup func() error
 	// readOnly marks a store opened via OpenReadOnly: open-time mutations
 	// (CREATE DATABASE, schema migrations) were skipped and write
 	// transactions are refused (bd-6dnrw.32).
@@ -86,6 +89,11 @@ var errClosed = errors.New("embeddeddolt: store is closed")
 
 // errReadOnly is returned when a write is attempted on a read-only store.
 var errReadOnly = errors.New("embeddeddolt: store is read-only")
+
+var (
+	ErrBackendMigrationBusy   = errors.New("embedded workspace is active in another process")
+	ErrBackendProviderChanged = errors.New("workspace backend changed while waiting for embedded Dolt")
+)
 
 // IsClosed reports whether the store has been closed. Implements
 // storage.LifecycleManager so that callers (e.g., maybeAutoCommit) can
@@ -150,6 +158,10 @@ func newStore(ctx context.Context, beadsDir, database, branch string, intent ope
 // opens of the same directory keep their own lifecycle. Write transactions on
 // the returned store are refused.
 func OpenReadOnly(ctx context.Context, beadsDir, database, branch string) (*EmbeddedDoltStore, error) {
+	return openReadOnly(ctx, beadsDir, database, branch, false)
+}
+
+func openReadOnly(ctx context.Context, beadsDir, database, branch string, retainDriverLock bool) (*EmbeddedDoltStore, error) {
 	if database == "" {
 		return nil, fmt.Errorf("embeddeddolt: database name must not be empty (caller should default to %q)", "beads")
 	}
@@ -173,19 +185,51 @@ func OpenReadOnly(ctx context.Context, beadsDir, database, branch string) (*Embe
 		readOnly: true,
 	}
 
-	db, cleanup, err := OpenSQL(ctx, dataDir, database, branch)
+	var db *sql.DB
+	var cleanup func() error
+	if retainDriverLock {
+		db, cleanup, err = openSQLForMigration(ctx, dataDir, database, branch)
+	} else {
+		db, cleanup, err = OpenSQL(ctx, dataDir, database, branch)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("embeddeddolt: open db: %w", err)
 	}
-	defer func() { _ = cleanup() }()
 	if err := schema.CheckForwardDrift(ctx, db); err != nil {
-		return nil, err
+		return nil, errors.Join(err, cleanup())
 	}
 	if err := schema.CheckBehindDrift(ctx, db); err != nil {
+		return nil, errors.Join(err, cleanup())
+	}
+	if retainDriverLock {
+		s.migrationDB = db
+		s.migrationCleanup = cleanup
+		return s, nil
+	}
+	if err := cleanup(); err != nil {
 		return nil, err
 	}
 
 	return s, nil
+}
+
+// openCheckedSQL acquires the embedded driver's journal lock and then
+// revalidates provider authority before returning the connection. The order is
+// load-bearing: a command that opened a Dolt store before a backend cutover may
+// wait here, but it must not resume against the preserved source afterward.
+func (s *EmbeddedDoltStore) openCheckedSQL(ctx context.Context, database, branch string) (*sql.DB, func() error, error) {
+	db, cleanup, err := OpenSQL(ctx, s.dataDir, database, branch)
+	if err != nil {
+		return nil, nil, err
+	}
+	cfg, cfgErr := configfile.Load(s.beadsDir)
+	if cfgErr != nil {
+		return nil, nil, errors.Join(fmt.Errorf("embeddeddolt: revalidate backend selection: %w", cfgErr), cleanup())
+	}
+	if cfg != nil && cfg.GetBackend() != configfile.BackendDolt {
+		return nil, nil, errors.Join(ErrBackendProviderChanged, cleanup())
+	}
+	return db, cleanup, nil
 }
 
 // withConn opens a short-lived database connection configured for the store's
@@ -207,14 +251,17 @@ func (s *EmbeddedDoltStore) withConn(ctx context.Context, commit bool, fn func(t
 
 	var db *sql.DB
 	var cleanup func() error
-	db, cleanup, err = OpenSQL(ctx, s.dataDir, s.database, s.branch)
-	if err != nil {
-		return
+	if s.migrationDB != nil {
+		db = s.migrationDB
+	} else {
+		db, cleanup, err = s.openCheckedSQL(ctx, s.database, s.branch)
+		if err != nil {
+			return
+		}
+		defer func() {
+			err = errors.Join(err, cleanup())
+		}()
 	}
-
-	defer func() {
-		err = errors.Join(err, cleanup())
-	}()
 
 	var tx *sql.Tx
 	tx, err = db.BeginTx(ctx, nil)
@@ -247,7 +294,7 @@ func (s *EmbeddedDoltStore) ApplySchemaMigrations(ctx context.Context) (int, err
 	if s.readOnly {
 		return 0, errReadOnly
 	}
-	db, cleanup, err := OpenSQL(ctx, s.dataDir, s.database, s.branch)
+	db, cleanup, err := s.openCheckedSQL(ctx, s.database, s.branch)
 	if err != nil {
 		return 0, fmt.Errorf("embeddeddolt: open db: %w", err)
 	}
@@ -263,7 +310,7 @@ func (s *EmbeddedDoltStore) ApplySchemaMigrations(ctx context.Context) (int, err
 }
 
 func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
-	db, cleanup, err := OpenSQL(ctx, s.dataDir, "", "")
+	db, cleanup, err := s.openCheckedSQL(ctx, "", "")
 	if err != nil {
 		return fmt.Errorf("embeddeddolt: open db: %w", err)
 	}
@@ -572,6 +619,9 @@ func (s *EmbeddedDoltStore) Close() error {
 	}
 	if s.closed.CompareAndSwap(false, true) {
 		s.cleanGitRemoteCacheGarbage()
+		if s.migrationCleanup != nil {
+			return s.migrationCleanup()
+		}
 	}
 	return nil
 }

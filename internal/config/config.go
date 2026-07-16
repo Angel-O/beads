@@ -568,21 +568,23 @@ func SaveConfigValue(key string, value interface{}, beadsDir string) error {
 		v.SetConfigFile(configPath)
 	}
 
-	// Read existing file contents to avoid dumping all merged viper state
-	// (defaults, env vars, overrides) into the config file.
-	existing := make(map[string]interface{})
-	if data, err := os.ReadFile(filepath.Clean(configPath)); err == nil {
-		_ = yaml.Unmarshal(data, &existing)
-	}
+	return withBackendSelectionControl(configPath, key, func() error {
+		// Read existing file contents to avoid dumping all merged viper state
+		// (defaults, env vars, overrides) into the config file.
+		existing := make(map[string]interface{})
+		if data, err := os.ReadFile(filepath.Clean(configPath)); err == nil {
+			_ = yaml.Unmarshal(data, &existing)
+		}
 
-	// Set the single key using dot-path splitting for nested keys (e.g. "routing.mode").
-	setNestedKey(existing, key, value)
+		// Set the single key using dot-path splitting for nested keys (e.g. "routing.mode").
+		setNestedKey(existing, key, value)
 
-	out, err := yaml.Marshal(existing)
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
-	}
-	return os.WriteFile(configPath, out, 0o600)
+		out, err := yaml.Marshal(existing)
+		if err != nil {
+			return fmt.Errorf("failed to marshal config: %w", err)
+		}
+		return os.WriteFile(configPath, out, 0o600)
+	})
 }
 
 // setNestedKey sets a value in a nested map using a dot-separated key path.

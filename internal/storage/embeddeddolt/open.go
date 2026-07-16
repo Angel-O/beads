@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
+	"github.com/dolthub/dolt/go/store/nbs"
 	doltembed "github.com/dolthub/driver/v2"
 )
 
@@ -30,6 +31,18 @@ const (
 // OpenSQL opens an embedded Dolt database at dir. The returned cleanup
 // function closes both the *sql.DB and the underlying connector.
 func OpenSQL(ctx context.Context, dir, database, branch string) (*sql.DB, func() error, error) {
+	return openSQL(ctx, dir, database, branch, 0)
+}
+
+func openSQLForMigration(ctx context.Context, dir, database, branch string) (*sql.DB, func() error, error) {
+	db, cleanup, err := openSQL(ctx, dir, database, branch, time.Second)
+	if errors.Is(err, nbs.ErrDatabaseLocked) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return nil, nil, ErrBackendMigrationBusy
+	}
+	return db, cleanup, err
+}
+
+func openSQL(ctx context.Context, dir, database, branch string, maxLockWait time.Duration) (*sql.DB, func() error, error) {
 	dsn := buildDSN(dir, database)
 
 	cfg, err := doltembed.ParseDSN(dsn)
@@ -38,8 +51,13 @@ func OpenSQL(ctx context.Context, dir, database, branch string) (*sql.DB, func()
 	}
 
 	bo := backoff.NewExponentialBackOff()
-	bo.MaxElapsedTime = 0 // wait until ctx cancellation
-	bo.MaxInterval = 5 * time.Second
+	bo.MaxElapsedTime = maxLockWait
+	if maxLockWait == 0 {
+		bo.MaxInterval = 5 * time.Second
+	} else {
+		bo.InitialInterval = 25 * time.Millisecond
+		bo.MaxInterval = 100 * time.Millisecond
+	}
 	cfg.BackOff = bo
 
 	connector, err := doltembed.NewConnector(cfg)

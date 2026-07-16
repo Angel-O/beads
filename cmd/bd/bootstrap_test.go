@@ -3,14 +3,21 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	backendmigrationcontrol "github.com/steveyegge/beads/internal/backendmigration/control"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage/schema"
 )
 
 func snapshotBootstrapEnv(t *testing.T) func() {
@@ -364,6 +371,41 @@ func TestDetectBootstrapAction_ExplicitSyncRemotePreservesRemotesAPIURL(t *testi
 	}
 	if plan.SyncRemote != syncRemote {
 		t.Errorf("SyncRemote = %q, want unnormalized explicit sync.remote %q", plan.SyncRemote, syncRemote)
+	}
+}
+
+func TestDetectBootstrapActionRedactsCredentialsFromVisiblePlan(t *testing.T) {
+	restore := snapshotBootstrapEnv(t)
+	defer restore()
+	config.ResetForTesting()
+	defer config.ResetForTesting()
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	const secret = "plan-secret"
+	const syncRemote = "https://operator:" + secret + "@provider.example/org/beads?token=" + secret
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("sync.remote: "+syncRemote+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+	t.Setenv("BEADS_TEST_IGNORE_REPO_CONFIG", "1")
+	if err := config.Initialize(); err != nil {
+		t.Fatalf("config.Initialize: %v", err)
+	}
+
+	plan := detectBootstrapAction(beadsDir, configfile.DefaultConfig())
+	visible, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(visible, []byte(secret)) || bytes.Contains(visible, []byte("operator@")) {
+		t.Fatalf("bootstrap plan exposed remote credentials: %s", visible)
+	}
+	if !bytes.Contains(visible, []byte("provider.example")) {
+		t.Fatalf("bootstrap plan lost useful remote identity: %s", visible)
 	}
 }
 
@@ -919,7 +961,10 @@ func TestBootstrapRigSubdirUsesParentDBName(t *testing.T) {
 	cfg, cfgErr := configfile.Load(synthesizedDir)
 	if cfgErr != nil || cfg == nil {
 		// This is the fix path: search parent directories for metadata.json
-		cfg = findParentConfig(synthesizedDir)
+		cfg, cfgErr = findParentConfig(synthesizedDir)
+		if cfgErr != nil {
+			t.Fatalf("findParentConfig: %v", cfgErr)
+		}
 	}
 	if cfg == nil {
 		cfg = configfile.DefaultConfig()
@@ -936,6 +981,800 @@ func TestBootstrapRigSubdirUsesParentDBName(t *testing.T) {
 	}
 	if plan.Database != "my_rig" {
 		t.Errorf("plan.Database = %q, want %q", plan.Database, "my_rig")
+	}
+}
+
+func TestFindParentConfigPreservesLegacyConfig(t *testing.T) {
+	workspace := t.TempDir()
+	parentBeadsDir := filepath.Join(workspace, ".beads")
+	if err := os.Mkdir(parentBeadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyPath := filepath.Join(parentBeadsDir, "config.json")
+	legacy := []byte(`{"backend":"dolt","dolt_mode":"embedded","dolt_database":"legacy_parent"}`)
+	if err := os.WriteFile(legacyPath, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	synthesizedDir := filepath.Join(workspace, "mayor", "rig", ".beads")
+	cfg, err := findParentConfig(synthesizedDir)
+	if err != nil {
+		t.Fatalf("findParentConfig: %v", err)
+	}
+	if cfg == nil || cfg.GetDoltDatabase() != "legacy_parent" {
+		t.Fatalf("parent config = %#v, want legacy_parent", cfg)
+	}
+	after, err := os.ReadFile(legacyPath)
+	if err != nil || !bytes.Equal(after, legacy) {
+		t.Fatalf("parent discovery changed legacy config: equal=%v err=%v", bytes.Equal(after, legacy), err)
+	}
+	if _, err := os.Lstat(configfile.ConfigPath(parentBeadsDir)); !os.IsNotExist(err) {
+		t.Fatalf("parent discovery created metadata.json: %v", err)
+	}
+}
+
+func TestFindParentConfigStopsAtInvalidNearestAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(t *testing.T, nearerBeadsDir string) string
+	}{
+		{
+			name: "corrupt metadata",
+			setup: func(t *testing.T, nearerBeadsDir string) string {
+				t.Helper()
+				path := configfile.ConfigPath(nearerBeadsDir)
+				if err := os.WriteFile(path, []byte(`{"backend":`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+		},
+		{
+			name: "ambiguous legacy config",
+			setup: func(t *testing.T, nearerBeadsDir string) string {
+				t.Helper()
+				path := filepath.Join(nearerBeadsDir, "config.json")
+				if err := os.WriteFile(path, []byte(`{"backend":"dolt","Backend":"sqlite"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+		},
+		{
+			name: "pending migration",
+			setup: func(t *testing.T, nearerBeadsDir string) string {
+				t.Helper()
+				path := filepath.Join(nearerBeadsDir, configfile.BackendMigrationStateFileName)
+				if err := os.WriteFile(path, []byte("pending"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			outer := t.TempDir()
+			outerBeadsDir := filepath.Join(outer, ".beads")
+			nearerBeadsDir := filepath.Join(outer, "nearer", ".beads")
+			if err := os.Mkdir(outerBeadsDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(nearerBeadsDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := (&configfile.Config{Backend: configfile.BackendDolt, DoltDatabase: "must_not_be_used"}).Save(outerBeadsDir); err != nil {
+				t.Fatal(err)
+			}
+			invalidPath := test.setup(t, nearerBeadsDir)
+			before, err := os.ReadFile(invalidPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			cfg, err := findParentConfig(filepath.Join(outer, "nearer", "rig", ".beads"))
+			if err == nil {
+				t.Fatalf("findParentConfig = %#v, nil; want nearest-authority error", cfg)
+			}
+			if cfg != nil {
+				t.Fatalf("findParentConfig returned outer config after nearer error: %#v", cfg)
+			}
+			after, readErr := os.ReadFile(invalidPath)
+			if readErr != nil || !bytes.Equal(after, before) {
+				t.Fatalf("failed parent discovery changed nearest authority: equal=%v err=%v", bytes.Equal(after, before), readErr)
+			}
+		})
+	}
+}
+
+func TestFindParentConfigRejectsLinkedNearestMetadataWithoutFollowingIt(t *testing.T) {
+	outer := t.TempDir()
+	outerBeadsDir := filepath.Join(outer, ".beads")
+	nearerBeadsDir := filepath.Join(outer, "nearer", ".beads")
+	if err := os.Mkdir(outerBeadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(nearerBeadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&configfile.Config{Backend: configfile.BackendDolt, DoltDatabase: "must_not_be_used"}).Save(outerBeadsDir); err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(t.TempDir(), "foreign.json")
+	foreignBytes := []byte(`{"backend":"dolt","dolt_database":"foreign"}`)
+	if err := os.WriteFile(foreign, foreignBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(foreign, configfile.ConfigPath(nearerBeadsDir)); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	cfg, err := findParentConfig(filepath.Join(outer, "nearer", "rig", ".beads"))
+	if err == nil || cfg != nil {
+		t.Fatalf("findParentConfig = %#v, %v; want linked nearest-authority error", cfg, err)
+	}
+	after, readErr := os.ReadFile(foreign)
+	if readErr != nil || !bytes.Equal(after, foreignBytes) {
+		t.Fatalf("linked parent discovery changed foreign target: equal=%v err=%v", bytes.Equal(after, foreignBytes), readErr)
+	}
+}
+
+func TestDetectBootstrapActionWithAuthorityRefusesTargetCutoverBeforeRemoteProbe(t *testing.T) {
+	repoDir := t.TempDir()
+	runGitForBootstrapTest(t, repoDir, "init", "-b", "main")
+	runGitForBootstrapTest(t, repoDir, "remote", "add", "origin", "https://provider.invalid/org/board")
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.Mkdir(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&configfile.Config{
+		Backend:      configfile.BackendDolt,
+		DoltMode:     configfile.DoltModeEmbedded,
+		DoltDatabase: "planned_dolt",
+	}).Save(beadsDir); err != nil {
+		t.Fatal(err)
+	}
+	authority, plannedCfg, err := captureBootstrapAuthority(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cutover := *plannedCfg
+	cutover.Backend = configfile.BackendSQLite
+	cutover.SQLitePath = "beads.db"
+	if err := cutover.SaveAfterBackendReinitialization(beadsDir); err != nil {
+		t.Fatal(err)
+	}
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+	if err := os.Chdir(repoDir); err != nil {
+		t.Fatal(err)
+	}
+	originalProbe := bootstrapGitOriginHasDoltDataRef
+	probeCalls := 0
+	bootstrapGitOriginHasDoltDataRef = func() bool {
+		probeCalls++
+		return true
+	}
+	defer func() { bootstrapGitOriginHasDoltDataRef = originalProbe }()
+
+	if _, err := detectBootstrapActionWithAuthority(beadsDir, plannedCfg, authority); err == nil {
+		t.Fatal("guarded bootstrap detection accepted a Dolt plan after SQLite cutover")
+	}
+	if probeCalls != 0 {
+		t.Fatalf("guarded bootstrap detection contacted the remote provider %d time(s) after cutover", probeCalls)
+	}
+}
+
+func TestDetectBootstrapActionWithAuthorityRefusesParentCutoverBeforeRemoteProbe(t *testing.T) {
+	workspace := t.TempDir()
+	parentBeadsDir := filepath.Join(workspace, ".beads")
+	if err := os.Mkdir(parentBeadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&configfile.Config{
+		Backend:      configfile.BackendDolt,
+		DoltMode:     configfile.DoltModeEmbedded,
+		DoltDatabase: "parent_dolt",
+	}).Save(parentBeadsDir); err != nil {
+		t.Fatal(err)
+	}
+	rigDir := filepath.Join(workspace, "mayor", "rig")
+	if err := os.MkdirAll(rigDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGitForBootstrapTest(t, rigDir, "init", "-b", "main")
+	runGitForBootstrapTest(t, rigDir, "remote", "add", "origin", "https://provider.invalid/org/board")
+	targetBeadsDir := filepath.Join(rigDir, ".beads")
+	authority, plannedCfg, err := captureBootstrapAuthority(targetBeadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authority.ownerDir != parentBeadsDir || plannedCfg.GetDoltDatabase() != "parent_dolt" {
+		t.Fatalf("captured authority = %#v, config = %#v; want parent owner", authority, plannedCfg)
+	}
+
+	cutover := *plannedCfg
+	cutover.Backend = configfile.BackendSQLite
+	cutover.SQLitePath = "beads.db"
+	if err := cutover.SaveAfterBackendReinitialization(parentBeadsDir); err != nil {
+		t.Fatal(err)
+	}
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+	if err := os.Chdir(rigDir); err != nil {
+		t.Fatal(err)
+	}
+	originalProbe := bootstrapGitOriginHasDoltDataRef
+	probeCalls := 0
+	bootstrapGitOriginHasDoltDataRef = func() bool {
+		probeCalls++
+		return true
+	}
+	defer func() { bootstrapGitOriginHasDoltDataRef = originalProbe }()
+
+	if _, err := detectBootstrapActionWithAuthority(targetBeadsDir, plannedCfg, authority); err == nil {
+		t.Fatal("guarded bootstrap detection accepted parent Dolt authority after parent SQLite cutover")
+	}
+	if probeCalls != 0 {
+		t.Fatalf("guarded parent bootstrap contacted the remote provider %d time(s) after cutover", probeCalls)
+	}
+	if _, err := os.Lstat(targetBeadsDir); !os.IsNotExist(err) {
+		t.Fatalf("refused parent bootstrap created target .beads: %v", err)
+	}
+}
+
+func TestDetectBootstrapActionWithAuthorityHoldsParentControlDuringRemoteProbe(t *testing.T) {
+	workspace := t.TempDir()
+	parentBeadsDir := filepath.Join(workspace, ".beads")
+	if err := os.Mkdir(parentBeadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&configfile.Config{
+		Backend:      configfile.BackendDolt,
+		DoltMode:     configfile.DoltModeEmbedded,
+		DoltDatabase: "parent_dolt",
+	}).Save(parentBeadsDir); err != nil {
+		t.Fatal(err)
+	}
+	rigDir := filepath.Join(workspace, "mayor", "rig")
+	if err := os.MkdirAll(rigDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGitForBootstrapTest(t, rigDir, "init", "-b", "main")
+	runGitForBootstrapTest(t, rigDir, "remote", "add", "origin", "https://provider.invalid/org/board")
+	targetBeadsDir := filepath.Join(rigDir, ".beads")
+	authority, plannedCfg, err := captureBootstrapAuthority(targetBeadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+	if err := os.Chdir(rigDir); err != nil {
+		t.Fatal(err)
+	}
+	originalProbe := bootstrapGitOriginHasDoltDataRef
+	probeEntered := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	bootstrapGitOriginHasDoltDataRef = func() bool {
+		close(probeEntered)
+		<-releaseProbe
+		return true
+	}
+	defer func() { bootstrapGitOriginHasDoltDataRef = originalProbe }()
+
+	type detectionResult struct {
+		plan BootstrapPlan
+		err  error
+	}
+	done := make(chan detectionResult, 1)
+	go func() {
+		plan, err := detectBootstrapActionWithAuthority(targetBeadsDir, plannedCfg, authority)
+		done <- detectionResult{plan: plan, err: err}
+	}()
+	select {
+	case <-probeEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("guarded detection did not reach remote probe")
+	}
+	contending, contentionErr := backendmigrationcontrol.TryAcquire(parentBeadsDir)
+	if contending != nil {
+		_ = contending.Close()
+	}
+	if !errors.Is(contentionErr, backendmigrationcontrol.ErrBusy) {
+		t.Fatalf("parent migration control during remote probe = %v, want ErrBusy", contentionErr)
+	}
+	close(releaseProbe)
+	select {
+	case result := <-done:
+		if result.err != nil || result.plan.Action != "sync" {
+			t.Fatalf("guarded parent detection = %#v, %v; want sync", result.plan, result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("guarded parent detection did not finish")
+	}
+	if _, err := os.Lstat(targetBeadsDir); !os.IsNotExist(err) {
+		t.Fatalf("planning created target .beads: %v", err)
+	}
+}
+
+func TestDetectBootstrapDryRunDoesNotPublishDirectMigrationControl(t *testing.T) {
+	workspace := t.TempDir()
+	beadsDir := filepath.Join(workspace, ".beads")
+	if err := os.Mkdir(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"direct_dry_run"}`)
+	if err := os.WriteFile(configfile.ConfigPath(beadsDir), metadata, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controlPath := filepath.Join(beadsDir, backendmigrationcontrol.FileName)
+	if _, err := os.Lstat(controlPath); !os.IsNotExist(err) {
+		t.Fatalf("precondition: migration control already exists: %v", err)
+	}
+
+	authority, cfg, err := captureBootstrapAuthority(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := detectBootstrapDryRunAction(beadsDir, cfg, authority); err != nil {
+		t.Fatalf("dry-run detection: %v", err)
+	}
+	if _, err := os.Lstat(controlPath); !os.IsNotExist(err) {
+		t.Fatalf("dry-run published migration control: %v", err)
+	}
+}
+
+func TestDetectBootstrapDryRunDoesNotPublishParentMigrationControl(t *testing.T) {
+	workspace := t.TempDir()
+	parentBeadsDir := filepath.Join(workspace, ".beads")
+	if err := os.Mkdir(parentBeadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"parent_dry_run"}`)
+	if err := os.WriteFile(configfile.ConfigPath(parentBeadsDir), metadata, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	targetBeadsDir := filepath.Join(workspace, "mayor", "rig", ".beads")
+	if err := os.MkdirAll(filepath.Dir(targetBeadsDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	controlPath := filepath.Join(parentBeadsDir, backendmigrationcontrol.FileName)
+	if _, err := os.Lstat(controlPath); !os.IsNotExist(err) {
+		t.Fatalf("precondition: parent migration control already exists: %v", err)
+	}
+
+	authority, cfg, err := captureBootstrapAuthority(targetBeadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authority.ownerDir != parentBeadsDir {
+		t.Fatalf("authority owner = %q, want parent %q", authority.ownerDir, parentBeadsDir)
+	}
+	if _, err := detectBootstrapDryRunAction(targetBeadsDir, cfg, authority); err != nil {
+		t.Fatalf("parent-derived dry-run detection: %v", err)
+	}
+	if _, err := os.Lstat(controlPath); !os.IsNotExist(err) {
+		t.Fatalf("dry-run published parent migration control: %v", err)
+	}
+	if _, err := os.Lstat(targetBeadsDir); !os.IsNotExist(err) {
+		t.Fatalf("dry-run created target .beads: %v", err)
+	}
+}
+
+func TestResolveBootstrapConfigAndAuthorityPreservesDryRunRepair(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.Mkdir(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&configfile.Config{
+		Backend:      configfile.BackendDolt,
+		DoltMode:     configfile.DoltModeServer,
+		DoltDatabase: "stale_on_disk",
+	}).Save(beadsDir); err != nil {
+		t.Fatal(err)
+	}
+
+	originalResolve := resolveBootstrapAuthoritativeMetadata
+	resolveBootstrapAuthoritativeMetadata = func(string, bool) (*configfile.Config, string, error) {
+		return &configfile.Config{
+			Backend:      configfile.BackendDolt,
+			DoltMode:     configfile.DoltModeServer,
+			DoltDatabase: "hypothetical_repair",
+		}, "would repair metadata", nil
+	}
+	defer func() { resolveBootstrapAuthoritativeMetadata = originalResolve }()
+
+	authority, cfg, msg, err := resolveBootstrapConfigAndAuthority(beadsDir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authority == nil || cfg.GetDoltDatabase() != "hypothetical_repair" || msg != "would repair metadata" {
+		t.Fatalf("dry-run resolution = %#v, %#v, %q; want hypothetical repaired config", authority, cfg, msg)
+	}
+	onDisk, err := configfile.LoadAuthoritativeReadOnly(beadsDir)
+	if err != nil || onDisk.GetDoltDatabase() != "stale_on_disk" {
+		t.Fatalf("dry-run changed on-disk config: %#v, %v", onDisk, err)
+	}
+}
+
+func TestExecuteBootstrapLocalActionsRefuseParentCutoverBeforeDoltEffects(t *testing.T) {
+	for _, action := range []string{"init", "restore", "jsonl-import"} {
+		t.Run(action, func(t *testing.T) {
+			workspace := t.TempDir()
+			parentBeadsDir := filepath.Join(workspace, ".beads")
+			if err := os.Mkdir(parentBeadsDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			parentMetadata := []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"parent_plan"}`)
+			if err := os.WriteFile(configfile.ConfigPath(parentBeadsDir), parentMetadata, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			targetBeadsDir := filepath.Join(workspace, "mayor", action, ".beads")
+			if err := os.MkdirAll(filepath.Join(targetBeadsDir, "backup"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			backupFile := filepath.Join(targetBeadsDir, "backup", "issues.jsonl")
+			jsonlFile := filepath.Join(targetBeadsDir, "issues.jsonl")
+			if err := os.WriteFile(backupFile, []byte("{}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(jsonlFile, []byte("{}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			authority, cfg, err := captureBootstrapAuthority(targetBeadsDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if authority.ownerDir != parentBeadsDir {
+				t.Fatalf("authority owner = %q, want parent %q", authority.ownerDir, parentBeadsDir)
+			}
+			plan := BootstrapPlan{
+				Action:    action,
+				BeadsDir:  targetBeadsDir,
+				Database:  cfg.GetDoltDatabase(),
+				BackupDir: filepath.Join(targetBeadsDir, "backup"),
+				JSONLFile: jsonlFile,
+				authority: authority,
+			}
+
+			cutoverMetadata := []byte(`{"database":"beads.db","backend":"sqlite","sqlite_path":"beads.db"}`)
+			if err := os.WriteFile(configfile.ConfigPath(parentBeadsDir), cutoverMetadata, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := executeBootstrapPlan(plan, cfg, true); err == nil {
+				t.Fatal("stale parent-derived bootstrap plan was executed after SQLite cutover")
+			}
+			if _, err := os.Lstat(filepath.Join(targetBeadsDir, "embeddeddolt")); !os.IsNotExist(err) {
+				t.Fatalf("stale bootstrap created embedded Dolt state: %v", err)
+			}
+		})
+	}
+}
+
+func TestExecuteSyncActionRefusesStaleDoltPlanAfterSQLiteCutover(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.Mkdir(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sourceDir := filepath.Join(beadsDir, "embeddeddolt")
+	if err := os.Mkdir(sourceDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sourceSentinel := filepath.Join(sourceDir, "retained-source")
+	if err := os.WriteFile(sourceSentinel, []byte("preserved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(beadsDir, "config.yaml")
+	configBytes := []byte("sync.remote: https://provider.invalid/org/board\n")
+	if err := os.WriteFile(configPath, configBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&configfile.Config{
+		Database:     "dolt",
+		Backend:      configfile.BackendDolt,
+		DoltMode:     configfile.DoltModeEmbedded,
+		DoltDatabase: "stale_plan",
+	}).Save(beadsDir); err != nil {
+		t.Fatal(err)
+	}
+	authority, plannedCfg, err := captureBootstrapAuthority(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := BootstrapPlan{
+		Action:     "sync",
+		BeadsDir:   beadsDir,
+		Database:   plannedCfg.GetDoltDatabase(),
+		SyncRemote: "https://provider.invalid/org/board",
+		authority:  authority,
+	}
+
+	cutover, err := configfile.LoadAuthoritativeReadOnly(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cutover.Backend = configfile.BackendSQLite
+	cutover.SQLitePath = "beads.db"
+	if err := cutover.SaveAfterBackendReinitialization(beadsDir); err != nil {
+		t.Fatal(err)
+	}
+	metadataBefore, err := os.ReadFile(configfile.ConfigPath(beadsDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configBefore, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceBefore, err := os.ReadFile(sourceSentinel)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	originalClone := cloneBootstrapRemote
+	var cloneCalls int
+	cloneBootstrapRemote = func(context.Context, string, string, string, *configfile.Config) error {
+		cloneCalls++
+		return errors.New("provider must not be called")
+	}
+	defer func() { cloneBootstrapRemote = originalClone }()
+
+	err = executeSyncAction(t.Context(), plan, plannedCfg)
+	if err == nil {
+		t.Fatal("executeSyncAction accepted a stale Dolt plan after SQLite cutover")
+	}
+	if cloneCalls != 0 {
+		t.Fatalf("stale bootstrap called provider %d time(s)", cloneCalls)
+	}
+	for path, before := range map[string][]byte{
+		configfile.ConfigPath(beadsDir): metadataBefore,
+		configPath:                      configBefore,
+		sourceSentinel:                  sourceBefore,
+	} {
+		after, readErr := os.ReadFile(path)
+		if readErr != nil || !bytes.Equal(after, before) {
+			t.Fatalf("stale bootstrap changed %s: equal=%v err=%v", filepath.Base(path), bytes.Equal(after, before), readErr)
+		}
+	}
+}
+
+func TestExecuteSyncActionHoldsMigrationControlWhileProviderIsBlocked(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.Mkdir(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&configfile.Config{
+		Database:     "dolt",
+		Backend:      configfile.BackendDolt,
+		DoltMode:     configfile.DoltModeEmbedded,
+		DoltDatabase: "controlled_clone",
+	}).Save(beadsDir); err != nil {
+		t.Fatal(err)
+	}
+	authority, cfg, err := captureBootstrapAuthority(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := BootstrapPlan{
+		Action:     "sync",
+		BeadsDir:   beadsDir,
+		Database:   cfg.GetDoltDatabase(),
+		SyncRemote: "https://provider.invalid/org/board",
+		authority:  authority,
+	}
+
+	providerEntered := make(chan struct{})
+	releaseProvider := make(chan struct{})
+	providerErr := errors.New("provider stopped")
+	originalClone := cloneBootstrapRemote
+	cloneBootstrapRemote = func(context.Context, string, string, string, *configfile.Config) error {
+		close(providerEntered)
+		<-releaseProvider
+		return providerErr
+	}
+	defer func() { cloneBootstrapRemote = originalClone }()
+
+	done := make(chan error, 1)
+	go func() { done <- executeSyncAction(context.Background(), plan, cfg) }()
+	select {
+	case <-providerEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider was not invoked")
+	}
+	contending, contentionErr := backendmigrationcontrol.TryAcquire(beadsDir)
+	if contending != nil {
+		_ = contending.Close()
+	}
+	if !errors.Is(contentionErr, backendmigrationcontrol.ErrBusy) {
+		t.Fatalf("migration control during provider call = %v, want ErrBusy", contentionErr)
+	}
+	close(releaseProvider)
+	select {
+	case err := <-done:
+		if !errors.Is(err, providerErr) {
+			t.Fatalf("executeSyncAction error = %v, want provider sentinel", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("executeSyncAction did not finish after provider release")
+	}
+	guard, err := backendmigrationcontrol.TryAcquire(beadsDir)
+	if err != nil {
+		t.Fatalf("migration control remained held after provider exit: %v", err)
+	}
+	if err := guard.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExecuteSyncActionRemoteMigrateErrorDoesNotExposeCredentials(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.Mkdir(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&configfile.Config{
+		Database:     "dolt",
+		Backend:      configfile.BackendDolt,
+		DoltMode:     configfile.DoltModeEmbedded,
+		DoltDatabase: "credential_error",
+	}).Save(beadsDir); err != nil {
+		t.Fatal(err)
+	}
+	authority, cfg, err := captureBootstrapAuthority(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const secret = "error-secret"
+	const syncRemote = "https://operator:" + secret + "@provider.example/org/beads?token=" + secret
+	plan := BootstrapPlan{
+		Action:     "sync",
+		BeadsDir:   beadsDir,
+		Database:   cfg.GetDoltDatabase(),
+		SyncRemote: syncRemote,
+		authority:  authority,
+	}
+
+	originalClone := cloneBootstrapRemote
+	originalWarmup := warmupSyncedBootstrap
+	cloneBootstrapRemote = func(context.Context, string, string, string, *configfile.Config) error { return nil }
+	warmupSyncedBootstrap = func(context.Context, BootstrapPlan, *configfile.Config, string) error {
+		return &schema.RemoteMigrateGateError{CurrentVersion: 49, LatestVersion: 50, Pending: 1}
+	}
+	defer func() {
+		cloneBootstrapRemote = originalClone
+		warmupSyncedBootstrap = originalWarmup
+	}()
+
+	err = executeSyncAction(context.Background(), plan, cfg)
+	if err == nil {
+		t.Fatal("expected remote-migrate gate error")
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "operator@") {
+		t.Fatalf("bootstrap error exposed remote credentials: %v", err)
+	}
+	if !strings.Contains(err.Error(), "configured remote") {
+		t.Fatalf("bootstrap error lost useful remote context: %v", err)
+	}
+}
+
+func TestExecuteSyncActionCloneErrorDoesNotExposeCredentials(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.Mkdir(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&configfile.Config{
+		Database:     "dolt",
+		Backend:      configfile.BackendDolt,
+		DoltMode:     configfile.DoltModeEmbedded,
+		DoltDatabase: "clone_error",
+	}).Save(beadsDir); err != nil {
+		t.Fatal(err)
+	}
+	authority, cfg, err := captureBootstrapAuthority(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const secret = "clone-secret"
+	const syncRemote = "https://operator:" + secret + "@provider.example/%zz"
+	plan := BootstrapPlan{
+		Action:     "sync",
+		BeadsDir:   beadsDir,
+		Database:   cfg.GetDoltDatabase(),
+		SyncRemote: syncRemote,
+		authority:  authority,
+	}
+
+	providerErr := fmt.Errorf("DOLT_CLONE %s failed", syncRemote)
+	originalClone := cloneBootstrapRemote
+	cloneBootstrapRemote = func(context.Context, string, string, string, *configfile.Config) error {
+		return providerErr
+	}
+	defer func() { cloneBootstrapRemote = originalClone }()
+
+	err = executeSyncAction(context.Background(), plan, cfg)
+	if err == nil {
+		t.Fatal("expected clone failure")
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "%zz") {
+		t.Fatalf("bootstrap clone error exposed remote credentials: %v", err)
+	}
+	if !strings.Contains(err.Error(), "configured remote") {
+		t.Fatalf("bootstrap clone error lost actionable context: %v", err)
+	}
+	if !errors.Is(err, providerErr) {
+		t.Fatalf("bootstrap clone error lost its internal cause: %v", err)
+	}
+}
+
+func TestExecuteSyncActionHoldsControlThroughFinalizeAndWarmup(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.Mkdir(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&configfile.Config{
+		Database:     "dolt",
+		Backend:      configfile.BackendDolt,
+		DoltMode:     configfile.DoltModeEmbedded,
+		DoltDatabase: "full_span",
+	}).Save(beadsDir); err != nil {
+		t.Fatal(err)
+	}
+	authority, cfg, err := captureBootstrapAuthority(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := BootstrapPlan{
+		Action:     "sync",
+		BeadsDir:   beadsDir,
+		Database:   cfg.GetDoltDatabase(),
+		SyncRemote: "https://provider.invalid/org/board",
+		authority:  authority,
+	}
+
+	originalClone := cloneBootstrapRemote
+	originalWarmup := warmupSyncedBootstrap
+	cloneBootstrapRemote = func(context.Context, string, string, string, *configfile.Config) error { return nil }
+	warmupSyncedBootstrap = func(context.Context, BootstrapPlan, *configfile.Config, string) error {
+		contending, contentionErr := backendmigrationcontrol.TryAcquire(beadsDir)
+		if contending != nil {
+			_ = contending.Close()
+		}
+		if !errors.Is(contentionErr, backendmigrationcontrol.ErrBusy) {
+			return fmt.Errorf("migration control during warmup = %v, want ErrBusy", contentionErr)
+		}
+		return nil
+	}
+	defer func() {
+		cloneBootstrapRemote = originalClone
+		warmupSyncedBootstrap = originalWarmup
+	}()
+
+	if err := executeSyncAction(context.Background(), plan, cfg); err != nil {
+		t.Fatalf("executeSyncAction: %v", err)
+	}
+	configYAML, err := os.ReadFile(filepath.Join(beadsDir, "config.yaml"))
+	if err != nil || !bytes.Contains(configYAML, []byte(plan.SyncRemote)) {
+		t.Fatalf("finalization did not persist confirmed sync remote: %q err=%v", configYAML, err)
+	}
+	guard, err := backendmigrationcontrol.TryAcquire(beadsDir)
+	if err != nil {
+		t.Fatalf("migration control remained held after warmup: %v", err)
+	}
+	if err := guard.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1052,7 +1891,10 @@ func TestDetectBootstrapAction_WorktreeSynthesizedDirPrefersSyncOverDefaultShare
 	synthesizedDir := filepath.Join(localBare, ".beads")
 	cfg, cfgErr := configfile.Load(synthesizedDir)
 	if cfgErr != nil || cfg == nil {
-		cfg = findParentConfig(synthesizedDir)
+		cfg, cfgErr = findParentConfig(synthesizedDir)
+		if cfgErr != nil {
+			t.Fatalf("findParentConfig: %v", cfgErr)
+		}
 	}
 	if cfg == nil {
 		cfg = configfile.DefaultConfig()

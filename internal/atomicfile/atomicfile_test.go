@@ -1,12 +1,63 @@
 package atomicfile
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 )
+
+func TestWriteFileDurableReportsAppliedDirectorySyncFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "durable.txt")
+	w, err := Create(path, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("installed")); err != nil {
+		t.Fatal(err)
+	}
+	w.syncParent = func(string) error { return errors.New("injected sync failure") }
+	err = w.close(true)
+	if !errors.Is(err, ErrApplied) {
+		t.Fatalf("durable close error = %v, want ErrApplied", err)
+	}
+	data, readErr := os.ReadFile(path)
+	if readErr != nil || string(data) != "installed" {
+		t.Fatalf("applied durable write = %q, %v", data, readErr)
+	}
+}
+
+func TestWriteAndRemoveFileDurable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "durable.txt")
+	if err := WriteFileDurable(path, []byte("durable"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveDurable(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("durable remove left target: %v", err)
+	}
+}
+
+func TestRemoveDurableReportsAppliedDirectorySyncFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "durable.txt")
+	if err := os.WriteFile(path, []byte("remove"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := removeDurable(path, func(string) error { return errors.New("injected sync failure") })
+	if !errors.Is(err, ErrApplied) {
+		t.Fatalf("durable remove error = %v, want ErrApplied", err)
+	}
+	if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("applied durable remove left target: %v", statErr)
+	}
+}
 
 func TestWriteFile_Basic(t *testing.T) {
 	t.Parallel()

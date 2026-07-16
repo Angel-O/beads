@@ -28,6 +28,10 @@ const (
 // stamps the schema version. db is a raw modernc connection (the DDL and seeds are
 // native SQLite and need no dialect translation).
 func InitSchema(ctx context.Context, db *sql.DB) error {
+	return initSchema(ctx, db, true)
+}
+
+func initSchema(ctx context.Context, db *sql.DB, seedDefaults bool) error {
 	for _, stmt := range splitStatements(ddl) {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("sqlite: exec DDL statement: %w\n-- statement:\n%s", err, stmt)
@@ -37,10 +41,21 @@ func InitSchema(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	if fresh {
+	if fresh && seedDefaults {
 		if err := seedDefaultConfig(ctx, db); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func verifySchemaVersion(ctx context.Context, db *sql.DB) error {
+	var stored string
+	if err := db.QueryRowContext(ctx, "SELECT `value` FROM metadata WHERE `key` = ?", schemaVersionKey).Scan(&stored); err != nil {
+		return fmt.Errorf("sqlite: read schema version: %w", err)
+	}
+	if stored != schemaVersion {
+		return fmt.Errorf("sqlite: workspace schema version %s, this binary requires %s", stored, schemaVersion)
 	}
 	return nil
 }

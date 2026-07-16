@@ -125,7 +125,7 @@ func TestPrintBootstrapRemoteBehindGuidance(t *testing.T) {
 		CurrentVersion: 49,
 		LatestVersion:  50,
 		Pending:        1,
-	}, "https://doltremoteapi.example.com/org/beads", "bd bootstrap")
+	}, "bd bootstrap")
 
 	out := buf.String()
 	for _, want := range []string{
@@ -148,10 +148,45 @@ func TestPrintBootstrapRemoteBehindGuidance_InitWording(t *testing.T) {
 		CurrentVersion: 49,
 		LatestVersion:  50,
 		Pending:        1,
-	}, "git+https://github.com/example/dotfiles.git", "bd init")
+	}, "bd init")
 
 	out := buf.String()
 	if !strings.Contains(out, "Re-running `bd init` will NOT fix this") {
 		t.Errorf("guidance missing init-specific retry line in:\n%s", out)
+	}
+}
+
+func TestPrintBootstrapRemoteBehindGuidanceUsesCredentialSafeLabel(t *testing.T) {
+	var buf bytes.Buffer
+	printBootstrapRemoteBehindGuidance(&buf, &schema.RemoteMigrateGateError{
+		CurrentVersion: 49,
+		LatestVersion:  50,
+		Pending:        1,
+	}, "bd bootstrap")
+
+	out := buf.String()
+	if strings.Contains(out, "://") || strings.Contains(out, "@") {
+		t.Fatalf("bootstrap guidance exposed a raw remote:\n%s", out)
+	}
+	if !strings.Contains(out, "configured remote") {
+		t.Fatalf("bootstrap guidance lost useful remote context:\n%s", out)
+	}
+}
+
+func TestPrintBootstrapCloneSuccessHonorsJSONOutput(t *testing.T) {
+	originalJSONOutput := jsonOutput
+	defer func() { jsonOutput = originalJSONOutput }()
+
+	var buf bytes.Buffer
+	jsonOutput = true
+	printBootstrapCloneSuccess(&buf, "server.example:3307")
+	if buf.Len() != 0 {
+		t.Fatalf("JSON clone success emitted prose: %q", buf.String())
+	}
+
+	jsonOutput = false
+	printBootstrapCloneSuccess(&buf, "server.example:3307")
+	if !strings.Contains(buf.String(), "configured remote") || strings.Contains(buf.String(), "://") {
+		t.Fatalf("clone success output is not credential-safe: %q", buf.String())
 	}
 }

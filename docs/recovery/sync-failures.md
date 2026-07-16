@@ -33,9 +33,13 @@ bd dolt stop
 **Step 2:** Check for lock files
 ```bash
 ls -la .beads/*.lock
-# Remove stale locks if Dolt server is definitely stopped
-rm -f .beads/*.lock
+# Remove only the Dolt server lock if the server is definitely stopped
+rm -f .beads/dolt-server.lock
 ```
+
+Never delete `.beads/backend-migration.lock`. It is durable recovery state, not
+a stale runtime lock. If it is present, follow the `Retry:` command emitted by
+`bd` to finish or safely restart the backend migration.
 
 **Step 3:** Back up and preview fixes
 ```bash

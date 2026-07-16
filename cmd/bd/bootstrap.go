@@ -2,13 +2,17 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +21,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/cmd/bd/doctor"
 	"github.com/steveyegge/beads/cmd/bd/doctor/fix"
+	backendmigrationcontrol "github.com/steveyegge/beads/internal/backendmigration/control"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
@@ -31,6 +36,42 @@ import (
 )
 
 var resolveBootstrapAuthoritativeMetadata = fix.ResolveAuthoritativeServerMetadata
+var cloneBootstrapRemote = cloneFromRemote
+var warmupSyncedBootstrap = warmupSyncedBootstrapStore
+var bootstrapGitOriginHasDoltDataRef = gitOriginHasDoltDataRef
+
+var (
+	errBootstrapAuthorityChanged     = errors.New("bootstrap backend authority changed")
+	errBootstrapAuthorityUnavailable = errors.New("bootstrap backend authority is unavailable")
+)
+
+type bootstrapAuthority struct {
+	targetExists bool
+	ownerDir     string
+	source       string
+	canonical    []byte
+}
+
+type bootstrapRefusal struct {
+	message string
+	hint    string
+}
+
+func (e *bootstrapRefusal) Error() string { return e.message }
+
+type bootstrapCloneFailure struct {
+	cause error
+}
+
+func (e *bootstrapCloneFailure) Error() string {
+	return "clone from configured remote failed; verify the remote URL, credentials, and provider availability"
+}
+
+func (e *bootstrapCloneFailure) Unwrap() error { return e.cause }
+
+type bootstrapAuthorityControl struct {
+	guards map[string]*backendmigrationcontrol.Guard
+}
 
 type bootstrapServerProbeConfig struct {
 	host     string
@@ -142,6 +183,7 @@ Examples:
 		nonInteractive := isNonInteractiveBootstrap(yesFlag || nonInteractiveFlag)
 
 		// Find beads directory
+		deferredFreshCloneRemoteCheck := false
 		beadsDir := beads.FindBeadsDir()
 		if beadsDir == "" {
 			// No .beads directory exists yet. Before giving up, probe the
@@ -157,7 +199,16 @@ Examples:
 			// to preserve --dry-run semantics.
 			if isGitRepo() && !isBareGitRepo() {
 				if originURL, err := gitOriginGetURL(); err == nil && originURL != "" {
-					if gitOriginHasDoltDataRef() {
+					shouldSynthesize := false
+					if dryRun {
+						// Whether refs/dolt/data exists requires provider access. Keep
+						// dry-run local-only and report that decision as deferred.
+						deferredFreshCloneRemoteCheck = true
+						shouldSynthesize = true
+					} else {
+						shouldSynthesize = bootstrapGitOriginHasDoltDataRef()
+					}
+					if shouldSynthesize {
 						if fallbackDir := beads.GetWorktreeFallbackBeadsDir(); fallbackDir != "" {
 							beadsDir = fallbackDir
 						} else {
@@ -183,38 +234,49 @@ Examples:
 			fmt.Fprintf(os.Stderr, "Bootstrap is for existing projects that need database setup.\n")
 			return HandleError("%s", activeWorkspaceNotFoundMessage())
 		}
-
-		// Load config from .beads/metadata.json. When the beadsDir was
-		// synthesized (fresh clone or rig with no local .beads), the file
-		// won't exist. In that case, walk up parent directories to find a
-		// workspace-level metadata.json that contains the correct database
-		// name (e.g. dolt_database). Without this, server-mode rigs get the
-		// default name "beads" instead of their configured name. (GH#3029)
-		cfg, err := configfile.Load(beadsDir)
-		if err != nil || cfg == nil {
-			cfg = findParentConfig(beadsDir)
-		}
-		if cfg == nil {
-			cfg = configfile.DefaultConfig()
+		if err := rejectBootstrapNonDoltBackend(beadsDir); err != nil {
+			return err
 		}
 
-		resolvedCfg, repairMsg, err := applyBootstrapMetadataRepair(beadsDir, cfg, !dryRun)
+		// Capture the exact target-or-parent metadata authority used for this
+		// plan. Apply-mode repairs are recaptured from disk; dry-run keeps the
+		// resolver's hypothetical repaired config without publishing it.
+		authority, cfg, repairMsg, err := resolveBootstrapConfigAndAuthority(beadsDir, dryRun)
 		if err != nil {
-			return HandleError("failed to reconcile shared-server metadata: %v", err)
+			return handleBootstrapCommandError(err)
 		}
-		if resolvedCfg != nil {
-			cfg = resolvedCfg
+		if err := validateBootstrapConfigBackend(cfg); err != nil {
+			return handleBootstrapCommandError(err)
 		}
 
-		// Determine action based on state
-		plan := detectBootstrapAction(beadsDir, cfg)
+		// Remote and server probes can activate retained Dolt state. Apply-mode
+		// planning runs them under migration control. Dry-run remains strictly
+		// read-only, so it defers provider probes and revalidates authority around
+		// its local inspection instead of publishing a control artifact.
+		var plan BootstrapPlan
+		if deferredFreshCloneRemoteCheck {
+			if err := revalidateBootstrapAuthorityReadOnly(beadsDir, authority); err != nil {
+				return handleBootstrapCommandError(err)
+			}
+			plan = BootstrapPlan{
+				Action:   "deferred",
+				Reason:   "No local Beads workspace exists; checking git origin for Dolt data is deferred until bootstrap runs without --dry-run",
+				BeadsDir: beadsDir,
+				Database: cfg.GetDoltDatabase(),
+			}
+		} else if dryRun {
+			plan, err = detectBootstrapDryRunAction(beadsDir, cfg, authority)
+		} else {
+			plan, err = detectBootstrapActionWithAuthority(beadsDir, cfg, authority)
+		}
+		if err != nil {
+			return handleBootstrapCommandError(err)
+		}
+		plan.authority = authority
 
 		if jsonOutput {
-			if err := outputJSON(plan); err != nil {
-				return err
-			}
 			if plan.Action == "none" || dryRun {
-				return nil
+				return outputJSON(plan)
 			}
 		} else {
 			if repairMsg != "" {
@@ -227,10 +289,42 @@ Examples:
 		}
 
 		if err := executeBootstrapPlan(plan, cfg, nonInteractive); err != nil {
-			return HandleError("Bootstrap failed: %v", err)
+			return handleBootstrapCommandError(err)
+		}
+		if jsonOutput {
+			return outputJSON(plan)
 		}
 		return nil
 	},
+}
+
+func resolveBootstrapConfigAndAuthority(beadsDir string, dryRun bool) (*bootstrapAuthority, *configfile.Config, string, error) {
+	authority, cfg, err := captureBootstrapAuthority(beadsDir)
+	if err != nil {
+		return nil, nil, "", errors.Join(errBootstrapAuthorityUnavailable, err)
+	}
+	if cfg == nil {
+		cfg = configfile.DefaultConfig()
+	}
+	resolved, repairMsg, err := applyBootstrapMetadataRepair(beadsDir, cfg, !dryRun)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("failed to reconcile shared-server metadata: %w", err)
+	}
+	if resolved != nil {
+		cfg = resolved
+	}
+	if dryRun {
+		return authority, cfg, repairMsg, nil
+	}
+
+	authority, onDisk, err := captureBootstrapAuthority(beadsDir)
+	if err != nil {
+		return nil, nil, "", errors.Join(errBootstrapAuthorityUnavailable, err)
+	}
+	if onDisk != nil {
+		cfg = onDisk
+	}
+	return authority, cfg, repairMsg, nil
 }
 
 func applyBootstrapMetadataRepair(beadsDir string, cfg *configfile.Config, apply bool) (*configfile.Config, string, error) {
@@ -252,7 +346,7 @@ func applyBootstrapMetadataRepair(beadsDir string, cfg *configfile.Config, apply
 
 // BootstrapPlan describes what bootstrap will do.
 type BootstrapPlan struct {
-	Action      string `json:"action"` // "sync", "restore", "jsonl-import", "init", "none"
+	Action      string `json:"action"` // "sync", "restore", "jsonl-import", "init", "deferred", "none"
 	Reason      string `json:"reason"` // Human-readable explanation
 	BeadsDir    string `json:"beads_dir"`
 	Database    string `json:"database"`
@@ -260,6 +354,34 @@ type BootstrapPlan struct {
 	BackupDir   string `json:"backup_dir,omitempty"`
 	JSONLFile   string `json:"jsonl_file,omitempty"`
 	HasExisting bool   `json:"has_existing"`
+	authority   *bootstrapAuthority
+	syncRemote  string
+}
+
+func (p *BootstrapPlan) setSyncRemote(raw string) {
+	p.syncRemote = raw
+	p.SyncRemote = bootstrapRemoteForDisplay(raw)
+}
+
+func (p BootstrapPlan) rawSyncRemote() string {
+	if p.syncRemote != "" {
+		return p.syncRemote
+	}
+	return p.SyncRemote
+}
+
+func bootstrapRemoteForDisplay(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" {
+		return "configured remote"
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	if display := parsed.String(); display != "" {
+		return display
+	}
+	return "configured remote"
 }
 
 func noWorkspaceBootstrapPayload() map[string]interface{} {
@@ -270,7 +392,321 @@ func noWorkspaceBootstrapPayload() map[string]interface{} {
 	}
 }
 
+// rejectBootstrapNonDoltBackend is the effect-free backend admission gate for
+// bootstrap. A successful Dolt-to-SQLite migration intentionally retains the
+// embedded Dolt source for rollback and audit, but that retained directory is
+// no longer authoritative. Bootstrap is a Dolt recovery command, so letting it
+// plan from sync.remote would reopen the retained engine and attempt DOLT_CLONE
+// before the later metadata transition guard could stop it.
+func rejectBootstrapNonDoltBackend(beadsDir string) error {
+	if beadsDir == "" {
+		return nil
+	}
+
+	cfg, err := readBootstrapAuthoritativeConfig(beadsDir)
+	if err != nil {
+		if errors.Is(err, backendmigrationcontrol.ErrRecoveryPending) {
+			return handleBootstrapCommandError(err)
+		}
+		return handleBootstrapCommandError(errBootstrapAuthorityUnavailable)
+	}
+	return rejectBootstrapConfigBackend(cfg)
+}
+
+func rejectBootstrapConfigBackend(cfg *configfile.Config) error {
+	return handleBootstrapCommandError(validateBootstrapConfigBackend(cfg))
+}
+
+func validateBootstrapConfigBackend(cfg *configfile.Config) error {
+	if cfg == nil || cfg.Backend == "" || cfg.Backend == configfile.BackendDolt {
+		return nil
+	}
+
+	switch cfg.Backend {
+	case configfile.BackendPostgres, configfile.BackendMySQL, configfile.BackendSQLite:
+		return &bootstrapRefusal{
+			message: fmt.Sprintf("bd bootstrap is only available for Dolt workspaces; this workspace uses the %s backend", cfg.Backend),
+			hint:    "run 'bd status' to verify the local data or 'bd doctor' to diagnose it",
+		}
+	default:
+		return &bootstrapRefusal{
+			message: "bd bootstrap could not safely identify the workspace backend",
+			hint:    "run 'bd doctor' to repair workspace metadata before retrying bootstrap",
+		}
+	}
+}
+
+func readBootstrapAuthoritativeConfig(beadsDir string) (*configfile.Config, error) {
+	return configfile.LoadAuthoritativeReadOnly(beadsDir)
+}
+
+func handleBootstrapCommandError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var refusal *bootstrapRefusal
+	if errors.As(err, &refusal) {
+		return HandleErrorWithHintRespectJSON(refusal.message, refusal.hint)
+	}
+	switch {
+	case errors.Is(err, backendmigrationcontrol.ErrBusy):
+		return HandleErrorWithHintRespectJSON(
+			"bd bootstrap could not safely continue because the workspace backend is changing",
+			"wait for the backend operation to finish, then retry 'bd bootstrap'",
+		)
+	case errors.Is(err, backendmigrationcontrol.ErrRecoveryPending):
+		return HandleErrorWithHintRespectJSON(
+			"bd bootstrap cannot continue while backend migration recovery is pending",
+			"finish recovery with 'bd migrate backend --to=sqlite --apply', then retry bootstrap if Dolt is still authoritative",
+		)
+	case errors.Is(err, errBootstrapAuthorityChanged):
+		return HandleErrorWithHintRespectJSON(
+			"bd bootstrap stopped because the workspace backend changed after planning",
+			"verify the active backend with 'bd status', then rerun 'bd bootstrap' only for a Dolt workspace",
+		)
+	case errors.Is(err, errBootstrapAuthorityUnavailable):
+		return HandleErrorWithHintRespectJSON(
+			"bd bootstrap could not safely identify the workspace backend",
+			"run 'bd doctor' to repair workspace metadata before retrying bootstrap",
+		)
+	default:
+		return HandleErrorRespectJSON("Bootstrap failed: %v", err)
+	}
+}
+
+func captureBootstrapAuthority(beadsDir string) (*bootstrapAuthority, *configfile.Config, error) {
+	info, err := os.Lstat(beadsDir)
+	targetExists := err == nil
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, nil, err
+	}
+	if targetExists && !info.IsDir() {
+		return nil, nil, errors.New("bootstrap workspace metadata directory is not a directory")
+	}
+
+	cfg, err := configfile.LoadAuthoritativeReadOnly(beadsDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	if cfg == nil {
+		var ownerDir string
+		cfg, ownerDir, err = findParentConfigWithOwner(beadsDir)
+		if err != nil {
+			return nil, nil, err
+		}
+		if cfg == nil {
+			return &bootstrapAuthority{targetExists: targetExists}, nil, nil
+		}
+		return marshalBootstrapAuthority(targetExists, ownerDir, cfg)
+	}
+	return marshalBootstrapAuthority(targetExists, beadsDir, cfg)
+}
+
+func marshalBootstrapAuthority(targetExists bool, ownerDir string, cfg *configfile.Config) (*bootstrapAuthority, *configfile.Config, error) {
+	source := configfile.ConfigFileName
+	if _, err := os.Lstat(configfile.ConfigPath(ownerDir)); errors.Is(err, os.ErrNotExist) {
+		source = "config.json"
+	} else if err != nil {
+		return nil, nil, err
+	}
+	canonical, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &bootstrapAuthority{
+		targetExists: targetExists,
+		ownerDir:     filepath.Clean(ownerDir),
+		source:       source,
+		canonical:    canonical,
+	}, cfg, nil
+}
+
+func sameBootstrapAuthority(expected, current *bootstrapAuthority) bool {
+	return expected != nil && current != nil &&
+		expected.targetExists == current.targetExists &&
+		filepath.Clean(expected.ownerDir) == filepath.Clean(current.ownerDir) &&
+		expected.source == current.source && bytes.Equal(expected.canonical, current.canonical)
+}
+
+func detectBootstrapActionWithAuthority(beadsDir string, cfg *configfile.Config, authority *bootstrapAuthority) (plan BootstrapPlan, resultErr error) {
+	control, _, err := acquireBootstrapAuthorityControl(beadsDir, authority, false)
+	if err != nil {
+		return BootstrapPlan{}, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, control.Close()) }()
+	if err := validateBootstrapConfigBackend(cfg); err != nil {
+		return BootstrapPlan{}, err
+	}
+	return detectBootstrapAction(beadsDir, cfg), nil
+}
+
+func detectBootstrapDryRunAction(beadsDir string, cfg *configfile.Config, authority *bootstrapAuthority) (BootstrapPlan, error) {
+	if err := validateBootstrapConfigBackend(cfg); err != nil {
+		return BootstrapPlan{}, err
+	}
+	if err := revalidateBootstrapAuthorityReadOnly(beadsDir, authority); err != nil {
+		return BootstrapPlan{}, err
+	}
+	plan := detectBootstrapActionWithoutProviderProbes(beadsDir, cfg)
+	if err := revalidateBootstrapAuthorityReadOnly(beadsDir, authority); err != nil {
+		return BootstrapPlan{}, err
+	}
+	return plan, nil
+}
+
+func revalidateBootstrapAuthorityReadOnly(beadsDir string, expected *bootstrapAuthority) error {
+	if expected == nil {
+		return errBootstrapAuthorityUnavailable
+	}
+	dirs := make([]string, 0, 2)
+	if expected.targetExists {
+		dirs = append(dirs, filepath.Clean(beadsDir))
+	}
+	if expected.ownerDir != "" && filepath.Clean(expected.ownerDir) != filepath.Clean(beadsDir) {
+		dirs = append(dirs, filepath.Clean(expected.ownerDir))
+	}
+	for _, dir := range dirs {
+		if err := backendmigrationcontrol.RejectPending(dir); err != nil {
+			return err
+		}
+	}
+	current, currentCfg, err := captureBootstrapAuthority(beadsDir)
+	if err != nil {
+		return errors.Join(errBootstrapAuthorityUnavailable, err)
+	}
+	if !sameBootstrapAuthority(expected, current) {
+		return errBootstrapAuthorityChanged
+	}
+	if err := validateBootstrapConfigBackend(currentCfg); err != nil {
+		return err
+	}
+	for _, dir := range dirs {
+		if err := backendmigrationcontrol.RejectPending(dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func acquireBootstrapAuthorityControl(beadsDir string, expected *bootstrapAuthority, createTarget bool) (*bootstrapAuthorityControl, *configfile.Config, error) {
+	if expected == nil {
+		return nil, nil, errBootstrapAuthorityUnavailable
+	}
+	control := &bootstrapAuthorityControl{guards: make(map[string]*backendmigrationcontrol.Guard)}
+	fail := func(err error) (*bootstrapAuthorityControl, *configfile.Config, error) {
+		return nil, nil, errors.Join(err, control.Close())
+	}
+
+	dirs := make([]string, 0, 2)
+	if expected.targetExists {
+		dirs = append(dirs, filepath.Clean(beadsDir))
+	}
+	if expected.ownerDir != "" && filepath.Clean(expected.ownerDir) != filepath.Clean(beadsDir) {
+		dirs = append(dirs, filepath.Clean(expected.ownerDir))
+	}
+	sort.Strings(dirs)
+	for _, dir := range dirs {
+		if err := control.acquire(dir); err != nil {
+			return fail(err)
+		}
+	}
+
+	current, currentCfg, err := captureBootstrapAuthority(beadsDir)
+	if err != nil {
+		return fail(errors.Join(errBootstrapAuthorityUnavailable, err))
+	}
+	if !sameBootstrapAuthority(expected, current) {
+		return fail(errBootstrapAuthorityChanged)
+	}
+	if err := validateBootstrapConfigBackend(currentCfg); err != nil {
+		return fail(err)
+	}
+
+	if createTarget && !expected.targetExists {
+		if err := os.Mkdir(beadsDir, 0o750); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				return fail(errBootstrapAuthorityChanged)
+			}
+			return fail(fmt.Errorf("create beads directory: %w", err))
+		}
+		if err := control.acquire(filepath.Clean(beadsDir)); err != nil {
+			return fail(err)
+		}
+		afterCreate, afterCreateCfg, err := captureBootstrapAuthority(beadsDir)
+		if err != nil {
+			return fail(errors.Join(errBootstrapAuthorityUnavailable, err))
+		}
+		expectedAfterCreate := *expected
+		expectedAfterCreate.targetExists = true
+		if !sameBootstrapAuthority(&expectedAfterCreate, afterCreate) {
+			return fail(errBootstrapAuthorityChanged)
+		}
+		currentCfg = afterCreateCfg
+	}
+	return control, currentCfg, nil
+}
+
+func (c *bootstrapAuthorityControl) acquire(beadsDir string) error {
+	if c == nil {
+		return errBootstrapAuthorityUnavailable
+	}
+	dir := filepath.Clean(beadsDir)
+	if _, ok := c.guards[dir]; ok {
+		return nil
+	}
+	if err := backendmigrationcontrol.RejectPending(dir); err != nil {
+		return err
+	}
+	guard, err := backendmigrationcontrol.TryAcquire(dir)
+	if err != nil {
+		return err
+	}
+	if err := backendmigrationcontrol.RejectPending(dir); err != nil {
+		_ = guard.Close()
+		return err
+	}
+	c.guards[dir] = guard
+	return nil
+}
+
+func (c *bootstrapAuthorityControl) release(beadsDir string) error {
+	if c == nil {
+		return nil
+	}
+	dir := filepath.Clean(beadsDir)
+	guard := c.guards[dir]
+	delete(c.guards, dir)
+	if guard == nil {
+		return nil
+	}
+	return guard.Close()
+}
+
+func (c *bootstrapAuthorityControl) Close() error {
+	if c == nil {
+		return nil
+	}
+	dirs := make([]string, 0, len(c.guards))
+	for dir := range c.guards {
+		dirs = append(dirs, dir)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(dirs)))
+	var resultErr error
+	for _, dir := range dirs {
+		resultErr = errors.Join(resultErr, c.release(dir))
+	}
+	return resultErr
+}
+
 func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPlan {
+	return detectBootstrapActionWithProviderProbes(beadsDir, cfg, true)
+}
+
+func detectBootstrapActionWithoutProviderProbes(beadsDir string, cfg *configfile.Config) BootstrapPlan {
+	return detectBootstrapActionWithProviderProbes(beadsDir, cfg, false)
+}
+
+func detectBootstrapActionWithProviderProbes(beadsDir string, cfg *configfile.Config, probeProviders bool) BootstrapPlan {
 	plan := BootstrapPlan{
 		BeadsDir: beadsDir,
 		Database: cfg.GetDoltDatabase(),
@@ -299,27 +735,27 @@ func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPla
 		// User-provided sync.remote — trust the URL format as-is.
 		// normalizeRemoteURL would convert http:// to git+http://,
 		// breaking Dolt remotesapi endpoints (GH#3339).
-		plan.SyncRemote = syncRemote
+		plan.setSyncRemote(syncRemote)
 		plan.Action = "sync"
-		plan.Reason = "sync.remote configured — will clone from " + syncRemote
+		plan.Reason = "sync.remote configured — will clone from " + plan.SyncRemote
 		return plan
 	}
 
 	// Auto-detect: probe git origin for Dolt data stored in git
 	// (refs/dolt/data). This only applies to git remotes — Dolt-native
 	// remotes (DoltHub, S3, etc.) must be configured via sync.remote.
-	if isGitRepo() && !isBareGitRepo() {
+	if probeProviders && isGitRepo() && !isBareGitRepo() {
 		if originURL, err := gitOriginGetURL(); err == nil && originURL != "" {
-			if gitOriginHasDoltDataRef() {
-				plan.SyncRemote = normalizeRemoteURL(originURL)
+			if bootstrapGitOriginHasDoltDataRef() {
+				plan.setSyncRemote(normalizeRemoteURL(originURL))
 				plan.Action = "sync"
-				plan.Reason = "Found Dolt data on git origin (refs/dolt/data) — will clone from " + originURL
+				plan.Reason = "Found Dolt data on git origin (refs/dolt/data) — will clone from " + plan.SyncRemote
 				return plan
 			}
 		}
 	}
 
-	if dbAction, ok := existingBootstrapDBPlan(beadsDir, cfg, isServer, isSharedServer); ok {
+	if dbAction, ok := existingBootstrapDBPlan(beadsDir, cfg, isServer, isSharedServer, probeProviders); ok {
 		// If the local beadsDir does not exist yet, prefer recovering via sync
 		// first. This avoids false "nothing to do" results when the default
 		// shared-server database name happens to exist for another project.
@@ -362,7 +798,7 @@ func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPla
 	return plan
 }
 
-func existingBootstrapDBPlan(beadsDir string, cfg *configfile.Config, isServer, isSharedServer bool) (BootstrapPlan, bool) {
+func existingBootstrapDBPlan(beadsDir string, cfg *configfile.Config, isServer, isSharedServer, probeProviders bool) (BootstrapPlan, bool) {
 	plan := BootstrapPlan{
 		BeadsDir: beadsDir,
 		Database: cfg.GetDoltDatabase(),
@@ -384,6 +820,12 @@ func existingBootstrapDBPlan(beadsDir string, cfg *configfile.Config, isServer, 
 	}
 
 	if isServer {
+		if !probeProviders {
+			plan.HasExisting = true
+			plan.Action = "none"
+			plan.Reason = fmt.Sprintf("Server data found for %s; live verification is deferred until bootstrap runs without --dry-run", cfg.GetDoltDatabase())
+			return plan, true
+		}
 		probeCfg := bootstrapServerProbeConfig{
 			host:     cfg.GetDoltServerHost(),
 			port:     bootstrapServerPort(beadsDir, cfg, isSharedServer),
@@ -493,6 +935,9 @@ func printBootstrapPlan(plan BootstrapPlan) {
 	case "init":
 		fmt.Printf("Bootstrap plan: create fresh database\n")
 		fmt.Printf("  Database: %s\n", plan.Database)
+	case "deferred":
+		fmt.Println("Bootstrap plan: remote check deferred")
+		fmt.Printf("  %s\n", plan.Reason)
 	}
 }
 
@@ -523,14 +968,46 @@ func executeBootstrapPlan(plan BootstrapPlan, cfg *configfile.Config, nonInterac
 	switch plan.Action {
 	case "sync":
 		return executeSyncAction(ctx, plan, cfg)
-	case "restore":
-		return executeRestoreAction(ctx, plan, cfg)
-	case "jsonl-import":
-		return executeJSONLImportAction(ctx, plan, cfg)
-	case "init":
-		return executeInitAction(ctx, plan, cfg)
+	case "restore", "jsonl-import", "init":
+		return executeBootstrapLocalActionWithAuthority(ctx, plan, cfg)
 	}
 	return nil
+}
+
+func executeBootstrapLocalActionWithAuthority(ctx context.Context, plan BootstrapPlan, cfg *configfile.Config) (resultErr error) {
+	if plan.authority == nil {
+		return errBootstrapAuthorityUnavailable
+	}
+	control, currentCfg, err := acquireBootstrapAuthorityControl(plan.BeadsDir, plan.authority, true)
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, control.Close()) }()
+
+	executionCfg := cfg
+	if currentCfg != nil {
+		executionCfg = currentCfg
+	}
+	if executionCfg == nil {
+		executionCfg = configfile.DefaultConfig()
+	}
+	if err := validateBootstrapConfigBackend(executionCfg); err != nil {
+		return err
+	}
+	if plan.Database != executionCfg.GetDoltDatabase() {
+		return errBootstrapAuthorityChanged
+	}
+
+	switch plan.Action {
+	case "restore":
+		return executeRestoreAction(ctx, plan, executionCfg)
+	case "jsonl-import":
+		return executeJSONLImportAction(ctx, plan, executionCfg)
+	case "init":
+		return executeInitAction(ctx, plan, executionCfg)
+	default:
+		return nil
+	}
 }
 
 func executeInitAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.Config) error {
@@ -556,7 +1033,9 @@ func executeInitAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 		return fmt.Errorf("commit: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Created fresh database with prefix %q\n", prefix)
+	if !jsonOutput {
+		fmt.Fprintf(os.Stderr, "Created fresh database with prefix %q\n", prefix)
+	}
 	return nil
 }
 
@@ -587,7 +1066,9 @@ func executeRestoreAction(ctx context.Context, plan BootstrapPlan, cfg *configfi
 		return fmt.Errorf("restore from backup: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Restored from backup\n")
+	if !jsonOutput {
+		fmt.Fprintln(os.Stderr, "Restored from backup")
+	}
 	return nil
 }
 
@@ -623,33 +1104,48 @@ func executeJSONLImportAction(ctx context.Context, plan BootstrapPlan, cfg *conf
 		return fmt.Errorf("commit import: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Imported %d issues from %s\n", count, plan.JSONLFile)
+	if !jsonOutput {
+		fmt.Fprintf(os.Stderr, "Imported %d issues from %s\n", count, plan.JSONLFile)
+	}
 	return nil
 }
 
-func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.Config) error {
-	// Ensure .beads directory exists — it may not in the "fresh clone"
-	// bootstrap path where we detected remote data before .beads was
-	// created. Deferred here to preserve --dry-run semantics. (GH#2792)
-	if err := os.MkdirAll(plan.BeadsDir, 0o750); err != nil {
-		return fmt.Errorf("create beads directory: %w", err)
+func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.Config) (resultErr error) {
+	// Confirmation and plan output have already happened. Revalidate the exact
+	// backend authority under migration control immediately before any provider
+	// or retained-Dolt effect, and keep that control through finalization and
+	// warmup. A changed plan is refused rather than silently retargeted.
+	if plan.authority == nil {
+		return errBootstrapAuthorityUnavailable
 	}
-
-	dbName := cfg.GetDoltDatabase()
-	if err := cloneFromRemote(ctx, plan.BeadsDir, plan.SyncRemote, dbName, cfg); err != nil {
+	control, currentCfg, err := acquireBootstrapAuthorityControl(plan.BeadsDir, plan.authority, true)
+	if err != nil {
 		return err
 	}
+	defer func() {
+		resultErr = errors.Join(resultErr, control.Close())
+	}()
+	executionCfg := cfg
+	if currentCfg != nil {
+		executionCfg = currentCfg
+	}
+	if executionCfg == nil {
+		executionCfg = configfile.DefaultConfig()
+	}
+	if err := validateBootstrapConfigBackend(executionCfg); err != nil {
+		return err
+	}
+	dbName := executionCfg.GetDoltDatabase()
+	if plan.Database != dbName {
+		return errBootstrapAuthorityChanged
+	}
+	remoteURL := plan.rawSyncRemote()
+	if err := cloneBootstrapRemote(ctx, plan.BeadsDir, remoteURL, dbName, executionCfg); err != nil {
+		return &bootstrapCloneFailure{cause: err}
+	}
 
-	// Finalize the bootstrapped workspace so subsequent bd commands can open
-	// the cloned database. Without metadata.json and config.yaml,
-	// configfile.Load() returns nil, callers fall back to the default
-	// dolt_database name, and bd loses track of the cloned database —
-	// producing "no beads configuration found" and "Error 1105: no database
-	// selected" on bd status / bd dolt push in fresh clones. Every other
-	// bootstrap action (init, restore, jsonl-import) writes these files via
-	// newDoltStore + createConfigYaml; the sync path historically did not.
-	// (GH#3201)
-	if err := finalizeSyncedBootstrap(plan.BeadsDir, plan.SyncRemote, cfg, dbName); err != nil {
+	prepareSyncedBootstrapConfig(executionCfg, dbName)
+	if err := finalizeSyncedBootstrapFiles(plan.BeadsDir, remoteURL); err != nil {
 		return err
 	}
 
@@ -657,7 +1153,8 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 	// created in the working set. Clone does not include these tables
 	// (they are never committed), so they must be recreated after clone.
 	// Both embedded and server mode handle this in their store init paths.
-	warmupStore, err := newDoltStoreFromConfig(ctx, plan.BeadsDir)
+	var postCloneErr error
+	err = warmupSyncedBootstrap(ctx, plan, executionCfg, dbName)
 	if err != nil {
 		// #4259: the cloned remote is behind this binary, so the remote-migrate
 		// gate held migration for an explicit operator decision. Surface that
@@ -669,25 +1166,57 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 		var gateErr *schema.RemoteMigrateGateError
 		if errors.As(err, &gateErr) {
 			if !jsonOutput {
-				printBootstrapRemoteBehindGuidance(os.Stderr, gateErr, plan.SyncRemote, "bd bootstrap")
+				printBootstrapRemoteBehindGuidance(os.Stderr, gateErr, "bd bootstrap")
 			}
 			unit := "migrations"
 			if gateErr.Pending == 1 {
 				unit = "migration"
 			}
-			return fmt.Errorf("clone from %s succeeded, but the database needs %d schema %s (v%d -> v%d) that bd will not auto-apply to a remote-backed database (#4259)",
-				plan.SyncRemote, gateErr.Pending, unit, gateErr.CurrentVersion, gateErr.LatestVersion)
+			postCloneErr = fmt.Errorf("clone from the configured remote succeeded, but the database needs %d schema %s (v%d -> v%d) that bd will not auto-apply to a remote-backed database (#4259)",
+				gateErr.Pending, unit, gateErr.CurrentVersion, gateErr.LatestVersion)
+		} else {
+			// Non-fatal: wisp tables will be created on the next command that
+			// opens the store. Warn so the user knows to retry if they hit
+			// "table not found: wisp_*" errors.
+			if !jsonOutput {
+				fmt.Fprintf(os.Stderr, "Warning: post-clone store init failed (wisp tables may be missing): %v\n", err)
+			}
 		}
-		// Non-fatal: wisp tables will be created on the next command that
-		// opens the store. Warn so the user knows to retry if they hit
-		// "table not found: wisp_*" errors.
-		fmt.Fprintf(os.Stderr, "Warning: post-clone store init failed (wisp tables may be missing): %v\n", err)
-		return nil
 	}
-	configureInitDoltRemote(ctx, warmupStore, plan.SyncRemote, false)
-	_ = warmupStore.Close()
 
-	return nil
+	// Publish target metadata last. Config.Save acquires target control itself,
+	// so release only that guard. Parent-derived plans keep the owning parent's
+	// control through publication; target-owned plans retain an exact source
+	// witness that makes Config.Save reject a handoff race.
+	if err := control.release(plan.BeadsDir); err != nil {
+		return err
+	}
+	if err := executionCfg.Save(plan.BeadsDir); err != nil {
+		return fmt.Errorf("write metadata.json: %w", err)
+	}
+	return postCloneErr
+}
+
+func warmupSyncedBootstrapStore(ctx context.Context, plan BootstrapPlan, cfg *configfile.Config, dbName string) error {
+	mode := resolveRemoteCloneMode(plan.BeadsDir, cfg, remoteCloneAuto)
+	storeCfg := &dolt.Config{
+		Path:           doltserver.ResolveDoltDir(plan.BeadsDir),
+		BeadsDir:       plan.BeadsDir,
+		Database:       dbName,
+		ServerMode:     mode == remoteCloneExternalServer,
+		ServerSocket:   cfg.GetDoltServerSocket(),
+		ServerHost:     cfg.GetDoltServerHost(),
+		ServerPort:     serverClonePort(plan.BeadsDir, cfg),
+		ServerUser:     cfg.GetDoltServerUser(),
+		ServerPassword: cfg.GetDoltServerPasswordForPort(serverClonePort(plan.BeadsDir, cfg)),
+		ServerTLS:      cfg.GetDoltServerTLS(),
+	}
+	store, err := newDoltStore(ctx, storeCfg)
+	if err != nil {
+		return err
+	}
+	configureInitDoltRemote(ctx, store, plan.rawSyncRemote(), false)
+	return store.Close()
 }
 
 // printBootstrapRemoteBehindGuidance explains a remote-migrate gate refusal in
@@ -697,13 +1226,13 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 // and re-cloning can never help. The way out is exactly one designated machine
 // migrating and pushing. rerunCmd is the command the operator just ran ("bd
 // bootstrap", "bd init") so the don't-bother-retrying line names it.
-func printBootstrapRemoteBehindGuidance(w io.Writer, e *schema.RemoteMigrateGateError, syncRemote, rerunCmd string) {
+func printBootstrapRemoteBehindGuidance(w io.Writer, e *schema.RemoteMigrateGateError, rerunCmd string) {
 	unit := "migrations"
 	if e.Pending == 1 {
 		unit = "migration"
 	}
-	fmt.Fprintf(w, "\nThe database cloned from %s needs %d schema %s (v%d -> v%d).\n",
-		syncRemote, e.Pending, unit, e.CurrentVersion, e.LatestVersion)
+	fmt.Fprintf(w, "\nThe database cloned from the configured remote needs %d schema %s (v%d -> v%d).\n",
+		e.Pending, unit, e.CurrentVersion, e.LatestVersion)
 	fmt.Fprint(w,
 		"  bd will not migrate it automatically: migrating clones independently forks\n"+
 			"  the schema so `bd dolt pull` can no longer merge (#4259).\n"+
@@ -724,6 +1253,14 @@ func printBootstrapRemoteBehindGuidance(w io.Writer, e *schema.RemoteMigrateGate
 // existing files intact (createConfigYaml skips if config.yaml exists; the
 // metadata.json write is a full rewrite that preserves caller fields).
 func finalizeSyncedBootstrap(beadsDir, syncRemote string, cfg *configfile.Config, dbName string) error {
+	prepareSyncedBootstrapConfig(cfg, dbName)
+	if err := cfg.Save(beadsDir); err != nil {
+		return fmt.Errorf("write metadata.json: %w", err)
+	}
+	return finalizeSyncedBootstrapFiles(beadsDir, syncRemote)
+}
+
+func prepareSyncedBootstrapConfig(cfg *configfile.Config, dbName string) {
 	// Preserve whatever upstream fields were already set in cfg (which may
 	// be DefaultConfig when metadata.json was absent, or a parent workspace
 	// config propagated by findParentConfig), then fill in the bits
@@ -743,11 +1280,9 @@ func finalizeSyncedBootstrap(beadsDir, syncRemote string, cfg *configfile.Config
 	if cfg.Database == "" || cfg.Database == beads.CanonicalDatabaseName {
 		cfg.Database = "dolt"
 	}
+}
 
-	if err := cfg.Save(beadsDir); err != nil {
-		return fmt.Errorf("write metadata.json: %w", err)
-	}
-
+func finalizeSyncedBootstrapFiles(beadsDir, syncRemote string) error {
 	if err := createConfigYaml(beadsDir, false, ""); err != nil {
 		return fmt.Errorf("create config.yaml: %w", err)
 	}
@@ -804,7 +1339,9 @@ func cloneFromRemoteWithMode(ctx context.Context, beadsDir, remoteURL, dbName st
 			return cloneViaServer(ctx, beadsDir, remoteURL, dbName, cfg)
 		}
 		// No config available — fall through to CLI clone.
-		fmt.Fprintf(os.Stderr, "Warning: server mode detected but no config available, falling back to CLI clone\n")
+		if !jsonOutput {
+			fmt.Fprintln(os.Stderr, "Warning: server mode detected but no config available, falling back to CLI clone")
+		}
 		return cloneViaCLI(ctx, beadsDir, remoteURL, dbName)
 
 	default:
@@ -849,7 +1386,7 @@ func cloneViaEmbedded(ctx context.Context, beadsDir, remoteURL, dbName string) e
 	if err := versioncontrolops.DoltClone(ctx, db, remoteURL, dbName, os.Getenv("DOLT_REMOTE_USER")); err != nil {
 		return fmt.Errorf("clone from remote: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "Synced database from %s\n", remoteURL)
+	printBootstrapCloneSuccess(os.Stderr, "")
 	return nil
 }
 
@@ -886,8 +1423,7 @@ func cloneViaServer(ctx context.Context, beadsDir, remoteURL, dbName string, cfg
 	if err := versioncontrolops.DoltClone(cloneCtx, db, remoteURL, dbName, os.Getenv("DOLT_REMOTE_USER")); err != nil {
 		return fmt.Errorf("clone from remote via server: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "Synced database from %s (via server at %s:%d)\n",
-		remoteURL, cfg.GetDoltServerHost(), port)
+	printBootstrapCloneSuccess(os.Stderr, fmt.Sprintf("%s:%d", cfg.GetDoltServerHost(), port))
 	return nil
 }
 
@@ -923,9 +1459,20 @@ func cloneViaCLI(ctx context.Context, beadsDir, remoteURL, dbName string) error 
 		return fmt.Errorf("sync from remote: %w", err)
 	}
 	if synced {
-		fmt.Fprintf(os.Stderr, "Synced database from %s\n", remoteURL)
+		printBootstrapCloneSuccess(os.Stderr, "")
 	}
 	return nil
+}
+
+func printBootstrapCloneSuccess(w io.Writer, serverAddress string) {
+	if jsonOutput {
+		return
+	}
+	if serverAddress != "" {
+		fmt.Fprintf(w, "Synced database from configured remote (via server at %s)\n", serverAddress)
+		return
+	}
+	fmt.Fprintln(w, "Synced database from configured remote")
 }
 
 func inferPrefix(cfg *configfile.Config) string {
@@ -955,8 +1502,14 @@ func isNonInteractiveBootstrap(flagValue bool) bool {
 // findParentConfig walks up from beadsDir's parent looking for a
 // .beads/metadata.json in ancestor directories. This handles the case where a
 // rig subdirectory (its own git repo) doesn't have a local .beads but its
-// parent workspace does. Returns nil if no parent config is found.
-func findParentConfig(beadsDir string) *configfile.Config {
+// parent workspace does. Invalid nearer metadata is an authority boundary: it
+// is returned as an error rather than skipped in favor of a farther ancestor.
+func findParentConfig(beadsDir string) (*configfile.Config, error) {
+	cfg, _, err := findParentConfigWithOwner(beadsDir)
+	return cfg, err
+}
+
+func findParentConfigWithOwner(beadsDir string) (*configfile.Config, string, error) {
 	// Start from the parent of beadsDir's enclosing directory.
 	// beadsDir is typically "<project>/.beads", so we start from <project>'s parent.
 	start := filepath.Dir(filepath.Dir(beadsDir))
@@ -964,8 +1517,12 @@ func findParentConfig(beadsDir string) *configfile.Config {
 
 	for dir := start; dir != "/" && dir != "."; {
 		candidate := filepath.Join(dir, ".beads")
-		if cfg, err := configfile.Load(candidate); err == nil && cfg != nil {
-			return cfg
+		cfg, err := configfile.LoadAuthoritativeReadOnly(candidate)
+		if err != nil {
+			return nil, "", err
+		}
+		if cfg != nil {
+			return cfg, candidate, nil
 		}
 
 		// Don't search above $HOME
@@ -979,7 +1536,7 @@ func findParentConfig(beadsDir string) *configfile.Config {
 		}
 		dir = parent
 	}
-	return nil
+	return nil, "", nil
 }
 
 func init() {

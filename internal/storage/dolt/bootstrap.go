@@ -85,7 +85,6 @@ func BootstrapFromRemoteWithDB(ctx context.Context, doltDir, remoteURL, database
 		return false, formatFailedCloneTargetError(err, output, cloneTarget, cleaned, cleanupErr)
 	}
 
-	fmt.Fprintf(os.Stderr, "Bootstrapped from remote: %s\n", remoteURL)
 	return true, nil
 }
 

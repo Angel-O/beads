@@ -113,6 +113,9 @@ var configSetCmd = &cobra.Command{
 		}()
 
 		key := args[0]
+		if config.IsYamlOnlyKey(key) {
+			key = config.CanonicalYamlKey(key)
+		}
 		value := args[1]
 
 		if msg, rejected := rejectProtectedConfigKey(key); rejected {
@@ -245,6 +248,9 @@ var configGetCmd = &cobra.Command{
 		}()
 
 		key := args[0]
+		if config.IsYamlOnlyKey(key) {
+			key = config.CanonicalYamlKey(key)
+		}
 
 		if key == "backup.enabled" {
 			// backup.enabled has an auto-detected effective value that
@@ -533,6 +539,9 @@ var configUnsetCmd = &cobra.Command{
 		}()
 
 		key := args[0]
+		if config.IsYamlOnlyKey(key) {
+			key = config.CanonicalYamlKey(key)
+		}
 
 		if config.IsYamlOnlyKey(key) {
 			location := "config.yaml"
@@ -796,7 +805,11 @@ Examples:
 			if idx <= 0 {
 				return HandleError("invalid argument %q (expected key=value format)", arg)
 			}
-			pairs = append(pairs, kvPair{key: arg[:idx], value: arg[idx+1:]})
+			key := arg[:idx]
+			if config.IsYamlOnlyKey(key) {
+				key = config.CanonicalYamlKey(key)
+			}
+			pairs = append(pairs, kvPair{key: key, value: arg[idx+1:]})
 		}
 
 		for _, p := range pairs {

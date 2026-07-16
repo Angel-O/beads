@@ -1,10 +1,16 @@
 package fix
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/steveyegge/beads/internal/artifactpreflight"
+	backendmigrationcontrol "github.com/steveyegge/beads/internal/backendmigration/control"
+	"github.com/steveyegge/beads/internal/configfile"
 )
 
 // ClassicArtifacts removes beads classic artifacts found by scanning the path.
@@ -13,41 +19,66 @@ import (
 // - SQLite WAL/SHM files and backup databases
 // - Extra files in redirect-only .beads directories
 func ClassicArtifacts(path string) error {
+	return classicArtifacts(path, os.Stdout)
+}
+
+// ClassicArtifactsQuiet performs the same cleanup without writing human
+// progress lines, so JSON callers can emit exactly one document.
+func ClassicArtifactsQuiet(path string) error {
+	return classicArtifacts(path, io.Discard)
+}
+
+func classicArtifacts(path string, output io.Writer) (returnErr error) {
 	var removed, skipped, errCount int
 
-	// Walk the directory tree looking for .beads/ directories
-	err := filepath.Walk(path, func(walkPath string, info os.FileInfo, err error) error {
+	// The first pass is strictly effect-free and checks every marker before any
+	// backend inspection. Then acquire every workspace control before deleting
+	// anything, and repeat the pass while those controls are held.
+	snapshot, err := artifactpreflight.Preflight(path)
+	if err != nil {
+		return err
+	}
+	guards := make([]*backendmigrationcontrol.Guard, 0, len(snapshot.Workspaces))
+	defer func() {
+		for index := len(guards) - 1; index >= 0; index-- {
+			returnErr = errors.Join(returnErr, guards[index].Close())
+		}
+	}()
+	for _, workspace := range snapshot.Workspaces {
+		guard, err := backendmigrationcontrol.TryAcquire(workspace.BeadsDir)
 		if err != nil {
-			return nil // Skip directories we can't read
+			return err
 		}
-
-		// Skip heavy directories
-		base := filepath.Base(walkPath)
-		if info.IsDir() && (base == "node_modules" || base == "vendor" || base == "__pycache__") {
-			return filepath.SkipDir
+		guards = append(guards, guard)
+	}
+	controlled, err := artifactpreflight.Preflight(path)
+	if err != nil {
+		return err
+	}
+	if !sameWorkspacePaths(snapshot.Workspaces, controlled.Workspaces) {
+		return errors.New("artifact workspace set changed during cleanup admission; retry")
+	}
+	for _, workspace := range controlled.Workspaces {
+		if workspace.CruftOnly {
+			r, e := cleanCruftBeadsDirFiles(workspace.BeadsDir, output)
+			removed += r
+			errCount += e
+			continue
 		}
-
-		// We only care about directories named ".beads"
-		if !info.IsDir() || base != ".beads" {
-			return nil
+		if workspace.Backend != configfile.BackendDolt {
+			continue
 		}
-
-		r, s, e := cleanBeadsDirArtifacts(walkPath)
+		r, s, e := cleanBeadsDirArtifacts(workspace.BeadsDir, output)
 		removed += r
 		skipped += s
 		errCount += e
-
-		return filepath.SkipDir
-	})
-	if err != nil {
-		return fmt.Errorf("failed to walk directory tree: %w", err)
 	}
 
 	// Report summary
-	fmt.Printf("  Artifact cleanup: %d removed, %d skipped, %d errors\n", removed, skipped, errCount)
+	fmt.Fprintf(output, "  Artifact cleanup: %d removed, %d skipped, %d errors\n", removed, skipped, errCount)
 
 	if skipped > 0 {
-		fmt.Println("  Skipped items may need manual review (e.g., issues.jsonl in dolt dirs, beads.db files)")
+		fmt.Fprintln(output, "  Skipped items may need manual review (e.g., issues.jsonl in dolt dirs, beads.db files)")
 	}
 
 	if errCount > 0 {
@@ -57,22 +88,34 @@ func ClassicArtifacts(path string) error {
 	return nil
 }
 
+func sameWorkspacePaths(first, second []artifactpreflight.Workspace) bool {
+	if len(first) != len(second) {
+		return false
+	}
+	for index := range first {
+		if first[index].BeadsDir != second[index].BeadsDir {
+			return false
+		}
+	}
+	return true
+}
+
 // cleanBeadsDirArtifacts cleans artifacts from a single .beads directory.
 // Returns counts of removed, skipped, and errored items.
-func cleanBeadsDirArtifacts(beadsDir string) (removed, skipped, errCount int) {
+func cleanBeadsDirArtifacts(beadsDir string, output io.Writer) (removed, skipped, errCount int) {
 	hasDolt := hasDoltDir(beadsDir)
 	isRedirectExpected := isRedirectExpectedLocation(beadsDir)
 
 	// 1. Clean JSONL artifacts in dolt-native directories
 	if hasDolt {
-		r, s, e := cleanJSONLArtifacts(beadsDir)
+		r, s, e := cleanJSONLArtifacts(beadsDir, output)
 		removed += r
 		skipped += s
 		errCount += e
 	}
 
 	// 2. Clean SQLite artifacts
-	r, s, e := cleanSQLiteArtifacts(beadsDir)
+	r, s, e := cleanSQLiteArtifacts(beadsDir, output)
 	removed += r
 	skipped += s
 	errCount += e
@@ -82,7 +125,7 @@ func cleanBeadsDirArtifacts(beadsDir string) (removed, skipped, errCount int) {
 	// (config.yaml, metadata.json, README.md, issues.jsonl, etc.) prevent
 	// the redirect from being created and should be removed regardless.
 	if isRedirectExpected {
-		r, e := cleanCruftBeadsDirFiles(beadsDir)
+		r, e := cleanCruftBeadsDirFiles(beadsDir, output)
 		removed += r
 		errCount += e
 	}
@@ -99,43 +142,11 @@ func hasDoltDir(beadsDir string) bool {
 // isRedirectExpectedLocation returns true if this .beads directory should contain
 // only a redirect file.
 func isRedirectExpectedLocation(beadsDir string) bool {
-	parent := filepath.Dir(beadsDir)
-	grandparent := filepath.Dir(parent)
-	grandparentName := filepath.Base(grandparent)
-	parentName := filepath.Base(parent)
-
-	// Pattern: */polecats/*/.beads/ (orchestrator worker — backwards compat)
-	if grandparentName == "polecats" {
-		return true
-	}
-	// Pattern: */crew/*/.beads/ (orchestrator assistant — backwards compat)
-	if grandparentName == "crew" {
-		return true
-	}
-	// Pattern: */refinery/rig/.beads/ (orchestrator processor — backwards compat)
-	if parentName == "rig" && grandparentName == "refinery" {
-		return true
-	}
-	// Pattern: .git/beads-worktrees/*/.beads/
-	if grandparentName == "beads-worktrees" {
-		return true
-	}
-	// Rig-root .beads/ with a mayor/rig/.beads/ canonical location
-	canonicalDir := filepath.Join(parent, "mayor", "rig", ".beads")
-	if _, err := os.Stat(canonicalDir); err == nil {
-		// Also check it has polecats/ or mayor/ siblings
-		for _, sibling := range []string{"mayor", "polecats"} {
-			if info, err := os.Stat(filepath.Join(parent, sibling)); err == nil && info.IsDir() {
-				return true
-			}
-		}
-	}
-
-	return false
+	return artifactpreflight.IsRedirectExpected(beadsDir)
 }
 
 // cleanJSONLArtifacts removes stale JSONL files from a dolt-native .beads directory.
-func cleanJSONLArtifacts(beadsDir string) (removed, skipped, errCount int) {
+func cleanJSONLArtifacts(beadsDir string, output io.Writer) (removed, skipped, errCount int) {
 	// Safe to delete (not the primary data source)
 	safeFiles := []string{
 		"issues.jsonl.new",
@@ -147,11 +158,11 @@ func cleanJSONLArtifacts(beadsDir string) (removed, skipped, errCount int) {
 			continue
 		}
 		if err := os.Remove(path); err != nil {
-			fmt.Printf("  Error removing %s: %v\n", path, err)
+			fmt.Fprintf(output, "  Error removing %s: %v\n", path, err)
 			errCount++
 			continue
 		}
-		fmt.Printf("  Removed: %s (JSONL artifact)\n", path)
+		fmt.Fprintf(output, "  Removed: %s (JSONL artifact)\n", path)
 		removed++
 	}
 
@@ -160,14 +171,14 @@ func cleanJSONLArtifacts(beadsDir string) (removed, skipped, errCount int) {
 	if info, err := os.Stat(interPath); err == nil {
 		if info.Size() == 0 {
 			if err := os.Remove(interPath); err != nil {
-				fmt.Printf("  Error removing %s: %v\n", interPath, err)
+				fmt.Fprintf(output, "  Error removing %s: %v\n", interPath, err)
 				errCount++
 			} else {
-				fmt.Printf("  Removed: %s (empty interactions log)\n", interPath)
+				fmt.Fprintf(output, "  Removed: %s (empty interactions log)\n", interPath)
 				removed++
 			}
 		} else {
-			fmt.Printf("  Skip (not empty): %s\n", interPath)
+			fmt.Fprintf(output, "  Skip (not empty): %s\n", interPath)
 			skipped++
 		}
 	}
@@ -175,7 +186,7 @@ func cleanJSONLArtifacts(beadsDir string) (removed, skipped, errCount int) {
 	// issues.jsonl in dolt-native directory - skip (needs manual review)
 	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
 	if _, err := os.Stat(issuesPath); err == nil {
-		fmt.Printf("  Skip (needs review): %s (issues.jsonl in dolt-native dir)\n", issuesPath)
+		fmt.Fprintf(output, "  Skip (needs review): %s (issues.jsonl in dolt-native dir)\n", issuesPath)
 		skipped++
 	}
 
@@ -183,7 +194,7 @@ func cleanJSONLArtifacts(beadsDir string) (removed, skipped, errCount int) {
 }
 
 // cleanSQLiteArtifacts removes leftover SQLite database files.
-func cleanSQLiteArtifacts(beadsDir string) (removed, skipped, errCount int) {
+func cleanSQLiteArtifacts(beadsDir string, output io.Writer) (removed, skipped, errCount int) {
 	entries, err := os.ReadDir(beadsDir)
 	if err != nil {
 		return
@@ -199,11 +210,11 @@ func cleanSQLiteArtifacts(beadsDir string) (removed, skipped, errCount int) {
 		if name == "beads.db-shm" || name == "beads.db-wal" {
 			path := filepath.Join(beadsDir, name)
 			if err := os.Remove(path); err != nil {
-				fmt.Printf("  Error removing %s: %v\n", path, err)
+				fmt.Fprintf(output, "  Error removing %s: %v\n", path, err)
 				errCount++
 				continue
 			}
-			fmt.Printf("  Removed: %s (SQLite WAL/SHM)\n", path)
+			fmt.Fprintf(output, "  Removed: %s (SQLite WAL/SHM)\n", path)
 			removed++
 			continue
 		}
@@ -211,7 +222,7 @@ func cleanSQLiteArtifacts(beadsDir string) (removed, skipped, errCount int) {
 		// beads.db - skip (needs manual review, could be active)
 		if name == "beads.db" {
 			path := filepath.Join(beadsDir, name)
-			fmt.Printf("  Skip (needs review): %s\n", path)
+			fmt.Fprintf(output, "  Skip (needs review): %s\n", path)
 			skipped++
 			continue
 		}
@@ -220,11 +231,11 @@ func cleanSQLiteArtifacts(beadsDir string) (removed, skipped, errCount int) {
 		if strings.HasPrefix(name, "beads.backup-") && strings.HasSuffix(name, ".db") {
 			path := filepath.Join(beadsDir, name)
 			if err := os.Remove(path); err != nil {
-				fmt.Printf("  Error removing %s: %v\n", path, err)
+				fmt.Fprintf(output, "  Error removing %s: %v\n", path, err)
 				errCount++
 				continue
 			}
-			fmt.Printf("  Removed: %s (pre-migration backup)\n", path)
+			fmt.Fprintf(output, "  Removed: %s (pre-migration backup)\n", path)
 			removed++
 		}
 	}
@@ -234,7 +245,7 @@ func cleanSQLiteArtifacts(beadsDir string) (removed, skipped, errCount int) {
 
 // cleanCruftBeadsDirFiles removes everything from a .beads directory except
 // the redirect file and .gitkeep.
-func cleanCruftBeadsDirFiles(beadsDir string) (removed, errCount int) {
+func cleanCruftBeadsDirFiles(beadsDir string, output io.Writer) (removed, errCount int) {
 	entries, err := os.ReadDir(beadsDir)
 	if err != nil {
 		return 0, 1
@@ -243,7 +254,7 @@ func cleanCruftBeadsDirFiles(beadsDir string) (removed, errCount int) {
 	for _, entry := range entries {
 		name := entry.Name()
 		// Keep redirect and .gitkeep
-		if name == "redirect" || name == ".gitkeep" {
+		if name == "redirect" || name == ".gitkeep" || name == backendmigrationcontrol.FileName {
 			continue
 		}
 
@@ -257,18 +268,18 @@ func cleanCruftBeadsDirFiles(beadsDir string) (removed, errCount int) {
 
 		if entry.IsDir() {
 			if err := os.RemoveAll(entryPath); err != nil {
-				fmt.Printf("  Error removing %s: %v\n", entryPath, err)
+				fmt.Fprintf(output, "  Error removing %s: %v\n", entryPath, err)
 				errCount++
 				continue
 			}
 		} else {
 			if err := os.Remove(entryPath); err != nil {
-				fmt.Printf("  Error removing %s: %v\n", entryPath, err)
+				fmt.Fprintf(output, "  Error removing %s: %v\n", entryPath, err)
 				errCount++
 				continue
 			}
 		}
-		fmt.Printf("  Removed: %s (cruft in redirect-only dir)\n", entryPath)
+		fmt.Fprintf(output, "  Removed: %s (cruft in redirect-only dir)\n", entryPath)
 		removed++
 	}
 

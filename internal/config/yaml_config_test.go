@@ -30,6 +30,8 @@ func TestIsYamlOnlyKey(t *testing.T) {
 		{"repos.primary", true},
 		{"external_projects.beads", true},
 		{"list.limit", true},
+		{"dolt.Mode", true},
+		{"DOLT.Shared-Server", true},
 
 		// Hierarchy settings (GH#995)
 		{"hierarchy.max-depth", true},
@@ -649,6 +651,9 @@ func TestValidateYamlConfigValue_SharedServer(t *testing.T) {
 	if err := validateYamlConfigValue("dolt.shared-server", "1"); err == nil {
 		t.Error("expected '1' to be invalid (not a boolean string)")
 	}
+	if err := validateYamlConfigValue("dolt.Shared-Server", "maybe"); err == nil {
+		t.Error("expected a case-variant shared-server key to retain validation")
+	}
 }
 
 func TestValidateYamlConfigValue_DoltDebug(t *testing.T) {
@@ -696,6 +701,9 @@ func TestValidateYamlConfigValue_DoltMode(t *testing.T) {
 	}
 	if err := validateYamlConfigValue("dolt.mode", "remote"); err == nil {
 		t.Error("expected 'remote' to be invalid")
+	}
+	if err := validateYamlConfigValue("dolt.Mode", "invalid"); err == nil {
+		t.Error("expected a case-variant mode key to retain validation")
 	}
 }
 

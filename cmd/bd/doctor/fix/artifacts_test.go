@@ -1,9 +1,14 @@
 package fix
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+
+	backendmigrationcontrol "github.com/steveyegge/beads/internal/backendmigration/control"
+	"github.com/steveyegge/beads/internal/configfile"
 )
 
 func TestClassicArtifacts_NoArtifacts(t *testing.T) {
@@ -43,6 +48,183 @@ func TestClassicArtifacts_RemovesSQLiteWAL(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(beadsDir, name)); !os.IsNotExist(err) {
 			t.Errorf("%s should have been removed", name)
 		}
+	}
+}
+
+func TestClassicArtifactsRejectsPendingBackendMigrationWithoutRemovingFiles(t *testing.T) {
+	for _, markerName := range []string{
+		configfile.BackendMigrationStateFileName,
+		".backend-migration-test.cleanup.lock",
+	} {
+		t.Run(markerName, func(t *testing.T) {
+			dir := t.TempDir()
+			beadsDir := filepath.Join(dir, ".beads")
+			if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			markerPath := filepath.Join(beadsDir, markerName)
+			marker := []byte("pending")
+			if err := os.WriteFile(markerPath, marker, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			walPath := filepath.Join(beadsDir, "beads.db-wal")
+			wal := []byte("recovery state")
+			if err := os.WriteFile(walPath, wal, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := ClassicArtifacts(dir); !errors.Is(err, configfile.ErrBackendMigrationPending) {
+				t.Fatalf("ClassicArtifacts pending migration error = %v", err)
+			}
+			for path, want := range map[string][]byte{markerPath: marker, walPath: wal} {
+				got, err := os.ReadFile(path)
+				if err != nil || string(got) != string(want) {
+					t.Fatalf("refused cleanup changed %s: got=%q err=%v", filepath.Base(path), got, err)
+				}
+			}
+		})
+	}
+}
+
+func TestClassicArtifactsPreflightsAllWorkspacesBeforeRemovingAnything(t *testing.T) {
+	root := t.TempDir()
+	beforeBeadsDir := filepath.Join(root, "a", ".beads")
+	markedBeadsDir := filepath.Join(root, "z", ".beads")
+	for _, beadsDir := range []string{beforeBeadsDir, markedBeadsDir} {
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, "beads.db-wal"), []byte("recovery state"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(markedBeadsDir, configfile.BackendMigrationStateFileName), []byte("pending"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ClassicArtifacts(root); !errors.Is(err, configfile.ErrBackendMigrationPending) {
+		t.Fatalf("ClassicArtifacts pending migration error = %v", err)
+	}
+	for _, beadsDir := range []string{beforeBeadsDir, markedBeadsDir} {
+		walPath := filepath.Join(beadsDir, "beads.db-wal")
+		if got, err := os.ReadFile(walPath); err != nil || string(got) != "recovery state" {
+			t.Fatalf("preflight failure changed %s: got=%q err=%v", walPath, got, err)
+		}
+	}
+}
+
+func TestClassicArtifactsPreflightPreservesEarlierLegacyWorkspace(t *testing.T) {
+	root := t.TempDir()
+	legacyDir := filepath.Join(root, "a", ".beads")
+	markedDir := filepath.Join(root, "z", "deep", ".beads")
+	for _, dir := range []string{legacyDir, markedDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacy := []byte(`{"backend":"dolt","dolt_mode":"embedded"}`)
+	legacyPath := filepath.Join(legacyDir, "config.json")
+	wal := []byte("recovery state")
+	walPath := filepath.Join(legacyDir, "beads.db-wal")
+	if err := os.WriteFile(legacyPath, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(walPath, wal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(markedDir, configfile.BackendMigrationStateFileName)
+	marker := []byte("pending")
+	if err := os.WriteFile(markerPath, marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ClassicArtifacts(root); !errors.Is(err, configfile.ErrBackendMigrationPending) {
+		t.Fatalf("ClassicArtifacts error = %v, want pending migration", err)
+	}
+	for path, want := range map[string][]byte{legacyPath: legacy, walPath: wal, markerPath: marker} {
+		got, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("preflight changed %s: equal=%v err=%v", path, bytes.Equal(got, want), err)
+		}
+	}
+	if _, err := os.Lstat(configfile.ConfigPath(legacyDir)); !os.IsNotExist(err) {
+		t.Fatalf("preflight created metadata.json: %v", err)
+	}
+}
+
+func TestClassicArtifactsAcquiresEveryWorkspaceControlBeforeDeleting(t *testing.T) {
+	root := t.TempDir()
+	firstDir := filepath.Join(root, "a", ".beads")
+	laterDir := filepath.Join(root, "z", ".beads")
+	for _, dir := range []string{firstDir, laterDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := (&configfile.Config{Backend: configfile.BackendDolt}).Save(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	walPath := filepath.Join(firstDir, "beads.db-wal")
+	wal := []byte("must remain")
+	if err := os.WriteFile(walPath, wal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	guard, err := backendmigrationcontrol.TryAcquire(laterDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guard.Close() //nolint:errcheck // test cleanup
+
+	if err := ClassicArtifacts(root); !errors.Is(err, backendmigrationcontrol.ErrBusy) {
+		t.Fatalf("ClassicArtifacts contention error = %v, want ErrBusy", err)
+	}
+	got, err := os.ReadFile(walPath)
+	if err != nil || !bytes.Equal(got, wal) {
+		t.Fatalf("partial cleanup changed earlier WAL: equal=%v err=%v", bytes.Equal(got, wal), err)
+	}
+}
+
+func TestClassicArtifactsPreservesActiveSQLiteWorkspaceDuringRecursiveCleanup(t *testing.T) {
+	root := t.TempDir()
+	sqliteBeadsDir := filepath.Join(root, "a-sqlite", ".beads")
+	if err := os.MkdirAll(sqliteBeadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&configfile.Config{Backend: configfile.BackendSQLite, SQLitePath: "beads.db"}).Save(sqliteBeadsDir); err != nil {
+		t.Fatal(err)
+	}
+	activeFiles := map[string][]byte{
+		"beads.db":     []byte("authoritative sqlite database"),
+		"beads.db-wal": []byte("authoritative sqlite wal"),
+		"beads.db-shm": []byte("authoritative sqlite shm"),
+	}
+	for name, data := range activeFiles {
+		if err := os.WriteFile(filepath.Join(sqliteBeadsDir, name), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	doltBeadsDir := filepath.Join(root, "z-dolt", ".beads")
+	if err := os.MkdirAll(doltBeadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := filepath.Join(doltBeadsDir, "beads.backup-20260204.db")
+	if err := os.WriteFile(backupPath, []byte("classic artifact"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ClassicArtifacts(root); err != nil {
+		t.Fatalf("ClassicArtifacts: %v", err)
+	}
+	for name, want := range activeFiles {
+		path := filepath.Join(sqliteBeadsDir, name)
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != string(want) {
+			t.Fatalf("recursive cleanup changed active SQLite %s: got=%q err=%v", name, got, err)
+		}
+	}
+	if _, err := os.Lstat(backupPath); !os.IsNotExist(err) {
+		t.Fatalf("unrelated Dolt artifact was not cleaned: %v", err)
 	}
 }
 

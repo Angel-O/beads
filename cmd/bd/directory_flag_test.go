@@ -63,3 +63,52 @@ func TestResolveChangeDirBeadsDirRejectsDirectoryWithoutProject(t *testing.T) {
 		t.Fatal("expected -C target without a beads project to fail")
 	}
 }
+
+func TestApplyChangeDirSelectionOverridesAmbientDatabaseSelectors(t *testing.T) {
+	projectDir := t.TempDir()
+	beadsDir := filepath.Join(projectDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"backend":"dolt"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	originalChangeDir := changeDir
+	originalSnapshot := changeDirEnvSnapshot
+	changeDir = projectDir
+	changeDirEnvSnapshot = nil
+	t.Cleanup(func() {
+		if changeDirEnvSnapshot != nil {
+			restoreChangeDirSelection()
+		}
+		changeDir = originalChangeDir
+		changeDirEnvSnapshot = originalSnapshot
+	})
+	t.Setenv("BEADS_DIR", "/ambient/beads")
+	t.Setenv("BEADS_DB", "/ambient/beads.db")
+	t.Setenv("BD_DB", "/ambient/legacy.db")
+
+	if err := applyChangeDirSelection(); err != nil {
+		t.Fatalf("applyChangeDirSelection: %v", err)
+	}
+	if got := os.Getenv("BEADS_DIR"); got != beadsDir {
+		t.Fatalf("BEADS_DIR = %q, want %q", got, beadsDir)
+	}
+	for _, key := range []string{"BEADS_DB", "BD_DB"} {
+		if value, present := os.LookupEnv(key); present {
+			t.Fatalf("%s remained set to %q after -C selection", key, value)
+		}
+	}
+
+	restoreChangeDirSelection()
+	for key, want := range map[string]string{
+		"BEADS_DIR": "/ambient/beads",
+		"BEADS_DB":  "/ambient/beads.db",
+		"BD_DB":     "/ambient/legacy.db",
+	} {
+		if got := os.Getenv(key); got != want {
+			t.Fatalf("restored %s = %q, want %q", key, got, want)
+		}
+	}
+}

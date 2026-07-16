@@ -1,9 +1,13 @@
 package doctor
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/configfile"
 )
 
 func TestCheckClassicArtifacts_NoArtifacts(t *testing.T) {
@@ -18,6 +22,55 @@ func TestCheckClassicArtifacts_NoArtifacts(t *testing.T) {
 	check := CheckClassicArtifacts(dir)
 	if check.Status != StatusOK {
 		t.Errorf("expected StatusOK, got %s: %s", check.Status, check.Message)
+	}
+}
+
+func TestScanForArtifactsRejectsNestedPendingMigrationEffectFree(t *testing.T) {
+	for _, marker := range []string{
+		configfile.BackendMigrationStateFileName,
+		".backend-migration-test.cleanup.lock",
+	} {
+		t.Run(marker, func(t *testing.T) {
+			root := t.TempDir()
+			legacyDir := filepath.Join(root, "a", ".beads")
+			markedDir := filepath.Join(root, "z", "deep", ".beads")
+			for _, dir := range []string{legacyDir, markedDir} {
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			legacy := []byte(`{"backend":"dolt","dolt_mode":"embedded"}`)
+			if err := os.WriteFile(filepath.Join(legacyDir, "config.json"), legacy, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			walPath := filepath.Join(legacyDir, "beads.db-wal")
+			wal := []byte("recovery state")
+			if err := os.WriteFile(walPath, wal, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			markerPath := filepath.Join(markedDir, marker)
+			markerBytes := []byte("pending")
+			if err := os.WriteFile(markerPath, markerBytes, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := ScanForArtifacts(root); !errors.Is(err, configfile.ErrBackendMigrationPending) {
+				t.Fatalf("ScanForArtifacts error = %v, want pending migration", err)
+			}
+			for path, want := range map[string][]byte{
+				filepath.Join(legacyDir, "config.json"): legacy,
+				walPath:                                 wal,
+				markerPath:                              markerBytes,
+			} {
+				got, err := os.ReadFile(path)
+				if err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("scan changed %s: equal=%v err=%v", path, bytes.Equal(got, want), err)
+				}
+			}
+			if _, err := os.Lstat(configfile.ConfigPath(legacyDir)); !os.IsNotExist(err) {
+				t.Fatalf("scan created metadata.json: %v", err)
+			}
+		})
 	}
 }
 

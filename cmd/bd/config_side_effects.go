@@ -15,6 +15,7 @@ type configSideEffect struct {
 // checkConfigSetSideEffects returns any hints/warnings for a config key being set.
 func checkConfigSetSideEffects(key, value string) []configSideEffect {
 	var effects []configSideEffect
+	key = strings.ToLower(strings.TrimSpace(key))
 
 	switch {
 	case key == "federation.remote":
@@ -73,6 +74,7 @@ func checkConfigSetSideEffects(key, value string) []configSideEffect {
 // checkConfigUnsetSideEffects returns any hints/warnings for a config key being unset.
 func checkConfigUnsetSideEffects(key string) []configSideEffect {
 	var effects []configSideEffect
+	key = strings.ToLower(strings.TrimSpace(key))
 
 	switch key {
 	case "federation.remote":

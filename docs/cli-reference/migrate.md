@@ -12,6 +12,7 @@ Database migration and data transformation commands.
 Without subcommand, checks and updates database metadata to current version.
 
 Subcommands:
+  backend                          Move embedded Dolt current state to SQLite
   hooks                            Plan git hook migration to marker-managed format
   issues                           Move issues between repositories
   schema                           Apply pending schema migrations (idempotent)
@@ -43,6 +44,38 @@ bd migrate [command]
       --json             Output migration statistics in JSON format
       --update-repo-id   Update repository ID (use after changing git remote)
       --yes              Auto-confirm prompts
+```
+
+## bd migrate backend
+
+Preview or apply an embedded Dolt to SQLite backend migration.
+
+Preview is the default and has no persistent effect. Applying preserves the
+embedded Dolt source (including its history), copies current issue-tracker
+state into a new workspace-local SQLite database, verifies it, and only then
+switches metadata.json to SQLite.
+
+This is the only state-preserving backend change. Do not substitute
+bd init --reinit-local --backend=sqlite: reinitialization is destructive and
+transfers neither current issue state nor Dolt history.
+
+Examples:
+  bd migrate backend --to=sqlite
+  bd migrate backend --to=sqlite --sqlite-path=beads-migrated.db
+  bd migrate backend --to=sqlite --apply
+  bd migrate backend --to=sqlite --apply --yes --json
+
+```
+bd migrate backend [flags]
+```
+
+**Flags:**
+
+```
+      --apply                Apply the planned migration
+      --sqlite-path string   Lowercase workspace-local SQLite database basename (default "beads.db")
+      --to string            Target backend (required: sqlite)
+      --yes                  Confirm apply for automation
 ```
 
 ## bd migrate from-proxied-server-to-server

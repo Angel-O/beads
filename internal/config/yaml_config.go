@@ -95,6 +95,7 @@ var YamlOnlyKeys = map[string]bool{
 // IsYamlOnlyKey returns true if the given key should be stored in config.yaml
 // rather than the Dolt database.
 func IsYamlOnlyKey(key string) bool {
+	key = normalizeYamlKey(key)
 	// Check exact match
 	if YamlOnlyKeys[key] {
 		return true
@@ -200,10 +201,18 @@ var keyAliases = map[string]string{}
 // Some keys have aliases (e.g., sync.branch -> sync-branch) to handle
 // different input formats consistently.
 func normalizeYamlKey(key string) string {
+	key = strings.ToLower(strings.TrimSpace(key))
 	if canonical, ok := keyAliases[key]; ok {
 		return canonical
 	}
 	return key
+}
+
+// CanonicalYamlKey returns the key form used by Viper and config.yaml.
+// Viper folds YAML keys to lower case recursively, so writers must do the
+// same before validation, routing, and migration-control admission.
+func CanonicalYamlKey(key string) string {
+	return normalizeYamlKey(key)
 }
 
 // SetYamlConfig sets a configuration value in the project's config.yaml file.
@@ -247,6 +256,7 @@ func SetYamlConfigInDir(beadsDir, key, value string) error {
 var userGlobalKeyPrefixes = []string{"metrics."}
 
 func IsUserGlobalKey(key string) bool {
+	key = normalizeYamlKey(key)
 	for _, prefix := range userGlobalKeyPrefixes {
 		if strings.HasPrefix(key, prefix) {
 			return true
@@ -401,28 +411,29 @@ func SetUserYamlConfig(key, value string) error {
 }
 
 func setYamlConfigAtPath(configPath, key, value string) error {
+	return withBackendSelectionControl(configPath, key, func() error {
+		// Normalize key to canonical yaml format
+		normalizedKey := normalizeYamlKey(key)
 
-	// Normalize key to canonical yaml format
-	normalizedKey := normalizeYamlKey(key)
+		// Read existing config
+		content, err := os.ReadFile(configPath) //nolint:gosec // configPath is from findProjectConfigYaml
+		if err != nil {
+			return fmt.Errorf("failed to read config.yaml: %w", err)
+		}
 
-	// Read existing config
-	content, err := os.ReadFile(configPath) //nolint:gosec // configPath is from findProjectConfigYaml
-	if err != nil {
-		return fmt.Errorf("failed to read config.yaml: %w", err)
-	}
+		// Update or add the key
+		newContent, err := updateYamlKey(string(content), normalizedKey, value)
+		if err != nil {
+			return err
+		}
 
-	// Update or add the key
-	newContent, err := updateYamlKey(string(content), normalizedKey, value)
-	if err != nil {
-		return err
-	}
+		// Write back
+		if err := os.WriteFile(configPath, []byte(newContent), 0600); err != nil { //nolint:gosec // configPath is validated
+			return fmt.Errorf("failed to write config.yaml: %w", err)
+		}
 
-	// Write back
-	if err := os.WriteFile(configPath, []byte(newContent), 0600); err != nil { //nolint:gosec // configPath is validated
-		return fmt.Errorf("failed to write config.yaml: %w", err)
-	}
-
-	return nil
+		return nil
+	})
 }
 
 // GetYamlConfig gets a configuration value from config.yaml.
@@ -444,20 +455,22 @@ func UnsetYamlConfig(key string) error {
 		return err
 	}
 
-	normalizedKey := normalizeYamlKey(key)
+	return withBackendSelectionControl(configPath, key, func() error {
+		normalizedKey := normalizeYamlKey(key)
 
-	content, err := os.ReadFile(configPath) //nolint:gosec // configPath is from findProjectConfigYaml
-	if err != nil {
-		return fmt.Errorf("failed to read config.yaml: %w", err)
-	}
+		content, err := os.ReadFile(configPath) //nolint:gosec // configPath is from findProjectConfigYaml
+		if err != nil {
+			return fmt.Errorf("failed to read config.yaml: %w", err)
+		}
 
-	newContent := commentOutYamlKey(string(content), normalizedKey)
+		newContent := commentOutYamlKey(string(content), normalizedKey)
 
-	if err := os.WriteFile(configPath, []byte(newContent), 0600); err != nil { //nolint:gosec // configPath is validated
-		return fmt.Errorf("failed to write config.yaml: %w", err)
-	}
+		if err := os.WriteFile(configPath, []byte(newContent), 0600); err != nil { //nolint:gosec // configPath is validated
+			return fmt.Errorf("failed to write config.yaml: %w", err)
+		}
 
-	return nil
+		return nil
+	})
 }
 
 // findProjectConfigYaml finds the active config.yaml path for YAML-only config writes.
@@ -797,6 +810,7 @@ func isDuration(s string) bool {
 // validateYamlConfigValue validates a configuration value before setting.
 // Returns an error if the value is invalid for the given key.
 func validateYamlConfigValue(key, value string) error {
+	key = normalizeYamlKey(key)
 	switch key {
 	case "hierarchy.max-depth":
 		// Must be a positive integer >= 1 (GH#995)

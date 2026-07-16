@@ -194,23 +194,17 @@ Examples:
 			}
 		}()
 
+		absPath, targetBeadsDir, err := resolveDoctorTarget(args)
+		if err != nil {
+			return HandleError("failed to resolve path: %v", err)
+		}
+		if err := rejectPendingBackendMigrationForCommand(targetBeadsDir); err != nil {
+			return err
+		}
+
 		if usesProxiedServer() {
 			fmt.Fprintln(os.Stderr, "Note: 'bd doctor' is not yet supported in proxied-server mode.")
 			return nil
-		}
-
-		var checkPath string
-		if len(args) > 0 {
-			checkPath = args[0]
-		} else if beadsDir := os.Getenv("BEADS_DIR"); beadsDir != "" {
-			checkPath = filepath.Dir(beadsDir)
-		} else {
-			checkPath = "."
-		}
-
-		absPath, err := filepath.Abs(checkPath)
-		if err != nil {
-			return HandleError("failed to resolve path: %v", err)
 		}
 
 		if doctorFix && isOrchestratorRoot(absPath) {
@@ -328,6 +322,20 @@ Examples:
 		}
 		return nil
 	},
+}
+
+func resolveDoctorTarget(args []string) (absPath, beadsDir string, err error) {
+	checkPath := "."
+	if len(args) > 0 {
+		checkPath = args[0]
+	} else if selected := os.Getenv("BEADS_DIR"); selected != "" {
+		checkPath = filepath.Dir(selected)
+	}
+	absPath, err = filepath.Abs(checkPath)
+	if err != nil {
+		return "", "", err
+	}
+	return absPath, doctor.ResolveBeadsDirForRepo(absPath), nil
 }
 
 func init() {

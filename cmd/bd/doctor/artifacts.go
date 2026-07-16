@@ -5,6 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/steveyegge/beads/internal/artifactpreflight"
+	backendmigrationcontrol "github.com/steveyegge/beads/internal/backendmigration/control"
+	"github.com/steveyegge/beads/internal/configfile"
 )
 
 // ArtifactFinding represents a single detected artifact that may need cleanup.
@@ -96,37 +100,12 @@ func CheckClassicArtifacts(path string) DoctorCheck {
 // Individual unreadable subdirectories are skipped without error.
 func ScanForArtifacts(rootPath string) (ArtifactReport, error) {
 	var report ArtifactReport
-
-	// Walk the directory tree looking for .beads/ directories
-	walkErr := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip directories we can't read
-		}
-
-		base := filepath.Base(path)
-		if base == ".git" && info.IsDir() {
-			scanGitWorktreeArtifacts(path, &report)
-			return filepath.SkipDir
-		}
-
-		// Skip node_modules and similar
-		if info.IsDir() && (base == "node_modules" || base == "vendor" || base == "__pycache__") {
-			return filepath.SkipDir
-		}
-
-		// We only care about directories named ".beads"
-		if !info.IsDir() || base != ".beads" {
-			return nil
-		}
-
-		// Found a .beads directory - scan it
-		scanBeadsDir(path, &report)
-
-		// Don't descend into .beads/ itself (we've scanned it)
-		return filepath.SkipDir
-	})
-	if walkErr != nil {
-		return report, fmt.Errorf("scanning artifacts at %s: %w", rootPath, walkErr)
+	snapshot, err := artifactpreflight.Preflight(rootPath)
+	if err != nil {
+		return report, err
+	}
+	for _, workspace := range snapshot.Workspaces {
+		scanBeadsDir(workspace, &report)
 	}
 
 	report.TotalCount = len(report.SQLiteArtifacts) +
@@ -146,41 +125,18 @@ func ScanForArtifacts(rootPath string) (ArtifactReport, error) {
 	return report, nil
 }
 
-// scanGitWorktreeArtifacts scans the git-managed worktree area only.
-// This avoids traversing the entire .git directory tree, which can be large and
-// is unrelated to classic beads artifact cleanup.
-func scanGitWorktreeArtifacts(gitDir string, report *ArtifactReport) {
-	worktreesDir := filepath.Join(gitDir, "beads-worktrees")
-	info, err := os.Stat(worktreesDir)
-	if err != nil || !info.IsDir() {
-		return
-	}
-
-	_ = filepath.Walk(worktreesDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if !info.IsDir() || filepath.Base(path) != ".beads" {
-			return nil
-		}
-		scanBeadsDir(path, report)
-		return filepath.SkipDir
-	})
-}
-
 // scanBeadsDir checks a single .beads directory for artifacts.
-func scanBeadsDir(beadsDir string, report *ArtifactReport) {
-	// Check if this should be a redirect-only directory
-	isRedirectExpected := isRedirectExpectedDir(beadsDir)
+func scanBeadsDir(workspace artifactpreflight.Workspace, report *ArtifactReport) {
+	beadsDir := workspace.BeadsDir
 
 	// Check if it has a redirect file
 	hasRedirect := hasRedirectFile(beadsDir)
 
 	// 1. Check for SQLite artifacts
-	scanSQLiteArtifacts(beadsDir, report)
+	scanSQLiteArtifacts(beadsDir, workspace.Backend, report)
 
 	// 2. Check for cruft .beads directories (should be redirect-only)
-	if isRedirectExpected {
+	if workspace.CruftOnly {
 		scanCruftBeadsDir(beadsDir, report)
 	}
 
@@ -195,54 +151,7 @@ func scanBeadsDir(beadsDir string, report *ArtifactReport) {
 // NOTE: The polecats/crew/refinery patterns are retained for backwards compatibility
 // with existing orchestrator installations.
 func isRedirectExpectedDir(beadsDir string) bool {
-	// The parent of .beads is the project dir
-	// We need to determine if this is a "leaf" .beads that should redirect
-	// to a "canonical" .beads (typically in the main rig or main worktree)
-
-	parent := filepath.Dir(beadsDir)
-	parentName := filepath.Base(parent)
-	grandparent := filepath.Dir(parent)
-	grandparentName := filepath.Base(grandparent)
-
-	// Pattern: */polecats/*/.beads/ (orchestrator worker worktree — backwards compat)
-	if grandparentName == "polecats" {
-		return true
-	}
-
-	// Pattern: */crew/*/.beads/ (orchestrator assistant workspace — backwards compat)
-	if grandparentName == "crew" {
-		return true
-	}
-
-	// Pattern: */refinery/rig/.beads/ (orchestrator processor — backwards compat)
-	if parentName == "rig" && grandparentName == "refinery" {
-		return true
-	}
-
-	// Pattern: .git/beads-worktrees/*/.beads/
-	if grandparentName == "beads-worktrees" {
-		return true
-	}
-
-	// Check if this is a rig-root .beads/ (e.g., my-project/.beads/)
-	// that should redirect to mayor/rig/.beads/
-	// A rig-root .beads has a sibling "mayor/" or "polecats/" directory
-	if hasSibling(parent, "mayor") || hasSibling(parent, "polecats") {
-		// This looks like a rig root, check if there's a canonical location
-		canonicalDir := filepath.Join(parent, "mayor", "rig", ".beads")
-		if _, err := os.Stat(canonicalDir); err == nil {
-			return true
-		}
-	}
-
-	return false
-}
-
-// hasSibling returns true if the directory has a sibling with the given name.
-func hasSibling(dir string, siblingName string) bool {
-	sibling := filepath.Join(dir, siblingName)
-	info, err := os.Stat(sibling)
-	return err == nil && info.IsDir()
+	return artifactpreflight.IsRedirectExpected(beadsDir)
 }
 
 // hasRedirectFile returns true if the .beads directory has a redirect file.
@@ -254,8 +163,8 @@ func hasRedirectFile(beadsDir string) bool {
 // scanSQLiteArtifacts checks for leftover SQLite database files.
 // Only flags SQLite files as artifacts if Dolt is the active backend.
 // If SQLite is still the active backend, beads.db is the live database.
-func scanSQLiteArtifacts(beadsDir string, report *ArtifactReport) {
-	if !IsDoltBackend(beadsDir) {
+func scanSQLiteArtifacts(beadsDir, backend string, report *ArtifactReport) {
+	if backend != configfile.BackendDolt {
 		return
 	}
 
@@ -310,7 +219,7 @@ func scanCruftBeadsDir(beadsDir string, report *ArtifactReport) {
 			continue
 		}
 		// .gitkeep is harmless
-		if name == ".gitkeep" {
+		if name == ".gitkeep" || name == backendmigrationcontrol.FileName {
 			continue
 		}
 		extraFiles = append(extraFiles, name)

@@ -15,6 +15,7 @@ func savePersistentPreRunState(t *testing.T) {
 	t.Helper()
 
 	oldServerMode := serverMode
+	oldProxiedServerMode := proxiedServerMode
 	oldCmdCtx := cmdCtx
 	oldDBPath := dbPath
 	oldActor := actor
@@ -24,6 +25,7 @@ func savePersistentPreRunState(t *testing.T) {
 	flagState := snapshotRootFlagState()
 	t.Cleanup(func() {
 		serverMode = oldServerMode
+		proxiedServerMode = oldProxiedServerMode
 		cmdCtx = oldCmdCtx
 		dbPath = oldDBPath
 		actor = oldActor
@@ -34,12 +36,61 @@ func savePersistentPreRunState(t *testing.T) {
 	})
 
 	serverMode = false
+	proxiedServerMode = false
 	cmdCtx = nil
 	dbPath = ""
 	actor = ""
 	jsonOutput = false
 	readonlyMode = false
 	doltAutoCommit = ""
+}
+
+func TestDoctorPersistentPreRunUsesPositionalTargetMode(t *testing.T) {
+	tests := []struct {
+		name       string
+		callerMode string
+		targetMode string
+	}{
+		{name: "embedded caller proxied target", callerMode: configfile.DoltModeEmbedded, targetMode: configfile.DoltModeProxiedServer},
+		{name: "proxied caller embedded target", callerMode: configfile.DoltModeProxiedServer, targetMode: configfile.DoltModeEmbedded},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			callerRepo := filepath.Join(t.TempDir(), "caller")
+			callerBeadsDir := filepath.Join(callerRepo, ".beads")
+			writeTestConfigYAML(t, callerBeadsDir, "")
+			writeMetadataConfig(t, callerBeadsDir, tt.callerMode, "caller_doctor_target_test")
+
+			targetRepo := filepath.Join(t.TempDir(), "target")
+			targetBeadsDir := filepath.Join(targetRepo, ".beads")
+			writeTestConfigYAML(t, targetBeadsDir, "")
+			writeMetadataConfig(t, targetBeadsDir, tt.targetMode, "target_doctor_target_test")
+
+			t.Chdir(callerRepo)
+			t.Setenv("BEADS_DIR", callerBeadsDir)
+			t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+			t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+			t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+			config.ResetForTesting()
+			t.Cleanup(config.ResetForTesting)
+			savePersistentPreRunState(t)
+
+			if err := rootCmd.PersistentPreRunE(doctorCmd, []string{targetRepo}); err != nil {
+				t.Fatalf("PersistentPreRunE: %v", err)
+			}
+			if got := os.Getenv("BEADS_DIR"); got != targetBeadsDir {
+				t.Fatalf("BEADS_DIR = %q, want positional target %q", got, targetBeadsDir)
+			}
+			wantProxied := tt.targetMode == configfile.DoltModeProxiedServer
+			if got := usesProxiedServer(); got != wantProxied {
+				t.Fatalf("usesProxiedServer() = %v, want %v for target mode %q", got, wantProxied, tt.targetMode)
+			}
+			wantServer := tt.targetMode == configfile.DoltModeServer || wantProxied
+			if got := usesSQLServer(); got != wantServer {
+				t.Fatalf("usesSQLServer() = %v, want %v for target mode %q", got, wantServer, tt.targetMode)
+			}
+		})
+	}
 }
 
 func writeMetadataConfig(t *testing.T, beadsDir string, doltMode string, database string) {

@@ -1,6 +1,10 @@
 package sqlite
 
-import "strings"
+import (
+	"net/url"
+	"path/filepath"
+	"strings"
+)
 
 // dsn builds a modernc.org/sqlite DSN for a database file path. Pragmas:
 //   - foreign_keys(1): FK enforcement (off by default in SQLite).
@@ -41,4 +45,20 @@ func dsn(path string) string {
 		return path
 	}
 	return "file:" + path + "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=case_sensitive_like(1)&_txlock=immediate&_time_format=datetime"
+}
+
+func filesystemDSN(path, mode, journalMode string) string {
+	uri := &url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
+	query := uri.Query()
+	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", "journal_mode("+journalMode+")")
+	query.Add("_pragma", "busy_timeout(5000)")
+	query.Add("_pragma", "case_sensitive_like(1)")
+	query.Set("_txlock", "immediate")
+	query.Set("_time_format", "datetime")
+	if mode != "" {
+		query.Set("mode", mode)
+	}
+	uri.RawQuery = query.Encode()
+	return uri.String()
 }
