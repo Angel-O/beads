@@ -84,11 +84,15 @@ func credentialBeforeConnect(src creds.Source) func(context.Context, *mysql.Conf
 }
 
 // dialTarget extracts the host and port bd is about to dial from the driver Config.
-// For a TCP address (the gateway path) Addr is "host:port"; a unix socket has no host,
-// so the raw Addr is reported with port 0.
+// For a TCP address (the gateway path) Addr is "host:port". A unix socket has no
+// network destination to gate, so it returns an empty host (and port 0): the resolve
+// then injects no BEADS_EXEC_INFO and adds no host cache dimension (dialContext
+// short-circuits on an empty DialHost, so the now-strict CanonicalHost is never asked
+// to canonicalize a socket path), while the token is still stamped and the socket
+// still dialed.
 func dialTarget(c *mysql.Config) (host string, port int) {
 	if c.Net == "unix" {
-		return c.Addr, 0
+		return "", 0
 	}
 	h, p, err := net.SplitHostPort(c.Addr)
 	if err != nil {

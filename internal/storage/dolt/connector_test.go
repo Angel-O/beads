@@ -107,6 +107,25 @@ func TestConnectorHookNoLoopbackExemption(t *testing.T) {
 	}
 }
 
+// A unix-socket dial has no network destination to gate: the hook still resolves and
+// stamps the token, but injects no BEADS_EXEC_INFO and adds no host cache dimension.
+// (Pre-fix, dialTarget reported the raw socket path as the host and the now-strict
+// CanonicalHost rejected the leading slash, aborting the dial.)
+func TestConnectorHookUnixSocketNoExecInfo(t *testing.T) {
+	src, out := canarySource(t, "tok-unix")
+	hook := credentialBeforeConnect(src)
+	c := &mysql.Config{Net: "unix", Addr: "/tmp/dolt.sock", DBName: "bd_prj_x"}
+	if err := hook(context.Background(), c); err != nil {
+		t.Fatalf("unix hook must not error: %v", err)
+	}
+	if c.User != "tok-unix" {
+		t.Fatalf("c.User = %q, want tok-unix (the token is still stamped for the socket dial)", c.User)
+	}
+	if _, _, _, present := readExecInfo(t, out); present {
+		t.Fatal("a unix-socket dial must inject no BEADS_EXEC_INFO")
+	}
+}
+
 // The hook fails closed: a failing helper aborts the dial and leaves the username unset.
 func TestConnectorHookFailsClosed(t *testing.T) {
 	src := creds.CommandSource{Command: "exit 7", Kind: creds.KindIdentity, Label: "X"}
@@ -167,8 +186,8 @@ func TestDialTarget(t *testing.T) {
 	if h, p := dialTarget(&mysql.Config{Net: "tcp", Addr: "gw.example:3306"}); h != "gw.example" || p != 3306 {
 		t.Fatalf("tcp: got %q/%d", h, p)
 	}
-	if h, p := dialTarget(&mysql.Config{Net: "unix", Addr: "/tmp/dolt.sock"}); h != "/tmp/dolt.sock" || p != 0 {
-		t.Fatalf("unix: got %q/%d", h, p)
+	if h, p := dialTarget(&mysql.Config{Net: "unix", Addr: "/tmp/dolt.sock"}); h != "" || p != 0 {
+		t.Fatalf("unix: got %q/%d, want empty host (a socket has no network destination to gate)", h, p)
 	}
 	if h, p := dialTarget(&mysql.Config{Net: "tcp", Addr: "hostonly"}); h != "hostonly" || p != 0 {
 		t.Fatalf("no-port: got %q/%d", h, p)
