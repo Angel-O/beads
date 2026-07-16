@@ -69,6 +69,33 @@ func TestListRejectsV0570ServerWorkspaceBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestListRejectsV0620ServerWorkspaceBeforeMutation(t *testing.T) {
+	bd := buildBDUnderTest(t)
+	repoDir, beadsDir := newV0620ServerWorkspace(t)
+	before := hashBackendPreflightTree(t, beadsDir)
+
+	started := time.Now()
+	stdout, stderr, err := runPrestoreGuardCommand(t, bd, repoDir,
+		"list", "--json", "--limit", "0", "--all")
+	elapsed := time.Since(started)
+	output := stdout + stderr
+
+	if err == nil {
+		t.Errorf("bd list succeeded against a v0.62.0 server workspace; stdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("bd list took %s to refuse the v0.62.0 server workspace, want at most 2s", elapsed)
+	}
+	if !strings.Contains(output, "requires explicit migration") || !strings.Contains(output, "bd 0.62.0") {
+		t.Errorf("bd list did not explain the required v0.62.0 migration; err=%v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+
+	after := hashBackendPreflightTree(t, beadsDir)
+	if before != after {
+		t.Errorf("bd list changed the v0.62.0 workspace before refusing: before=%x after=%x", before, after)
+	}
+}
+
 func TestIncompatibleMetadataStillAllowsStoreFreeCommands(t *testing.T) {
 	bd := buildBDUnderTest(t)
 	tests := []struct {
@@ -225,6 +252,167 @@ func TestLegacyDoltServerGuardAcceptsCurrentWorkspaceShapes(t *testing.T) {
 	}
 }
 
+func TestLegacyDoltServerGuardAcceptsCurrentRemoteServerWorkspace(t *testing.T) {
+	beadsDir := t.TempDir()
+	writeFile(t, filepath.Join(beadsDir, ".local_version"), []byte(Version+"\n"))
+	cfg := &configfile.Config{
+		Database:     "dolt",
+		Backend:      configfile.BackendDolt,
+		DoltMode:     configfile.DoltModeServer,
+		DoltDatabase: "remote_beads",
+		ProjectID:    "current-project-id",
+	}
+
+	if err := refuseLegacyDoltServerWorkspace(beadsDir, cfg); err != nil {
+		t.Fatalf("current remote-server workspace rejected: %v", err)
+	}
+}
+
+func TestLegacyDoltServerGuardAcceptsCurrentRemoteServerWorkspaceWithoutLocalVersion(t *testing.T) {
+	beadsDir := t.TempDir()
+	cfg := &configfile.Config{
+		Database:     "dolt",
+		Backend:      configfile.BackendDolt,
+		DoltMode:     configfile.DoltModeServer,
+		DoltDatabase: "remote_beads",
+		ProjectID:    "current-project-id",
+	}
+
+	if err := refuseLegacyDoltServerWorkspace(beadsDir, cfg); err != nil {
+		t.Fatalf("current remote-server workspace without a local version rejected: %v", err)
+	}
+}
+
+func TestLegacyDoltServerGuardRejectsV0620RemoteServerWorkspace(t *testing.T) {
+	beadsDir := t.TempDir()
+	writeFile(t, filepath.Join(beadsDir, ".local_version"), []byte("0.62.0\n"))
+	cfg := &configfile.Config{
+		Database:     "dolt",
+		Backend:      configfile.BackendDolt,
+		DoltMode:     configfile.DoltModeServer,
+		DoltDatabase: "remote_beads",
+		ProjectID:    "historical-project-id",
+	}
+
+	err := refuseLegacyDoltServerWorkspace(beadsDir, cfg)
+	if err == nil {
+		t.Fatal("v0.62.0 remote-server workspace was accepted without a local Dolt data root")
+	}
+	if !strings.Contains(err.Error(), "bd 0.62.0") || !strings.Contains(err.Error(), "requires explicit migration") {
+		t.Fatalf("v0.62.0 remote-server refusal lacks migration guidance: %v", err)
+	}
+}
+
+func TestLegacyDoltServerGuardRejectsVersionWitnessPathReplacement(t *testing.T) {
+	beadsDir := t.TempDir()
+	versionPath := filepath.Join(beadsDir, ".local_version")
+	replacementPath := filepath.Join(beadsDir, ".local_version.replacement")
+	writeFile(t, versionPath, []byte("0.62.0\n"))
+	writeFile(t, replacementPath, []byte("1.10.0\n"))
+	stableModTime := time.Unix(1_700_000_000, 0)
+	if err := os.Chtimes(versionPath, stableModTime, stableModTime); err != nil {
+		t.Fatalf("set source version witness timestamp: %v", err)
+	}
+	if err := os.Chtimes(replacementPath, stableModTime, stableModTime); err != nil {
+		t.Fatalf("set replacement version witness timestamp: %v", err)
+	}
+	cfg := &configfile.Config{
+		Database:     "dolt",
+		Backend:      configfile.BackendDolt,
+		DoltMode:     configfile.DoltModeServer,
+		DoltDatabase: "remote_beads",
+		ProjectID:    "historical-project-id",
+	}
+
+	err := refuseLegacyDoltServerWorkspaceWithVersionWitnessOpener(beadsDir, cfg, func(path string) (*os.File, error) {
+		opened, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.Rename(replacementPath, versionPath); err != nil {
+			_ = opened.Close()
+			return nil, err
+		}
+		return opened, nil
+	})
+	if err == nil {
+		t.Fatal("project-identity server workspace was accepted after its version witness path was replaced")
+	}
+	if !strings.Contains(err.Error(), "cannot safely classify") ||
+		!strings.Contains(err.Error(), "refusing to open or modify") {
+		t.Fatalf("path-replacement refusal lacks safe recovery guidance: %v", err)
+	}
+}
+
+func TestLegacyDoltServerGuardRejectsVersionWitnessInPlaceRewrite(t *testing.T) {
+	beadsDir := t.TempDir()
+	versionPath := filepath.Join(beadsDir, ".local_version")
+	writeFile(t, versionPath, []byte("0.62.0\n"))
+	cfg := &configfile.Config{
+		Database:     "dolt",
+		Backend:      configfile.BackendDolt,
+		DoltMode:     configfile.DoltModeServer,
+		DoltDatabase: "remote_beads",
+		ProjectID:    "historical-project-id",
+	}
+
+	err := refuseLegacyDoltServerWorkspaceWithVersionWitnessOpener(beadsDir, cfg, func(path string) (*os.File, error) {
+		opened, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(path, []byte("1.10.0\n"), 0o600); err != nil {
+			_ = opened.Close()
+			return nil, err
+		}
+		changed := time.Now().Add(time.Hour)
+		if err := os.Chtimes(path, changed, changed); err != nil {
+			_ = opened.Close()
+			return nil, err
+		}
+		return opened, nil
+	})
+	if err == nil {
+		t.Fatal("project-identity server workspace was accepted after its version witness was rewritten in place")
+	}
+	if !strings.Contains(err.Error(), "cannot safely classify") ||
+		!strings.Contains(err.Error(), "refusing to open or modify") {
+		t.Fatalf("in-place-rewrite refusal lacks safe recovery guidance: %v", err)
+	}
+}
+
+func TestLegacyDoltVersionWitnessBoundaries(t *testing.T) {
+	tests := []struct {
+		version         string
+		legacy          bool
+		projectIdentity bool
+	}{
+		{version: "0.49.9"},
+		{version: "0.50.0", legacy: true},
+		{version: "0.58.99", legacy: true},
+		{version: "0.59.0", legacy: true, projectIdentity: true},
+		{version: "0.62.99", legacy: true, projectIdentity: true},
+		{version: "0.63.0"},
+		{version: "v0.62.0"},
+		{version: "0.62"},
+		{version: "0.62.0-rc.1"},
+		{version: "00.62.0"},
+		{version: "0.062.0"},
+		{version: "0.62.+0"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.version, func(t *testing.T) {
+			if got := isLegacyDoltVersionWitness(test.version); got != test.legacy {
+				t.Errorf("isLegacyDoltVersionWitness(%q) = %v, want %v", test.version, got, test.legacy)
+			}
+			if got := isProjectIdentityLegacyDoltVersionWitness(test.version); got != test.projectIdentity {
+				t.Errorf("isProjectIdentityLegacyDoltVersionWitness(%q) = %v, want %v", test.version, got, test.projectIdentity)
+			}
+		})
+	}
+}
+
 func TestLegacyDoltServerGuardDoesNotTrustMutableVersionMarkers(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -354,6 +542,35 @@ func newV0570ServerWorkspace(t *testing.T) (repoDir, beadsDir string) {
 	writeFile(t, filepath.Join(beadsDir, "dolt", "smoke", ".dolt", "config.json"), []byte("{}\n"))
 	writeFile(t, filepath.Join(beadsDir, "dolt", "smoke", ".dolt", "repo_state.json"), []byte("{\"head\":\"refs/heads/main\"}\n"))
 	writeFile(t, filepath.Join(beadsDir, "dolt", "config.yaml"), []byte("listener:\n  host: 127.0.0.1\n  port: 3307\n"))
+	return repoDir, beadsDir
+}
+
+func newV0620ServerWorkspace(t *testing.T) (repoDir, beadsDir string) {
+	t.Helper()
+	repoDir = newPrestoreGuardRepo(t)
+	beadsDir = filepath.Join(repoDir, ".beads")
+
+	// This is the canonical server metadata written by the official v0.62.0
+	// release. Unlike v0.57.0, it includes a project identity, but it still uses
+	// the external Dolt layout and schema that require an explicit bridge.
+	writeFile(t, filepath.Join(beadsDir, "metadata.json"), []byte(`{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_server_host": "127.0.0.1",
+  "dolt_server_port": 3307,
+  "dolt_database": "smoke",
+  "project_id": "7ef372b4-4c3c-4e2c-a6cc-29dd2d0a28c6"
+}`))
+	writeFile(t, filepath.Join(beadsDir, ".local_version"), []byte("0.62.0\n"))
+	writeFile(t, filepath.Join(beadsDir, "dolt", ".dolt", "config.json"), []byte("{}\n"))
+	writeFile(t, filepath.Join(beadsDir, "dolt", ".dolt", "repo_state.json"), []byte("{\"head\":\"refs/heads/main\"}\n"))
+	writeFile(t, filepath.Join(beadsDir, "dolt", "smoke", ".dolt", "config.json"), []byte("{}\n"))
+	writeFile(t, filepath.Join(beadsDir, "dolt", "smoke", ".dolt", "repo_state.json"), []byte("{\"head\":\"refs/heads/main\"}\n"))
+	writeFile(t, filepath.Join(beadsDir, "dolt", "config.yaml"), []byte("listener:\n  host: 127.0.0.1\n  port: 3307\n"))
+	if err := os.Chmod(beadsDir, 0o700); err != nil {
+		t.Fatalf("chmod v0.62.0 beads directory: %v", err)
+	}
 	return repoDir, beadsDir
 }
 
