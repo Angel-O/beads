@@ -507,6 +507,22 @@ func lockProcessHint() string {
 	return fmt.Sprintf(" Processes %s (bd/dolt) may be holding the lock.", strings.Join(holders, ", "))
 }
 
+// isAuthError reports whether err is a MySQL access-denied (1045) failure — the
+// gateway rejecting a presented credential. On the credential path this is the signal
+// that a cached rotating token was revoked before its recorded expiry. It is
+// deliberately distinct from isConnectionError (a 1045 is not a connection failure and
+// must never trip the circuit breaker).
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) {
+		return myErr.Number == 1045
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "access denied")
+}
+
 // withRetry executes an operation with retry for transient errors.
 // If a circuit breaker is configured, it checks the breaker before each attempt
 // and records connection failures/successes to coordinate fail-fast across processes.
@@ -518,10 +534,26 @@ func (s *DoltStore) withRetry(ctx context.Context, op func() error) error {
 	}
 
 	attempts := 0
+	authRetried := false
 	bo := newServerRetryBackoff()
 	err := backoff.Retry(func() error {
 		attempts++
 		err := op()
+		// A rotating gateway token revoked before its cached expiry surfaces as a
+		// MySQL 1045. Drop the cached token so the retry's fresh dial re-mints via the
+		// connector's BeforeConnect hook. Only on the credential path (a static user
+		// has nothing to refresh), and bounded to exactly one invalidate+retry: bd runs
+		// under a bounded exec timeout, so an unbounded auth-retry loop would convert a
+		// clean 1045 into a timeout kill. A 1045 is not a connection error, so the
+		// circuit breaker is deliberately untouched here.
+		if err != nil && s.credentialSource != nil && isAuthError(err) {
+			if authRetried {
+				return backoff.Permanent(err)
+			}
+			authRetried = true
+			creds.Invalidate(s.credentialSource)
+			return err
+		}
 		if err != nil && isRetryableError(err) {
 			// Record connection-level failures to the circuit breaker
 			if s.breaker != nil && isConnectionError(err) {
@@ -717,10 +749,24 @@ func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 	if s.serverMode {
 		bo.MaxElapsedTime = 15 * time.Second
 	}
+	authRetried := false
 	return backoff.Retry(func() error {
 		err := s.withWriteTx(ctx, fn)
 		if err == nil {
 			return nil
+		}
+		// A 1045 on the write path is a fresh-dial auth rejection (BeginTx dials a new
+		// physical connection), so it is pre-commit and safe to replay. Same bounded
+		// one-shot invalidate+re-mint as withRetry — without it a token rotated mid-life
+		// would fail every write until the store is reopened. Only on the credential
+		// path; bounded to one so a dead credential fails fast under bd's exec timeout.
+		if s.credentialSource != nil && isAuthError(err) {
+			if authRetried {
+				return backoff.Permanent(err)
+			}
+			authRetried = true
+			creds.Invalidate(s.credentialSource)
+			return err
 		}
 		// Serialization failures (1213/1205) guarantee a server-side rollback,
 		// so the write never landed — safe to replay at any phase.
