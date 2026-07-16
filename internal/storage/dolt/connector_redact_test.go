@@ -90,8 +90,8 @@ func TestRedactingConnectorScrubsPerDialTokenAtSource(t *testing.T) {
 
 // The exact-per-dial-token approach is immune to the cache-eviction race that broke the
 // cache-scan redactor: here the cache entry is dropped AFTER the hook stamps the token
-// but BEFORE the 1045 is redacted. RedactKnownTokens would find nothing and leak; the
-// per-dial holder still carries the exact token, so the scrub succeeds.
+// but BEFORE the 1045 is redacted. A cache-scan redactor would find nothing and leak;
+// the per-dial holder still carries the exact token, so the scrub succeeds.
 func TestRedactingConnectorImmuneToCacheEviction(t *testing.T) {
 	const token = "eyJhbGciOiJSUzI1NiJ9.LIVE-evicted-before-redact-abc.sig"
 	src := identitySource(token)

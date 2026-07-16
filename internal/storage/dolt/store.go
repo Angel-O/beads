@@ -583,10 +583,9 @@ func (s *DoltStore) withRetry(ctx context.Context, op func() error) error {
 		// clean 1045 into a timeout kill. A 1045 is not a connection error, so the
 		// circuit breaker is deliberately untouched here.
 		if err != nil && s.credentialSource != nil && isAuthError(err) {
-			// Scrub the presented token out of the message BEFORE invalidating (the
-			// token is still cached at this point, so RedactKnownTokens can find it);
-			// the gateway echoes it as the wire username in a 1045.
-			err = redactCredentialError(err)
+			// The redacting connector already scrubbed the presented token out of this
+			// 1045 at the dial source, so err carries the sentinel, never the token. Drop
+			// the cached token so the retry's fresh dial re-mints via BeforeConnect.
 			if authRetried {
 				return backoff.Permanent(err)
 			}
@@ -801,9 +800,9 @@ func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 		// would fail every write until the store is reopened. Only on the credential
 		// path; bounded to one so a dead credential fails fast under bd's exec timeout.
 		if s.credentialSource != nil && isAuthError(err) {
-			// Scrub the presented token BEFORE invalidating (still cached here); the
-			// 1045 message carries it as the wire username.
-			err = redactCredentialError(err)
+			// The redacting connector already scrubbed the token-echoing 1045 at the dial
+			// source, so err is safe to surface. Drop the cached token so the retry's
+			// fresh BeginTx dial re-mints via BeforeConnect.
 			if authRetried {
 				return backoff.Permanent(err)
 			}
@@ -1615,11 +1614,9 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, er
 	// above would close the *sql.DB we just handed the caller.
 	if cfg.Gateway {
 		if err := db.PingContext(ctx); err != nil {
-			// The connector stamps the minted token as the wire username, so a 1045
-			// from the gateway echoes it. Scrub before surfacing.
-			if cfg.CredentialSource != nil {
-				err = redactCredentialError(err)
-			}
+			// On the credential path the redacting connector already scrubbed any
+			// token-echoing 1045 at the dial source, so this error carries the sentinel,
+			// never the token.
 			return nil, "", fmt.Errorf("failed to connect to gateway server %s:%d (database %q): %w",
 				cfg.ServerHost, cfg.ServerPort, cfg.Database, err)
 		}

@@ -40,22 +40,3 @@ func redactErrorToken(err error, token string) error {
 	}
 	return &redactedError{scrubbed: scrubbed, err: err}
 }
-
-// redactCredentialError scrubs live token material out of err's message before it can
-// surface to stderr, logs, or telemetry. The gateway reads the minted identity token
-// as the wire username, so a 1045 echoes it verbatim ("Access denied for user
-// '<token>'"); this replaces every currently-cached token with a sentinel.
-//
-// If nothing is redacted the original error is returned unchanged, preserving its
-// identity; otherwise the redactedError wrapper keeps errors.As reaching the inner
-// error so isAuthError and the circuit breaker are unaffected. Safe on a nil error.
-func redactCredentialError(err error) error {
-	if err == nil {
-		return nil
-	}
-	scrubbed := creds.RedactKnownTokens(err.Error())
-	if scrubbed == err.Error() {
-		return err
-	}
-	return &redactedError{scrubbed: scrubbed, err: err}
-}

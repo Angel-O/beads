@@ -14,34 +14,17 @@ import (
 	"github.com/steveyegge/beads/internal/creds"
 )
 
-// warmToken caches token for (command, gw.example) in the process-global credential
-// cache via a real one-line shell helper, then returns a CommandSource pinned to that
-// destination. The gateway would echo this exact token as the wire username in a 1045.
-func warmToken(t *testing.T, token string) creds.CommandSource {
-	t.Helper()
-	src := creds.CommandSource{
-		Command:  "printf %s '" + token + "'",
-		Kind:     creds.KindIdentity,
-		DialHost: "gw.example",
-		DialPort: 3306,
-		Database: "db",
-	}
-	if _, err := creds.ResolveForDial(context.Background(), src, "gw.example", 3306, "db"); err != nil {
-		t.Fatalf("warming the credential cache: %v", err)
-	}
-	return src
-}
-
-// redactCredentialError scrubs the token out of the message while preserving the error
-// chain: the fmt-wrapped result reads the sentinel, contains no token, and errors.As
-// still reaches the inner 1045 so isAuthError keeps classifying it.
-func TestRedactCredentialErrorPreservesClassification(t *testing.T) {
+// redactErrorToken scrubs the exact per-dial token out of the message while preserving
+// the error chain: the fmt-wrapped result reads the sentinel, contains no token, and
+// errors.As still reaches the inner 1045 so isAuthError keeps classifying it. A nil error,
+// an empty token, and a token absent from the message all preserve identity.
+func TestRedactErrorTokenPreservesClassification(t *testing.T) {
 	const token = "eyJhbGciOiJSUzI1NiJ9.LIVE-token-classification-xyz.sig"
-	_ = warmToken(t, token)
 
 	inner := &mysql.MySQLError{Number: 1045, Message: "Access denied for user '" + token + "'@'10.0.0.1' (using password: YES)"}
-	// Mirror openServerConnection's gateway-open wrap: redact, then fmt.Errorf(%w).
-	wrapped := fmt.Errorf("failed to connect to gateway server gw.example:3306 (database %q): %w", "db", redactCredentialError(inner))
+	// Mirror openServerConnection's gateway-open wrap: the connector-scrubbed error is
+	// then fmt.Errorf(%w)-wrapped by the caller.
+	wrapped := fmt.Errorf("failed to connect to gateway server gw.example:3306 (database %q): %w", "db", redactErrorToken(inner, token))
 
 	if strings.Contains(wrapped.Error(), token) {
 		t.Fatalf("wrapped error leaked the token: %q", wrapped.Error())
@@ -57,47 +40,41 @@ func TestRedactCredentialErrorPreservesClassification(t *testing.T) {
 		t.Fatal("isAuthError must still classify the scrubbed, wrapped error")
 	}
 
-	if redactCredentialError(nil) != nil {
+	if redactErrorToken(nil, token) != nil {
 		t.Fatal("a nil error must stay nil")
 	}
 	plain := errors.New("connection refused")
-	if got := redactCredentialError(plain); got != plain {
-		t.Fatal("an error with no cached token must be returned unchanged (identity preserved)")
+	if got := redactErrorToken(plain, token); got != plain {
+		t.Fatal("an error without the token must be returned unchanged (identity preserved)")
+	}
+	if got := redactErrorToken(inner, ""); got != inner {
+		t.Fatal("an empty token must return the error unchanged (no needle)")
 	}
 }
 
-// withRetry scrubs the token before the 1045 surfaces. The op models the connector's
-// per-dial BeforeConnect: it re-mints (repopulating the cache the retry invalidated)
-// then returns the gateway's token-echoing 1045. The surfaced error carries the
-// sentinel, never the token, and still classifies as an auth error.
-func TestWithRetry1045RedactsToken(t *testing.T) {
+// withRetry surfaces the connector-scrubbed 1045 without reintroducing token material and
+// while preserving classification through its bounded one-shot invalidate+retry. The op
+// returns what the redacting connector yields — an already-scrubbed 1045 — and the
+// surfaced error still reads the sentinel, never the token, and still classifies.
+func TestWithRetryPreservesConnectorRedaction(t *testing.T) {
 	ctx := context.Background()
 	const token = "eyJhbGciOiJSUzI1NiJ9.LIVE-EIA-do-not-leak-abc.sig"
-	src := warmToken(t, token)
-
+	src := creds.CommandSource{Command: "printf tok", Kind: creds.KindIdentity}
 	s := &DoltStore{credentialSource: src}
-	authErr := &mysql.MySQLError{Number: 1045, Message: "Access denied for user '" + token + "'@'10.0.0.1' (using password: YES)"}
-	op := func() error {
-		// The retry's fresh dial re-mints the (constant) token back into the cache.
-		if _, err := creds.ResolveForDial(ctx, src, "gw.example", 3306, "db"); err != nil {
-			return err
-		}
-		return authErr
-	}
 
-	surfaced := s.withRetry(ctx, op)
+	scrubbed := redactErrorToken(&mysql.MySQLError{Number: 1045, Message: "Access denied for user '" + token + "'@'10.0.0.1' (using password: YES)"}, token)
+	surfaced := s.withRetry(ctx, func() error { return scrubbed })
 	assertRedacted(t, surfaced, token)
 }
 
-// withRetryTx scrubs the token on the write path. A driver whose BeginTx re-mints the
-// token (as the connector would on a fresh dial) and returns a token-echoing 1045
-// proves the surfaced write-path error is scrubbed too.
-func TestWithRetryTx1045RedactsToken(t *testing.T) {
+// withRetryTx surfaces the connector-scrubbed 1045 on the write path. A driver whose
+// BeginTx returns the already-scrubbed error (as the redacting connector would on a fresh
+// dial) proves the write-path retry keeps the scrub and the 1045 classification.
+func TestWithRetryTxPreservesConnectorRedaction(t *testing.T) {
 	ctx := context.Background()
 	const token = "eyJhbGciOiJSUzI1NiJ9.LIVE-EIA-write-leak-def.sig"
-	src := warmToken(t, token)
 
-	drv := &authTokenDriver{src: src, token: token}
+	drv := &authTokenDriver{token: token}
 	name := fmt.Sprintf("authtoken-%s-%p", t.Name(), drv)
 	sql.Register(name, drv)
 	db, err := sql.Open(name, "ignored")
@@ -105,6 +82,7 @@ func TestWithRetryTx1045RedactsToken(t *testing.T) {
 		t.Fatalf("sql.Open(authtoken): %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	src := creds.CommandSource{Command: "printf tok", Kind: creds.KindIdentity}
 	s := &DoltStore{db: db, serverMode: true, credentialSource: src}
 
 	surfaced := s.withRetryTx(ctx, func(*sql.Tx) error { return nil })
@@ -133,27 +111,18 @@ func assertRedacted(t *testing.T, surfaced error, token string) {
 	}
 }
 
-// authTokenDriver fails BeginTx with a token-echoing 1045. Each BeginTx first re-mints
-// the token into the credential cache (mirroring the connector's per-dial resolve on a
-// fresh dial) so redaction at the surface point has the token available.
-type authTokenDriver struct {
-	src   creds.CommandSource
-	token string
-}
+// authTokenDriver fails BeginTx with the connector-scrubbed token-echoing 1045 — the
+// exact error shape the redacting connector produces on a fresh write-path dial.
+type authTokenDriver struct{ token string }
 
 func (d *authTokenDriver) Open(string) (driver.Conn, error) { return &authTokenConn{drv: d}, nil }
 
 type authTokenConn struct{ drv *authTokenDriver }
 
-func (c *authTokenConn) Prepare(string) (driver.Stmt, error) {
-	return nil, c.drv.err()
-}
-func (c *authTokenConn) Close() error { return nil }
-func (c *authTokenConn) Begin() (driver.Tx, error) {
-	// Re-mint the constant token back into the cache, as a real fresh dial would.
-	_, _ = creds.ResolveForDial(context.Background(), c.drv.src, "gw.example", 3306, "db")
-	return nil, c.drv.err()
-}
+func (c *authTokenConn) Prepare(string) (driver.Stmt, error) { return nil, c.drv.err() }
+func (c *authTokenConn) Close() error                        { return nil }
+func (c *authTokenConn) Begin() (driver.Tx, error)           { return nil, c.drv.err() }
 func (d *authTokenDriver) err() error {
-	return &mysql.MySQLError{Number: 1045, Message: "Access denied for user '" + d.token + "'@'10.0.0.1'"}
+	raw := &mysql.MySQLError{Number: 1045, Message: "Access denied for user '" + d.token + "'@'10.0.0.1'"}
+	return redactErrorToken(raw, d.token)
 }
