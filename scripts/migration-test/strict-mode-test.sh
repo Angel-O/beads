@@ -53,11 +53,15 @@ sha=$(strict_release_sha256 v0.62.0 linux amd64) || fail "missing v0.62.0 releas
 [ "$sha" = "4cca7265b22e5c3ca8d62ab0b9752bec31f68b7f5fa636282a4c7e5454c35535" ] ||
     fail "unexpected v0.62.0 release checksum"
 [ "$(strict_expected_status v0.62.0)" = "MANUAL" ] || fail "unexpected v0.62.0 status"
-[ "$(strict_expected_recipe v0.62.0)" = "server_to_embedded" ] || fail "unexpected v0.62.0 recipe"
+[ "$(strict_expected_recipe v0.62.0)" = "public_v062_bridge" ] ||
+    fail "unexpected v0.62.0 recipe"
 [ "$(strict_expected_features v0.62.0)" = "epic task bug dependency standalone closed label comment" ] ||
     fail "unexpected v0.62.0 source features"
-[ "$(server_bridge_strategy v0.62.0)" = "native_export_show_comments" ] ||
-    fail "unexpected v0.62.0 bridge strategy"
+[[ ${SERVER_BRIDGE_STRATEGIES["v0.62.0"]+present} != present ]] ||
+    fail "v0.62.0 remained in the private server bridge strategy map"
+if server_bridge_strategy v0.62.0 >/dev/null 2>&1; then
+    fail "v0.62.0 unexpectedly selected a private server bridge strategy"
+fi
 [ "$(server_bootstrap_strategy v0.62.0)" = "prestarted_server" ] ||
     fail "unexpected v0.62.0 server bootstrap strategy"
 [ "$(strict_required_dolt_version v0.62.0)" = "1.84.0" ] ||
@@ -98,6 +102,123 @@ done
 tmp=$(mktemp -d)
 guard_server_pid=""
 trap '[ -z "${guard_server_pid:-}" ] || kill -9 -- "$guard_server_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+
+server_recipe_route=$(awk '
+    /# Step 5: Direct upgrade failed/ { in_recipe_section = 1 }
+    in_recipe_section && /^[[:space:]]*case "\$era" in$/ { in_era_case = 1 }
+    in_era_case && /^[[:space:]]*dolt_server\)$/ { in_server_route = 1 }
+    in_server_route {
+        print
+        if ($0 ~ /^[[:space:]]*;;[[:space:]]*$/) exit
+    }
+' "$SCRIPT_DIR/run.sh")
+[ -n "$server_recipe_route" ] || fail "could not locate the Dolt-server recipe route"
+public_v062_route=$(awk '
+    /if \[ "\$version" = "v0\.62\.0" \]; then/ { in_public_route = 1 }
+    in_public_route && /^[[:space:]]*elif recipe_server_to_embedded/ { exit }
+    in_public_route { print }
+' <<< "$server_recipe_route")
+grep -Fq 'run_public_v062_bridge' \
+    <<< "$public_v062_route" || fail "v0.62.0 did not route through the public bridge"
+grep -Fq '"$source_identity_json"' <<< "$public_v062_route" ||
+    fail "v0.62.0 public bridge route omitted authenticated source identity"
+grep -Fq 'recipe_name="public_v062_bridge"' <<< "$public_v062_route" ||
+    fail "v0.62.0 did not report the public bridge recipe"
+if grep -Fq 'recipe_server_to_embedded' <<< "$public_v062_route"; then
+    fail "v0.62.0 public route retained a private server bridge fallback"
+fi
+grep -Fq 'elif recipe_server_to_embedded' <<< "$server_recipe_route" ||
+    fail "legacy Dolt-server versions lost the private v0.55/v0.57 recipe route"
+
+public_route_root="$tmp/public-route-project"
+public_route_bin_dir="$tmp/public-route-bin"
+public_route_bridge="$public_route_root/scripts/migrate-v062-server-to-current.sh"
+public_route_source_bd="$tmp/public-route-source-bd"
+public_route_target_bd="$tmp/public-route-target-bd"
+public_route_dolt="$public_route_bin_dir/dolt"
+public_route_ws="$tmp/public-route-workspace"
+public_route_calls="$tmp/public-route.calls"
+public_route_private_calls="$tmp/public-route-private.calls"
+public_route_plan=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+public_route_identity='{"issue_prefix":"legacy","database":"smoke","project_id":"7ef372b4-4c3c-4e2c-a6cc-29dd2d0a28c6"}'
+mkdir -p "$public_route_root/scripts" "$public_route_bin_dir" "$public_route_ws"
+cat > "$public_route_bridge" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+{
+    for arg in "$@"; do
+        printf '<%s>' "$arg"
+    done
+    printf '\n'
+} >> "${PUBLIC_ROUTE_CALLS:?}"
+case "${1:-}" in
+    --inspect)
+        printf '{"schema_version":1,"operation":"v062_server_to_current","mode":"inspect","status":"planned","effect":"none","source":{"database":"smoke","project_id":"7ef372b4-4c3c-4e2c-a6cc-29dd2d0a28c6"},"plan":{"digest":"%s","source_identity":{"issue_prefix":"legacy","database":"smoke","project_id":"7ef372b4-4c3c-4e2c-a6cc-29dd2d0a28c6"}}}\n' \
+            "${PUBLIC_ROUTE_PLAN:?}"
+        ;;
+    --apply)
+        args=("$@")
+        expected_plan=""
+        for ((i = 0; i < ${#args[@]}; i++)); do
+            if [ "${args[$i]}" = "--expect-plan" ] && [ $((i + 1)) -lt ${#args[@]} ]; then
+                expected_plan="${args[$((i + 1))]}"
+            fi
+        done
+        [ -n "$expected_plan" ] || exit 2
+        apply_count=$(grep -c '^<--apply>' "${PUBLIC_ROUTE_CALLS:?}")
+        if [ "$apply_count" -eq 1 ]; then
+            printf '{"schema_version":1,"operation":"v062_server_to_current","mode":"apply","status":"succeeded","effect":"workspace_migrated","plan":{"digest":"%s","source_identity":{"issue_prefix":"legacy","database":"smoke","project_id":"7ef372b4-4c3c-4e2c-a6cc-29dd2d0a28c6"}},"target":{"backend":"dolt-embedded"}}\n' \
+                "$expected_plan"
+        else
+            printf '{"schema_version":1,"operation":"v062_server_to_current","mode":"apply","status":"succeeded","effect":"none","no_op":true,"plan":{"digest":"%s","source_identity":{"issue_prefix":"legacy","database":"smoke","project_id":"7ef372b4-4c3c-4e2c-a6cc-29dd2d0a28c6"}},"target":{"backend":"dolt-embedded"},"verification":{"separate_process_reopen":true}}\n' \
+                "$expected_plan"
+        fi
+        ;;
+    *) exit 2 ;;
+esac
+EOF
+printf '%s\n' '#!/bin/bash' 'exit 0' > "$public_route_source_bd"
+printf '%s\n' '#!/bin/bash' 'exit 0' > "$public_route_target_bd"
+printf '%s\n' '#!/bin/bash' 'exit 0' > "$public_route_dolt"
+chmod +x \
+    "$public_route_bridge" "$public_route_source_bd" \
+    "$public_route_target_bd" "$public_route_dolt"
+if [[ "$public_route_source_bd" != /* ]] || [[ "$public_route_dolt" != /* ]]; then
+    fail "public-route probe binaries were not absolute"
+fi
+if ! PATH="$public_route_bin_dir:$PATH" \
+    PUBLIC_ROUTE_CALLS="$public_route_calls" \
+    PUBLIC_ROUTE_PLAN="$public_route_plan" \
+    bash -c '
+    set -euo pipefail
+    export MIGRATION_TEST_RUN_LIBRARY_ONLY=1
+    source "$1"
+    PROJECT_ROOT="$2"
+    private_calls="$3"
+    recipe_server_to_embedded() {
+        printf "private fallback\n" >> "$private_calls"
+        return 1
+    }
+    run_public_v062_bridge "$4" "$5" "$6" "$7"
+' public-route-probe "$SCRIPT_DIR/run.sh" "$public_route_root" \
+        "$public_route_private_calls" "$public_route_ws" \
+        "$public_route_source_bd" "$public_route_target_bd" \
+        "$public_route_identity"; then
+    fail "run.sh public v0.62.0 inspect/apply route failed"
+fi
+[ ! -e "$public_route_private_calls" ] ||
+    fail "run.sh public v0.62.0 route invoked the private recipe fallback"
+mapfile -t public_route_argv < "$public_route_calls"
+[ "${#public_route_argv[@]}" -eq 3 ] ||
+    fail "public v0.62.0 route did not make one inspect and two apply calls"
+expected_public_inspect="<--inspect><--source-bd><$public_route_source_bd><--source-dolt><$public_route_dolt><--workspace><$public_route_ws><--target-bd><$public_route_target_bd><--json>"
+expected_public_apply="<--apply><--yes><--expect-plan><$public_route_plan><--source-bd><$public_route_source_bd><--source-dolt><$public_route_dolt><--workspace><$public_route_ws><--target-bd><$public_route_target_bd><--json>"
+[ "${public_route_argv[0]}" = "$expected_public_inspect" ] ||
+    fail "public v0.62.0 inspect did not receive exact absolute source inputs"
+[ "${public_route_argv[1]}" = "$expected_public_apply" ] ||
+    fail "public v0.62.0 apply was not bound to the exact value-bearing inspect plan"
+[ "${public_route_argv[2]}" = "$expected_public_apply" ] ||
+    fail "public v0.62.0 no-op did not repeat the exact value-bearing inspect plan"
 
 unsafe_cleanup_calls="$tmp/unsafe-cleanup.calls"
 if (
@@ -1482,44 +1603,48 @@ fi
 [ ! -e "$stop_refusal_ws/.beads/legacy-dolt.pre-migration" ] ||
     fail "server-stop verification failure created a rollback tree"
 
-restart_refusal_ws="$tmp/restart-refusal-workspace"
-restart_refusal_calls="$tmp/restart-refusal.calls"
-restart_refusal_binary_calls="$tmp/restart-refusal-binary.calls"
-mkdir -p "$restart_refusal_ws/.beads/dolt"
-printf 'active restart-refusal data' > "$restart_refusal_ws/.beads/dolt/table.dat"
-printf 'active restart-refusal metadata' > "$restart_refusal_ws/.beads/metadata.json"
-restart_refusal_manifest=$(legacy_dolt_artifact_manifest "$restart_refusal_ws/.beads")
-export LEGACY_RACE_CALLS="$restart_refusal_binary_calls"
-: > "$restart_refusal_calls"
-: > "$restart_refusal_binary_calls"
-if (
-    stop_dolt_server() { :; }
+private_v062_ws="$tmp/private-v062-refusal-workspace"
+private_v062_effect_calls="$tmp/private-v062-refusal.effects"
+private_v062_binary_calls="$tmp/private-v062-refusal.binaries"
+mkdir -p "$private_v062_ws/.beads/dolt"
+printf 'active private-route data' > "$private_v062_ws/.beads/dolt/table.dat"
+printf 'active private-route metadata' > "$private_v062_ws/.beads/metadata.json"
+private_v062_fingerprint=$(source_artifact_fingerprint "$private_v062_ws/.beads")
+export LEGACY_RACE_CALLS="$private_v062_binary_calls"
+: > "$private_v062_effect_calls"
+: > "$private_v062_binary_calls"
+private_v062_output=""
+if private_v062_output=$(
+    stop_dolt_server() { printf 'stop\n' >> "$private_v062_effect_calls"; }
     start_owned_migration_dolt_server() {
-        printf '%s\n' "$1" >> "$restart_refusal_calls"
-        return 1
+        printf 'start\n' >> "$private_v062_effect_calls"
+    }
+    preserve_legacy_dolt_source() {
+        printf 'preserve\n' >> "$private_v062_effect_calls"
     }
     recipe_server_to_embedded \
-        "$restart_refusal_ws" "$legacy_race_old_bin" "$legacy_race_candidate_bin" \
+        "$private_v062_ws" "$legacy_race_old_bin" "$legacy_race_candidate_bin" \
         v0.62.0 "$legacy_race_before"
-) >/dev/null 2>&1; then
-    fail "v0.62.0 server bridge continued after owned-server restart failed"
+); then
+    fail "private server-to-embedded recipe accepted v0.62.0"
 fi
-[ "$(cat "$restart_refusal_calls")" = "$restart_refusal_ws" ] ||
-    fail "v0.62.0 server bridge did not attempt exactly one owned-server restart"
-[ ! -s "$restart_refusal_binary_calls" ] ||
-    fail "owned-server restart failure invoked a historical or candidate binary"
-[ "$(legacy_dolt_artifact_manifest "$restart_refusal_ws/.beads")" = \
-    "$restart_refusal_manifest" ] ||
-    fail "owned-server restart failure mutated the active historical source"
-verify_retained_legacy_dolt_source \
-    "$restart_refusal_ws/.beads" "$restart_refusal_manifest" ||
-    fail "owned-server restart failure did not retain an exact rollback source"
+grep -Fq 'v0.62.0 must use the public migration bridge' <<< "$private_v062_output" ||
+    fail "private server-to-embedded recipe did not explain the v0.62.0 refusal"
+[ ! -s "$private_v062_effect_calls" ] ||
+    fail "private v0.62.0 recipe refusal reached a migration effect"
+[ ! -s "$private_v062_binary_calls" ] ||
+    fail "private v0.62.0 recipe refusal invoked a historical or candidate binary"
+[ "$(source_artifact_fingerprint "$private_v062_ws/.beads")" = \
+    "$private_v062_fingerprint" ] ||
+    fail "private v0.62.0 recipe refusal mutated the historical source"
+[ ! -e "$private_v062_ws/.beads/legacy-dolt.pre-migration" ] ||
+    fail "private v0.62.0 recipe refusal created a rollback tree"
 
 [ "$(server_bridge_strategy v0.55.4)" = "native_export" ] ||
     fail "v0.55.4 did not select its pinned server bridge strategy"
 [ "$(server_bridge_strategy v0.57.0)" = "native_export_show_comments" ] ||
     fail "v0.57.0 did not select its lossless export+show server bridge strategy"
-for unsupported_version in v0.56.1 v0.58.0 v9.9.9; do
+for unsupported_version in v0.56.1 v0.58.0 v0.62.0 v9.9.9; do
     if server_bridge_strategy "$unsupported_version" >/dev/null 2>&1; then
         fail "$unsupported_version unexpectedly selected a server bridge strategy"
     fi

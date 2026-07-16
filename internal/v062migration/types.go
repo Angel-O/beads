@@ -35,6 +35,7 @@ const (
 	CodeSourceMetadataMissing     Code = "source_metadata_missing"
 	CodeSourceMetadataMismatch    Code = "source_metadata_mismatch"
 	CodeSourceLayoutMissing       Code = "source_layout_missing"
+	CodeSourceRoutingUnsupported  Code = "source_routing_unsupported"
 	CodeUnsafeSourceSymlink       Code = "unsafe_source_symlink"
 	CodeUnsafeSourceHardlink      Code = "unsafe_source_hardlink"
 	CodeUnsafeSourceObject        Code = "unsafe_source_object"
@@ -62,6 +63,8 @@ type Source struct {
 	Workspace string `json:"workspace"`
 	Version   string `json:"version"`
 	Backend   string `json:"backend"`
+	Database  string `json:"database"`
+	ProjectID string `json:"project_id"`
 	// TreeSHA256 is admission evidence with the lifetime explicitly bounded
 	// by DigestScope; it must never authorize a later effectful operation.
 	TreeSHA256 string `json:"tree_sha256"`
@@ -108,7 +111,7 @@ func refuse(code Code, retryable bool, cause error) error {
 	return &Refusal{Code: code, Retryable: retryable, Effect: EffectNone, cause: cause}
 }
 
-func QualifiedResult(workspace, targetVersion, treeSHA256 string) Result {
+func QualifiedResult(workspace, targetVersion, database, projectID, treeSHA256 string) Result {
 	return Result{
 		SchemaVersion: SchemaVersion,
 		Operation:     Operation,
@@ -119,6 +122,8 @@ func QualifiedResult(workspace, targetVersion, treeSHA256 string) Result {
 			Workspace:   workspace,
 			Version:     "0.62.0",
 			Backend:     "dolt-server",
+			Database:    database,
+			ProjectID:   projectID,
 			TreeSHA256:  treeSHA256,
 			DigestScope: DigestScopeAdmissionObservation,
 		},

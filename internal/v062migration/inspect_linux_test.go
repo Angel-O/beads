@@ -34,6 +34,12 @@ func TestInspectQualifiesExactV062ServerTreeWithoutMutation(t *testing.T) {
 	if result.Source.Workspace != project || result.Source.Version != "0.62.0" || result.Source.Backend != "dolt-server" {
 		t.Fatalf("unexpected source: %#v", result.Source)
 	}
+	if result.Source.Database != "smoke" {
+		t.Fatalf("source database = %q, want %q", result.Source.Database, "smoke")
+	}
+	if result.Source.ProjectID != "7ef372b4-4c3c-4e2c-a6cc-29dd2d0a28c6" {
+		t.Fatalf("source project ID = %q", result.Source.ProjectID)
+	}
 	if result.Source.DigestScope != DigestScopeAdmissionObservation {
 		t.Fatalf("digest scope = %q, want %q", result.Source.DigestScope, DigestScopeAdmissionObservation)
 	}
@@ -270,6 +276,22 @@ func TestInspectRefusesUnsafeAndMixedSourceShapes(t *testing.T) {
 				if err := os.Mkdir(filepath.Join(project, ".beads", "embeddeddolt"), 0o700); err != nil {
 					t.Fatal(err)
 				}
+			},
+		},
+		{
+			name: "project env routing override",
+			want: Code("source_routing_unsupported"),
+			edit: func(t *testing.T, project string) {
+				t.Helper()
+				mustWrite(t, filepath.Join(project, ".beads", ".env"), "BEADS_DOLT_SERVER_HOST=poison.invalid\n")
+			},
+		},
+		{
+			name: "project redirect routing override",
+			want: Code("source_routing_unsupported"),
+			edit: func(t *testing.T, project string) {
+				t.Helper()
+				mustWrite(t, filepath.Join(project, ".beads", "redirect"), "../other/.beads\n")
 			},
 		},
 		{

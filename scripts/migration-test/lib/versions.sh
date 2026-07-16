@@ -66,7 +66,7 @@ declare -Ar STRICT_EXPECTED_RECIPES=(
     ["v0.49.6"]="sqlite_to_current"
     ["v0.55.4"]="server_to_embedded"
     ["v0.57.0"]="server_to_embedded"
-    ["v0.62.0"]="server_to_embedded"
+    ["v0.62.0"]="public_v062_bridge"
     ["v0.63.3"]=""
 )
 declare -Ar STRICT_EXPECTED_FEATURES=(
@@ -79,7 +79,6 @@ declare -Ar STRICT_EXPECTED_FEATURES=(
 declare -Ar SERVER_BRIDGE_STRATEGIES=(
     ["v0.55.4"]="native_export"
     ["v0.57.0"]="native_export_show_comments"
-    ["v0.62.0"]="native_export_show_comments"
 )
 declare -Ar SERVER_BOOTSTRAP_STRATEGIES=(
     ["v0.62.0"]="prestarted_server"

@@ -3,10 +3,9 @@
 #
 # Each server-era release needs an explicit extraction strategy. v0.55.4 has
 # a lossless native export for the qualified fixture. v0.57.0 needs its native
-# export enriched with comment bodies from one-item show queries. v0.62.0 uses
-# the same bridge after normalizing the three derived epic counters that its
-# show command adds but its export command omits. v0.56.1 and v0.58.0 remain
-# unqualified.
+# export enriched with comment bodies from one-item show queries. v0.56.1 and
+# v0.58.0 remain unqualified. v0.62.0 must use the public bridge instead of
+# this harness-private recipe.
 #
 # Strategy:
 #   1. Stop any running Dolt server
@@ -15,10 +14,9 @@
 #   4. If candidate DB is empty, reimport from JSONL export
 #
 # User-facing instructions:
-#   Use the pinned migration harness for qualified v0.55.4, v0.57.0, and
-#   v0.62.0 core fixtures. It stops the historical server, retains a
-#   byte-verified rollback tree, extracts and validates JSONL, and only then
-#   initializes the candidate.
+#   Use the pinned migration harness for qualified v0.55.4 and v0.57.0 core
+#   fixtures. It stops the historical server, retains a byte-verified rollback
+#   tree, extracts and validates JSONL, and only then initializes the candidate.
 
 publish_legacy_dolt_rollback() {
     mv --no-target-directory --no-clobber --no-copy -- "$1" "$2"
@@ -387,6 +385,11 @@ recipe_server_to_embedded() {
     local export_path="$ws/.beads/issues.jsonl"
     local existing_export_state="absent"
     local existing_export_checksum=""
+
+    if [ "$version" = "v0.62.0" ]; then
+        echo "  FAILED: v0.62.0 must use the public migration bridge"
+        return 1
+    fi
 
     echo "  Trying server→embedded recipe..."
     strategy=$(server_bridge_strategy "$version") || {

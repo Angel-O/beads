@@ -56,7 +56,8 @@ var (
 )
 
 type metadataShape struct {
-	database string
+	database  string
+	projectID string
 }
 
 type treeSnapshot struct {
@@ -164,7 +165,7 @@ func inspectWithHooks(project, targetVersion string, hooks inspectHooks) (result
 		return Result{}, err
 	}
 
-	return QualifiedResult(project, targetVersion, first.treeSHA256), nil
+	return QualifiedResult(project, targetVersion, shape.database, shape.projectID, first.treeSHA256), nil
 }
 
 // checkInspectPreconditions rejects environments and workspace arguments that
@@ -475,46 +476,48 @@ func parseMetadata(data []byte) (metadataShape, error) {
 	if err != nil {
 		return metadataShape{}, err
 	}
-	database, err := requiredMetadataShape(values)
+	database, projectID, err := requiredMetadataShape(values)
 	if err != nil {
 		return metadataShape{}, err
 	}
 	if err := rejectDisallowedMetadataFields(values); err != nil {
 		return metadataShape{}, err
 	}
-	return metadataShape{database: database}, nil
+	return metadataShape{database: database, projectID: projectID}, nil
 }
 
 // requiredMetadataShape enforces the exact scalar contract of a v0.62 local
-// Dolt-server metadata document and returns the validated dolt database name.
-func requiredMetadataShape(values map[string]json.RawMessage) (string, error) {
+// Dolt-server metadata document and returns the validated dolt database name
+// and project id.
+func requiredMetadataShape(values map[string]json.RawMessage) (string, string, error) {
 	for _, field := range []struct{ key, want string }{
 		{"backend", "dolt"},
 		{"database", "dolt"},
 		{"dolt_mode", "server"},
 	} {
 		if got, ok := requiredString(values, field.key); !ok || got != field.want {
-			return "", errors.New(field.key)
+			return "", "", errors.New(field.key)
 		}
 	}
 	if _, present := values["dolt_server_host"]; present {
 		if host, ok := requiredString(values, "dolt_server_host"); !ok || host != "127.0.0.1" {
-			return "", errors.New("dolt_server_host")
+			return "", "", errors.New("dolt_server_host")
 		}
 	}
 	database, ok := requiredString(values, "dolt_database")
 	if !ok || !databaseNamePattern.MatchString(database) {
-		return "", errors.New("dolt_database")
+		return "", "", errors.New("dolt_database")
 	}
-	if projectID, ok := requiredString(values, "project_id"); !ok || !projectIDPattern.MatchString(projectID) {
-		return "", errors.New("project_id")
+	projectID, ok := requiredString(values, "project_id")
+	if !ok || !projectIDPattern.MatchString(projectID) {
+		return "", "", errors.New("project_id")
 	}
 	if _, present := values["dolt_server_port"]; present {
 		if port, ok := requiredInteger(values, "dolt_server_port"); !ok || port < 1 || port > 65535 {
-			return "", errors.New("dolt_server_port")
+			return "", "", errors.New("dolt_server_port")
 		}
 	}
-	return database, nil
+	return database, projectID, nil
 }
 
 // rejectDisallowedMetadataFields fails closed on any field outside the allowed
@@ -796,6 +799,11 @@ func checkDevice(actual, expected uint64) error {
 }
 
 func validateRequiredLayout(kinds map[string]byte, database string) error {
+	for _, routingArtifact := range []string{".env", "redirect"} {
+		if _, exists := kinds[routingArtifact]; exists {
+			return refuse(CodeSourceRoutingUnsupported, false, nil)
+		}
+	}
 	for _, mixed := range []string{"embeddeddolt", "beads.db", "proxieddb", "sqlite.db"} {
 		if _, exists := kinds[mixed]; exists {
 			return refuse(CodeMixedStorageLayout, false, nil)
