@@ -143,7 +143,7 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 			// non-assignee reason (status changed underneath us): report the
 			// status rather than a misleading held-by-someone refusal.
 			if slices.Contains(pools, assignee) {
-				return nil, fmt.Errorf("%w: status %s", storage.ErrNotClaimable, currentStatus)
+				return nil, fmt.Errorf("%w%s%s", storage.ErrNotClaimable, storage.NotClaimableStatusFragment, currentStatus)
 			}
 			if currentStatus == types.StatusOpen {
 				// Do not name a release command here — not `bd unclaim`, not
@@ -154,9 +154,9 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 				// whose lease has already expired.
 				return nil, fmt.Errorf("issue already assigned to %q — coordinate with the holder; if their claim is abandoned (crashed agent), lease expiry will surface it for bd reclaim", assignee)
 			}
-			return nil, fmt.Errorf("%w by %s", storage.ErrAlreadyClaimed, assignee)
+			return nil, fmt.Errorf("%w%s%s", storage.ErrAlreadyClaimed, storage.ClaimedByFragment, assignee)
 		}
-		return nil, fmt.Errorf("%w: status %s", storage.ErrNotClaimable, currentStatus)
+		return nil, fmt.Errorf("%w%s%s", storage.ErrNotClaimable, storage.NotClaimableStatusFragment, currentStatus)
 	}
 
 	// Grant the lease: what makes the claim recoverable — a worker that dies
