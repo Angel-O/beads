@@ -88,6 +88,55 @@ type RemoteStore = storage.RemoteStore
 // SyncStore provides high-level sync operations with peers.
 type SyncStore = storage.SyncStore
 
+// DependencyQueryStore provides extended dependency queries beyond the base
+// Storage interface (raw source-keyed and target-keyed dependency records,
+// blocking info, counts). Type-assert a Storage value to reach it:
+//
+//	if dq, ok := store.(beads.DependencyQueryStore); ok {
+//	    rows, err := dq.GetDependentRecords(ctx, targetID, "", 100, "")
+//	}
+type DependencyQueryStore = storage.DependencyQueryStore
+
+// EventQueryStore provides keyset paging over the durable event log
+// (EventsSince). Type-assert a Storage value to reach it.
+type EventQueryStore = storage.EventQueryStore
+
+// EventCursor is a keyset position in the durable events stream, ordered by
+// (created_at, id). The zero value means "from the beginning".
+type EventCursor = storage.EventCursor
+
+// ErrCircuitOpen is re-exported (aliased, so errors.Is works across the package
+// boundary) from the Dolt storage layer: a read or write rejected because the
+// Dolt circuit breaker is open wraps it. The claim sentinels ErrAlreadyClaimed
+// and ErrNotClaimable — the ones ParseClaimConflict recovers assignee/status
+// detail from — are re-exported with the other error sentinels below.
+var (
+	ErrCircuitOpen = dolt.ErrCircuitOpen
+)
+
+// IssueClaimer is the atomic-claim surface of a Storage. ClaimIssue and
+// ClaimReadyIssue live on the storage.BulkIssueStore extension rather than the
+// base Storage interface, so callers reach them by type-assertion via
+// AsIssueClaimer rather than off the Storage value directly.
+type IssueClaimer interface {
+	// ClaimIssue atomically claims id for actor using compare-and-swap
+	// semantics (open ∧ unassigned-or-same-actor). Returns a wrapped
+	// ErrAlreadyClaimed or ErrNotClaimable on conflict.
+	ClaimIssue(ctx context.Context, id string, actor string) error
+	// ClaimReadyIssue atomically claims the first ready issue matching filter,
+	// or returns (nil, nil) when none is claimable.
+	ClaimReadyIssue(ctx context.Context, filter WorkFilter, actor string) (*Issue, error)
+}
+
+// AsIssueClaimer returns the IssueClaimer view of s when the backing store
+// supports atomic claim (Dolt-backed stores do), and (nil, false) otherwise.
+// Assert once at startup and fail loud: a Storage decorator that does not
+// forward the claim surface makes this return false.
+func AsIssueClaimer(s Storage) (IssueClaimer, bool) {
+	c, ok := s.(IssueClaimer)
+	return c, ok
+}
+
 // VersionControlReader provides read-only version control operations.
 // Write operations (Branch, Checkout, Merge, DeleteBranch) are not yet
 // part of the public API. If you need them, please open an issue.
@@ -216,6 +265,7 @@ const (
 const (
 	EventCreated           = types.EventCreated
 	EventUpdated           = types.EventUpdated
+	EventClaimed           = types.EventClaimed
 	EventStatusChanged     = types.EventStatusChanged
 	EventCommented         = types.EventCommented
 	EventClosed            = types.EventClosed
