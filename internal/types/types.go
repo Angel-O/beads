@@ -1066,6 +1066,7 @@ type EventType string
 const (
 	EventCreated           EventType = "created"
 	EventUpdated           EventType = "updated"
+	EventClaimed           EventType = "claimed"
 	EventStatusChanged     EventType = "status_changed"
 	EventCommented         EventType = "commented"
 	EventClosed            EventType = "closed"
