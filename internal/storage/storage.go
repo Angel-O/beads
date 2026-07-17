@@ -339,6 +339,7 @@ type DoltStorage interface {
 	FederationStore
 	BulkIssueStore
 	DependencyQueryStore
+	EventQueryStore
 	AnnotationStore
 	ConfigMetadataStore
 	CompactionStore
