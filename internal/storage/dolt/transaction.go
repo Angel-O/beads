@@ -23,6 +23,16 @@ type doltTransaction struct {
 	ignoredTx *sql.Tx
 	store     *DoltStore
 	dirty     versioncontrolops.DirtyTableTracker
+
+	// wroteRegularDep/wroteWispDep record whether a dependency row has been
+	// written to each tier during this logical transaction. Regular and wisp
+	// dependency tables live on separate SQL sessions, so a single-session
+	// cycle check cannot see the other session's uncommitted edges; these flags
+	// let AddDependencyWithOptions fall back to the merged two-session cycle
+	// check once both tiers are in play. The DirtyTableTracker cannot serve this
+	// role: it deliberately drops wisp_* tables because they are dolt-ignored.
+	wroteRegularDep bool
+	wroteWispDep    bool
 }
 
 func (t *doltTransaction) txFor(table string) *sql.Tx {
@@ -720,20 +730,29 @@ func (t *doltTransaction) AddDependencyWithOptions(ctx context.Context, dep *typ
 	// target reads on the write tx cannot see a target created earlier in
 	// this same logical transaction (e.g. `bd create --deps blocks:<id>`
 	// swapping the new issue into the target slot). Read the target on its
-	// own tx and hand the row to AddDependencyInTx; check cycles on the
-	// merged two-session graph for the same reason.
-	if kind != issueops.DepTargetExternal && t.txFor(targetTable) != t.txFor(table) {
+	// own tx and hand the row to AddDependencyInTx.
+	crossTierTarget := kind != issueops.DepTargetExternal && t.txFor(targetTable) != t.txFor(table)
+	if crossTierTarget {
 		precheck, err := t.readDepTargetForPrecheck(ctx, targetTable, dep.DependsOnID)
 		if err != nil {
 			return err
 		}
 		opts.PrecheckedTarget = precheck
-		if !addOpts.SkipCycleCheck {
-			if err := t.checkCrossTierSchedulingCycle(ctx, dep); err != nil {
-				return err
-			}
-			opts.SkipCycleCheck = true
+	}
+
+	// The single-session in-tx cycle check only sees its own session's
+	// uncommitted rows. Fall back to the merged two-session check whenever a
+	// scheduling cycle could hide on the other session: either this edge itself
+	// crosses tiers, or a dependency row was already written to the other tier
+	// earlier in this logical transaction. The latter covers a create-time
+	// batch like `blocks:<wisp>,depends-on:<regular>`, where the cross-tier
+	// `blocks` edge is pending on the ignored session and the same-tier
+	// `depends-on` edge would otherwise close the cycle unseen.
+	if !opts.SkipCycleCheck && (crossTierTarget || t.otherDepTierPending(table)) {
+		if err := t.checkCrossTierSchedulingCycle(ctx, dep); err != nil {
+			return err
 		}
+		opts.SkipCycleCheck = true
 	}
 
 	var addErr error
@@ -746,7 +765,32 @@ func (t *doltTransaction) AddDependencyWithOptions(ctx context.Context, dep *typ
 		return addErr
 	}
 	t.dirty.MarkDirty(table)
+	t.recordDepTierWrite(table)
 	return nil
+}
+
+// otherDepTierPending reports whether a dependency row was written to the tier
+// opposite writeTable earlier in this logical transaction. Because the regular
+// and wisp dependency tables run on separate SQL sessions, an in-tx cycle check
+// on writeTable's session cannot see the other session's uncommitted scheduling
+// edges; when the other tier has pending writes the caller must use the merged
+// two-session cycle check instead.
+func (t *doltTransaction) otherDepTierPending(writeTable string) bool {
+	if writeTable == "wisp_dependencies" {
+		return t.wroteRegularDep
+	}
+	return t.wroteWispDep
+}
+
+// recordDepTierWrite notes that a dependency row was written to writeTable's
+// tier so a later same-tier edge on the opposite session can detect that the
+// merged cycle check is required. See otherDepTierPending.
+func (t *doltTransaction) recordDepTierWrite(writeTable string) {
+	if writeTable == "wisp_dependencies" {
+		t.wroteWispDep = true
+		return
+	}
+	t.wroteRegularDep = true
 }
 
 // addWispDepSuspendingIssueTargetFK inserts a wisp-source dependency whose

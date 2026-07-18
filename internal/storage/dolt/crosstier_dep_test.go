@@ -229,3 +229,79 @@ func TestRunInTransactionCrossTierCycleRejected(t *testing.T) {
 		t.Fatalf("regular issue dependency records after rollback = %v (err %v), want none", deps, derr)
 	}
 }
+
+// A scheduling cycle whose CLOSING edge is same-tier must still be rejected when
+// an earlier edge in the same logical transaction is cross-tier and pending on
+// the other session. This is the create-time batch
+// `bd create R --deps blocks:<wisp W>,depends-on:<regular C>` with a committed
+// path C -> W: the `blocks:W` edge (W -> R) is uncommitted on the ignored
+// session, and the same-tier `depends-on:C` edge (R -> C) closes the cycle
+// R -> C -> W -> R. The per-edge cross-tier gate only ran the merged two-session
+// cycle check when the closing edge itself crossed tiers, so a same-tier closing
+// edge saw only the regular session and missed the pending W -> R edge, letting
+// the cycle commit. AddDependencyWithOptions now forces the merged check once
+// both dependency tiers are in play.
+func TestRunInTransactionMixedTierCycleSameTierClosingEdgeRejected(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Committed setup: regular C, wisp W, and the committed scheduling path
+	// C -> W (C depends on W).
+	regularC := crossTierRegularIssue("test-mixed-cycle-regular-c", "committed regular C in mixed-tier cycle")
+	if err := store.CreateIssue(ctx, regularC, "tester"); err != nil {
+		t.Fatalf("CreateIssue regular C: %v", err)
+	}
+	wispW := crossTierWispIssue("test-mixed-cycle-wisp-w", "committed wisp W in mixed-tier cycle")
+	if err := store.CreateIssue(ctx, wispW, "tester"); err != nil {
+		t.Fatalf("CreateIssue wisp W: %v", err)
+	}
+	if err := store.RunInTransaction(ctx, "seed committed C depends-on W", func(tx storage.Transaction) error {
+		return tx.AddDependency(ctx, &types.Dependency{
+			IssueID:     regularC.ID,
+			DependsOnID: wispW.ID,
+			Type:        types.DepBlocks,
+		}, "tester")
+	}); err != nil {
+		t.Fatalf("seed committed C -> W edge: %v", err)
+	}
+
+	// Under-test transaction: create regular R, then add the cross-tier
+	// `blocks:W` edge (W -> R, pending on the ignored session) before the
+	// same-tier `depends-on:C` edge (R -> C) that closes the cycle.
+	regularR := crossTierRegularIssue("test-mixed-cycle-regular-r", "new regular R in mixed-tier cycle")
+	err := store.RunInTransaction(ctx, "create R with blocks:W then depends-on:C", func(tx storage.Transaction) error {
+		if err := tx.CreateIssue(ctx, regularR, "tester"); err != nil {
+			return err
+		}
+		// blocks:W -> W depends-on R: wisp source, regular target (cross-tier,
+		// pending on the ignored session).
+		if err := tx.AddDependency(ctx, &types.Dependency{
+			IssueID:     wispW.ID,
+			DependsOnID: regularR.ID,
+			Type:        types.DepBlocks,
+		}, "tester"); err != nil {
+			return err
+		}
+		// depends-on:C -> R depends-on C: both regular (same-tier closing edge).
+		return tx.AddDependency(ctx, &types.Dependency{
+			IssueID:     regularR.ID,
+			DependsOnID: regularC.ID,
+			Type:        types.DepBlocks,
+		}, "tester")
+	})
+	if err == nil || !strings.Contains(err.Error(), "would create a cycle") {
+		t.Fatalf("RunInTransaction error = %v, want cycle rejection", err)
+	}
+
+	// The under-test transaction must roll back entirely: R never lands and no
+	// edge from it persists.
+	assertIssueCount(ctx, t, store.db, regularR.ID, 0)
+	if deps, derr := store.GetDependencyRecords(ctx, regularR.ID); derr != nil || len(deps) != 0 {
+		t.Fatalf("regular R dependency records after rollback = %v (err %v), want none", deps, derr)
+	}
+	// The committed C -> W edge is untouched by the rolled-back transaction.
+	assertDepEdge(ctx, t, store, regularC.ID, wispW.ID)
+}

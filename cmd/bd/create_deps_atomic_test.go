@@ -12,17 +12,38 @@ package main
 // (--deps, --parent, --waits-for) commit in ONE transaction. Any dep failure
 // fails the command with a nonzero exit and rolls back the create.
 //
-// These tests run the real bd binary against a sqlite-backend workspace (the
-// backend the concurrency audit hammered), so they work in both cgo and
-// pure-Go builds.
+// These tests run the real bd binary against an isolated Dolt-backed
+// workspace. The binary is built with the gms_pure_go embedded-Dolt engine
+// (see buildBDForInitTests), so the tests need no external Dolt server and work
+// in both cgo and pure-Go builds.
 
 import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// createDepsTestEnv returns a hermetic environment for the subprocess bd
+// commands. It strips ambient BEADS_/BD_ configuration so a developer or CI
+// shell pointing at a shared Dolt server (BEADS_DOLT_SERVER_*) or a real
+// workspace (BEADS_DIR) cannot leak in, then pins BEADS_DIR at the isolated
+// per-test workspace and keeps the child non-interactive.
+func createDepsTestEnv(dir string) []string {
+	var env []string
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "BEADS_") || strings.HasPrefix(e, "BD_") {
+			continue
+		}
+		env = append(env, e)
+	}
+	return append(env,
+		"BEADS_DIR="+filepath.Join(dir, ".beads"),
+		"BD_NON_INTERACTIVE=1",
+	)
+}
 
 // runCreateDepsBD runs bd and returns stdout only. Warnings (e.g. the
 // beads.role notice) go to stderr and must never leak into parsed output
@@ -31,7 +52,7 @@ func runCreateDepsBD(t *testing.T, bd, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command(bd, args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "BD_NON_INTERACTIVE=1")
+	cmd.Env = createDepsTestEnv(dir)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -46,7 +67,7 @@ func runCreateDepsBD(t *testing.T, bd, dir string, args ...string) string {
 func runCreateDepsBDRaw(bd, dir string, args ...string) (string, error) {
 	cmd := exec.Command(bd, args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "BD_NON_INTERACTIVE=1")
+	cmd.Env = createDepsTestEnv(dir)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -96,7 +117,7 @@ func createDepsExtractID(t *testing.T, out string) string {
 func TestCreateDepsAtomicity(t *testing.T) {
 	bd := buildBDForInitTests(t)
 	dir := t.TempDir()
-	runCreateDepsBD(t, bd, dir, "init", "--backend", "sqlite", "--prefix", "test",
+	runCreateDepsBD(t, bd, dir, "init", "--backend", "dolt", "--prefix", "test",
 		"--quiet", "--non-interactive", "--skip-hooks", "--skip-agents")
 
 	blocker := strings.TrimSpace(runCreateDepsBD(t, bd, dir, "create", "existing blocker", "--silent"))
