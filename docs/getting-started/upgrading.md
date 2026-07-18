@@ -305,13 +305,60 @@ Before changing binaries:
 5. Revalidate the sealed rollback copy, and retain it until issue counts,
    fields, comments, labels, and dependency edges have been verified.
 
-The repository's migration CI contains release-specific bridges for its pinned
-historical fixtures, but those recipes are test infrastructure, not a supported
-command for arbitrary user databases. A generic `list --json` export is not a
-lossless substitute: historical release shapes can omit comments, labels, or
-dependency details. Until a user-facing bridge is published, keep using the
-matching historical binary rather than applying the old destructive conversion
-steps.
+#### Qualified v0.62.0 bridge (Linux)
+
+The repository now includes a user-facing bridge for one deliberately narrow
+v0.62.0 shape. It accepts exactly the five-record qualification corpus covering
+eight features: epic, task, bug, dependency, standalone rich fields, closed
+state, label, and comment. A different record count, an unsupported top-level
+or nested field, a different historical release, or an unsafe layout is refused
+before cutover. This is not yet a general converter for arbitrary v0.62 data.
+
+Stop the historical server and every writer first. Keep checksum-verified copies
+of the exact v0.62.0 `bd` binary and Dolt 1.84.0 runtime, then inspect without
+workspace effects:
+
+```bash
+workspace=$(realpath /path/to/project)
+target_bd=$(realpath /path/to/current/bd)
+source_bd=$(realpath /path/to/bd-v0.62.0)
+source_dolt=$(realpath /path/to/dolt-1.84.0)
+
+./scripts/migrate-v062-server-to-current.sh \
+  --inspect --json \
+  --workspace "$workspace" \
+  --target-bd "$target_bd" \
+  --source-bd "$source_bd" \
+  --source-dolt "$source_dolt" \
+  > /tmp/beads-v062-plan.json
+
+plan=$(jq -er '.plan.digest' /tmp/beads-v062-plan.json)
+```
+
+Review the plan, keep the historical server stopped, and explicitly apply that
+exact digest:
+
+```bash
+./scripts/migrate-v062-server-to-current.sh \
+  --apply --yes --json --expect-plan "$plan" \
+  --workspace "$workspace" \
+  --target-bd "$target_bd" \
+  --source-bd "$source_bd" \
+  --source-dolt "$source_dolt"
+```
+
+Apply retains the complete historical source at
+`.beads-v0.62.0-rollback` and publishes the verified embedded target at
+`.beads`. It is never automatic. Re-running the same consent-bound plan after
+success verifies the receipt-backed target and returns a no-op; an authenticated
+interrupted cutover is recovered on retry, while ambiguous state is preserved
+for manual recovery.
+
+For other v0.50.x-v0.62.x shapes, keep using the matching historical binary.
+The migration CI recipes are qualification infrastructure, not supported
+commands for arbitrary databases. A generic `list --json` export is not a
+lossless substitute because historical release shapes can omit comments,
+labels, or dependency details.
 
 ### From v0.30.x-v0.50.x SQLite workspaces
 

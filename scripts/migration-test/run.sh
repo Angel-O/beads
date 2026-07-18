@@ -61,6 +61,8 @@ verify_strict_retained_source() {
     local era="$2"
     local sqlite_manifest="$3"
     local legacy_dolt_manifest="$4"
+    local version="${5:-}"
+    local source_fingerprint="${6:-}"
 
     case "$era" in
         sqlite)
@@ -68,13 +70,186 @@ verify_strict_retained_source() {
                 verify_retained_sqlite_source "$ws/.beads" "$sqlite_manifest"
             ;;
         dolt_server)
-            [ -n "$legacy_dolt_manifest" ] && \
-                verify_retained_legacy_dolt_source "$ws/.beads" "$legacy_dolt_manifest"
+            if [ "$version" = "v0.62.0" ]; then
+                local retained_fingerprint=""
+                [ -n "$source_fingerprint" ] || return 1
+                retained_fingerprint=$(source_artifact_fingerprint \
+                    "$ws/.beads-v0.62.0-rollback") || return 1
+                if [ "$retained_fingerprint" != "$source_fingerprint" ]; then
+                    echo "  FIDELITY: retained public v0.62.0 rollback source changed" >&2
+                    return 1
+                fi
+            else
+                [ -n "$legacy_dolt_manifest" ] && \
+                    verify_retained_legacy_dolt_source \
+                        "$ws/.beads" "$legacy_dolt_manifest"
+            fi
             ;;
         *)
             return 0
             ;;
     esac
+}
+
+PUBLIC_V062_BRIDGE_FAILURE_DETAIL=""
+
+run_public_v062_bridge() {
+    local ws="$1"
+    local source_bd="$2"
+    local target_bd="$3"
+    local source_identity="$4"
+    local bridge="$PROJECT_ROOT/scripts/migrate-v062-server-to-current.sh"
+    local source_dolt=""
+    local inspect_output=""
+    local inspect_json=""
+    local inspect_status=0
+    local inspect_code=""
+    local plan_digest=""
+    local apply_output=""
+    local apply_json=""
+    local apply_status=0
+    local apply_code=""
+    local no_op_output=""
+    local no_op_json=""
+    local no_op_status=0
+    local no_op_code=""
+
+    PUBLIC_V062_BRIDGE_FAILURE_DETAIL=""
+    if [ ! -f "$bridge" ] || [ -L "$bridge" ] || [ ! -x "$bridge" ]; then
+        PUBLIC_V062_BRIDGE_FAILURE_DETAIL="public v0.62 bridge is unavailable"
+        echo "  FAILED: $PUBLIC_V062_BRIDGE_FAILURE_DETAIL"
+        return 1
+    fi
+
+    source_dolt=$(type -P dolt 2>/dev/null) || source_dolt=""
+    if [ -n "$source_dolt" ]; then
+        source_dolt=$(readlink -f -- "$source_dolt" 2>/dev/null) || source_dolt=""
+    fi
+    if [ -z "$source_dolt" ] || [ ! -f "$source_dolt" ] || \
+        [ ! -x "$source_dolt" ]; then
+        PUBLIC_V062_BRIDGE_FAILURE_DETAIL="pinned v0.62 Dolt runtime is unavailable"
+        echo "  FAILED: $PUBLIC_V062_BRIDGE_FAILURE_DETAIL"
+        return 1
+    fi
+
+    inspect_output=$("$bridge" \
+        --inspect --source-bd "$source_bd" --source-dolt "$source_dolt" \
+        --workspace "$ws" --target-bd "$target_bd" --json) || \
+        inspect_status=$?
+    inspect_json=$(jq -cse '
+        if length == 1 and (.[0] | type) == "object"
+        then .[0]
+        else empty
+        end
+    ' <<< "$inspect_output") || inspect_json=""
+
+    if [ "$inspect_status" -ne 0 ]; then
+        if [ -n "$inspect_json" ]; then
+            inspect_code=$(jq -r '.code // empty' <<< "$inspect_json" 2>/dev/null) || \
+                inspect_code=""
+        fi
+        PUBLIC_V062_BRIDGE_FAILURE_DETAIL="public v0.62 bridge inspect failed: ${inspect_code:-exit $inspect_status}"
+        echo "  FAILED: $PUBLIC_V062_BRIDGE_FAILURE_DETAIL"
+        return 1
+    fi
+    if [ -z "$inspect_json" ]; then
+        PUBLIC_V062_BRIDGE_FAILURE_DETAIL="public v0.62 bridge inspect returned invalid JSON"
+        echo "  FAILED: $PUBLIC_V062_BRIDGE_FAILURE_DETAIL"
+        return 1
+    fi
+
+    plan_digest=$(jq -er --argjson source_identity "$source_identity" '
+        select(
+            .schema_version == 1 and
+            .operation == "v062_server_to_current" and
+            .mode == "inspect" and
+            .status == "planned" and
+            .effect == "none" and
+            .source.database == $source_identity.database and
+            .source.project_id == $source_identity.project_id and
+            .plan.source_identity == $source_identity
+        ) |
+        .plan.digest |
+        select(type == "string" and test("^[0-9a-f]{64}$"))
+    ' <<< "$inspect_json" 2>/dev/null) || plan_digest=""
+    if [ -z "$plan_digest" ]; then
+        PUBLIC_V062_BRIDGE_FAILURE_DETAIL="public v0.62 bridge inspect returned no bindable plan"
+        echo "  FAILED: $PUBLIC_V062_BRIDGE_FAILURE_DETAIL"
+        return 1
+    fi
+
+    apply_output=$("$bridge" \
+        --apply --yes --expect-plan "$plan_digest" \
+        --source-bd "$source_bd" --source-dolt "$source_dolt" \
+        --workspace "$ws" --target-bd "$target_bd" --json) || \
+        apply_status=$?
+    apply_json=$(jq -cse '
+        if length == 1 and (.[0] | type) == "object"
+        then .[0]
+        else empty
+        end
+    ' <<< "$apply_output") || apply_json=""
+
+    if [ "$apply_status" -ne 0 ]; then
+        if [ -n "$apply_json" ]; then
+            apply_code=$(jq -r '.code // empty' <<< "$apply_json" 2>/dev/null) || \
+                apply_code=""
+        fi
+        PUBLIC_V062_BRIDGE_FAILURE_DETAIL="public v0.62 bridge apply failed: ${apply_code:-exit $apply_status}"
+        echo "  FAILED: $PUBLIC_V062_BRIDGE_FAILURE_DETAIL"
+        return 1
+    fi
+    if ! jq -e --arg plan_digest "$plan_digest" \
+        --argjson source_identity "$source_identity" '
+        .schema_version == 1 and
+        .operation == "v062_server_to_current" and
+        .mode == "apply" and
+        .status == "succeeded" and
+        .effect == "workspace_migrated" and
+        .plan.digest == $plan_digest and
+        .plan.source_identity == $source_identity and
+        .target.backend == "dolt-embedded"
+    ' >/dev/null 2>&1 <<< "$apply_json"; then
+        PUBLIC_V062_BRIDGE_FAILURE_DETAIL="public v0.62 bridge apply returned an invalid success result"
+        echo "  FAILED: $PUBLIC_V062_BRIDGE_FAILURE_DETAIL"
+        return 1
+    fi
+
+    no_op_output=$("$bridge" \
+        --apply --yes --expect-plan "$plan_digest" \
+        --source-bd "$source_bd" --source-dolt "$source_dolt" \
+        --workspace "$ws" --target-bd "$target_bd" --json) || \
+        no_op_status=$?
+    no_op_json=$(jq -cse '
+        if length == 1 and (.[0] | type) == "object"
+        then .[0]
+        else empty
+        end
+    ' <<< "$no_op_output") || no_op_json=""
+    if [ "$no_op_status" -ne 0 ]; then
+        if [ -n "$no_op_json" ]; then
+            no_op_code=$(jq -r '.code // empty' <<< "$no_op_json" 2>/dev/null) ||
+                no_op_code=""
+        fi
+        PUBLIC_V062_BRIDGE_FAILURE_DETAIL="public v0.62 bridge no-op verification failed: ${no_op_code:-exit $no_op_status}"
+        echo "  FAILED: $PUBLIC_V062_BRIDGE_FAILURE_DETAIL"
+        return 1
+    fi
+    if ! jq -e --arg plan_digest "$plan_digest" \
+        --argjson source_identity "$source_identity" '
+        .schema_version == 1 and
+        .operation == "v062_server_to_current" and
+        .mode == "apply" and .status == "succeeded" and
+        .effect == "none" and .no_op == true and
+        .plan.digest == $plan_digest and
+        .plan.source_identity == $source_identity and
+        .target.backend == "dolt-embedded" and
+        .verification.separate_process_reopen == true
+    ' >/dev/null 2>&1 <<< "$no_op_json"; then
+        PUBLIC_V062_BRIDGE_FAILURE_DETAIL="public v0.62 bridge returned an invalid receipt-backed no-op"
+        echo "  FAILED: $PUBLIC_V062_BRIDGE_FAILURE_DETAIL"
+        return 1
+    fi
 }
 
 verify_v062_prestarted_source() {
@@ -133,6 +308,150 @@ verify_v062_prestarted_source() {
             .schema_version == "9")
     ' <<< "$schema_json" >/dev/null; then
         echo "v0.62.0 source schema version is not exactly string 9"
+        return 1
+    fi
+}
+
+capture_v062_source_identity() {
+    local ws="$1" source_bd="$2"
+    local metadata="$ws/.beads/metadata.json"
+    local context_output database project_id prefix_output issue_prefix
+
+    context_output=$(bd_in "$ws" "$source_bd" context --json 2>/dev/null) || {
+        echo "could not read the v0.62.0 source context" >&2
+        return 1
+    }
+    database=$(jq -crse '
+        if length == 1 then .[0] else empty end |
+        select(
+            type == "object" and .backend == "dolt" and
+            .dolt_mode == "server" and
+            (.database | type) == "string" and
+            (.database | test("^[A-Za-z_][A-Za-z0-9_-]{0,63}$")) and
+            (.project_id | type) == "string" and
+            (.project_id | test(
+                "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+            ))
+        ) |
+        .database
+    ' 2>/dev/null <<< "$context_output") || {
+        echo "v0.62.0 returned an invalid source context" >&2
+        return 1
+    }
+    project_id=$(jq -er '.project_id' <<< "$context_output" 2>/dev/null) ||
+        return 1
+    if ! jq -e --arg database "$database" --arg project_id "$project_id" '
+        .backend == "dolt" and .dolt_mode == "server" and
+        .dolt_database == $database and .project_id == $project_id
+    ' "$metadata" >/dev/null 2>&1; then
+        echo "v0.62.0 context and metadata identities disagree" >&2
+        return 1
+    fi
+    prefix_output=$(bd_in "$ws" "$source_bd" \
+        config get issue_prefix --json 2>/dev/null) || {
+        echo "could not read the v0.62.0 source issue prefix" >&2
+        return 1
+    }
+    issue_prefix=$(jq -crse '
+        if length == 1 then .[0] else empty end |
+        select(
+            type == "object" and keys == ["key", "value"] and
+            .key == "issue_prefix" and
+            (.value | type) == "string" and
+            (.value | test("^[A-Za-z][A-Za-z0-9._-]{0,63}$"))
+        ) |
+        .value
+    ' 2>/dev/null <<< "$prefix_output") || {
+        echo "v0.62.0 returned an invalid issue-prefix identity" >&2
+        return 1
+    }
+    jq -cn \
+        --arg issue_prefix "$issue_prefix" --arg database "$database" \
+        --arg project_id "$project_id" '
+        {
+            issue_prefix: $issue_prefix,
+            database: $database,
+            project_id: $project_id
+        }
+    '
+}
+
+verify_v062_migrated_identity() {
+    local ws="$1" candidate_bd="$2" source_identity="$3"
+    local metadata="$ws/.beads/metadata.json"
+    local context_output prefix_output create_output created_id show_output
+
+    if [ ! -f "$metadata" ] || [ -L "$metadata" ] ||
+        ! jq -e --argjson source_identity "$source_identity" '
+            .backend == "dolt" and .dolt_mode == "embedded" and
+            (.dolt_database // .database) == $source_identity.database and
+            .project_id == $source_identity.project_id
+        ' "$metadata" >/dev/null 2>&1; then
+        echo "migrated metadata does not preserve the v0.62.0 source identity"
+        return 1
+    fi
+    context_output=$(bd_in "$ws" "$candidate_bd" context --json 2>/dev/null) || {
+        echo "could not read the migrated backend context"
+        return 1
+    }
+    if ! jq -cse --argjson source_identity "$source_identity" '
+        if length == 1 then .[0] else empty end |
+        select(
+            type == "object" and .schema_version == 1 and
+            .backend == "dolt" and .dolt_mode == "embedded" and
+            .database == $source_identity.database and
+            .project_id == $source_identity.project_id and
+            (has("server_host") | not) and (has("server_port") | not)
+        )
+    ' >/dev/null 2>&1 <<< "$context_output"; then
+        echo "migrated context does not preserve the embedded source identity"
+        return 1
+    fi
+    prefix_output=$(bd_in "$ws" "$candidate_bd" \
+        config get issue_prefix --json 2>/dev/null) || {
+        echo "could not read the migrated database-backed issue prefix"
+        return 1
+    }
+    if ! jq -cse --argjson source_identity "$source_identity" '
+        if length == 1 then .[0] else empty end |
+        select(
+            type == "object" and
+            keys == ["key", "schema_version", "value"] and
+            .schema_version == 1 and
+            .key == "issue_prefix" and
+            .value == $source_identity.issue_prefix
+        )
+    ' >/dev/null 2>&1 <<< "$prefix_output"; then
+        echo "migrated database does not preserve the v0.62.0 issue prefix"
+        return 1
+    fi
+    create_output=$(bd_in "$ws" "$candidate_bd" \
+        create "Post-upgrade identity probe" --json 2>/dev/null) || {
+        echo "could not create a post-upgrade identity probe"
+        return 1
+    }
+    created_id=$(jq -crse --argjson source_identity "$source_identity" '
+        if length == 1 then .[0] else empty end |
+        select(
+            type == "object" and .schema_version == 1 and
+            (.id | type) == "string" and
+            (.id | startswith($source_identity.issue_prefix + "-"))
+        ) |
+        .id
+    ' 2>/dev/null <<< "$create_output") || {
+        echo "post-upgrade issue creation did not retain the v0.62.0 prefix"
+        return 1
+    }
+    show_output=$(bd_in "$ws" "$candidate_bd" \
+        show --id="$created_id" --json 2>/dev/null) || {
+        echo "could not reopen the post-upgrade identity probe"
+        return 1
+    }
+    if ! jq -cse --arg id "$created_id" '
+        if length == 1 then .[0] else empty end |
+        select(type == "array" and length == 1 and .[0].id == $id)
+    ' >/dev/null 2>&1 <<< "$show_output"; then
+        echo "post-upgrade identity probe was not persisted"
         return 1
     fi
 }
@@ -275,6 +594,7 @@ test_direct_path() {
         return 0
     fi
     migration_run_activate_workspace "$WS" "$SNAPSHOTS_DIR"
+    local source_identity_json=""
 
     # Step 1: Init with source binary
     local init_ok=false
@@ -315,7 +635,7 @@ test_direct_path() {
         if init_output=$(bd_in "$WS" "$src_bin" init \
             --quiet \
             --server-host 127.0.0.1 --server-port "$init_port" \
-            --database smoke --prefix smoke </dev/null 2>&1); then
+            --database smoke --prefix legacy </dev/null 2>&1); then
             init_ok=true
         else
             local init_first_line=""
@@ -404,6 +724,28 @@ test_direct_path() {
         echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
         return 0
     fi
+    if [ "$version" = "v0.62.0" ]; then
+        if ! capture_v062_source_identity "$WS" "$src_bin" \
+            > "$SNAPSHOTS_DIR/source-identity.json"; then
+            migration_run_record_result_after_cleanup \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                "could not capture the authenticated v0.62.0 source identity" || true
+            echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
+            return 0
+        fi
+        source_identity_json=$(jq -ce '
+            select(
+                type == "object" and
+                keys == ["database", "issue_prefix", "project_id"]
+            )
+        ' "$SNAPSHOTS_DIR/source-identity.json" 2>/dev/null) || {
+            migration_run_record_result_after_cleanup \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                "captured v0.62.0 source identity is invalid" || true
+            echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
+            return 0
+        }
+    fi
 
     # Stop source server before upgrade
     if ! stop_dolt_server "$WS"; then
@@ -412,6 +754,38 @@ test_direct_path() {
             "could not prove the historical server stopped before upgrade; preserved at $WS"
         echo -e "  ${RED}BLOCKED: could not prove the historical server stopped before upgrade${NC}"
         return 0
+    fi
+
+    # Exercise the public bridge against authentic v0.62 routing conflicts.
+    # Historical bd must not follow either source when the bridge binds its
+    # private server explicitly by host, port, and database.
+    if $STRICT_MODE && [ "$version" = "v0.62.0" ]; then
+        local routing_conflict_port=1
+        local routing_conflict_status=0
+        if migration_server_port_in_use "$routing_conflict_port"; then
+            migration_run_record_result_after_cleanup \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                "reserved routing-conflict port is unexpectedly occupied" || true
+            echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
+            return 0
+        else
+            routing_conflict_status=$?
+        fi
+        if [ "$routing_conflict_status" -ne 1 ] || \
+            [ ! -f "$WS/.beads/config.yaml" ] || \
+            [ -L "$WS/.beads/config.yaml" ] || \
+            [ -L "$WS/.beads/dolt-server.port" ] || \
+            ! printf '%s\n' "$routing_conflict_port" \
+                > "$WS/.beads/dolt-server.port" || \
+            ! printf '\ndolt.shared-server: true\ndolt.host: 127.0.0.1\ndolt.port: %s\ndolt.database: migration_routing_conflict\n' \
+                "$routing_conflict_port" >> "$WS/.beads/config.yaml"; then
+            migration_run_record_result_after_cleanup \
+                "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                "could not install isolated v0.62 source-routing conflicts" || true
+            echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
+            return 0
+        fi
+        echo "  source-routing-conflicts: port file and config.yaml active"
     fi
 
     local source_era
@@ -487,6 +861,18 @@ test_direct_path() {
         check_blocker_paths "$WS" "$cand_bin" || blocker_violations=$?
         violations=$((violations + blocker_violations))
 
+        if [ "$version" = "v0.62.0" ]; then
+            local identity_detail=""
+            if ! identity_detail=$(verify_v062_migrated_identity \
+                "$WS" "$cand_bin" "$source_identity_json" 2>&1); then
+                migration_run_record_result_after_cleanup \
+                    "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                    "${identity_detail:-migrated v0.62.0 identity verification failed}" || true
+                echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
+                return 0
+            fi
+        fi
+
         local direct_status direct_detail
         if [ "$blocker_violations" -gt 0 ]; then
             direct_status="BLOCKED"
@@ -525,7 +911,19 @@ test_direct_path() {
             fi
             ;;
         dolt_server)
-            if recipe_server_to_embedded \
+            if [ "$version" = "v0.62.0" ]; then
+                if run_public_v062_bridge \
+                    "$WS" "$src_bin" "$cand_bin" "$source_identity_json"; then
+                    recipe_worked=true
+                    recipe_name="public_v062_bridge"
+                else
+                    migration_run_record_result_after_cleanup \
+                        "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                        "${PUBLIC_V062_BRIDGE_FAILURE_DETAIL:-public v0.62 bridge failed}" || true
+                    echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
+                    return 0
+                fi
+            elif recipe_server_to_embedded \
                 "$WS" "$src_bin" "$cand_bin" "$version" "$SNAPSHOTS_DIR/before.json"; then
                 recipe_worked=true
                 recipe_name="server_to_embedded"
@@ -549,7 +947,8 @@ test_direct_path() {
 
     if $recipe_worked; then
         if $STRICT_MODE && ! verify_strict_retained_source \
-            "$WS" "$era" "$source_sqlite_manifest" "$source_legacy_dolt_manifest"; then
+            "$WS" "$era" "$source_sqlite_manifest" "$source_legacy_dolt_manifest" \
+            "$version" "$source_fingerprint"; then
             migration_run_record_result_after_cleanup \
                 "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
                 "manual bridge mutated the retained historical rollback source" || true
@@ -576,6 +975,18 @@ test_direct_path() {
         check_blocker_paths "$WS" "$cand_bin" || blocker_violations=$?
         violations=$((violations + blocker_violations))
 
+        if [ "$version" = "v0.62.0" ]; then
+            local identity_detail=""
+            if ! identity_detail=$(verify_v062_migrated_identity \
+                "$WS" "$cand_bin" "$source_identity_json" 2>&1); then
+                migration_run_record_result_after_cleanup \
+                    "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
+                    "${identity_detail:-migrated v0.62.0 identity verification failed}" || true
+                echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
+                return 0
+            fi
+        fi
+
         if ! stop_dolt_server "$WS"; then
             migration_run_forget_workspace "$WS"
             record_result "$path_label" "BLOCKED" \
@@ -585,7 +996,8 @@ test_direct_path() {
         fi
 
         if $STRICT_MODE && ! verify_strict_retained_source \
-            "$WS" "$era" "$source_sqlite_manifest" "$source_legacy_dolt_manifest"; then
+            "$WS" "$era" "$source_sqlite_manifest" "$source_legacy_dolt_manifest" \
+            "$version" "$source_fingerprint"; then
             migration_run_record_result_after_cleanup \
                 "$WS" "$SNAPSHOTS_DIR" "$path_label" "BLOCKED" \
                 "post-upgrade commands mutated the retained historical rollback source" || true

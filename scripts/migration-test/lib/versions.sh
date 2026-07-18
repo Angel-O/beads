@@ -66,7 +66,7 @@ declare -Ar STRICT_EXPECTED_RECIPES=(
     ["v0.49.6"]="sqlite_to_current"
     ["v0.55.4"]="server_to_embedded"
     ["v0.57.0"]="server_to_embedded"
-    ["v0.62.0"]="server_to_embedded"
+    ["v0.62.0"]="public_v062_bridge"
     ["v0.63.3"]=""
 )
 declare -Ar STRICT_EXPECTED_FEATURES=(
@@ -79,7 +79,6 @@ declare -Ar STRICT_EXPECTED_FEATURES=(
 declare -Ar SERVER_BRIDGE_STRATEGIES=(
     ["v0.55.4"]="native_export"
     ["v0.57.0"]="native_export_show_comments"
-    ["v0.62.0"]="native_export_show_comments"
 )
 declare -Ar SERVER_BOOTSTRAP_STRATEGIES=(
     ["v0.62.0"]="prestarted_server"
@@ -147,6 +146,15 @@ strict_required_dolt_sha256() {
     printf '%s\n' "$value"
 }
 
+# Local strict-runtime gate. This is deliberately version-string-only: it
+# confirms the resolved dolt reports the pinned historical version, nothing
+# more. Authoritative binary-integrity enforcement (sha256 of the downloaded
+# release archive against strict_required_dolt_sha256) is CI-side, in
+# .github/workflows/migration-test.yml. We do not checksum the local dolt here
+# because a developer's installed dolt 1.84.0 can be a legitimately different
+# build (package manager, `go install`, other arch) with a different hash, so
+# enforcing the release-archive SHA against an arbitrary local binary would
+# reject authentic runtimes. CI owns integrity; this only pins the version.
 verify_strict_historical_runtime() {
     local version="$1"
     local expected output
