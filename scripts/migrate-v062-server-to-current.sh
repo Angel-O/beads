@@ -1485,6 +1485,16 @@ verify_embedded_layout() {
         [ ! -e "$root/.beads/dolt" ] && [ ! -L "$root/.beads/dolt" ]
 }
 
+# Post-init identity re-check (belt-and-suspenders): re-verify backend,
+# dolt_mode, database, project_id, and issue_prefix directly from the published
+# target. repo_id/clone_id are intentionally NOT re-checked here even though
+# --migration-v062-repository-root exists to get them right: they are computed
+# by the target binary's init from that flag, their persistence is
+# fatal-on-failure (cmd/bd/init.go), and it is proven end to end in Go by
+# TestMigrationV062StagedInitPublishesFinalRepositoryIdentity. Re-deriving them
+# in shell would duplicate the Go identity logic (ComputeRepoIDForPath /
+# GetCloneIDForPath) this bridge deliberately reuses rather than reimplements,
+# so those two guarantees are delegated to init's fatal contract.
 verify_target_identity() {
     local root="$1" metadata prefix_json
     metadata="$root/.beads/metadata.json"

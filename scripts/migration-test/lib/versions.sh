@@ -146,6 +146,15 @@ strict_required_dolt_sha256() {
     printf '%s\n' "$value"
 }
 
+# Local strict-runtime gate. This is deliberately version-string-only: it
+# confirms the resolved dolt reports the pinned historical version, nothing
+# more. Authoritative binary-integrity enforcement (sha256 of the downloaded
+# release archive against strict_required_dolt_sha256) is CI-side, in
+# .github/workflows/migration-test.yml. We do not checksum the local dolt here
+# because a developer's installed dolt 1.84.0 can be a legitimately different
+# build (package manager, `go install`, other arch) with a different hash, so
+# enforcing the release-archive SHA against an arbitrary local binary would
+# reject authentic runtimes. CI owns integrity; this only pins the version.
 verify_strict_historical_runtime() {
     local version="$1"
     local expected output

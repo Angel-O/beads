@@ -1,6 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Test coverage scope
+# -------------------
+# This harness drives the public v0.62 bridge's apply / crash-injection /
+# rollback / idempotency / losslessness matrix against deterministic bash+jq
+# fakes (make_fake_bd, make_fake_source_bd, make_fake_source_dolt) that stand in
+# for source-bd, source-dolt, and the target-bd. Because the fakes emit real
+# ".beads" layouts, the matrix genuinely exercises the bridge's control flow,
+# refusal codes, and, most importantly, its filesystem transaction (atomic
+# ".beads" renames + inode journal) and crash-recovery behavior. It does NOT
+# run a real Dolt import, so a real-Dolt losslessness regression (a dropped
+# field, or a mid-cutover real-engine crash) would not turn this matrix red.
+#
+# Real-Dolt import losslessness is guarded elsewhere, not by this suite:
+#   - run.sh's server->embedded strict lane (run_public_v062_bridge) drives the
+#     bridge end to end against the real current bd and a real pinned dolt. That
+#     lane is happy-path only (no failpoint/SIGKILL injection) and is SKIP-gated
+#     when a real dolt runtime is unavailable.
+#   - The production bridge fails closed on a lossy real import at runtime: after
+#     importing into the embedded target it runs semantics_match against the
+#     source and rolls back on mismatch (see migrate-v062-server-to-current.sh),
+#     so end users are protected regardless of this suite's mock realism.
+#
+# Do not read the fake-target assertions below as real-Dolt coverage.
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BRIDGE="$REPO_ROOT/scripts/migrate-v062-server-to-current.sh"
 
