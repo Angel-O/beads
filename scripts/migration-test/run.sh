@@ -96,6 +96,15 @@ test_direct_path() {
     echo ""
     echo -e "${BOLD}● Direct: ${path_label}${NC}"
 
+    if $STRICT_MODE && ! verify_strict_historical_runtime "$version"; then
+        local required_runtime=""
+        required_runtime=$(strict_required_dolt_version "$version" 2>/dev/null) || true
+        record_result "$path_label" "BLOCKED" \
+            "required Dolt runtime ${required_runtime:-unknown} is unavailable"
+        echo -e "  ${RED}BLOCKED: required Dolt runtime ${required_runtime:-unknown} is unavailable${NC}"
+        return 0
+    fi
+
     # Download source binary
     local src_bin
     if $STRICT_MODE; then
@@ -113,9 +122,18 @@ test_direct_path() {
     fi
 
     local WS
-    WS=$(new_workspace)
-    local SNAPSHOTS_DIR
-    SNAPSHOTS_DIR=$(mktemp -d /tmp/bd-snapshots-XXXXXX)
+    if ! WS=$(new_workspace); then
+        record_result "$path_label" "BLOCKED" "could not create isolated workspace"
+        echo -e "  ${RED}BLOCKED: could not create isolated workspace${NC}"
+        return 0
+    fi
+    local SNAPSHOTS_DIR=""
+    if ! SNAPSHOTS_DIR=$(mktemp -d /tmp/bd-snapshots-XXXXXX); then
+        record_result_after_workspace_cleanup \
+            "$WS" "$path_label" "BLOCKED" "could not create isolated snapshot directory" || true
+        echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
+        return 0
+    fi
 
     # Step 1: Init with source binary
     local init_ok=false
@@ -126,17 +144,22 @@ test_direct_path() {
     fi
 
     if ! $init_ok; then
-        local init_err
+        local init_err init_status init_detail
         init_err=$(bd_in "$WS" "$src_bin" init --quiet --prefix smoke </dev/null 2>&1 | head -1 || true)
-        cleanup_workspace "$WS"
-        rm -rf "$SNAPSHOTS_DIR"
 
         if echo "$init_err" | grep -qi "CGO"; then
-            record_result "$path_label" "SKIP" "binary built without CGO"
+            init_status="SKIP"
+            init_detail="binary built without CGO"
         elif echo "$init_err" | grep -qi "dolt.*server\|unreachable\|auto-start"; then
-            record_result "$path_label" "SKIP" "needs dolt server"
+            init_status="SKIP"
+            init_detail="needs dolt server"
         else
-            record_result "$path_label" "BLOCKED" "init failed: ${init_err}"
+            init_status="BLOCKED"
+            init_detail="init failed: ${init_err}"
+        fi
+        if record_result_after_workspace_cleanup \
+            "$WS" "$path_label" "$init_status" "$init_detail"; then
+            rm -rf "$SNAPSHOTS_DIR"
         fi
         echo -e "  ${RESULT_STATUSES[-1]}: ${RESULT_DETAILS[-1]}"
         return 0
@@ -188,7 +211,12 @@ test_direct_path() {
     fi
 
     # Stop source server before upgrade
-    stop_dolt_server "$WS"
+    if ! stop_dolt_server "$WS"; then
+        record_result "$path_label" "BLOCKED" \
+            "could not prove the historical server stopped before upgrade; preserved at $WS"
+        echo -e "  ${RED}BLOCKED: could not prove the historical server stopped before upgrade${NC}"
+        return 0
+    fi
 
     local source_era
     source_era=$(get_era "$version")
@@ -233,7 +261,6 @@ test_direct_path() {
     fi
 
     if [ "$probe_status" -eq 2 ]; then
-        stop_dolt_server "$WS"
         cleanup_workspace "$WS"
         rm -rf "$SNAPSHOTS_DIR"
         record_result "$path_label" "BLOCKED" "$DIRECT_PROBE_FAILURE_DETAIL"
@@ -247,7 +274,6 @@ test_direct_path() {
     if $upgrade_ok; then
         # Capture after-snapshot and check fidelity
         if ! capture_snapshot "$WS" "$cand_bin" > "$SNAPSHOTS_DIR/after.json"; then
-            stop_dolt_server "$WS"
             cleanup_workspace "$WS"
             rm -rf "$SNAPSHOTS_DIR"
             record_result "$path_label" "BLOCKED" "could not capture the complete candidate snapshot"
@@ -265,20 +291,30 @@ test_direct_path() {
         check_blocker_paths "$WS" "$cand_bin" || blocker_violations=$?
         violations=$((violations + blocker_violations))
 
-        stop_dolt_server "$WS"
-
-        cleanup_workspace "$WS"
-        rm -rf "$SNAPSHOTS_DIR"
+        local direct_status direct_detail
         if [ "$blocker_violations" -gt 0 ]; then
-            record_result "$path_label" "BLOCKED" "direct upgrade, $violations fidelity/blocker violations" "" "$violations"
+            direct_status="BLOCKED"
+            direct_detail="direct upgrade, $violations fidelity/blocker violations"
         else
-            record_result "$path_label" "AUTO" "direct upgrade, $violations fidelity violations" "" "$violations"
+            direct_status="AUTO"
+            direct_detail="direct upgrade, $violations fidelity violations"
+        fi
+        if record_result_after_workspace_cleanup \
+            "$WS" "$path_label" "$direct_status" "$direct_detail" "" "$violations"; then
+            rm -rf "$SNAPSHOTS_DIR"
+        else
+            echo -e "  ${RED}BLOCKED: could not prove isolated workspace cleanup${NC}"
         fi
         return 0
     fi
 
     # Step 5: Direct upgrade failed — try recipes
-    stop_dolt_server "$WS"
+    if ! stop_dolt_server "$WS"; then
+        record_result "$path_label" "BLOCKED" \
+            "could not prove the direct-probe server stopped before migration recipes; preserved at $WS"
+        echo -e "  ${RED}BLOCKED: could not prove the direct-probe server stopped before migration recipes${NC}"
+        return 0
+    fi
     echo "  direct upgrade failed, trying recipes..."
 
     local era="$source_era"
@@ -318,7 +354,6 @@ test_direct_path() {
     if $recipe_worked; then
         if $STRICT_MODE && ! verify_strict_retained_source \
             "$WS" "$era" "$source_sqlite_manifest" "$source_legacy_dolt_manifest"; then
-            stop_dolt_server "$WS"
             cleanup_workspace "$WS"
             rm -rf "$SNAPSHOTS_DIR"
             record_result "$path_label" "BLOCKED" "manual bridge mutated the retained historical rollback source"
@@ -328,7 +363,6 @@ test_direct_path() {
 
         # Re-capture and check fidelity after recipe
         if ! capture_snapshot "$WS" "$cand_bin" > "$SNAPSHOTS_DIR/after.json"; then
-            stop_dolt_server "$WS"
             cleanup_workspace "$WS"
             rm -rf "$SNAPSHOTS_DIR"
             record_result "$path_label" "BLOCKED" "could not capture the complete candidate snapshot after recipe"
@@ -346,7 +380,12 @@ test_direct_path() {
         check_blocker_paths "$WS" "$cand_bin" || blocker_violations=$?
         violations=$((violations + blocker_violations))
 
-        stop_dolt_server "$WS"
+        if ! stop_dolt_server "$WS"; then
+            record_result "$path_label" "BLOCKED" \
+                "could not prove the candidate server stopped before rollback verification; preserved at $WS"
+            echo -e "  ${RED}BLOCKED: could not prove the candidate server stopped before rollback verification${NC}"
+            return 0
+        fi
 
         if $STRICT_MODE && ! verify_strict_retained_source \
             "$WS" "$era" "$source_sqlite_manifest" "$source_legacy_dolt_manifest"; then
@@ -357,20 +396,27 @@ test_direct_path() {
             return 0
         fi
 
-        cleanup_workspace "$WS"
-        rm -rf "$SNAPSHOTS_DIR"
+        local recipe_status recipe_detail
         if [ "$blocker_violations" -gt 0 ]; then
-            record_result "$path_label" "BLOCKED" "recipe: $recipe_name, $violations fidelity/blocker violations" "$recipe_name" "$violations"
+            recipe_status="BLOCKED"
+            recipe_detail="recipe: $recipe_name, $violations fidelity/blocker violations"
         else
-            record_result "$path_label" "MANUAL" "recipe: $recipe_name, $violations fidelity violations" "$recipe_name" "$violations"
+            recipe_status="MANUAL"
+            recipe_detail="recipe: $recipe_name, $violations fidelity violations"
+        fi
+        if record_result_after_workspace_cleanup \
+            "$WS" "$path_label" "$recipe_status" "$recipe_detail" "$recipe_name" "$violations"; then
+            rm -rf "$SNAPSHOTS_DIR"
+        else
+            echo -e "  ${RED}BLOCKED: could not prove isolated workspace cleanup${NC}"
         fi
         return 0
     fi
 
     # All recipes failed
-    stop_dolt_server "$WS"
-    cleanup_workspace "$WS"
-    rm -rf "$SNAPSHOTS_DIR"
+    if cleanup_workspace "$WS"; then
+        rm -rf "$SNAPSHOTS_DIR"
+    fi
     record_result "$path_label" "BLOCKED" "no working upgrade path found"
     echo -e "  ${RED}BLOCKED: no working upgrade path${NC}"
 }
@@ -404,9 +450,18 @@ test_stepping_stone_path() {
     done
 
     local WS
-    WS=$(new_workspace)
-    local SNAPSHOTS_DIR
-    SNAPSHOTS_DIR=$(mktemp -d /tmp/bd-snapshots-XXXXXX)
+    if ! WS=$(new_workspace); then
+        record_result "$path_label" "BLOCKED" "could not create isolated workspace"
+        echo -e "  ${RED}BLOCKED: could not create isolated workspace${NC}"
+        return 0
+    fi
+    local SNAPSHOTS_DIR=""
+    if ! SNAPSHOTS_DIR=$(mktemp -d /tmp/bd-snapshots-XXXXXX); then
+        record_result_after_workspace_cleanup \
+            "$WS" "$path_label" "BLOCKED" "could not create isolated snapshot directory" || true
+        echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
+        return 0
+    fi
 
     # Init with first version
     local first_bin="${bins[0]}"
@@ -420,10 +475,11 @@ test_stepping_stone_path() {
     fi
 
     if ! $init_ok; then
-        cleanup_workspace "$WS"
-        rm -rf "$SNAPSHOTS_DIR"
-        record_result "$path_label" "SKIP" "could not init with $first_ver"
-        echo -e "  ${YELLOW}SKIP: could not init with $first_ver${NC}"
+        if record_result_after_workspace_cleanup \
+            "$WS" "$path_label" "SKIP" "could not init with $first_ver"; then
+            rm -rf "$SNAPSHOTS_DIR"
+        fi
+        echo -e "  ${RESULT_STATUSES[-1]}: ${RESULT_DETAILS[-1]}"
         return 0
     fi
     git -C "$WS" config beads.role maintainer 2>/dev/null || true
@@ -438,7 +494,12 @@ test_stepping_stone_path() {
 
     # Capture initial snapshot
     capture_snapshot "$WS" "$first_bin" > "$SNAPSHOTS_DIR/before.json"
-    stop_dolt_server "$WS"
+    if ! stop_dolt_server "$WS"; then
+        record_result "$path_label" "BLOCKED" \
+            "could not prove the first historical server stopped before stepping; preserved at $WS"
+        echo -e "  ${RED}BLOCKED: could not prove the first historical server stopped before stepping${NC}"
+        return 0
+    fi
 
     # Step through intermediate versions
     local step_failed=false
@@ -463,7 +524,11 @@ test_stepping_stone_path() {
             fi
         fi
 
-        stop_dolt_server "$WS"
+        if ! stop_dolt_server "$WS"; then
+            step_failed=true
+            failed_at="$step_ver (server stop unverified)"
+            break
+        fi
 
         if ! $step_ok; then
             step_failed=true
@@ -498,7 +563,6 @@ test_stepping_stone_path() {
     fi
 
     if ! $upgrade_ok; then
-        stop_dolt_server "$WS"
         cleanup_workspace "$WS"
         rm -rf "$SNAPSHOTS_DIR"
         record_result "$path_label" "BLOCKED" "final step to candidate failed"
@@ -515,13 +579,19 @@ test_stepping_stone_path() {
     check_blocker_paths "$WS" "$cand_bin" || blocker_violations=$?
     violations=$((violations + blocker_violations))
 
-    stop_dolt_server "$WS"
-    cleanup_workspace "$WS"
-    rm -rf "$SNAPSHOTS_DIR"
+    local step_status step_detail
     if [ "$blocker_violations" -gt 0 ]; then
-        record_result "$path_label" "BLOCKED" "steps passed, $violations fidelity/blocker violations" "" "$violations"
+        step_status="BLOCKED"
+        step_detail="steps passed, $violations fidelity/blocker violations"
     else
-        record_result "$path_label" "AUTO" "all steps passed, $violations fidelity violations" "" "$violations"
+        step_status="AUTO"
+        step_detail="all steps passed, $violations fidelity violations"
+    fi
+    if record_result_after_workspace_cleanup \
+        "$WS" "$path_label" "$step_status" "$step_detail" "" "$violations"; then
+        rm -rf "$SNAPSHOTS_DIR"
+    else
+        echo -e "  ${RED}BLOCKED: could not prove isolated workspace cleanup${NC}"
     fi
 }
 
@@ -621,45 +691,61 @@ if $SELF_TEST; then
     echo ""
     echo -e "${BOLD}● Self-test: candidate → candidate${NC}"
 
-    WS=$(new_workspace)
-    SNAPSHOTS_DIR=$(mktemp -d /tmp/bd-snapshots-XXXXXX)
-
-    # Init with candidate
-    if ! bd_in "$WS" "$CAND_BIN" init --quiet --non-interactive --prefix smoke </dev/null >/dev/null 2>&1; then
-        cleanup_workspace "$WS"
-        rm -rf "$SNAPSHOTS_DIR"
-        echo -e "  ${RED}BLOCKED: candidate init failed${NC}"
-        record_result "candidate → candidate" "BLOCKED" "init failed"
+    if ! WS=$(new_workspace); then
+        echo -e "  ${RED}BLOCKED: could not create isolated workspace${NC}"
+        record_result "candidate → candidate" "BLOCKED" "could not create isolated workspace"
     else
-        git -C "$WS" config beads.role maintainer 2>/dev/null || true
-
-        # Create dataset
-        if create_dataset "$WS" "$CAND_BIN" "candidate"; then
-            capture_snapshot "$WS" "$CAND_BIN" > "$SNAPSHOTS_DIR/before.json"
-            before_count=$(jq 'length' "$SNAPSHOTS_DIR/before.json" 2>/dev/null) || before_count=0
-            echo "  snapshot: $before_count items"
-
-            # "Upgrade" is a no-op — just re-read with the same binary
-            capture_snapshot "$WS" "$CAND_BIN" > "$SNAPSHOTS_DIR/after.json"
-
-            violations=0
-            check_fidelity "candidate" "$SNAPSHOTS_DIR/before.json" "$SNAPSHOTS_DIR/after.json" || violations=$?
-
-            blocker_violations=0
-            check_blocker_paths "$WS" "$CAND_BIN" || blocker_violations=$?
-            violations=$((violations + blocker_violations))
-
-            stop_dolt_server "$WS"
-            if [ "$blocker_violations" -gt 0 ]; then
-                record_result "candidate → candidate" "BLOCKED" "self-test, $violations fidelity/blocker violations" "" "$violations"
-            else
-                record_result "candidate → candidate" "AUTO" "self-test, $violations fidelity violations" "" "$violations"
+        SNAPSHOTS_DIR=""
+        if ! SNAPSHOTS_DIR=$(mktemp -d /tmp/bd-snapshots-XXXXXX); then
+            record_result_after_workspace_cleanup \
+                "$WS" "candidate → candidate" "BLOCKED" \
+                "could not create isolated snapshot directory" || true
+            echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
+        # Init with candidate
+        elif ! bd_in "$WS" "$CAND_BIN" init --quiet --non-interactive --prefix smoke </dev/null >/dev/null 2>&1; then
+            if record_result_after_workspace_cleanup \
+                "$WS" "candidate → candidate" "BLOCKED" "init failed"; then
+                rm -rf "$SNAPSHOTS_DIR"
             fi
+            echo -e "  ${RED}BLOCKED: ${RESULT_DETAILS[-1]}${NC}"
         else
-            record_result "candidate → candidate" "BLOCKED" "could not create test data"
+            git -C "$WS" config beads.role maintainer 2>/dev/null || true
+            self_status="BLOCKED"
+            self_detail="could not create test data"
+            self_violations=0
+
+            # Create dataset
+            if create_dataset "$WS" "$CAND_BIN" "candidate"; then
+                capture_snapshot "$WS" "$CAND_BIN" > "$SNAPSHOTS_DIR/before.json"
+                before_count=$(jq 'length' "$SNAPSHOTS_DIR/before.json" 2>/dev/null) || before_count=0
+                echo "  snapshot: $before_count items"
+
+                # "Upgrade" is a no-op — just re-read with the same binary
+                capture_snapshot "$WS" "$CAND_BIN" > "$SNAPSHOTS_DIR/after.json"
+
+                violations=0
+                check_fidelity "candidate" "$SNAPSHOTS_DIR/before.json" "$SNAPSHOTS_DIR/after.json" || violations=$?
+
+                blocker_violations=0
+                check_blocker_paths "$WS" "$CAND_BIN" || blocker_violations=$?
+                violations=$((violations + blocker_violations))
+                self_violations="$violations"
+
+                if [ "$blocker_violations" -gt 0 ]; then
+                    self_status="BLOCKED"
+                    self_detail="self-test, $violations fidelity/blocker violations"
+                else
+                    self_status="AUTO"
+                    self_detail="self-test, $violations fidelity violations"
+                fi
+            fi
+            if record_result_after_workspace_cleanup \
+                "$WS" "candidate → candidate" "$self_status" "$self_detail" "" "$self_violations"; then
+                rm -rf "$SNAPSHOTS_DIR"
+            else
+                echo -e "  ${RED}BLOCKED: could not prove isolated workspace cleanup${NC}"
+            fi
         fi
-        cleanup_workspace "$WS"
-        rm -rf "$SNAPSHOTS_DIR"
     fi
 fi
 

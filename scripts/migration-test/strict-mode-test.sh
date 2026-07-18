@@ -30,6 +30,21 @@ sha=$(strict_release_sha256 v0.55.4 linux amd64) || fail "missing v0.55.4 releas
 [ "$(strict_expected_recipe v0.55.4)" = "server_to_embedded" ] || fail "unexpected v0.55.4 recipe"
 [ "$(strict_expected_features v0.55.4)" = "epic task bug dependency standalone closed label comment" ] ||
     fail "unexpected v0.55.4 source features"
+
+asset=$(strict_release_asset v0.57.0 linux amd64) || fail "missing v0.57.0 release asset"
+[ "$asset" = "beads_0.57.0_linux_amd64.tar.gz" ] || fail "unexpected v0.57.0 release asset"
+sha=$(strict_release_sha256 v0.57.0 linux amd64) || fail "missing v0.57.0 release checksum"
+[ "$sha" = "f8629d5627bed7d25f06f92334addc171d679f9aed9d08c5d42a9684205dc04b" ] ||
+    fail "unexpected v0.57.0 release checksum"
+[ "$(strict_expected_status v0.57.0)" = "MANUAL" ] || fail "unexpected v0.57.0 status"
+[ "$(strict_expected_recipe v0.57.0)" = "server_to_embedded" ] || fail "unexpected v0.57.0 recipe"
+[ "$(strict_expected_features v0.57.0)" = "epic task bug dependency standalone closed label comment" ] ||
+    fail "unexpected v0.57.0 source features"
+[ "$(strict_required_dolt_version v0.57.0)" = "2.1.8" ] ||
+    fail "unexpected v0.57.0 Dolt runtime version"
+[ "$(strict_required_dolt_sha256 v0.57.0 linux amd64)" = \
+    "f66318f08ed66e409fc39363ae0fff8ce6fbf6dba9f5bac632b91527b9632a74" ] ||
+    fail "unexpected v0.57.0 Dolt runtime checksum"
 [ "${LEGACY_DOLT_ROLLBACK_FILES[*]}" = "metadata.json config.json config.yaml issues.jsonl" ] ||
     fail "unexpected legacy Dolt rollback file inventory"
 
@@ -43,9 +58,307 @@ for lookup in strict_expected_status strict_expected_recipe strict_expected_feat
         fail "$lookup accepted an unknown qualification manifest"
     fi
 done
+for lookup in strict_required_dolt_version strict_required_dolt_sha256; do
+    if "$lookup" v9.9.9 linux amd64 >/dev/null 2>&1; then
+        fail "$lookup accepted an unknown historical runtime manifest"
+    fi
+done
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+guard_server_pid=""
+trap '[ -z "${guard_server_pid:-}" ] || kill -9 -- "$guard_server_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+
+unsafe_cleanup_calls="$tmp/unsafe-cleanup.calls"
+if (
+    pkill() { printf 'pkill %s\n' "$*" >> "$unsafe_cleanup_calls"; }
+    rm() { printf 'rm %s\n' "$*" >> "$unsafe_cleanup_calls"; }
+    sleep() { :; }
+    cleanup_workspace ""
+); then
+    fail "cleanup accepted an empty workspace path"
+fi
+[ ! -e "$unsafe_cleanup_calls" ] ||
+    fail "empty workspace cleanup invoked a process or filesystem command"
+
+unowned_workspace="$tmp/unowned-workspace"
+mkdir -p "$unowned_workspace"
+if (
+    pkill() { printf 'pkill %s\n' "$*" >> "$unsafe_cleanup_calls"; }
+    rm() { printf 'rm %s\n' "$*" >> "$unsafe_cleanup_calls"; }
+    sleep() { :; }
+    cleanup_workspace "$unowned_workspace"
+); then
+    fail "cleanup accepted a workspace not owned by this harness"
+fi
+[ ! -e "$unsafe_cleanup_calls" ] ||
+    fail "unowned workspace cleanup invoked a process or filesystem command"
+
+allocation_failure_tmp="$tmp/not-a-directory"
+allocation_failure_bin="$tmp/allocation-failure-bin"
+allocation_failure_log="$tmp/allocation-failure-process.calls"
+allocation_failure_output="$tmp/allocation-failure.out"
+printf 'not a directory\n' > "$allocation_failure_tmp"
+mkdir -p "$allocation_failure_bin"
+cat > "$allocation_failure_bin/pkill" <<'EOF'
+#!/bin/bash
+printf 'pkill %s\n' "$*" >> "${MIGRATION_TEST_PROCESS_LOG:?}"
+EOF
+chmod +x "$allocation_failure_bin/pkill"
+if PATH="$allocation_failure_bin:$PATH" \
+    TMPDIR="$allocation_failure_tmp" \
+    MIGRATION_TEST_PROCESS_LOG="$allocation_failure_log" \
+    CANDIDATE_BIN=/bin/true \
+    "$SCRIPT_DIR/run.sh" --self-test > "$allocation_failure_output" 2>&1; then
+    fail "self-test unexpectedly passed after workspace allocation failed"
+fi
+grep -q 'BLOCKED: could not create isolated workspace' "$allocation_failure_output" ||
+    fail "workspace allocation failure did not produce an explicit BLOCKED result"
+[ ! -e "$allocation_failure_log" ] ||
+    fail "workspace allocation failure reached process cleanup"
+if (
+    mktemp() { return 1; }
+    new_workspace
+); then
+    fail "workspace creation accepted a failed mktemp allocation"
+fi
+
+snapshot_failure_bin="$tmp/snapshot-failure-bin"
+snapshot_failure_output="$tmp/snapshot-failure.out"
+real_mktemp=$(command -v mktemp)
+mkdir -p "$snapshot_failure_bin"
+cat > "$snapshot_failure_bin/mktemp" <<EOF
+#!/bin/bash
+case "\${*: -1}" in
+    /tmp/bd-snapshots-*) exit 1 ;;
+    *) exec "$real_mktemp" "\$@" ;;
+esac
+EOF
+chmod +x "$snapshot_failure_bin/mktemp"
+if PATH="$snapshot_failure_bin:$PATH" \
+    CANDIDATE_BIN=/bin/false \
+    "$SCRIPT_DIR/run.sh" --self-test > "$snapshot_failure_output" 2>&1; then
+    fail "self-test unexpectedly passed after snapshot allocation failed"
+fi
+grep -q 'BLOCKED: could not create isolated snapshot directory' "$snapshot_failure_output" ||
+    fail "snapshot allocation failure did not produce an explicit BLOCKED result"
+
+host_hooks_dir="$tmp/host-hooks"
+host_hook_log="$tmp/host-hook.calls"
+host_git_config="$tmp/host.gitconfig"
+mkdir -p "$host_hooks_dir"
+cat > "$host_hooks_dir/pre-commit" <<'EOF'
+#!/bin/bash
+printf 'host hook ran\n' >> "${HOST_HOOK_LOG:?}"
+exit 99
+EOF
+chmod +x "$host_hooks_dir/pre-commit"
+git config -f "$host_git_config" core.hooksPath "$host_hooks_dir"
+if ! hook_guard_workspace=$(
+    HOST_HOOK_LOG="$host_hook_log" GIT_CONFIG_GLOBAL="$host_git_config" new_workspace
+); then
+    fail "workspace creation inherited a failing host-global Git hook"
+fi
+[ ! -e "$host_hook_log" ] ||
+    fail "workspace creation executed a host-global Git hook"
+cleanup_workspace "$hook_guard_workspace" ||
+    fail "could not clean up the Git-hook isolation workspace"
+
+pid_guard_workspace=$(new_workspace) ||
+    fail "could not create a workspace for PID cleanup guards"
+mkdir -p "$pid_guard_workspace/.beads"
+for unsafe_pid in 0 -1 not-a-pid "$$"; do
+    pid_guard_calls="$tmp/pid-guard-${unsafe_pid//[^[:alnum:]]/_}.calls"
+    printf '%s\n' "$unsafe_pid" > "$pid_guard_workspace/.beads/dolt-server.pid"
+    if ! (
+        kill() { printf 'kill %s\n' "$*" >> "$pid_guard_calls"; }
+        pkill() { printf 'pkill %s\n' "$*" >> "$pid_guard_calls"; }
+        sleep() { :; }
+        migration_server_port_in_use() { return 1; }
+        stop_dolt_server "$pid_guard_workspace"
+    ); then
+        fail "server cleanup rejected its owned workspace for PID value $unsafe_pid"
+    fi
+    if [ -e "$pid_guard_calls" ]; then
+        fail "server cleanup trusted unsafe or unrelated PID value $unsafe_pid"
+    fi
+done
+
+printf '0\n' > "$pid_guard_workspace/.beads/dolt-server.pid"
+for occupancy_status in 0 2; do
+    pid_guard_calls="$tmp/pid-guard-occupancy-$occupancy_status.calls"
+    if (
+        kill() { printf 'kill %s\n' "$*" >> "$pid_guard_calls"; }
+        pkill() { printf 'pkill %s\n' "$*" >> "$pid_guard_calls"; }
+        sleep() { :; }
+        migration_server_port_in_use() { return "$occupancy_status"; }
+        stop_dolt_server "$pid_guard_workspace"
+    ); then
+        fail "server cleanup accepted unsafe PID 0 with port occupancy status $occupancy_status"
+    fi
+    [ ! -e "$pid_guard_calls" ] ||
+        fail "server cleanup signaled a process for unsafe PID 0 with occupancy status $occupancy_status"
+done
+
+external_dolt_cwd="$tmp/external-dolt-cwd"
+mkdir -p "$external_dolt_cwd"
+(
+    cd "$external_dolt_cwd"
+    exec -a 'dolt sql-server' sleep 600
+) &
+guard_server_pid=$!
+for _ in $(seq 1 50); do
+    if [ "$(readlink "/proc/$guard_server_pid/cwd" 2>/dev/null || true)" = "$external_dolt_cwd" ] &&
+        tr '\0' ' ' < "/proc/$guard_server_pid/cmdline" 2>/dev/null | grep -q 'dolt.*sql-server'; then
+        break
+    fi
+    sleep 0.02
+done
+printf '%s\n' "$guard_server_pid" > "$pid_guard_workspace/.beads/dolt-server.pid"
+stop_dolt_server "$pid_guard_workspace" ||
+    fail "server cleanup rejected a free port for an unrelated Dolt-shaped process"
+if ! kill -0 "$guard_server_pid" 2>/dev/null; then
+    guard_server_pid=""
+    fail "server cleanup killed a Dolt-shaped process rooted outside its workspace"
+fi
+kill -9 -- "$guard_server_pid" 2>/dev/null || true
+wait "$guard_server_pid" 2>/dev/null || true
+guard_server_pid=""
+
+fake_dolt_cwd="$pid_guard_workspace/.beads/dolt"
+mkdir -p "$fake_dolt_cwd"
+(
+    cd "$fake_dolt_cwd"
+    exec -a 'dolt sql-server' sleep 600
+) &
+guard_server_pid=$!
+for _ in $(seq 1 50); do
+    if [ "$(readlink "/proc/$guard_server_pid/cwd" 2>/dev/null || true)" = "$fake_dolt_cwd" ] &&
+        tr '\0' ' ' < "/proc/$guard_server_pid/cmdline" 2>/dev/null | grep -q 'dolt.*sql-server'; then
+        break
+    fi
+    sleep 0.02
+done
+printf '%s\n' "$guard_server_pid" > "$pid_guard_workspace/.beads/dolt-server.pid"
+stop_dolt_server "$pid_guard_workspace" ||
+    fail "server cleanup rejected a verified Dolt server rooted in its workspace"
+if kill -0 "$guard_server_pid" 2>/dev/null; then
+    kill -9 -- "$guard_server_pid" 2>/dev/null || true
+    wait "$guard_server_pid" 2>/dev/null || true
+    guard_server_pid=""
+    fail "server cleanup left a verified Dolt server running"
+fi
+wait "$guard_server_pid" 2>/dev/null || true
+guard_server_pid=""
+
+rm -f "$pid_guard_workspace/.beads/dolt-server.pid"
+cleanup_workspace "$pid_guard_workspace" ||
+    fail "could not clean up the PID guard workspace"
+
+port_ws_one="$tmp/port-workspace-one"
+port_ws_two="$tmp/port-workspace-two"
+port_probe_bin="$tmp/port-probe-bd"
+mkdir -p "$port_ws_one/.git" "$port_ws_two/.git"
+reserve_migration_server_port "$port_ws_one" ||
+    fail "could not reserve the first isolated historical server port"
+reserve_migration_server_port "$port_ws_two" ||
+    fail "could not reserve the second isolated historical server port"
+port_one=$(cat "$port_ws_one/.git/bd-migration-server-port")
+port_two=$(cat "$port_ws_two/.git/bd-migration-server-port")
+[[ "$port_one" =~ ^2[0-9]{4}$ ]] || fail "first isolated server port is outside the reserved range"
+[[ "$port_two" =~ ^2[0-9]{4}$ ]] || fail "second isolated server port is outside the reserved range"
+[ "$port_one" != "$port_two" ] || fail "concurrent workspaces reused a historical server port"
+port_lock_one=$(cat "$port_ws_one/.git/bd-migration-server-port-lock")
+port_lock_two=$(cat "$port_ws_two/.git/bd-migration-server-port-lock")
+[ -d "$port_lock_one" ] && [ -d "$port_lock_two" ] ||
+    fail "isolated historical server port was not reserved atomically"
+cat > "$port_probe_bin" <<'EOF'
+#!/bin/bash
+printf '%s\n' "${BEADS_DOLT_SERVER_PORT:-}"
+EOF
+chmod +x "$port_probe_bin"
+[ "$(bd_in "$port_ws_one" "$port_probe_bin")" = "$port_one" ] ||
+    fail "bd_in did not propagate the workspace-specific historical server port"
+
+env_probe_bin="$tmp/environment-probe-bd"
+cat > "$env_probe_bin" <<'EOF'
+#!/bin/bash
+env | sort
+EOF
+chmod +x "$env_probe_bin"
+poisoned_env_output=$(
+    BEADS_DB=/production/beads.db \
+    BEADS_DIR=/production/.beads \
+    BEADS_DOLT_DATA_DIR=/production/dolt \
+    BEADS_BACKEND=postgres \
+    BD_DB=/production/bd.db \
+    GT_ROOT=/production/town \
+    DOLT_ROOT_PATH=/production/dolt-root \
+    HOME=/production/home \
+    XDG_CONFIG_HOME=/production/config \
+    GIT_CONFIG_GLOBAL=/production/gitconfig \
+    BASH_ENV=/production/bash-env \
+    bd_in "$port_ws_one" "$env_probe_bin"
+)
+if grep -Eq \
+    '^(BEADS_DB|BEADS_DIR|BEADS_DOLT_DATA_DIR|BEADS_BACKEND|BD_DB|GT_ROOT|DOLT_ROOT_PATH|BASH_ENV)=' \
+    <<< "$poisoned_env_output"; then
+    fail "bd_in exposed a poisoned host routing or shell environment"
+fi
+grep -Fqx "HOME=$port_ws_one/.git/bd-migration-home" <<< "$poisoned_env_output" ||
+    fail "bd_in did not isolate HOME inside the workspace"
+grep -Fqx "XDG_CONFIG_HOME=$port_ws_one/.git/bd-migration-home/.config" \
+    <<< "$poisoned_env_output" ||
+    fail "bd_in did not isolate XDG configuration inside the workspace"
+grep -Fqx "TMPDIR=$port_ws_one/.git/bd-migration-tmp" <<< "$poisoned_env_output" ||
+    fail "bd_in did not isolate temporary files inside the workspace"
+grep -Fqx 'GIT_CONFIG_GLOBAL=/dev/null' <<< "$poisoned_env_output" ||
+    fail "bd_in did not disable host-global Git configuration"
+grep -Fqx "BEADS_DOLT_SERVER_PORT=$port_one" <<< "$poisoned_env_output" ||
+    fail "bd_in did not retain the workspace-specific Dolt port"
+grep -Fqx 'BEADS_TEST_MODE=0' <<< "$poisoned_env_output" ||
+    fail "bd_in did not force the server-capable migration test mode"
+grep -Fqx 'BEADS_NO_DAEMON=1' <<< "$poisoned_env_output" ||
+    fail "bd_in did not disable the historical background daemon"
+grep -Fqx 'BEADS_DOLT_AUTO_START=1' <<< "$poisoned_env_output" ||
+    fail "bd_in did not force the intended historical server auto-start behavior"
+
+release_migration_server_port "$port_ws_one" ||
+    fail "could not release the first isolated historical server port"
+release_migration_server_port "$port_ws_two" ||
+    fail "could not release the second isolated historical server port"
+[ ! -e "$port_lock_one" ] && [ ! -e "$port_lock_two" ] ||
+    fail "historical server port reservation leaked after release"
+
+port_unknown_ws="$tmp/port-workspace-unknown-occupancy"
+mkdir -p "$port_unknown_ws/.git"
+if (
+    migration_server_port_in_use() { return 2; }
+    reserve_migration_server_port "$port_unknown_ws"
+); then
+    fail "historical server port reservation treated unknown occupancy as free"
+fi
+[ ! -e "$port_unknown_ws/.git/bd-migration-server-port" ] &&
+    [ ! -e "$port_unknown_ws/.git/bd-migration-server-port-lock" ] ||
+    fail "failed historical server port reservation left workspace markers"
+
+runtime_bin_dir="$tmp/runtime-bin"
+mkdir -p "$runtime_bin_dir"
+cat > "$runtime_bin_dir/dolt" <<'EOF'
+#!/bin/bash
+printf 'dolt version %s\n' "${FAKE_DOLT_VERSION:-unknown}"
+EOF
+chmod +x "$runtime_bin_dir/dolt"
+if ! PATH="$runtime_bin_dir:$PATH" FAKE_DOLT_VERSION=2.1.8 \
+    verify_strict_historical_runtime v0.57.0; then
+    fail "qualified v0.57.0 Dolt runtime was rejected"
+fi
+if PATH="$runtime_bin_dir:$PATH" FAKE_DOLT_VERSION=2.1.9 \
+    verify_strict_historical_runtime v0.57.0 >/dev/null 2>&1; then
+    fail "unqualified v0.57.0 Dolt runtime was accepted"
+fi
+verify_strict_historical_runtime v0.49.6 ||
+    fail "a release without an external Dolt requirement was rejected"
+
 printf 'not the release archive' > "$tmp/archive.tar.gz"
 if OS=linux ARCH=amd64 verify_release_archive v0.49.6 "$tmp/archive.tar.gz" >/dev/null 2>&1; then
     fail "tampered release archive was accepted"
@@ -53,11 +366,16 @@ fi
 if OS=linux ARCH=amd64 verify_release_archive v0.55.4 "$tmp/archive.tar.gz" >/dev/null 2>&1; then
     fail "tampered v0.55.4 release archive was accepted"
 fi
+if OS=linux ARCH=amd64 verify_release_archive v0.57.0 "$tmp/archive.tar.gz" >/dev/null 2>&1; then
+    fail "tampered v0.57.0 release archive was accepted"
+fi
 
 strict_fixture_has_expected_features v0.49.6 epic task bug dependency standalone closed label comment ||
     fail "complete source fixture was rejected"
 strict_fixture_has_expected_features v0.55.4 epic task bug dependency standalone closed label comment ||
     fail "complete v0.55.4 source fixture was rejected"
+strict_fixture_has_expected_features v0.57.0 epic task bug dependency standalone closed label comment ||
+    fail "complete v0.57.0 source fixture was rejected"
 if strict_fixture_has_expected_features v0.49.6 epic task bug standalone closed label >/dev/null 2>&1; then
     fail "source fixture without dependency was accepted"
 fi
@@ -83,22 +401,24 @@ strict_snapshot_has_expected_fixture v0.49.6 "$tmp/fixture.json" ||
     fail "exact v0.49.6 source fixture was rejected"
 strict_snapshot_has_expected_fixture v0.55.4 "$tmp/fixture.json" ||
     fail "exact v0.55.4 source fixture was rejected"
+strict_snapshot_has_expected_fixture v0.57.0 "$tmp/fixture.json" ||
+    fail "exact v0.57.0 source fixture was rejected"
 jq 'map(select(.id != "old-epic"))' "$tmp/fixture.json" > "$tmp/fixture-four-items.json"
-for version in v0.49.6 v0.55.4; do
+for version in v0.49.6 v0.55.4 v0.57.0; do
     if strict_snapshot_has_expected_fixture "$version" "$tmp/fixture-four-items.json" >/dev/null 2>&1; then
         fail "$version source fixture with four items was accepted"
     fi
 done
 jq '. + [{"id":"old-extra","title":"Unexpected extra issue"}]' \
     "$tmp/fixture.json" > "$tmp/fixture-six-items.json"
-for version in v0.49.6 v0.55.4; do
+for version in v0.49.6 v0.55.4 v0.57.0; do
     if strict_snapshot_has_expected_fixture "$version" "$tmp/fixture-six-items.json" >/dev/null 2>&1; then
         fail "$version source fixture with six items was accepted"
     fi
 done
 jq 'map(if .id == "old-epic" then .issue_type = "task" else . end)' \
     "$tmp/fixture.json" > "$tmp/fixture-wrong-epic.json"
-for version in v0.49.6 v0.55.4; do
+for version in v0.49.6 v0.55.4 v0.57.0; do
     if strict_snapshot_has_expected_fixture "$version" "$tmp/fixture-wrong-epic.json" >/dev/null 2>&1; then
         fail "$version source fixture with an inexact epic was accepted"
     fi
@@ -111,6 +431,9 @@ fi
 if strict_snapshot_has_expected_fixture v0.55.4 "$tmp/fixture-missing-rich-field.json" >/dev/null 2>&1; then
     fail "v0.55.4 source fixture without the exact rich fields was accepted"
 fi
+if strict_snapshot_has_expected_fixture v0.57.0 "$tmp/fixture-missing-rich-field.json" >/dev/null 2>&1; then
+    fail "v0.57.0 source fixture without the exact rich fields was accepted"
+fi
 jq 'map(if .id == "old-task" then .labels = [] else . end)' \
     "$tmp/fixture.json" > "$tmp/fixture-missing-label.json"
 if strict_snapshot_has_expected_fixture v0.49.6 "$tmp/fixture-missing-label.json" >/dev/null 2>&1; then
@@ -119,6 +442,9 @@ fi
 if strict_snapshot_has_expected_fixture v0.55.4 "$tmp/fixture-missing-label.json" >/dev/null 2>&1; then
     fail "v0.55.4 source fixture without the exact label was accepted"
 fi
+if strict_snapshot_has_expected_fixture v0.57.0 "$tmp/fixture-missing-label.json" >/dev/null 2>&1; then
+    fail "v0.57.0 source fixture without the exact label was accepted"
+fi
 jq 'map(if .id == "old-bug" then .dependencies = [] else . end)' \
     "$tmp/fixture.json" > "$tmp/fixture-missing-dependency.json"
 if strict_snapshot_has_expected_fixture v0.49.6 "$tmp/fixture-missing-dependency.json" >/dev/null 2>&1; then
@@ -126,6 +452,9 @@ if strict_snapshot_has_expected_fixture v0.49.6 "$tmp/fixture-missing-dependency
 fi
 if strict_snapshot_has_expected_fixture v0.55.4 "$tmp/fixture-missing-dependency.json" >/dev/null 2>&1; then
     fail "v0.55.4 source fixture without the exact dependency was accepted"
+fi
+if strict_snapshot_has_expected_fixture v0.57.0 "$tmp/fixture-missing-dependency.json" >/dev/null 2>&1; then
+    fail "v0.57.0 source fixture without the exact dependency was accepted"
 fi
 
 mkdir -p "$tmp/source/.beads"
@@ -340,9 +669,34 @@ if find "$legacy_race_ws/.beads" -maxdepth 2 \
     fail "rollback publication race left a temporary copy"
 fi
 
+stop_refusal_ws="$tmp/stop-refusal-workspace"
+stop_refusal_calls="$tmp/stop-refusal.calls"
+mkdir -p "$stop_refusal_ws/.beads/dolt"
+printf 'active stop-refusal data' > "$stop_refusal_ws/.beads/dolt/table.dat"
+printf 'active stop-refusal metadata' > "$stop_refusal_ws/.beads/metadata.json"
+stop_refusal_fingerprint=$(source_artifact_fingerprint "$stop_refusal_ws/.beads")
+export LEGACY_RACE_CALLS="$stop_refusal_calls"
+: > "$stop_refusal_calls"
+if (
+    stop_dolt_server() { return 1; }
+    recipe_server_to_embedded \
+        "$stop_refusal_ws" "$legacy_race_old_bin" "$legacy_race_candidate_bin" \
+        v0.55.4 "$legacy_race_before"
+) >/dev/null 2>&1; then
+    fail "server bridge continued after server-stop verification failed"
+fi
+[ ! -s "$stop_refusal_calls" ] ||
+    fail "server-stop verification failure invoked a migration binary"
+[ "$(source_artifact_fingerprint "$stop_refusal_ws/.beads")" = "$stop_refusal_fingerprint" ] ||
+    fail "server-stop verification failure mutated the active source"
+[ ! -e "$stop_refusal_ws/.beads/legacy-dolt.pre-migration" ] ||
+    fail "server-stop verification failure created a rollback tree"
+
 [ "$(server_bridge_strategy v0.55.4)" = "native_export" ] ||
     fail "v0.55.4 did not select its pinned server bridge strategy"
-for unsupported_version in v0.56.1 v0.57.0 v0.58.0 v9.9.9; do
+[ "$(server_bridge_strategy v0.57.0)" = "native_export_show_comments" ] ||
+    fail "v0.57.0 did not select its lossless export+show server bridge strategy"
+for unsupported_version in v0.56.1 v0.58.0 v9.9.9; do
     if server_bridge_strategy "$unsupported_version" >/dev/null 2>&1; then
         fail "$unsupported_version unexpectedly selected a server bridge strategy"
     fi
@@ -371,6 +725,22 @@ RESULT_DETAILS=("recipe: sqlite_to_current, 0 fidelity violations")
 RESULT_RECIPES=("sqlite_to_current")
 RESULT_VIOLATIONS=("0")
 strict_results_match MANUAL sqlite_to_current || fail "qualified result was rejected"
+
+cleanup_blocked_result=$(
+    RESULT_PATHS=()
+    RESULT_STATUSES=()
+    RESULT_DETAILS=()
+    RESULT_RECIPES=()
+    RESULT_VIOLATIONS=()
+    cleanup_workspace() { return 1; }
+    record_result_after_workspace_cleanup \
+        "/tmp/bd-migration-ABC123" "v0.57.0 → candidate" \
+        "MANUAL" "recipe passed" "server_to_embedded" "0" || true
+    printf '%s|%s|%s\n' \
+        "${RESULT_STATUSES[0]}" "${RESULT_RECIPES[0]}" "${RESULT_DETAILS[0]}"
+)
+[[ "$cleanup_blocked_result" == BLOCKED\|\|*preserved* ]] ||
+    fail "cleanup verification failure did not override a successful lane result"
 
 RESULT_STATUSES=("SKIP")
 if strict_results_match MANUAL sqlite_to_current >/dev/null 2>&1; then
@@ -532,6 +902,309 @@ if migration_jsonl_matches_snapshot \
     fail "historical JSONL contract accepted two records on one line"
 fi
 
+# v0.57.0's native export preserves issue/label/dependency records and a
+# comment_count, but omits comment bodies. Its release-specific bridge must use
+# `export -o PATH`, enrich each exported ID from `show ID --json`, and finish
+# validating the list/export/show consensus before invoking the candidate.
+v057_before="$tmp/v057-before.json"
+v057_old_bin="$tmp/fake-v0.57.0-bd"
+v057_candidate_bin="$tmp/fake-v0.57.0-candidate-bd"
+v057_old_calls="$tmp/v057-old.calls"
+v057_candidate_calls="$tmp/v057-candidate.calls"
+printf '%s\n' '[
+  {"id":"v57-task","title":"Legacy task","labels":["urgent"],"dependencies":[{"id":"v57-bug","dependency_type":"parent-child"}],"comments":[{"id":7,"issue_id":"v57-task","author":"legacy-author","text":"v0.57 comment body","created_at":"2025-01-02T03:04:05Z"}]},
+  {"id":"v57-bug","title":"Legacy bug","dependencies":[{"id":"v57-task","dependency_type":"blocks"}],"comments":[]}
+]' > "$v057_before"
+cat > "$v057_old_bin" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$V057_OLD_CALLS"
+
+write_valid_export() {
+    printf '%s\n' \
+        '{"id":"v57-task","title":"Legacy task","labels":["urgent"],"dependencies":[{"issue_id":"v57-task","depends_on_id":"v57-bug","type":"parent-child","metadata":"{}"}],"dependency_count":0,"comment_count":1}' \
+        '{"id":"v57-bug","title":"Legacy bug","dependencies":[{"issue_id":"v57-bug","depends_on_id":"v57-task","type":"blocks","metadata":"{}"}],"dependency_count":1,"comment_count":0}' \
+        > "$1"
+}
+
+write_valid_task_show() {
+    printf '%s\n' '[{"id":"v57-task","title":"Legacy task","labels":["urgent"],"dependencies":[{"id":"v57-bug","dependency_type":"parent-child"}],"comments":[{"id":7,"issue_id":"v57-task","author":"legacy-author","text":"v0.57 comment body","created_at":"2025-01-02T03:04:05Z"}]}]'
+}
+
+write_valid_bug_show() {
+    printf '%s\n' '[{"id":"v57-bug","title":"Legacy bug","dependencies":[{"id":"v57-task","dependency_type":"blocks"}],"comments":[]}]'
+}
+
+case "$1" in
+    export)
+        # v0.57.0 removed v0.55.4's --format flag. Pin the actual release CLI.
+        [ "$#" -eq 3 ] && [ "$2" = "-o" ] && [ -n "$3" ] || exit 2
+        case "${V057_MODE:-valid}" in
+            export-missing)
+                printf '%s\n' \
+                    '{"id":"v57-task","title":"Legacy task","labels":["urgent"],"dependencies":[{"issue_id":"v57-task","depends_on_id":"v57-bug","type":"parent-child","metadata":"{}"}],"dependency_count":0,"comment_count":1}' \
+                    > "$3"
+                ;;
+            export-extra)
+                write_valid_export "$3"
+                printf '%s\n' \
+                    '{"id":"v57-extra","title":"Unexpected","comment_count":0}' \
+                    >> "$3"
+                ;;
+            export-duplicate)
+                write_valid_export "$3"
+                printf '%s\n' \
+                    '{"id":"v57-task","title":"Duplicate","comment_count":1}' \
+                    >> "$3"
+                ;;
+            export-core-changed)
+                write_valid_export "$3"
+                sed -i 's/"title":"Legacy task"/"title":"Changed task"/' "$3"
+                ;;
+            export-label-changed)
+                write_valid_export "$3"
+                sed -i 's/"labels":\["urgent"\]/"labels":[]/' "$3"
+                ;;
+            export-dependency-changed)
+                write_valid_export "$3"
+                sed -i 's/"depends_on_id":"v57-task"/"depends_on_id":"v57-other"/' "$3"
+                ;;
+            export-unsupported-field)
+                write_valid_export "$3"
+                sed -i 's/"title":"Legacy task"/"title":"Legacy task","quality_score":0.5/' "$3"
+                ;;
+            export-unsupported-creator)
+                write_valid_export "$3"
+                sed -i 's/"title":"Legacy task"/"title":"Legacy task","creator":{"type":"human","id":"legacy"}/' "$3"
+                ;;
+            export-unsupported-validations)
+                write_valid_export "$3"
+                sed -i 's/"title":"Legacy task"/"title":"Legacy task","validations":[{"validator":"legacy"}]/' "$3"
+                ;;
+            export-unsupported-holder)
+                write_valid_export "$3"
+                sed -i 's/"title":"Legacy task"/"title":"Legacy task","holder":"legacy-agent"/' "$3"
+                ;;
+            export-unsupported-closed-session)
+                write_valid_export "$3"
+                sed -i 's/"title":"Legacy task"/"title":"Legacy task","closed_by_session":"legacy-session"/' "$3"
+                ;;
+            export-dependency-metadata)
+                write_valid_export "$3"
+                sed -i 's/"metadata":"{}"/"metadata":"legacy-edge-data"/' "$3"
+                ;;
+            *)
+                write_valid_export "$3"
+                ;;
+        esac
+        ;;
+    show)
+        shift
+        id=""
+        json=false
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --json) json=true ;;
+                --id=*)
+                    [ -z "$id" ] || exit 2
+                    id="${1#--id=}"
+                    ;;
+                --id)
+                    shift
+                    [ "$#" -gt 0 ] && [ -z "$id" ] || exit 2
+                    id="$1"
+                    ;;
+                --*) exit 2 ;;
+                *)
+                    [ -z "$id" ] || exit 2
+                    id="$1"
+                    ;;
+            esac
+            shift
+        done
+        $json && [ -n "$id" ] || exit 2
+        if [ "$id" = "v57-task" ]; then
+            case "${V057_MODE:-valid}" in
+                show-fail)
+                    write_valid_task_show
+                    exit 1
+                    ;;
+                show-malformed) printf '%s\n' 'not JSON' ;;
+                show-object) printf '%s\n' '{"id":"v57-task","title":"Legacy task","comments":[]}' ;;
+                show-empty) printf '%s\n' '[]' ;;
+                show-wrong-id) printf '%s\n' '[{"id":"v57-other","comments":[]}]' ;;
+                show-duplicate)
+                    printf '%s\n' '[{"id":"v57-task","comments":[]},{"id":"v57-task","comments":[]}]'
+                    ;;
+                show-core-changed)
+                    printf '%s\n' '[{"id":"v57-task","title":"Changed task","labels":["urgent"],"dependencies":[{"id":"v57-bug","dependency_type":"parent-child"}],"comments":[{"id":7,"issue_id":"v57-task","author":"legacy-author","text":"v0.57 comment body","created_at":"2025-01-02T03:04:05Z"}]}]'
+                    ;;
+                comment-missing)
+                    printf '%s\n' '[{"id":"v57-task","title":"Legacy task","labels":["urgent"],"dependencies":[{"id":"v57-bug","dependency_type":"parent-child"}],"comments":[]}]'
+                    ;;
+                comment-changed)
+                    printf '%s\n' '[{"id":"v57-task","title":"Legacy task","labels":["urgent"],"dependencies":[{"id":"v57-bug","dependency_type":"parent-child"}],"comments":[{"id":7,"issue_id":"v57-task","author":"legacy-author","text":"changed body","created_at":"2025-01-02T03:04:05Z"}]}]'
+                    ;;
+                *) write_valid_task_show ;;
+            esac
+        elif [ "$id" = "v57-bug" ]; then
+            write_valid_bug_show
+        else
+            exit 2
+        fi
+        ;;
+    *)
+        exit 2
+        ;;
+esac
+EOF
+cat > "$v057_candidate_bin" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$V057_CANDIDATE_CALLS"
+[ "$1" = "init" ] || exit 2
+for arg in "$@"; do
+    if [ "$arg" = "--from-jsonl" ]; then
+        jq -se '
+            length == 2 and
+            ([.[].id] | sort) == ["v57-bug", "v57-task"] and
+            ([.[] | select(.id == "v57-task")] | length) == 1 and
+            (first(.[] | select(.id == "v57-task")) |
+                .comment_count == 1 and
+                (.comments | length) == 1 and
+                .comments[0].author == "legacy-author" and
+                .comments[0].text == "v0.57 comment body") and
+            (first(.[] | select(.id == "v57-bug")) |
+                .comment_count == 0 and ((.comments // []) | length) == 0)
+        ' .beads/issues.jsonl >/dev/null
+        exit
+    fi
+done
+exit 1
+EOF
+chmod +x "$v057_old_bin" "$v057_candidate_bin"
+
+prepare_v057_workspace() {
+    local ws="$1"
+    mkdir -p "$ws/.beads/dolt"
+    printf 'v0.57 legacy Dolt bytes' > "$ws/.beads/dolt/table.dat"
+    printf 'v0.57 legacy metadata' > "$ws/.beads/metadata.json"
+    printf '%s\n' '{"id":"v57-task","title":"Original passive export"}' \
+        > "$ws/.beads/issues.jsonl"
+}
+
+v057_happy_ws="$tmp/v057-happy-workspace"
+prepare_v057_workspace "$v057_happy_ws"
+v057_happy_manifest=$(legacy_dolt_artifact_manifest "$v057_happy_ws/.beads")
+v057_happy_original_jsonl=$(sha256_file "$v057_happy_ws/.beads/issues.jsonl")
+export V057_MODE=valid
+export V057_OLD_CALLS="$v057_old_calls"
+export V057_CANDIDATE_CALLS="$v057_candidate_calls"
+: > "$v057_old_calls"
+: > "$v057_candidate_calls"
+if ! (
+    stop_dolt_server() { :; }
+    recipe_server_to_embedded \
+        "$v057_happy_ws" "$v057_old_bin" "$v057_candidate_bin" \
+        v0.57.0 "$v057_before"
+) >/dev/null; then
+    fail "v0.57.0 export+show bridge did not produce a lossless candidate import"
+fi
+grep -E "^export -o $v057_happy_ws/\.beads/\.issues\.jsonl\.migration\.tmp\." \
+    "$v057_old_calls" >/dev/null ||
+    fail "v0.57.0 bridge did not use its release-specific native export syntax"
+if grep -q -- '--format' "$v057_old_calls"; then
+    fail "v0.57.0 bridge used the unsupported historical --format flag"
+fi
+[ "$(grep -c '^show ' "$v057_old_calls")" -eq 2 ] ||
+    fail "v0.57.0 bridge did not issue exactly one show query per exported id"
+grep '^show ' "$v057_old_calls" | grep 'v57-task' >/dev/null ||
+    fail "v0.57.0 bridge did not enrich v57-task"
+grep '^show ' "$v057_old_calls" | grep 'v57-bug' >/dev/null ||
+    fail "v0.57.0 bridge did not enrich v57-bug"
+jq -se '
+    length == 2 and
+    (first(.[] | select(.id == "v57-task")) |
+        .comment_count == 1 and
+        (.comments | length) == 1 and
+        .comments[0].author == "legacy-author" and
+        .comments[0].text == "v0.57 comment body")
+' "$v057_happy_ws/.beads/issues.jsonl" >/dev/null ||
+    fail "v0.57.0 bridge did not publish the show-enriched comment body"
+verify_retained_legacy_dolt_source \
+    "$v057_happy_ws/.beads" "$v057_happy_manifest" ||
+    fail "v0.57.0 bridge did not retain an exact rollback source"
+[ "$(sha256_file "$v057_happy_ws/.beads/legacy-dolt.pre-migration/issues.jsonl")" = \
+    "$v057_happy_original_jsonl" ] ||
+    fail "v0.57.0 bridge did not retain the original passive JSONL"
+
+assert_v057_bridge_rejected() {
+    local mode="$1"
+    local description="$2"
+    local ws="$tmp/v057-reject-$mode"
+    local before_manifest original_jsonl after_manifest
+
+    prepare_v057_workspace "$ws"
+    before_manifest=$(legacy_dolt_artifact_manifest "$ws/.beads")
+    original_jsonl=$(sha256_file "$ws/.beads/issues.jsonl")
+    export V057_MODE="$mode"
+    : > "$v057_old_calls"
+    : > "$v057_candidate_calls"
+
+    if (
+        stop_dolt_server() { :; }
+        recipe_server_to_embedded \
+            "$ws" "$v057_old_bin" "$v057_candidate_bin" \
+            v0.57.0 "$v057_before"
+    ) >/dev/null 2>&1; then
+        fail "v0.57.0 bridge accepted $description"
+    fi
+    [ ! -s "$v057_candidate_calls" ] ||
+        fail "$description invoked the candidate before lossless extraction completed"
+    after_manifest=$(legacy_dolt_artifact_manifest "$ws/.beads") ||
+        fail "$description removed the active legacy source"
+    [ "$after_manifest" = "$before_manifest" ] ||
+        fail "$description mutated the active legacy source"
+    [ "$(sha256_file "$ws/.beads/issues.jsonl")" = "$original_jsonl" ] ||
+        fail "$description replaced the original passive JSONL"
+    verify_retained_legacy_dolt_source "$ws/.beads" "$before_manifest" ||
+        fail "$description did not leave an exact rollback source"
+    if find "$ws/.beads" -maxdepth 1 \
+        \( -name '.issues.jsonl.migration.tmp.*' -o \
+           -name '.issues.jsonl.enriched.tmp.*' -o \
+           -name '.issues.jsonl.show.tmp.*' \) \
+        -print -quit | grep -q .; then
+        fail "$description left an extraction staging file"
+    fi
+    case "$mode" in
+        export-*)
+            if grep -q '^show ' "$v057_old_calls"; then
+                fail "$description invoked show after export inventory validation failed"
+            fi
+            ;;
+    esac
+}
+
+assert_v057_bridge_rejected export-missing "an export missing a listed id"
+assert_v057_bridge_rejected export-extra "an export with an unlisted id"
+assert_v057_bridge_rejected export-duplicate "an export with a duplicate id"
+assert_v057_bridge_rejected export-core-changed "an export with changed core issue data"
+assert_v057_bridge_rejected export-label-changed "an export with changed labels"
+assert_v057_bridge_rejected export-dependency-changed "an export with changed dependencies"
+assert_v057_bridge_rejected export-unsupported-field "an export with candidate-unsupported issue data"
+assert_v057_bridge_rejected export-unsupported-creator "an export with a candidate-unsupported creator"
+assert_v057_bridge_rejected export-unsupported-validations "an export with candidate-unsupported validations"
+assert_v057_bridge_rejected export-unsupported-holder "an export with a candidate-unsupported holder"
+assert_v057_bridge_rejected export-unsupported-closed-session "an export with a candidate-unsupported close session"
+assert_v057_bridge_rejected export-dependency-metadata "an export with candidate-unsupported dependency metadata"
+assert_v057_bridge_rejected show-fail "a nonzero show command with valid-looking JSON"
+assert_v057_bridge_rejected show-malformed "malformed show JSON"
+assert_v057_bridge_rejected show-object "a show object instead of a one-item array"
+assert_v057_bridge_rejected show-empty "a show result missing its requested id"
+assert_v057_bridge_rejected show-wrong-id "a show result with a mismatched id"
+assert_v057_bridge_rejected show-duplicate "a show result with a duplicate id"
+assert_v057_bridge_rejected show-core-changed "a show result with changed core issue data"
+assert_v057_bridge_rejected comment-missing "a show result missing an exported comment"
+assert_v057_bridge_rejected comment-changed "a show result with changed comment text"
+
 server_export_ws="$tmp/server-export-workspace"
 server_export_calls="$tmp/server-export-calls"
 server_export_old_bin="$tmp/fake-v0.55.4-bd"
@@ -576,10 +1249,12 @@ exit 1
 EOF
 chmod +x "$server_export_old_bin" "$server_export_candidate_bin"
 export SERVER_EXPORT_CALLS="$server_export_calls"
-if ! recipe_server_to_embedded \
-    "$server_export_ws" "$server_export_old_bin" "$server_export_candidate_bin" \
-    v0.55.4 "$server_export_before" \
-    >/dev/null; then
+if ! (
+    stop_dolt_server() { :; }
+    recipe_server_to_embedded \
+        "$server_export_ws" "$server_export_old_bin" "$server_export_candidate_bin" \
+        v0.55.4 "$server_export_before"
+) >/dev/null; then
     fail "server-to-embedded recipe lost comments exposed only by historical export"
 fi
 grep -E "^export --format jsonl -o $server_export_ws/\.beads/\.issues\.jsonl\.migration\.tmp\." \

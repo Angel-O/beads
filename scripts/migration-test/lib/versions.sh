@@ -45,25 +45,37 @@ declare -ar LEGACY_DOLT_ROLLBACK_FILES=(
 declare -Ar STRICT_RELEASE_ASSETS=(
     ["v0.49.6|linux|amd64"]="beads_0.49.6_linux_amd64.tar.gz"
     ["v0.55.4|linux|amd64"]="beads_0.55.4_linux_amd64.tar.gz"
+    ["v0.57.0|linux|amd64"]="beads_0.57.0_linux_amd64.tar.gz"
 )
 declare -Ar STRICT_RELEASE_SHA256=(
     ["v0.49.6|linux|amd64"]="8546dc9a47e11dc31ac2bc9a0224a9c690975e91850932cbb62623053fbb7db8"
     ["v0.55.4|linux|amd64"]="e0fa25456dd82890230eef17653448a0bf995104c78864be91c5ed84426a5f49"
+    ["v0.57.0|linux|amd64"]="f8629d5627bed7d25f06f92334addc171d679f9aed9d08c5d42a9684205dc04b"
 )
 declare -Ar STRICT_EXPECTED_STATUSES=(
     ["v0.49.6"]="MANUAL"
     ["v0.55.4"]="MANUAL"
+    ["v0.57.0"]="MANUAL"
 )
 declare -Ar STRICT_EXPECTED_RECIPES=(
     ["v0.49.6"]="sqlite_to_current"
     ["v0.55.4"]="server_to_embedded"
+    ["v0.57.0"]="server_to_embedded"
 )
 declare -Ar STRICT_EXPECTED_FEATURES=(
     ["v0.49.6"]="epic task bug dependency standalone closed label comment"
     ["v0.55.4"]="epic task bug dependency standalone closed label comment"
+    ["v0.57.0"]="epic task bug dependency standalone closed label comment"
 )
 declare -Ar SERVER_BRIDGE_STRATEGIES=(
     ["v0.55.4"]="native_export"
+    ["v0.57.0"]="native_export_show_comments"
+)
+declare -Ar STRICT_REQUIRED_DOLT_VERSIONS=(
+    ["v0.57.0"]="2.1.8"
+)
+declare -Ar STRICT_REQUIRED_DOLT_SHA256=(
+    ["v0.57.0|linux|amd64"]="f66318f08ed66e409fc39363ae0fff8ce6fbf6dba9f5bac632b91527b9632a74"
 )
 
 strict_release_asset() {
@@ -100,6 +112,30 @@ server_bridge_strategy() {
     local value="${SERVER_BRIDGE_STRATEGIES[$1]:-}"
     [ -n "$value" ] || return 1
     printf '%s\n' "$value"
+}
+
+strict_required_dolt_version() {
+    local value="${STRICT_REQUIRED_DOLT_VERSIONS[$1]:-}"
+    [ -n "$value" ] || return 1
+    printf '%s\n' "$value"
+}
+
+strict_required_dolt_sha256() {
+    local value="${STRICT_REQUIRED_DOLT_SHA256["$1|$2|$3"]:-}"
+    [ -n "$value" ] || return 1
+    printf '%s\n' "$value"
+}
+
+verify_strict_historical_runtime() {
+    local version="$1"
+    local expected output
+
+    if ! expected=$(strict_required_dolt_version "$version"); then
+        return 0
+    fi
+    command -v dolt >/dev/null 2>&1 || return 1
+    output=$(dolt version 2>/dev/null) || return 1
+    grep -Fqx "dolt version $expected" <<< "$output"
 }
 
 strict_fixture_has_expected_features() {
