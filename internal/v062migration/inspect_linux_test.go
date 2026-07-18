@@ -732,6 +732,108 @@ func TestInspectRefusesDeterministicRevalidationDrift(t *testing.T) {
 	assertRefusalCode(t, err, CodeSourceChanged)
 }
 
+// TestInspectRevalidationRefusesProjectDirectorySwap proves that the
+// residual-window project-identity revalidation in revalidateSource — not the
+// second admission tree-digest comparison — is what refuses a source whose
+// canonical project directory is swapped for a fresh inode after the first tree
+// inspection. The retained .beads descriptor still names the original inode, so
+// the second inspectTree walks an unchanged tree and cannot observe the swap;
+// only the project-descriptor revalidation (the retained-fd stat check plus the
+// /proc/self/fd identity readlink ahead of reverifyProjectIdentity) catches it.
+// If that revalidation were neutralized the swapped source would be admitted and
+// this test would flip from refuse to qualify, which is exactly the regression
+// the existing repo_state.json drift test (caught by the tree digest) cannot see.
+func TestInspectRevalidationRefusesProjectDirectorySwap(t *testing.T) {
+	project := newV062Project(t)
+	result, err := inspectWithHooks(project, "1.1.0", inspectHooks{
+		afterFirstTree: func() {
+			swapped := project + ".swapped"
+			if renameErr := os.Rename(project, swapped); renameErr != nil {
+				t.Fatalf("swap project directory aside: %v", renameErr)
+			}
+			// Recreate a fresh inode at the original canonical path so a
+			// path-based reopen resolves to a different directory than the one
+			// the inspector admitted while the retained .beads tree is untouched.
+			if mkErr := os.Mkdir(project, 0o700); mkErr != nil {
+				t.Fatalf("recreate project path: %v", mkErr)
+			}
+		},
+	})
+	if result.Status != "" {
+		t.Fatalf("project swap returned result %#v", result)
+	}
+	assertRefusalCode(t, err, CodeSourceChanged)
+}
+
+// TestInspectRevalidationRefusesWitnessDriftBeforeTreeDigest proves the
+// residual-window witness revalidation in revalidateSource refuses a witness
+// that drifts after the first tree inspection, and that the refusal is produced
+// by that revalidation rather than only by the second admission tree-digest
+// comparison. The size-preserving in-place rewrite fires inside the
+// afterFirstTree hook, so revalidateSource observes the drift on its retained
+// witness descriptor and short-circuits before inspectWithHooks runs the second
+// inspectTree. The mountIDAt seam is used as a tripwire: it records whether the
+// second tree walk re-examined the witness entry after the mutation. It must
+// not, because a healthy revalidateSource refuses first; if it does, the refusal
+// came from the tree-digest path the review flagged as the only proven guard.
+func TestInspectRevalidationRefusesWitnessDriftBeforeTreeDigest(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		witness string
+		rewrite func(t *testing.T, project string)
+	}{
+		{
+			name:    "local_version",
+			witness: ".local_version",
+			rewrite: func(t *testing.T, project string) {
+				// 7 bytes -> 7 bytes: the witness content drifts, size is kept.
+				mustWrite(t, filepath.Join(project, ".beads", ".local_version"), "0.62.1\n")
+			},
+		},
+		{
+			name:    "metadata_json",
+			witness: "metadata.json",
+			rewrite: func(t *testing.T, project string) {
+				path := filepath.Join(project, ".beads", "metadata.json")
+				original, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatalf("read metadata witness: %v", err)
+				}
+				drifted := strings.Replace(string(original), "3307", "3308", 1)
+				if len(drifted) != len(original) || drifted == string(original) {
+					t.Fatalf("metadata rewrite was not a size-preserving drift")
+				}
+				mustWrite(t, path, drifted)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			project := newV062Project(t)
+			mutated := false
+			secondTreeObservedWitness := false
+			result, err := inspectWithHooks(project, "1.1.0", inspectHooks{
+				afterFirstTree: func() {
+					tc.rewrite(t, project)
+					mutated = true
+				},
+				mountIDAt: func(dirfd int, path string, flags int) (uint64, error) {
+					if mutated && path == tc.witness && descriptorPathHasSuffix(dirfd, "/.beads") {
+						secondTreeObservedWitness = true
+					}
+					return readMountIDAt(dirfd, path, flags)
+				},
+			})
+			if result.Status != "" {
+				t.Fatalf("witness drift returned result %#v", result)
+			}
+			assertRefusalCode(t, err, CodeSourceChanged)
+			if secondTreeObservedWitness {
+				t.Fatal("second inspectTree re-examined the drifted witness; the refusal came from the tree-digest comparison, not residual-window revalidation")
+			}
+		})
+	}
+}
+
 func TestInspectReleasesDescriptorsOnSuccessAndRefusal(t *testing.T) {
 	project := newV062Project(t)
 	before := openDescriptorCount(t)
