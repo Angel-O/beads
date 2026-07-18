@@ -27,6 +27,30 @@ func CloseIssueWithoutEventInTx(ctx context.Context, tx DBTX, id string, reason,
 	return closeIssueInTx(ctx, tx, id, reason, actor, session, false)
 }
 
+// CloseIssueCheckedInTx closes an issue within a transaction, refusing with
+// storage.ErrCloseBlocked when it is still blocked (is_blocked=1) unless force
+// is set. The guard (IsBlockedInTx) and the close (CloseIssueInTx) share the
+// SAME transaction, so no blocker can clear between the check and the close.
+func CloseIssueCheckedInTx(ctx context.Context, tx DBTX, id, reason, actor, session string, force bool) (*CloseResult, error) {
+	if !force {
+		blocked, blockers, err := IsBlockedInTx(ctx, tx, id)
+		if err != nil {
+			return nil, err
+		}
+		if blocked {
+			// A purely transitive block (e.g. an active parent-child chain)
+			// sets is_blocked=1 without any direct blocks/waits-for/
+			// conditional-blocks edge, so blockers is empty — omit the "blocked
+			// by" clause rather than render "blocked by []".
+			if len(blockers) > 0 {
+				return nil, fmt.Errorf("%w: %s is blocked by %v", storage.ErrCloseBlocked, id, blockers)
+			}
+			return nil, fmt.Errorf("%w: %s", storage.ErrCloseBlocked, id)
+		}
+	}
+	return CloseIssueInTx(ctx, tx, id, reason, actor, session)
+}
+
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
 func closeIssueInTx(ctx context.Context, tx DBTX, id string, reason, actor, session string, recordEvent bool) (*CloseResult, error) {
 	isWisp := IsActiveWispInTx(ctx, tx, id)
