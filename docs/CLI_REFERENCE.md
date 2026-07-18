@@ -627,11 +627,9 @@ Gate types:
   timer   - Expires after timeout (Phase 2)
   gh:run  - Waits for GitHub workflow (Phase 3)
   gh:pr   - Waits for PR merge (Phase 3)
-  bead    - Waits for another bead to close (Phase 4)
+  bead    - Waits for cross-rig bead to close (Phase 4)
 
-For bead gates, await_id is a bead ID in this rig's database (e.g., "bd-abc123").
-The historical cross-rig form &lt;rig&gt;:&lt;bead-id&gt; can no longer be evaluated
-(multi-rig routing removed) and stays pending until resolved manually.
+For bead gates, await_id format is &lt;rig&gt;:&lt;bead-id&gt; (e.g., "other-project:op-abc123").
 
 Examples:
   bd gate list           # Show all open gates
@@ -1458,10 +1456,6 @@ Update one or more issues.
 
 If no issue ID is provided, updates the last touched issue (from most recent
 create, update, show, or close operation).
-
-Updates are applied per issue ID, not atomically across IDs: when some IDs
-fail, the remaining issues are still updated, every failed ID is reported on
-stderr, and the command exits nonzero.
 
 ```
 bd update [id...] [flags]

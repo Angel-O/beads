@@ -405,20 +405,32 @@ stderr, and the command exits nonzero.`,
 				regularUpdates["status"] = string(types.StatusOpen)
 			}
 
-			// Handle --metadata: merge with existing metadata instead of replacing
+			// Handle --metadata: merge with existing metadata instead of replacing.
+			// A merge failure (e.g. the issue's existing metadata is not a JSON
+			// object) is a per-ID failure, not a batch abort: record it and move
+			// on like the resolve/update/label/parent paths above, so later IDs
+			// still update and the failed ID surfaces in the nonzero-exit report
+			// instead of the generic stdout error path.
 			if newMeta, ok := regularUpdates["metadata"].(json.RawMessage); ok && len(issue.Metadata) > 0 {
 				merged, err := mergeMetadata(issue.Metadata, newMeta)
 				if err != nil {
-					return HandleErrorRespectJSON("metadata merge failed for %s: %v", id, err)
+					fmt.Fprintf(os.Stderr, "Error merging metadata for %s: %v\n", id, err)
+					recordFailure(id, fmt.Sprintf("merging metadata: %v", err))
+					closeIfUnmutated(result)
+					continue
 				}
 				regularUpdates["metadata"] = merged
 			}
-			// Handle incremental metadata edits (GH#1406)
+			// Handle incremental metadata edits (GH#1406). Same per-ID failure
+			// contract as the merge path above.
 			if setMeta, ok := updates["_set_metadata"].([]string); ok {
 				unsetMeta, _ := updates["_unset_metadata"].([]string)
 				merged, err := applyMetadataEdits(issue.Metadata, setMeta, unsetMeta)
 				if err != nil {
-					return HandleErrorRespectJSON("metadata edit failed for %s: %v", id, err)
+					fmt.Fprintf(os.Stderr, "Error editing metadata for %s: %v\n", id, err)
+					recordFailure(id, fmt.Sprintf("editing metadata: %v", err))
+					closeIfUnmutated(result)
+					continue
 				}
 				regularUpdates["metadata"] = merged
 			}
@@ -499,15 +511,27 @@ stderr, and the command exits nonzero.`,
 					closeIfUnmutated(result)
 					continue
 				}
+				oldParentRemoveFailed := false
 				for _, dep := range deps {
 					if dep.Type == types.DepParentChild {
 						if err := issueStore.RemoveDependency(ctx, result.ResolvedID, dep.DependsOnID, actor); err != nil {
+							// Reparenting removes the old parent edge before adding
+							// the new one; if removal fails, adding the new edge would
+							// leave the issue with two parents. Record the failed ID
+							// and stop so it surfaces in the nonzero-exit report
+							// instead of being silently counted as a success.
 							fmt.Fprintf(os.Stderr, "Error removing old parent dependency: %v\n", err)
+							recordFailure(id, fmt.Sprintf("removing old parent dependency: %v", err))
+							oldParentRemoveFailed = true
 						} else {
 							trackMutation(result)
 						}
 						break
 					}
+				}
+				if oldParentRemoveFailed {
+					closeIfUnmutated(result)
+					continue
 				}
 
 				// Add new parent-child dependency (if not removing parent)

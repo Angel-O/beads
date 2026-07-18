@@ -12,10 +12,6 @@ Update one or more issues.
 If no issue ID is provided, updates the last touched issue (from most recent
 create, update, show, or close operation).
 
-Updates are applied per issue ID, not atomically across IDs: when some IDs
-fail, the remaining issues are still updated, every failed ID is reported on
-stderr, and the command exits nonzero.
-
 ```
 bd update [id...] [flags]
 ```
