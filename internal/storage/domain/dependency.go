@@ -16,8 +16,41 @@ import (
 var ErrSelfDependency = errors.New("cannot add self-dependency")
 
 // ErrDependencyCycle is returned when adding a dependency edge would introduce a
-// scheduling cycle.
+// scheduling cycle. It is scoped to the dependency-add family — the single and
+// bulk add paths (add/addBulk) and the dolt cross-tier check — so callers can
+// errors.Is any dependency-add cycle rejection. The whole-graph construction
+// paths (ApplyIssueGraph/ApplyWispGraph) are a separate family and deliberately
+// do not carry this sentinel yet.
 var ErrDependencyCycle = errors.New("adding dependency would create a cycle")
+
+// cycleError carries a fully-formatted cycle-rejection message while unwrapping
+// to ErrDependencyCycle. The bulk dependency-add path surfaces this text
+// verbatim through the proxied CLI (HandleErrorRespectJSON("%v", err)), so a
+// plain fmt.Errorf("...: %w", ErrDependencyCycle) — which appends the sentinel's
+// own "adding dependency would create a cycle" text to an already-complete
+// message — would change the user-facing string. This keeps the message
+// byte-for-byte and adds only errors.Is matchability.
+type cycleError struct {
+	msg string
+}
+
+func (e *cycleError) Error() string { return e.msg }
+func (e *cycleError) Unwrap() error { return ErrDependencyCycle }
+
+// cycleErrorf formats a cycle-rejection message that errors.Is-matches
+// ErrDependencyCycle without altering the rendered text.
+func cycleErrorf(format string, args ...any) error {
+	return &cycleError{msg: fmt.Sprintf(format, args...)}
+}
+
+// NewCycleError is the exported entry point for cycleErrorf. The embedded bulk
+// CLI final gate (cmd/bd/dep.go addBulkDependenciesInTx) lives in a different
+// package but must type its cycle rejection identically to this bulk path, so it
+// builds the same errors.Is-matchable-but-text-preserving error through here
+// rather than duplicating the cycleError wrapper.
+func NewCycleError(format string, args ...any) error {
+	return cycleErrorf(format, args...)
+}
 
 // DependencyTypeConflictError is returned when an edge already exists between
 // the same pair with a DIFFERENT type. Its message is byte-identical to the
@@ -538,6 +571,16 @@ func (u *dependencyUseCaseImpl) addBulk(ctx context.Context, deps []*types.Depen
 		if dep.IssueID == "" || dep.DependsOnID == "" {
 			return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: IssueID and DependsOnID must be non-empty", i)
 		}
+		// Self-dependency guard mirrors the single-edge add() path and
+		// issueops.CheckDependencyCycleInTx: reject a self-edge for ALL dep
+		// types before the hierarchy/cycle probe, so a scheduling self-edge is
+		// typed as ErrSelfDependency instead of tripping HasCycle (or the final
+		// CycleThroughEdges gate) and surfacing as a cycle. The message is
+		// byte-identical to every other self-dep site so the proxied bulk CLI
+		// (bd dep add / bd link) shows one consistent self-dependency error.
+		if dep.IssueID == dep.DependsOnID {
+			return BulkAddDepsResult{}, fmt.Errorf("%w: %s cannot depend on itself", ErrSelfDependency, dep.IssueID)
+		}
 	}
 	// Parent-child edges must be visible before blocking edges in the same
 	// request. The shared repository guard can then evaluate existing + planned
@@ -561,7 +604,7 @@ func (u *dependencyUseCaseImpl) addBulk(ctx context.Context, deps []*types.Depen
 					return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: cycle check: %w", i, err)
 				}
 				if cycle {
-					return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: adding %s -> %s: %w", i, dep.IssueID, dep.DependsOnID, ErrDependencyCycle)
+					return BulkAddDepsResult{}, cycleErrorf("add deps[%d]: adding %s -> %s would create a cycle", i, dep.IssueID, dep.DependsOnID)
 				}
 			}
 			if err := u.depRepo.Insert(ctx, dep, actor, insertOpts); err != nil {
@@ -586,7 +629,7 @@ func (u *dependencyUseCaseImpl) addBulk(ctx context.Context, deps []*types.Depen
 			return BulkAddDepsResult{}, fmt.Errorf("add deps: final cycle check: %w", err)
 		}
 		if cyclePath != "" {
-			return BulkAddDepsResult{}, fmt.Errorf("add deps: dependency cycle would be created: %s", cyclePath)
+			return BulkAddDepsResult{}, cycleErrorf("add deps: dependency cycle would be created: %s", cyclePath)
 		}
 	}
 	return BulkAddDepsResult{Added: deps}, nil

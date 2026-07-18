@@ -67,7 +67,10 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 		return errors.New("db: DependencySQLRepository.Insert: DependsOnID must not be empty")
 	}
 	if dep.IssueID == dep.DependsOnID {
-		return fmt.Errorf("db: DependencySQLRepository.Insert: %s cannot depend on itself: %w", dep.IssueID, domain.ErrSelfDependency)
+		// Lead with the sentinel so this defensive repo-layer guard renders like
+		// every other self-dep site ("cannot add self-dependency: X cannot depend
+		// on itself") instead of appending the sentinel text.
+		return fmt.Errorf("db: DependencySQLRepository.Insert: %w: %s cannot depend on itself", domain.ErrSelfDependency, dep.IssueID)
 	}
 
 	metadata := dep.Metadata
