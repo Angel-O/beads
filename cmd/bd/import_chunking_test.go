@@ -483,6 +483,176 @@ func TestImportChunkedNoReadyWindowAtAnyFreezePoint(t *testing.T) {
 	}
 }
 
+// orderImportIssuesForChunking must emit a cycle member before a valid row that
+// blocks on it, even when that row precedes the cycle in file order. A plain
+// file-order cycle fallback would chunk the dependent ahead of its blocker and
+// defer the live readiness edge. Regression for the attempt-1 review finding.
+func TestOrderImportIssuesForChunkingPlacesCycleBeforeDependent(t *testing.T) {
+	issues := chunkTestIssues(4)
+	// bd-chunk03 <-> bd-chunk04 is a tolerated blocking cycle; bd-chunk01
+	// validly blocks on bd-chunk03 — an acyclic edge pointing into the cycle.
+	issues[2].Dependencies = []*types.Dependency{{IssueID: issues[2].ID, DependsOnID: issues[3].ID, Type: types.DepBlocks}}
+	issues[3].Dependencies = []*types.Dependency{{IssueID: issues[3].ID, DependsOnID: issues[2].ID, Type: types.DepBlocks}}
+	issues[0].Dependencies = []*types.Dependency{{IssueID: issues[0].ID, DependsOnID: issues[2].ID, Type: types.DepBlocks}}
+
+	ordered := orderImportIssuesForChunking(issues)
+	if len(ordered) != len(issues) {
+		t.Fatalf("ordered length = %d, want %d", len(ordered), len(issues))
+	}
+	pos := map[string]int{}
+	for i, issue := range ordered {
+		pos[issue.ID] = i
+	}
+	if pos["bd-chunk03"] > pos["bd-chunk01"] {
+		t.Fatalf("bd-chunk03 (blocker on a cycle) at %d must precede its dependent bd-chunk01 at %d so the edge rides inline",
+			pos["bd-chunk03"], pos["bd-chunk01"])
+	}
+}
+
+// A readiness edge that points INTO a tolerated readiness cycle must still ride
+// inline with its row across every import freeze point: the cycle-fallback
+// ordering must not place a valid dependent of a cycle in an earlier chunk than
+// the cycle member it blocks on. The import only meets a blocking cycle in
+// corrupted or legacy JSONL, which it tolerates (SkipDependencyValidationErrors),
+// but the no-ready-window invariant must hold there too — otherwise the
+// dependent commits ready-without-blocker for the rest of the import. Regression
+// for the attempt-1 review finding.
+func TestImportChunkedNoReadyWindowWithReadinessEdgeIntoCycle(t *testing.T) {
+	setImportChunkSize(t, 5)
+	recordImportPauses(t)
+	setImportProgressBuffer(t)
+	ctx := context.Background()
+
+	makeIssues := func() []*types.Issue {
+		issues := chunkTestIssues(12)
+		// bd-chunk11 <-> bd-chunk12 form a tolerated blocking cycle. bd-chunk01
+		// validly blocks on bd-chunk11; in file order it precedes the cycle, so
+		// a plain file-order fallback would chunk it ahead of bd-chunk11 and
+		// defer the live edge.
+		issues[10].Dependencies = []*types.Dependency{{IssueID: issues[10].ID, DependsOnID: issues[11].ID, Type: types.DepBlocks}}
+		issues[11].Dependencies = []*types.Dependency{{IssueID: issues[11].ID, DependsOnID: issues[10].ID, Type: types.DepBlocks}}
+		issues[0].Dependencies = []*types.Dependency{{IssueID: issues[0].ID, DependsOnID: issues[10].ID, Type: types.DepBlocks}}
+		return issues
+	}
+
+	// A full import must tolerate the cycle, leave bd-chunk01 blocked by open
+	// bd-chunk11, and report how many transactions the import issues.
+	full := provisionChunkStore(t)
+	counting := &failNthCreateStore{DoltStorage: full}
+	if _, err := importIssuesCore(ctx, "", counting, makeIssues(), ImportOptions{SkipPrefixValidation: true}); err != nil {
+		t.Fatalf("full import (tolerated cycle): %v", err)
+	}
+	totalCalls := counting.calls
+	if totalCalls < 2 {
+		t.Fatalf("totalCalls = %d, want a chunked import", totalCalls)
+	}
+	deps, err := full.GetDependencies(ctx, "bd-chunk01")
+	if err != nil {
+		t.Fatalf("GetDependencies(bd-chunk01): %v", err)
+	}
+	if len(deps) != 1 || deps[0].ID != "bd-chunk11" {
+		t.Fatalf("bd-chunk01 must be blocked by bd-chunk11 after import, got %#v", deps)
+	}
+	ready, err := full.GetReadyWork(ctx, types.WorkFilter{Limit: 50})
+	if err != nil {
+		t.Fatalf("GetReadyWork: %v", err)
+	}
+	for _, issue := range ready {
+		if issue.ID == "bd-chunk01" {
+			t.Fatalf("bd-chunk01 ready after a full import; it is blocked by open bd-chunk11 (cycle member)")
+		}
+	}
+
+	// Freeze at every transaction boundary: whenever bd-chunk01 is visible, its
+	// blocking edge into the cycle must be visible too, so it is never offered
+	// as ready mid-import.
+	for failAt := 1; failAt <= totalCalls; failAt++ {
+		store := provisionChunkStore(t)
+		failing := &failNthCreateStore{DoltStorage: store, failOnCall: failAt}
+		if _, err := importIssuesCore(ctx, "", failing, makeIssues(), ImportOptions{SkipPrefixValidation: true}); err == nil {
+			t.Fatalf("freeze point %d: import unexpectedly succeeded", failAt)
+		}
+		if _, err := store.GetIssue(ctx, "bd-chunk01"); err != nil {
+			continue // row not committed yet: nothing to observe
+		}
+		deps, err := store.GetDependencies(ctx, "bd-chunk01")
+		if err != nil {
+			t.Fatalf("freeze point %d: GetDependencies: %v", failAt, err)
+		}
+		if len(deps) == 0 {
+			t.Fatalf("freeze point %d: bd-chunk01 committed without its blocking edge into the cycle — ready window", failAt)
+		}
+		ready, err := store.GetReadyWork(ctx, types.WorkFilter{Limit: 50})
+		if err != nil {
+			t.Fatalf("freeze point %d: GetReadyWork: %v", failAt, err)
+		}
+		for _, issue := range ready {
+			if issue.ID == "bd-chunk01" {
+				t.Fatalf("freeze point %d: blocked bead bd-chunk01 offered as ready work mid-import", failAt)
+			}
+		}
+	}
+}
+
+// A waits-for waiter's is_blocked state is gated on its spawner having an active
+// parent-child child, and the per-chunk is_blocked recompute only re-evaluates
+// the rows in its own transaction. So when the waiter and its spawner's active
+// child straddle a chunk boundary in file order (waiter first, child later), a
+// naive ordering leaves the waiter's chunk computing is_blocked=0 against a
+// still-childless spawner, and the later chunk that imports the child never
+// re-blocks the waiter — it sits ready for the rest of the import and after it.
+// Ordering the spawner inline with the waiter is not enough; every in-batch
+// child of a waited spawner must be emitted no later than the waiter. Regression
+// for the attempt-2 review blocker.
+func TestImportChunkedWaitsForChildImportedLaterStaysBlocked(t *testing.T) {
+	setImportChunkSize(t, 5)
+	recordImportPauses(t)
+	setImportProgressBuffer(t)
+	ctx := context.Background()
+
+	makeIssues := func() []*types.Issue {
+		// File order: waiter, spawner, three fillers, active child. At chunk
+		// size 5 the waiter (chunk 0) and the child (chunk 1) straddle the
+		// boundary unless the import reorders the child ahead of the waiter.
+		// bd-chunk01 waits for bd-chunk02; bd-chunk06 is an open parent-child
+		// child of bd-chunk02.
+		issues := chunkTestIssues(6)
+		issues[0].Dependencies = []*types.Dependency{{IssueID: issues[0].ID, DependsOnID: issues[1].ID, Type: types.DepWaitsFor}}
+		issues[5].Dependencies = []*types.Dependency{{IssueID: issues[5].ID, DependsOnID: issues[1].ID, Type: types.DepParentChild}}
+		return issues
+	}
+
+	full := provisionChunkStore(t)
+	counting := &failNthCreateStore{DoltStorage: full}
+	if _, err := importIssuesCore(ctx, "", counting, makeIssues(), ImportOptions{SkipPrefixValidation: true}); err != nil {
+		t.Fatalf("full import (waits-for child across chunks): %v", err)
+	}
+	if counting.calls < 2 {
+		t.Fatalf("calls = %d, want a chunked (>=2 transaction) import so the waiter and child can straddle a boundary", counting.calls)
+	}
+
+	// The waits-for edge must be wired inline so the gate can see it.
+	waiterDeps, err := full.GetDependencies(ctx, "bd-chunk01")
+	if err != nil {
+		t.Fatalf("GetDependencies(bd-chunk01): %v", err)
+	}
+	if len(waiterDeps) != 1 || waiterDeps[0].ID != "bd-chunk02" {
+		t.Fatalf("bd-chunk01 must wait for bd-chunk02 after import, got %#v", waiterDeps)
+	}
+
+	// The waiter must NOT be ready: its spawner bd-chunk02 has an open child
+	// bd-chunk06, so the waits-for gate keeps bd-chunk01 blocked.
+	ready, err := full.GetReadyWork(ctx, types.WorkFilter{Limit: 50})
+	if err != nil {
+		t.Fatalf("GetReadyWork: %v", err)
+	}
+	for _, issue := range ready {
+		if issue.ID == "bd-chunk01" {
+			t.Fatalf("bd-chunk01 ready after a full import; it waits for bd-chunk02 whose active child bd-chunk06 was imported in a later chunk")
+		}
+	}
+}
+
 // raceInjectingStore simulates a concurrent writer landing between import
 // transactions: before the Nth CreateIssuesWithFullOptions call it updates an
 // issue directly, bumping its updated_at — exactly what a concurrent

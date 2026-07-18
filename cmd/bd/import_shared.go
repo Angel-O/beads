@@ -210,18 +210,22 @@ func importIssuesCore(ctx context.Context, _ string, store storage.DoltStorage, 
 // waiters acquire (see importInterChunkPause).
 //
 // Rows are written in dependency order (orderImportIssuesForChunking): every
-// readiness-affecting edge whose graph is acyclic points at a row in the same
-// or an earlier chunk, so the edge rides inline with its row and both commit
-// in one transaction. A concurrent reader therefore never observes an
-// imported bead without the blocking edges its import file declares —
+// valid readiness-affecting edge points at a row in the same or an earlier
+// chunk — Kahn's order for the acyclic majority, plus a cycle-breaking fallback
+// that still emits each cycle member before the rows it blocks — so the edge
+// rides inline with its row and both commit in one transaction. A concurrent
+// reader therefore never observes an imported bead without the blocking edges
+// its import file declares —
 // `bd ready` mid-import cannot offer blocked work for dispatch, and a crash
 // mid-import cannot freeze a bead in a spuriously-ready state.
 //
 // Only edges that cannot be satisfied when their row commits are deferred to
 // a final dependency pass: edges into an intra-batch dependency cycle
-// (invalid for blocking types; skip-reported at wire time, exactly as the
-// single-transaction import did) and non-readiness edges (related,
-// discovered-from) that point at a later chunk. The dependency pass submits
+// (invalid for blocking types; still broken and skip-reported at wire time,
+// though for a cycle of length >=3 the specific edge dropped — and thus which
+// member is left spuriously ready — can differ from the single-transaction
+// import, which checks the whole cycle in file order) and non-readiness edges
+// (related, discovered-from) that point at a later chunk. The dependency pass submits
 // row copies stripped to those deferred edges with ConflictSkip set, so an
 // existing row is never rewritten: a concurrent update landing between a
 // row's chunk and the dependency pass cannot stale-reject the pass and drop
@@ -251,12 +255,9 @@ func importIssuesChunked(ctx context.Context, store storage.DoltStorage, issues 
 	}
 	ordered := orderImportIssuesForChunking(issues)
 
-	// Partition each issue's dependencies into edges wired inline with the
-	// row (target outside the batch, or first written in the same or an
-	// earlier chunk) and edges deferred to the dependency pass. The inline
-	// subset temporarily replaces the issue's dependency slice; always
-	// restore the full slices so the caller's issues stay intact for retries
-	// and reporting.
+	// Partitioning narrows each issue's dependency slice to its inline subset in
+	// place; always restore the full slices so the caller's issues stay intact
+	// for retries and reporting.
 	fullDeps := make([][]*types.Dependency, len(ordered))
 	for i, issue := range ordered {
 		fullDeps[i] = issue.Dependencies
@@ -266,40 +267,7 @@ func importIssuesChunked(ctx context.Context, store storage.DoltStorage, issues 
 			issue.Dependencies = fullDeps[i]
 		}
 	}()
-
-	firstChunkOf := make(map[string]int, len(ordered))
-	for pos, issue := range ordered {
-		if issue.ID == "" {
-			continue // ID assigned by the engine at insert; nothing can reference it yet
-		}
-		if _, ok := firstChunkOf[issue.ID]; !ok {
-			firstChunkOf[issue.ID] = pos / importChunkSize
-		}
-	}
-	type deferredEdges struct {
-		issue *types.Issue
-		deps  []*types.Dependency
-	}
-	var deferred []deferredEdges
-	for pos, issue := range ordered {
-		if len(issue.Dependencies) == 0 {
-			continue
-		}
-		chunk := pos / importChunkSize
-		var inline, later []*types.Dependency
-		for _, dep := range issue.Dependencies {
-			if targetChunk, inBatch := firstChunkOf[dep.DependsOnID]; inBatch && targetChunk > chunk {
-				later = append(later, dep)
-				continue
-			}
-			inline = append(inline, dep)
-		}
-		if len(later) == 0 {
-			continue
-		}
-		issue.Dependencies = inline
-		deferred = append(deferred, deferredEdges{issue: issue, deps: later})
-	}
+	deferred := partitionChunkedImportDeps(ordered)
 
 	// Record phase-1 stale rejections locally (as well as forwarding them to
 	// the caller): the dependency pass must skip those rows.
@@ -312,28 +280,103 @@ func importIssuesChunked(ctx context.Context, store storage.DoltStorage, issues 
 		}
 	}
 
-	transactions := 0
-	beforeTx := func() {
-		if transactions > 0 {
-			importPause(importInterChunkPause)
-		}
-		transactions++
+	pacer := &importChunkPacer{}
+	if err := writeImportRowChunks(ctx, store, ordered, actor, rowOpts, pacer); err != nil {
+		return err
 	}
+	return wireDeferredImportDeps(ctx, store, deferred, phase1Stale, len(ordered), actor, opts, pacer)
+}
 
+// importChunkPacer sleeps importInterChunkPause between import transactions. One
+// shared pacer spans phase 1 and the dependency pass, so the fairness pause is
+// issued before every transaction except the very first: SQLite busy-polling has
+// no fairness queue, and a back-to-back BEGIN IMMEDIATE re-takes the lock before
+// a waiter's poll fires (see importInterChunkPause).
+type importChunkPacer struct{ transactions int }
+
+func (p *importChunkPacer) beforeTx() {
+	if p.transactions > 0 {
+		importPause(importInterChunkPause)
+	}
+	p.transactions++
+}
+
+// deferredImportEdges carries the dependencies of one row that could not be
+// wired inline with its phase-1 write and must be applied in the dependency
+// pass.
+type deferredImportEdges struct {
+	issue *types.Issue
+	deps  []*types.Dependency
+}
+
+// partitionChunkedImportDeps splits each ordered row's dependencies into edges
+// wired inline with the row (target outside the batch, or first written in the
+// same or an earlier chunk) and edges deferred to the dependency pass. It
+// narrows each issue's dependency slice to the inline subset in place and
+// returns the deferred edges. orderImportIssuesForChunking guarantees every
+// valid readiness edge points at the same or an earlier chunk, so only
+// non-readiness edges (related, discovered-from) into a later chunk and
+// genuinely cyclic blocking edges are ever deferred here.
+func partitionChunkedImportDeps(ordered []*types.Issue) []deferredImportEdges {
+	firstChunkOf := make(map[string]int, len(ordered))
+	for pos, issue := range ordered {
+		if issue.ID == "" {
+			continue // ID assigned by the engine at insert; nothing can reference it yet
+		}
+		if _, ok := firstChunkOf[issue.ID]; !ok {
+			firstChunkOf[issue.ID] = pos / importChunkSize
+		}
+	}
+	var deferred []deferredImportEdges
+	for pos, issue := range ordered {
+		if len(issue.Dependencies) == 0 {
+			continue
+		}
+		inline, later := splitDepsByChunk(issue.Dependencies, pos/importChunkSize, firstChunkOf)
+		if len(later) == 0 {
+			continue
+		}
+		issue.Dependencies = inline
+		deferred = append(deferred, deferredImportEdges{issue: issue, deps: later})
+	}
+	return deferred
+}
+
+// splitDepsByChunk partitions one row's dependencies (the row lands in rowChunk)
+// into edges that can be wired inline and edges whose target is first written in
+// a later chunk and so must be deferred.
+func splitDepsByChunk(deps []*types.Dependency, rowChunk int, firstChunkOf map[string]int) (inline, later []*types.Dependency) {
+	for _, dep := range deps {
+		if targetChunk, inBatch := firstChunkOf[dep.DependsOnID]; inBatch && targetChunk > rowChunk {
+			later = append(later, dep)
+			continue
+		}
+		inline = append(inline, dep)
+	}
+	return inline, later
+}
+
+// writeImportRowChunks writes the ordered rows (dependencies already narrowed to
+// their inline subset) in bounded transactions, pausing between commits.
+func writeImportRowChunks(ctx context.Context, store storage.DoltStorage, ordered []*types.Issue, actor string, rowOpts storage.BatchCreateOptions, pacer *importChunkPacer) error {
 	total := len(ordered)
 	chunks := (total + importChunkSize - 1) / importChunkSize
 	for start, chunk := 0, 1; start < total; start, chunk = start+importChunkSize, chunk+1 {
 		end := min(start+importChunkSize, total)
-		beforeTx()
+		pacer.beforeTx()
 		if err := store.CreateIssuesWithFullOptions(ctx, ordered[start:end], actor, rowOpts); err != nil {
 			return fmt.Errorf("import chunk %d/%d failed, %d issues already committed (committed rows are durable; re-run the import to resume — it converges): %w", chunk, chunks, start, err)
 		}
 		fmt.Fprintf(importProgress, "bd import: %d/%d issues committed\n", end, total)
 	}
+	return nil
+}
 
-	// Dependency pass: wire the deferred edges, now that every target row
-	// exists, without touching the rows themselves.
-	var depRows []*types.Issue
+// wireDeferredImportDeps applies the deferred edges once every target row exists,
+// without rewriting the rows themselves. rowTotal is the count of phase-1 rows
+// already committed, used only for the resume message.
+func wireDeferredImportDeps(ctx context.Context, store storage.DoltStorage, deferred []deferredImportEdges, phase1Stale map[string]struct{}, rowTotal int, actor string, opts storage.BatchCreateOptions, pacer *importChunkPacer) error {
+	depRows := make([]*types.Issue, 0, len(deferred))
 	for _, d := range deferred {
 		if _, stale := phase1Stale[d.issue.ID]; stale {
 			continue // stale snapshot: its deps stay out too (bd-578h9.8)
@@ -345,6 +388,9 @@ func importIssuesChunked(ctx context.Context, store storage.DoltStorage, issues 
 		cp.Labels = nil
 		cp.Comments = nil
 		depRows = append(depRows, &cp)
+	}
+	if len(depRows) == 0 {
+		return nil
 	}
 	depOpts := opts
 	// Never rewrite an existing row here: the import's row write already
@@ -360,63 +406,155 @@ func importIssuesChunked(ctx context.Context, store storage.DoltStorage, issues 
 	depChunks := (depTotal + importChunkSize - 1) / importChunkSize
 	for start, chunk := 0, 1; start < depTotal; start, chunk = start+importChunkSize, chunk+1 {
 		end := min(start+importChunkSize, depTotal)
-		beforeTx()
+		pacer.beforeTx()
 		if err := store.CreateIssuesWithFullOptions(ctx, depRows[start:end], actor, depOpts); err != nil {
-			return fmt.Errorf("import dependency pass chunk %d/%d failed (all %d issue rows are committed; re-run the import to resume — it converges): %w", chunk, depChunks, total, err)
+			return fmt.Errorf("import dependency pass chunk %d/%d failed (all %d issue rows are committed; re-run the import to resume — it converges): %w", chunk, depChunks, rowTotal, err)
 		}
 		fmt.Fprintf(importProgress, "bd import: deferred dependencies wired for %d/%d issues\n", end, depTotal)
 	}
 	return nil
 }
 
-// orderImportIssuesForChunking returns the issues reordered so that, wherever
-// the dependency graph allows, an issue lands in the same chunk as its
-// readiness-affecting targets or a later one — which lets the import wire
-// those edges in the same transaction as the row. Kahn's algorithm over the
-// intra-batch readiness edges (blocks, parent-child, conditional-blocks,
-// waits-for; the types GetReadyWork consults), seeded in file order so
-// unconstrained rows keep their relative order. Duplicate IDs are chained in
-// file order to preserve last-row-wins upsert semantics. Rows on a
-// dependency cycle (invalid for blocking types) cannot be ordered; they are
-// appended in file order and their unsatisfiable edges fall to the deferred
-// dependency pass, where the engine's cycle check skip-reports them exactly
-// as the single-transaction import did.
+// orderImportIssuesForChunking returns the issues reordered so that every valid
+// readiness-affecting edge (blocks, parent-child, conditional-blocks, waits-for;
+// the types GetReadyWork consults) points at a row in the same or an earlier
+// chunk, which lets the import wire that edge in the same transaction as the
+// row. It runs Kahn's algorithm over the intra-batch readiness edges, seeded in
+// file order so unconstrained rows keep their relative order; duplicate IDs are
+// chained in file order to preserve last-row-wins upsert semantics.
+//
+// A readiness cycle (invalid for blocking types; only ever present in the
+// corrupted or legacy JSONL the import tolerates) cannot be fully ordered.
+// Appending the stalled rows in plain file order — as an earlier version did —
+// can place a valid dependent of a cycle before the cycle member it blocks on,
+// deferring that live readiness edge and briefly exposing the dependent as ready
+// without its blocker. Instead each stall is broken by emitting a row that
+// genuinely lies on a cycle, so only the cycle's own unsatisfiable edges are
+// left to defer; the engine skip-reports those, still breaking the cycle, while
+// every valid acyclic readiness edge still rides inline. For a cycle of length
+// >=3 the edge left to defer (and hence which member is left spuriously ready)
+// can differ from the one the single-transaction import drops, which checks all
+// cycle edges in file order against the already-persisted set; both break it.
 func orderImportIssuesForChunking(issues []*types.Issue) []*types.Issue {
-	n := len(issues)
-	if n < 2 {
+	if len(issues) < 2 {
 		return issues
 	}
-	indicesByID := make(map[string][]int, n)
+	return buildImportOrderGraph(issues).topologicalFileOrder(issues)
+}
+
+// importOrderGraph is the intra-batch readiness-edge graph over import rows,
+// indexed by position in the input slice. An edge target->dependent means the
+// target (a readiness blocker, or an earlier duplicate of the same ID) must be
+// emitted no later than the dependent.
+type importOrderGraph struct {
+	dependents [][]int // dependents[t]: rows released when row t is emitted
+	blockers   [][]int // blockers[u]: rows that must be emitted before row u
+	indegree   []int
+}
+
+func buildImportOrderGraph(issues []*types.Issue) importOrderGraph {
+	n := len(issues)
+	indicesByID := indexImportIssuesByID(issues)
+	// A waits-for waiter's is_blocked state is gated on whether its spawner has
+	// an active parent-child child, not on the spawner row itself, so those
+	// child rows are readiness inputs to the waiter (see addRowReadinessEdges).
+	// Index them by spawner up front so the edge pass can order them.
+	childrenBySpawnerID := parentChildChildrenBySpawner(issues)
+	g := importOrderGraph{
+		dependents: make([][]int, n),
+		blockers:   make([][]int, n),
+		indegree:   make([]int, n),
+	}
+	for i, issue := range issues {
+		g.addRowReadinessEdges(i, issue, indicesByID, childrenBySpawnerID)
+	}
+	// Chain duplicate IDs in file order so the last row wins the upsert.
+	for _, indices := range indicesByID {
+		for k := 1; k < len(indices); k++ {
+			g.addEdge(indices[k-1], indices[k])
+		}
+	}
+	return g
+}
+
+// indexImportIssuesByID maps each import row's ID to its positions in the input
+// slice. ID-less rows are skipped: their ID is assigned by the engine at insert,
+// so nothing in the batch can reference them yet.
+func indexImportIssuesByID(issues []*types.Issue) map[string][]int {
+	indicesByID := make(map[string][]int, len(issues))
 	for i, issue := range issues {
 		if issue.ID == "" {
-			continue // ID assigned by the engine at insert; nothing can reference it yet
+			continue
 		}
 		indicesByID[issue.ID] = append(indicesByID[issue.ID], i)
 	}
-	dependents := make([][]int, n) // dependents[t] = indices released when t is emitted
-	indegree := make([]int, n)
-	addEdge := func(target, dependent int) {
-		dependents[target] = append(dependents[target], dependent)
-		indegree[dependent]++
-	}
+	return indicesByID
+}
+
+// parentChildChildrenBySpawner maps each spawner ID to the positions of the
+// in-batch rows that declare it as their parent-child parent. A parent-child
+// dependency row is stored on the child (issue_id = child, depends_on = parent),
+// so the child is the row carrying the edge.
+func parentChildChildrenBySpawner(issues []*types.Issue) map[string][]int {
+	children := make(map[string][]int)
 	for i, issue := range issues {
 		for _, dep := range issue.Dependencies {
-			if dep == nil || dep.DependsOnID == "" || !dep.Type.AffectsReadyWork() {
-				continue
-			}
-			for _, target := range indicesByID[dep.DependsOnID] {
-				if target != i {
-					addEdge(target, i)
-				}
+			if dep != nil && dep.Type == types.DepParentChild && dep.DependsOnID != "" {
+				children[dep.DependsOnID] = append(children[dep.DependsOnID], i)
 			}
 		}
 	}
-	for _, indices := range indicesByID {
-		for k := 1; k < len(indices); k++ {
-			addEdge(indices[k-1], indices[k])
-		}
-	}
+	return children
+}
 
+// addEdge records that row target must be emitted no later than row dependent.
+func (g importOrderGraph) addEdge(target, dependent int) {
+	g.dependents[target] = append(g.dependents[target], dependent)
+	g.blockers[dependent] = append(g.blockers[dependent], target)
+	g.indegree[dependent]++
+}
+
+// addEdgesBefore orders every target row no later than dependent, skipping any
+// self-reference.
+func (g importOrderGraph) addEdgesBefore(dependent int, targets []int) {
+	for _, target := range targets {
+		if target != dependent {
+			g.addEdge(target, dependent)
+		}
+	}
+}
+
+// addRowReadinessEdges records the intra-batch ordering edges that row i imposes:
+// every readiness blocker it names must be emitted no later than i, and for a
+// waits-for edge the spawner's in-batch parent-child children must be too.
+//
+// The waiter's is_blocked state keys on whether its spawner has an active child,
+// not on the spawner row itself, and the per-chunk is_blocked recompute only
+// re-evaluates the rows in its own transaction. So a waiter whose spawner's child
+// lands in a later chunk would compute is_blocked=0 against a still-childless
+// spawner and never be re-blocked — spuriously ready for the rest of the import
+// and after it. Ordering the spawner inline is not enough; the child must be
+// committed by the time the waiter's chunk recomputes.
+func (g importOrderGraph) addRowReadinessEdges(i int, issue *types.Issue, indicesByID, childrenBySpawnerID map[string][]int) {
+	for _, dep := range issue.Dependencies {
+		if dep == nil || dep.DependsOnID == "" || !dep.Type.AffectsReadyWork() {
+			continue
+		}
+		g.addEdgesBefore(i, indicesByID[dep.DependsOnID])
+		if dep.Type == types.DepWaitsFor {
+			g.addEdgesBefore(i, childrenBySpawnerID[dep.DependsOnID])
+		}
+	}
+}
+
+// topologicalFileOrder emits rows in dependency order (Kahn's, file-order
+// seeded), breaking each stall by force-emitting a row that lies on a readiness
+// cycle so that only unsatisfiable cycle edges — never valid acyclic ones — are
+// left for the deferred dependency pass.
+func (g importOrderGraph) topologicalFileOrder(issues []*types.Issue) []*types.Issue {
+	n := len(issues)
+	indegree := append([]int(nil), g.indegree...)
+	emitted := make([]bool, n)
 	queue := make([]int, 0, n)
 	for i := range n {
 		if indegree[i] == 0 {
@@ -424,25 +562,65 @@ func orderImportIssuesForChunking(issues []*types.Issue) []*types.Issue {
 		}
 	}
 	ordered := make([]*types.Issue, 0, n)
-	emitted := make([]bool, n)
-	for len(queue) > 0 {
+	for len(ordered) < n {
+		if len(queue) == 0 {
+			queue = append(queue, g.nextCycleParticipant(emitted))
+		}
 		i := queue[0]
 		queue = queue[1:]
+		if emitted[i] {
+			continue
+		}
 		emitted[i] = true
 		ordered = append(ordered, issues[i])
-		for _, j := range dependents[i] {
-			indegree[j]--
-			if indegree[j] == 0 {
-				queue = append(queue, j)
-			}
-		}
-	}
-	for i := range n { // cycle fallback: keep file order
-		if !emitted[i] {
-			ordered = append(ordered, issues[i])
-		}
+		queue = g.release(i, indegree, emitted, queue)
 	}
 	return ordered
+}
+
+// release decrements the indegree of every row that row i blocks and enqueues
+// any that becomes free and has not already been emitted.
+func (g importOrderGraph) release(i int, indegree []int, emitted []bool, queue []int) []int {
+	for _, j := range g.dependents[i] {
+		indegree[j]--
+		if indegree[j] == 0 && !emitted[j] {
+			queue = append(queue, j)
+		}
+	}
+	return queue
+}
+
+// nextCycleParticipant returns an un-emitted row that lies on a readiness cycle,
+// used to break a Kahn stall.
+func (g importOrderGraph) nextCycleParticipant(emitted []bool) int {
+	start := 0
+	for start < len(emitted) && emitted[start] {
+		start++
+	}
+	return g.cycleParticipant(start, emitted)
+}
+
+// cycleParticipant walks blocker edges from an un-emitted row until it revisits
+// a row, which therefore lies on a cycle. At a stall every un-emitted row still
+// has an un-emitted blocker, so the walk always closes a cycle.
+func (g importOrderGraph) cycleParticipant(start int, emitted []bool) int {
+	seen := make(map[int]bool)
+	v := start
+	for !seen[v] {
+		seen[v] = true
+		next := -1
+		for _, b := range g.blockers[v] {
+			if !emitted[b] {
+				next = b
+				break
+			}
+		}
+		if next == -1 {
+			return v // defensive: no un-emitted blocker (unexpected at a stall)
+		}
+		v = next
+	}
+	return v
 }
 
 // importChangePlan reports how the import batch relates to existing local
