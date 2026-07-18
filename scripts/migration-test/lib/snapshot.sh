@@ -14,7 +14,24 @@ capture_snapshot() {
 
     # bd list --json returns a flat array of issue objects
     local list_json
-    list_json=$(bd_in "$ws" "$bin" list --json -n 0 --all 2>/dev/null) || true
+    if ! list_json=$(bd_in "$ws" "$bin" list --json -n 0 --all 2>/dev/null); then
+        echo "  FIDELITY: bd list failed while capturing snapshot" >&2
+        echo "[]"
+        return 1
+    fi
+
+    if ${STRICT_MODE:-false} && ! jq -e '
+        type == "array" and
+        length > 0 and
+        all(.[];
+            type == "object" and
+            ((.id? | type) == "string") and
+            ((.id? | length) > 0))
+        ' >/dev/null 2>&1 <<< "$list_json"; then
+        echo "  FIDELITY: bd list returned an invalid snapshot inventory" >&2
+        echo "[]"
+        return 1
+    fi
 
     if [ -z "$list_json" ] || [ "$list_json" = "null" ] || [ "$list_json" = "[]" ]; then
         echo "[]"
@@ -39,15 +56,30 @@ capture_snapshot() {
         local show_json
         # Current binaries require --include-comments for full bodies; older
         # releases included them by default and reject the newer flag.
-        show_json=$(bd_in "$ws" "$bin" show "$id" --json --include-comments 2>/dev/null) || \
-            show_json=$(bd_in "$ws" "$bin" show "$id" --json 2>/dev/null) || true
+        local show_ok=false
+        if show_json=$(bd_in "$ws" "$bin" show "$id" --json --include-comments 2>/dev/null); then
+            show_ok=true
+        elif show_json=$(bd_in "$ws" "$bin" show "$id" --json 2>/dev/null); then
+            show_ok=true
+        fi
+        if ! $show_ok; then
+            echo "  FIDELITY: bd show failed for listed source id $id" >&2
+            return 1
+        fi
+        if ${STRICT_MODE:-false} && ! jq -e --arg id "$id" '
+            (if type == "array" then . else [.] end) |
+            length == 1 and
+            (.[0] | type == "object") and
+            ((.[0].id? | type) == "string") and
+            .[0].id == $id
+            ' >/dev/null 2>&1 <<< "$show_json"; then
+            echo "  FIDELITY: bd show returned an invalid snapshot for source id $id" >&2
+            return 1
+        fi
         if [ -n "$show_json" ] && [ "$show_json" != "null" ]; then
             # show returns an array — concatenate it
             items=$(echo "$items" | jq --argjson arr "$show_json" \
                 'if ($arr | type) == "array" then . + $arr else . + [$arr] end' 2>/dev/null) || true
-        elif ${STRICT_MODE:-false}; then
-            echo "  FIDELITY: bd show failed for listed source id $id" >&2
-            return 1
         fi
     done <<< "$ids"
 
@@ -71,6 +103,44 @@ capture_snapshot() {
     echo "$items" | jq -S 'sort_by(.title // "")' 2>/dev/null || echo "$items"
 }
 
+source_artifact_fingerprint() {
+    local beads_dir="$1"
+    local manifest_file digest
+
+    [ -d "$beads_dir" ] && [ ! -L "$beads_dir" ] || return 1
+    manifest_file=$(mktemp "${TMPDIR:-/tmp}/bd-source-fingerprint.XXXXXX") || return 1
+    if ! (
+        set -o pipefail
+        cd "$beads_dir" || exit 1
+        find . -mindepth 1 -print0 | LC_ALL=C sort -z | while IFS= read -r -d '' path; do
+            local mode checksum target
+            if [ -L "$path" ]; then
+                target=$(readlink -- "$path") || exit 1
+                printf 'link\0%s\0%s\0' "$path" "$target" || exit 1
+            elif [ -d "$path" ]; then
+                mode=$(stat -c '%a' -- "$path") || exit 1
+                printf 'directory\0%s\0%s\0' "$path" "$mode" || exit 1
+            elif [ -f "$path" ]; then
+                mode=$(stat -c '%a' -- "$path") || exit 1
+                checksum=$(sha256_file "$path") || exit 1
+                printf 'file\0%s\0%s\0%s\0' "$path" "$mode" "$checksum" || exit 1
+            else
+                echo "  FIDELITY: unsupported path in historical source tree: $beads_dir/$path" >&2
+                exit 1
+            fi
+        done
+    ) > "$manifest_file"; then
+        rm -f "$manifest_file"
+        return 1
+    fi
+    digest=$(sha256_file "$manifest_file") || {
+        rm -f "$manifest_file"
+        return 1
+    }
+    rm -f "$manifest_file"
+    printf '%s\n' "$digest"
+}
+
 # Validate the exact source values that make a strict historical fixture
 # meaningful. Without this check, an unsupported create flag can silently
 # disappear from both snapshots and produce a false fidelity pass.
@@ -79,18 +149,28 @@ strict_snapshot_has_expected_fixture() {
     local snapshot="$2"
 
     case "$version" in
-        v0.49.6)
+        v0.49.6|v0.55.4)
+            local epic_id="${DATASET_IDS[epic]:-}"
             local standalone_id="${DATASET_IDS[standalone]:-}"
             local closed_id="${DATASET_IDS[closed]:-}"
             local task_id="${DATASET_IDS[task]:-}"
             local bug_id="${DATASET_IDS[bug]:-}"
-            [ -n "$standalone_id" ] && [ -n "$closed_id" ] && \
+            [ -n "$epic_id" ] && [ -n "$standalone_id" ] && [ -n "$closed_id" ] && \
                 [ -n "$task_id" ] && [ -n "$bug_id" ] || return 1
             jq -e \
+                --arg epic "$epic_id" \
                 --arg standalone "$standalone_id" \
                 --arg closed "$closed_id" \
                 --arg task "$task_id" \
                 --arg bug "$bug_id" '
+                length == 5 and
+                any(.[];
+                    .id == $epic and
+                    .title == "Migration epic" and
+                    .description == "Epic for migration testing" and
+                    .priority == 2 and
+                    .issue_type == "epic" and
+                    .status == "open") and
                 any(.[];
                     .id == $standalone and
                     .title == "Standalone detailed task" and
@@ -150,6 +230,136 @@ verify_retained_sqlite_source() {
     actual_manifest=$(classic_sqlite_artifact_manifest "$beads_dir" ".pre-migration") || return 1
     if [ "$actual_manifest" != "$expected_manifest" ]; then
         echo "  FIDELITY: retained classic SQLite rollback artifacts changed" >&2
+        return 1
+    fi
+}
+
+legacy_dolt_artifact_manifest() {
+    local root="$1"
+    local dolt_dir="$root/dolt"
+    local manifest_file digest relative path mode checksum
+
+    if [ -L "$root" ] || [ ! -d "$root" ]; then
+        echo "  FIDELITY: legacy Dolt artifact root is not a regular directory: $root" >&2
+        return 1
+    fi
+    if [ -L "$dolt_dir" ] || [ ! -d "$dolt_dir" ]; then
+        echo "  FIDELITY: legacy Dolt source is not a regular directory: $dolt_dir" >&2
+        return 1
+    fi
+
+    manifest_file=$(mktemp "${TMPDIR:-/tmp}/bd-legacy-dolt-manifest.XXXXXX") || return 1
+    if ! (
+        set -o pipefail
+        cd "$root" || exit 1
+
+        if ! find dolt -mindepth 0 -print0 | sort -z | while IFS= read -r -d '' path; do
+            if [ -L "$path" ]; then
+                echo "  FIDELITY: symlink in legacy Dolt source: $root/$path" >&2
+                exit 1
+            elif [ -d "$path" ]; then
+                mode=$(stat -c '%a' -- "$path") || exit 1
+                printf 'directory\0%s\0%s\0' "$path" "$mode"
+            elif [ -f "$path" ]; then
+                mode=$(stat -c '%a' -- "$path") || exit 1
+                checksum=$(sha256_file "$path") || exit 1
+                printf 'file\0%s\0%s\0%s\0' "$path" "$mode" "$checksum"
+            else
+                echo "  FIDELITY: non-regular path in legacy Dolt source: $root/$path" >&2
+                exit 1
+            fi
+        done; then
+            exit 1
+        fi
+
+        for relative in "${LEGACY_DOLT_ROLLBACK_FILES[@]}"; do
+            path="$relative"
+            if [ -L "$path" ]; then
+                echo "  FIDELITY: symlink rollback artifact: $root/$path" >&2
+                exit 1
+            fi
+            if [ -e "$path" ]; then
+                if [ ! -f "$path" ]; then
+                    echo "  FIDELITY: rollback artifact is not a regular file: $root/$path" >&2
+                    exit 1
+                fi
+                mode=$(stat -c '%a' -- "$path") || exit 1
+                checksum=$(sha256_file "$path") || exit 1
+                printf 'file\0%s\0%s\0%s\0' "$path" "$mode" "$checksum"
+            fi
+        done
+    ) > "$manifest_file"; then
+        rm -f "$manifest_file"
+        return 1
+    fi
+
+    digest=$(sha256_file "$manifest_file") || {
+        rm -f "$manifest_file"
+        return 1
+    }
+    rm -f "$manifest_file"
+    printf '%s\n' "$digest"
+}
+
+verify_retained_legacy_dolt_source() {
+    local beads_dir="$1"
+    local expected_manifest="$2"
+    local retained="$beads_dir/legacy-dolt.pre-migration"
+
+    verify_legacy_dolt_rollback_root "$retained" "$expected_manifest"
+}
+
+legacy_dolt_rollback_inventory_is_exact() {
+    local root="$1"
+    local inventory_file name allowed relative invalid_name=""
+
+    if [ -L "$root" ] || [ ! -d "$root" ]; then
+        echo "  FIDELITY: retained legacy Dolt source is not a regular directory: $root" >&2
+        return 1
+    fi
+    inventory_file=$(mktemp "${TMPDIR:-/tmp}/bd-legacy-dolt-inventory.XXXXXX") || return 1
+    if ! find "$root" -mindepth 1 -maxdepth 1 -printf '%f\0' > "$inventory_file"; then
+        rm -f "$inventory_file"
+        return 1
+    fi
+
+    while IFS= read -r -d '' name; do
+        allowed=false
+        if [ "$name" = "dolt" ]; then
+            allowed=true
+        else
+            for relative in "${LEGACY_DOLT_ROLLBACK_FILES[@]}"; do
+                if [ "$name" = "$relative" ]; then
+                    allowed=true
+                    break
+                fi
+            done
+        fi
+        if ! $allowed; then
+            invalid_name="$name"
+            break
+        fi
+    done < "$inventory_file"
+    rm -f "$inventory_file"
+    if [ -n "$invalid_name" ]; then
+        echo "  FIDELITY: unexpected path in retained legacy Dolt source: $root/$invalid_name" >&2
+        return 1
+    fi
+}
+
+verify_legacy_dolt_rollback_root() {
+    local root="$1"
+    local expected_manifest="$2"
+    local actual_manifest
+
+    if [ -z "$expected_manifest" ]; then
+        echo "  FIDELITY: expected legacy Dolt rollback manifest is empty" >&2
+        return 1
+    fi
+    legacy_dolt_rollback_inventory_is_exact "$root" || return 1
+    actual_manifest=$(legacy_dolt_artifact_manifest "$root") || return 1
+    if [ "$actual_manifest" != "$expected_manifest" ]; then
+        echo "  FIDELITY: retained legacy Dolt rollback artifacts changed" >&2
         return 1
     fi
 }
@@ -348,16 +558,24 @@ check_blocker_paths() {
 
     # 1. bd blocked must list the dependent (bug) while the blocker (task) is
     #    still open — proves is_blocked survived migration on the dependent.
-    local blocked_json
-    blocked_json=$(bd_in "$ws" "$bin" blocked --json 2>/dev/null) || true
+    local blocked_json blocked_status=0
+    blocked_json=$(bd_in "$ws" "$bin" blocked --json 2>/dev/null) || blocked_status=$?
+    if [ "$blocked_status" -ne 0 ]; then
+        echo -e "  ${RED:-}BLOCKER-CHECK VIOLATION: 'bd blocked' exited $blocked_status${NC:-}"
+        violations=$((violations + 1))
+    fi
     if ! echo "$blocked_json" | jq -e --arg id "$dependent_id" 'any(.[]?; .id == $id)' >/dev/null 2>&1; then
         echo -e "  ${RED:-}BLOCKER-CHECK VIOLATION: 'bd blocked' does not list dependent '$dependent_id' while blocker '$blocker_id' is open${NC:-}"
         violations=$((violations + 1))
     fi
 
     # 2. bd ready must NOT list the dependent, but MUST list the blocker.
-    local ready_json
-    ready_json=$(bd_in "$ws" "$bin" ready --json 2>/dev/null) || true
+    local ready_json ready_status=0
+    ready_json=$(bd_in "$ws" "$bin" ready --json 2>/dev/null) || ready_status=$?
+    if [ "$ready_status" -ne 0 ]; then
+        echo -e "  ${RED:-}BLOCKER-CHECK VIOLATION: 'bd ready' exited $ready_status${NC:-}"
+        violations=$((violations + 1))
+    fi
     if echo "$ready_json" | jq -e --arg id "$dependent_id" 'any(.[]?; .id == $id)' >/dev/null 2>&1; then
         echo -e "  ${RED:-}BLOCKER-CHECK VIOLATION: 'bd ready' lists blocked dependent '$dependent_id'${NC:-}"
         violations=$((violations + 1))
@@ -373,8 +591,12 @@ check_blocker_paths() {
         echo -e "  ${RED:-}BLOCKER-CHECK VIOLATION: 'bd close $blocker_id' failed after migration (errno 1105 / stale-schema regression)${NC:-}"
         violations=$((violations + 1))
     else
-        local ready_after_json
-        ready_after_json=$(bd_in "$ws" "$bin" ready --json 2>/dev/null) || true
+        local ready_after_json ready_after_status=0
+        ready_after_json=$(bd_in "$ws" "$bin" ready --json 2>/dev/null) || ready_after_status=$?
+        if [ "$ready_after_status" -ne 0 ]; then
+            echo -e "  ${RED:-}BLOCKER-CHECK VIOLATION: post-close 'bd ready' exited $ready_after_status${NC:-}"
+            violations=$((violations + 1))
+        fi
         if ! echo "$ready_after_json" | jq -e --arg id "$dependent_id" 'any(.[]?; .id == $id)' >/dev/null 2>&1; then
             echo -e "  ${RED:-}BLOCKER-CHECK VIOLATION: dependent '$dependent_id' not ready after blocker '$blocker_id' closed${NC:-}"
             violations=$((violations + 1))

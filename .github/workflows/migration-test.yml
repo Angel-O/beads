@@ -24,16 +24,33 @@ on:
           - direct-only
           - stepping-only
 
+permissions:
+  contents: read
+
 env:
   BD_DISABLE_METRICS: "1"
   BD_DISABLE_EVENT_FLUSH: "1"
 
 jobs:
-  sqlite-history:
-    name: SQLite v0.49.6 upgrade qualification
+  historical-upgrades:
+    name: ${{ matrix.qualification }} upgrade qualification
     if: ${{ github.event_name == 'pull_request' }}
-    runs-on: ubuntu-latest
+    # v0.55.4 is dynamically linked against the ICU version shipped here.
+    # Pin the image so a runner alias update cannot invalidate the fixture.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - qualification: SQLite v0.49.6
+            version: v0.49.6
+            expected: MANUAL
+            cache-identity: sqlite-v0.49.6-8546dc9a47e11dc31ac2bc9a0224a9c690975e91850932cbb62623053fbb7db8
+          - qualification: Legacy Dolt-dir v0.55.4
+            version: v0.55.4
+            expected: MANUAL
+            cache-identity: legacy-dolt-v0.55.4-e0fa25456dd82890230eef17653448a0bf995104c78864be91c5ed84426a5f49
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
@@ -56,7 +73,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: ~/.cache/beads-regression
-          key: migration-sqlite-v0.49.6-8546dc9a47e11dc3-${{ runner.os }}-${{ runner.arch }}
+          key: migration-${{ matrix.cache-identity }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Build candidate
         run: make build
@@ -64,16 +81,18 @@ jobs:
       - name: Verify strict harness guards
         run: ./scripts/migration-test/strict-mode-test.sh
 
-      - name: Qualify v0.49.6 SQLite upgrade
+      - name: Qualify ${{ matrix.qualification }} upgrade
         env:
           CANDIDATE_BIN: ./bd
           GIT_CONFIG_NOSYSTEM: "1"
-        run: ./scripts/migration-test/run.sh --strict --expect MANUAL v0.49.6
+          EXPECTED_STATUS: ${{ matrix.expected }}
+          HISTORICAL_VERSION: ${{ matrix.version }}
+        run: ./scripts/migration-test/run.sh --strict --expect "$EXPECTED_STATUS" "$HISTORICAL_VERSION"
 
   migration-test:
     name: Migration fidelity
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
