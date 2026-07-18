@@ -313,6 +313,19 @@ dependency details. Until a user-facing bridge is published, keep using the
 matching historical binary rather than applying the old destructive conversion
 steps.
 
+> **Known limitation (fresh clones of v0.59-v0.62 server workspaces).** The
+> refusal for the v0.59-v0.62 range relies on the gitignored `.local_version`
+> witness, because that era's committed `.beads/metadata.json` is otherwise
+> indistinguishable from a modern server workspace. A brand-new clone of a
+> genuinely legacy v0.59-v0.62 server workspace has no local `.local_version`,
+> so `bd` cannot detect the era from committed metadata alone and will open it
+> like a modern server workspace. This is a deliberate trade-off: adding a
+> store-free "modern" marker that refused on its absence would false-refuse the
+> far more common case of cloning a healthy modern shared server workspace. If
+> you are migrating a v0.59-v0.62 server database, run the historical binary in
+> the original checkout (which still has `.local_version`) and follow the backup
+> and export steps above before cloning or upgrading.
+
 ### From v0.30.x-v0.50.x SQLite workspaces
 
 The old binary stored data in SQLite. The new binary uses Dolt.

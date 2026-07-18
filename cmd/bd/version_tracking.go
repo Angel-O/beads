@@ -29,6 +29,17 @@ const localVersionFile = ".local_version"
 // providers, so that later cohort additionally requires an exact, safely read
 // historical version witness. This check is store-free and has no migration
 // side effects.
+//
+// Accepted limitation (maintainer signed off): the .local_version witness is
+// positive proof of a specific legacy version, and it is gitignored, so a fresh
+// clone of a *modern* v0.59+ server workspace routinely has no witness. Because
+// v0.59-v0.62 server metadata is byte-indistinguishable from modern server
+// metadata, absence of the witness cannot separate "legacy without witness"
+// from "modern without witness", and refusing on absence would false-refuse the
+// common shared-server clone workflow. We therefore fail OPEN on a missing
+// witness and refuse only on a present legacy witness or a tampered/ambiguous
+// one. A fresh clone of a genuinely legacy v0.59-v0.62 server workspace that
+// lacks its local witness is admitted; see docs/getting-started/upgrading.md.
 func refuseLegacyDoltServerWorkspace(beadsDir string, cfg *configfile.Config) error {
 	return refuseLegacyDoltServerWorkspaceWithVersionWitnessOpener(beadsDir, cfg, safefile.OpenReadOnlyNoFollow)
 }
@@ -49,6 +60,11 @@ func refuseLegacyDoltServerWorkspaceWithVersionWitnessOpener(
 		if state == legacyDoltVersionWitnessAmbiguous {
 			return fmt.Errorf("cannot safely classify possible legacy Dolt-server workspace at %q because its %s witness changed or could not be read consistently; preserve a byte-for-byte backup of .beads, stop other bd processes touching the workspace, and retry (refusing to open or modify it)", beadsDir, localVersionFile)
 		}
+		// Deliberate fail-open: a missing witness (state Missing) or a witness
+		// for a non-project-identity version cannot prove this is a legacy
+		// v0.59-v0.62 workspace, and the witness is gitignored so modern fresh
+		// clones legitimately lack it. Admit rather than false-refuse modern
+		// server clones. See the function doc for the accepted trade-off.
 		if state != legacyDoltVersionWitnessStable || !isProjectIdentityLegacyDoltVersionWitness(version) {
 			return nil
 		}
@@ -116,7 +132,7 @@ func readLegacyDoltVersionWitnessWithOpener(
 	if os.IsNotExist(err) {
 		return "", legacyDoltVersionWitnessMissing
 	}
-	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxLegacyVersionWitnessBytes {
+	if err != nil || !plausibleLegacyVersionWitnessInfo(info) {
 		return "", legacyDoltVersionWitnessAmbiguous
 	}
 	file, err := opener(path)
@@ -125,8 +141,7 @@ func readLegacyDoltVersionWitnessWithOpener(
 	}
 	defer func() { _ = file.Close() }()
 	openedInfo, err := file.Stat()
-	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) ||
-		openedInfo.Size() != info.Size() || !openedInfo.ModTime().Equal(info.ModTime()) {
+	if err != nil || !openedWitnessMatchesLstat(info, openedInfo) {
 		return "", legacyDoltVersionWitnessAmbiguous
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxLegacyVersionWitnessBytes+1))
@@ -138,14 +153,45 @@ func readLegacyDoltVersionWitnessWithOpener(
 		return "", legacyDoltVersionWitnessAmbiguous
 	}
 	namedAfter, err := os.Lstat(path)
-	if err != nil || !namedAfter.Mode().IsRegular() ||
-		!os.SameFile(openedInfo, afterInfo) || !os.SameFile(openedInfo, namedAfter) ||
-		openedInfo.Size() != afterInfo.Size() || int64(len(data)) != afterInfo.Size() ||
-		!openedInfo.ModTime().Equal(afterInfo.ModTime()) {
+	if err != nil || !witnessStableAfterRead(openedInfo, afterInfo, namedAfter, len(data)) {
 		return "", legacyDoltVersionWitnessAmbiguous
 	}
-	version := strings.TrimSpace(string(data))
-	return version, legacyDoltVersionWitnessStable
+	return strings.TrimSpace(string(data)), legacyDoltVersionWitnessStable
+}
+
+// plausibleLegacyVersionWitnessInfo reports whether a pre-open Lstat result
+// looks like a readable version witness: a regular file whose size is within
+// the bounded witness window. A symlink or other non-regular shape is treated
+// as ambiguous rather than read.
+func plausibleLegacyVersionWitnessInfo(info os.FileInfo) bool {
+	return info.Mode().IsRegular() &&
+		info.Size() > 0 &&
+		info.Size() <= maxLegacyVersionWitnessBytes
+}
+
+// openedWitnessMatchesLstat reports whether the opened descriptor still
+// describes the same regular file the pre-open Lstat saw — same inode
+// (os.SameFile), size, and mtime. It closes the open-by-name TOCTOU window
+// between Lstat and open before any bytes are trusted.
+func openedWitnessMatchesLstat(lstatInfo, openedInfo os.FileInfo) bool {
+	return openedInfo.Mode().IsRegular() &&
+		os.SameFile(lstatInfo, openedInfo) &&
+		openedInfo.Size() == lstatInfo.Size() &&
+		openedInfo.ModTime().Equal(lstatInfo.ModTime())
+}
+
+// witnessStableAfterRead reports whether the witness still resolves to the same
+// regular file after the read, verified through both the open descriptor
+// (afterInfo) and a fresh path Lstat (namedAfter), and that the bytes read
+// account for the whole file. A concurrent in-place rewrite or path swap fails
+// one of these checks and is reported as ambiguous.
+func witnessStableAfterRead(openedInfo, afterInfo, namedAfter os.FileInfo, readLen int) bool {
+	return namedAfter.Mode().IsRegular() &&
+		os.SameFile(openedInfo, afterInfo) &&
+		os.SameFile(openedInfo, namedAfter) &&
+		openedInfo.Size() == afterInfo.Size() &&
+		int64(readLen) == afterInfo.Size() &&
+		openedInfo.ModTime().Equal(afterInfo.ModTime())
 }
 
 func isLegacyDoltVersionWitness(version string) bool {
