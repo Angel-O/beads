@@ -210,12 +210,14 @@ func importIssuesCore(ctx context.Context, _ string, store storage.DoltStorage, 
 // waiters acquire (see importInterChunkPause).
 //
 // Rows are written in dependency order (orderImportIssuesForChunking): every
-// valid readiness-affecting edge points at a row in the same or an earlier
-// chunk — Kahn's order for the acyclic majority, plus a cycle-breaking fallback
-// that still emits each cycle member before the rows it blocks — so the edge
-// rides inline with its row and both commit in one transaction. A concurrent
-// reader therefore never observes an imported bead without the blocking edges
-// its import file declares —
+// readiness-affecting edge owned by a non-cycle row points at a row in the same
+// or an earlier chunk — Kahn's order for the acyclic majority, plus a
+// cycle-breaking fallback that still emits each cycle member before the rows it
+// blocks — so that edge rides inline with its row and both commit in one
+// transaction. Only a force-emitted cycle member can carry a readiness edge into
+// the deferred pass, and that is the already-tolerated corrupt/legacy-cycle
+// window. A concurrent reader therefore never observes a non-cycle imported bead
+// without the blocking edges its import file declares —
 // `bd ready` mid-import cannot offer blocked work for dispatch, and a crash
 // mid-import cannot freeze a bead in a spuriously-ready state.
 //
@@ -243,8 +245,9 @@ func importIssuesCore(ctx context.Context, _ string, store storage.DoltStorage, 
 // re-run, so the pre-filter stale-skips that snapshot wholesale (row and any
 // still-unwired deferred edges), reported in StaleSkippedIDs. That is the
 // same local-wins outcome the single-transaction import gave a rival update
-// racing a crashed import, and it can only affect non-readiness edges —
-// readiness edges commit with their rows.
+// racing a crashed import, and it can only affect deferred edges (non-readiness
+// edges, plus the readiness edges of force-emitted cycle members); every
+// non-cycle row's readiness edges commit with their row.
 func importIssuesChunked(ctx context.Context, store storage.DoltStorage, issues []*types.Issue, actor string, opts storage.BatchCreateOptions) error {
 	// Apply the cross-bucket dependency policy over the full set up front:
 	// the engine's per-batch filter only sees one chunk, so it could no
@@ -314,9 +317,11 @@ type deferredImportEdges struct {
 // same or an earlier chunk) and edges deferred to the dependency pass. It
 // narrows each issue's dependency slice to the inline subset in place and
 // returns the deferred edges. orderImportIssuesForChunking guarantees every
-// valid readiness edge points at the same or an earlier chunk, so only
-// non-readiness edges (related, discovered-from) into a later chunk and
-// genuinely cyclic blocking edges are ever deferred here.
+// readiness edge owned by a non-cycle row points at the same or an earlier
+// chunk, so only non-readiness edges (related, discovered-from) into a later
+// chunk and the readiness edges of force-emitted cycle members (their own cyclic
+// edges, plus any acyclic blocker they were emitted ahead of) are ever deferred
+// here.
 func partitionChunkedImportDeps(ordered []*types.Issue) []deferredImportEdges {
 	firstChunkOf := make(map[string]int, len(ordered))
 	for pos, issue := range ordered {
@@ -429,9 +434,11 @@ func wireDeferredImportDeps(ctx context.Context, store storage.DoltStorage, defe
 // can place a valid dependent of a cycle before the cycle member it blocks on,
 // deferring that live readiness edge and briefly exposing the dependent as ready
 // without its blocker. Instead each stall is broken by emitting a row that
-// genuinely lies on a cycle, so only the cycle's own unsatisfiable edges are
-// left to defer; the engine skip-reports those, still breaking the cycle, while
-// every valid acyclic readiness edge still rides inline. For a cycle of length
+// genuinely lies on a cycle, so every readiness edge owned by a non-cycle row
+// still rides inline; only a force-emitted cycle member may defer a readiness
+// edge — its own unsatisfiable cycle edge, or a valid acyclic edge whose blocker
+// it was emitted ahead of — and the engine skip-reports the unsatisfiable ones,
+// still breaking the cycle. For a cycle of length
 // >=3 the edge left to defer (and hence which member is left spuriously ready)
 // can differ from the one the single-transaction import drops, which checks all
 // cycle edges in file order against the already-persisted set; both break it.
@@ -549,8 +556,10 @@ func (g importOrderGraph) addRowReadinessEdges(i int, issue *types.Issue, indice
 
 // topologicalFileOrder emits rows in dependency order (Kahn's, file-order
 // seeded), breaking each stall by force-emitting a row that lies on a readiness
-// cycle so that only unsatisfiable cycle edges — never valid acyclic ones — are
-// left for the deferred dependency pass.
+// cycle, so every non-cycle row's readiness edges ride inline; only a
+// force-emitted cycle member can leave a readiness edge (its unsatisfiable cycle
+// edge, or a valid acyclic edge it was emitted ahead of) for the deferred
+// dependency pass.
 func (g importOrderGraph) topologicalFileOrder(issues []*types.Issue) []*types.Issue {
 	n := len(issues)
 	indegree := append([]int(nil), g.indegree...)
