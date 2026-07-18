@@ -100,6 +100,38 @@ func TestInspectAdmitsDefaultV062MetadataWithoutPersistedServerEndpoint(t *testi
 	}
 }
 
+func TestInspectAdmitsWellFormedOptionalV062Metadata(t *testing.T) {
+	// The allow-listed optional fields (retention days, remotesapi port, server
+	// user/tls, last_bd_version) are legitimately present in real v0.62 server
+	// metadata. Enforcing their scalar contract must reject malformed values
+	// without false-refusing the correctly typed ones.
+	project := newV062Project(t)
+	mustWrite(t, filepath.Join(project, ".beads", "metadata.json"), `{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_server_host": "127.0.0.1",
+  "dolt_server_port": 3307,
+  "dolt_server_user": "root",
+  "dolt_server_tls": false,
+  "dolt_remotesapi_port": 8080,
+  "deletions_retention_days": 3,
+  "stale_closed_issues_days": 30,
+  "last_bd_version": "0.62.0",
+  "dolt_database": "smoke",
+  "project_id": "7ef372b4-4c3c-4e2c-a6cc-29dd2d0a28c6"
+}
+`)
+	before := snapshotTree(t, project)
+
+	if _, err := Inspect(project, "1.1.0"); err != nil {
+		t.Fatalf("Inspect() rejected well-formed optional v0.62 metadata: %v", err)
+	}
+	if after := snapshotTree(t, project); after != before {
+		t.Fatalf("inspection mutated source tree\nbefore: %s\nafter:  %s", before, after)
+	}
+}
+
 func TestInspectTreeDigestChangesWithRegularFileContent(t *testing.T) {
 	first := newV062Project(t)
 	second := newV062Project(t)
@@ -440,6 +472,50 @@ func TestInspectRefusesMalformedV062Metadata(t *testing.T) {
 		{
 			name: "non-empty custom data dir",
 			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "dolt_data_dir", "/srv/dolt") },
+		},
+		{
+			name: "object last_bd_version",
+			edit: func(t *testing.T, project string) {
+				setV062MetadataField(t, project, "last_bd_version", map[string]any{"not": "a v0.62 scalar"})
+			},
+		},
+		{
+			name: "array last_bd_version",
+			edit: func(t *testing.T, project string) {
+				setV062MetadataField(t, project, "last_bd_version", []any{"0.62.0"})
+			},
+		},
+		{
+			name: "non-string dolt server user",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "dolt_server_user", 5) },
+		},
+		{
+			name: "non-boolean dolt server tls",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "dolt_server_tls", "yes") },
+		},
+		{
+			name: "negative deletions retention days",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "deletions_retention_days", -1) },
+		},
+		{
+			name: "non-integer deletions retention days",
+			edit: func(t *testing.T, project string) {
+				setV062MetadataField(t, project, "deletions_retention_days", "thirty")
+			},
+		},
+		{
+			name: "object stale closed issues days",
+			edit: func(t *testing.T, project string) {
+				setV062MetadataField(t, project, "stale_closed_issues_days", map[string]any{})
+			},
+		},
+		{
+			name: "out-of-range remotesapi port",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "dolt_remotesapi_port", 70000) },
+		},
+		{
+			name: "non-integer remotesapi port",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "dolt_remotesapi_port", "8080") },
 		},
 		{
 			name: "unknown metadata field",

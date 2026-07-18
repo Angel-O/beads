@@ -227,7 +227,24 @@ if ! inspection_json=$("$JQ_BIN" -cse \
                 keys == [
                     "effect", "operation", "retryable", "schema_version",
                     "source", "status", "target"
-                ]
+                ] and
+                (.source | type) == "object" and
+                (.source | keys) == [
+                    "backend", "digest_scope", "tree_sha256",
+                    "version", "workspace"
+                ] and
+                (.source.workspace | type) == "string" and
+                (.source.version | type) == "string" and
+                (.source.backend | type) == "string" and
+                (.source.tree_sha256 | type) == "string" and
+                (.source.digest_scope | type) == "string" and
+                (.target | type) == "object" and
+                (.target | keys) == [
+                    "backend", "embedded_capable", "version"
+                ] and
+                (.target.version | type) == "string" and
+                (.target.backend | type) == "string" and
+                (.target.embedded_capable | type) == "boolean"
             ) or
             (
                 .status == "refused" and $process_status == 1 and
@@ -293,7 +310,18 @@ if $JSON_OUTPUT; then
             schema_version: 1, operation: $operation, mode: $mode,
             status: "failed", code: "apply_not_available",
             retryable: false, effect: "none",
-            source: $inspection.source, target: $inspection.target,
+            source: {
+                workspace: $inspection.source.workspace,
+                version: $inspection.source.version,
+                backend: $inspection.source.backend,
+                tree_sha256: $inspection.source.tree_sha256,
+                digest_scope: $inspection.source.digest_scope
+            },
+            target: {
+                version: $inspection.target.version,
+                backend: $inspection.target.backend,
+                embedded_capable: $inspection.target.embedded_capable
+            },
             rollback: {path: $rollback, policy: "retain"},
             verification: {
                 source_shape: "qualified",

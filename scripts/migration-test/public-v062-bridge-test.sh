@@ -67,6 +67,8 @@ case "\${1:-}" in
         qualified_digest_scope=admission_observation
         qualified_exit=0
         repeat_qualified=false
+        qualified_source_extra=
+        qualified_target_extra=
         case "\${3##*/}" in
             wrong-witness) inspection_code=source_version_mismatch ;;
             missing-witness) inspection_code=source_version_missing ;;
@@ -98,12 +100,18 @@ case "\${1:-}" in
                 inspection_code=source_changed
                 inspection_retryable=true
                 ;;
+            smuggle-source-field)
+                qualified_source_extra=',"injected":"evil"'
+                ;;
+            smuggle-target-field)
+                qualified_target_extra=',"injected":"evil"'
+                ;;
         esac
         if [ -n "\$inspection_code" ]; then
             printf '{"schema_version":1,"operation":"v062_source_inspection","status":"refused","retryable":%s,"effect":"none","code":"%s"}\n' "\$inspection_retryable" "\$inspection_code"
             exit "\$inspection_exit"
         fi
-        printf '{"schema_version":1,"operation":"v062_source_inspection","status":"qualified","retryable":false,"effect":"none","source":{"workspace":"%s","version":"0.62.0","backend":"dolt-server","tree_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","digest_scope":"%s"},"target":{"version":"%s","backend":"dolt-embedded","embedded_capable":true}}\n' "\$qualified_workspace" "\$qualified_digest_scope" '$version'
+        printf '{"schema_version":1,"operation":"v062_source_inspection","status":"qualified","retryable":false,"effect":"none","source":{"workspace":"%s","version":"0.62.0","backend":"dolt-server","tree_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","digest_scope":"%s"%s},"target":{"version":"%s","backend":"dolt-embedded","embedded_capable":true%s}}\n' "\$qualified_workspace" "\$qualified_digest_scope" "\$qualified_source_extra" '$version' "\$qualified_target_extra"
         if \$repeat_qualified; then
             printf '{"schema_version":1,"operation":"v062_source_inspection","status":"qualified","retryable":false,"effect":"none","source":{"workspace":"%s","version":"0.62.0","backend":"dolt-server","tree_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","digest_scope":"%s"},"target":{"version":"%s","backend":"dolt-embedded","embedded_capable":true}}\n' "\$qualified_workspace" "\$qualified_digest_scope" '$version'
         fi
@@ -316,7 +324,9 @@ for protocol_case in \
     refused-wrong-exit \
     unknown-refusal-code \
     wrong-retryability-stable \
-    wrong-retryability-transient; do
+    wrong-retryability-transient \
+    smuggle-source-field \
+    smuggle-target-field; do
     if ! check_protocol_rejected "$protocol_case"; then
         protocol_rejection_failures+=("$protocol_case")
     fi

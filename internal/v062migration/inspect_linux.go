@@ -33,25 +33,33 @@ const (
 )
 
 var (
-	databaseNamePattern       = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]{0,63}$`)
-	projectIDPattern          = regexp.MustCompile(`^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$`)
-	errWitnessOutsideBound    = errors.New("witness outside size bound")
-	errWitnessChanged         = errors.New("witness changed while read")
-	allowedV062MetadataFields = map[string]struct{}{
-		"backend":                  {},
-		"database":                 {},
-		"deletions_retention_days": {},
-		"dolt_data_dir":            {},
-		"dolt_database":            {},
-		"dolt_mode":                {},
-		"dolt_remotesapi_port":     {},
-		"dolt_server_host":         {},
-		"dolt_server_port":         {},
-		"dolt_server_tls":          {},
-		"dolt_server_user":         {},
-		"last_bd_version":          {},
-		"project_id":               {},
-		"stale_closed_issues_days": {},
+	databaseNamePattern    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]{0,63}$`)
+	projectIDPattern       = regexp.MustCompile(`^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$`)
+	errWitnessOutsideBound = errors.New("witness outside size bound")
+	errWitnessChanged      = errors.New("witness changed while read")
+	// allowedV062MetadataFields is both the field allow-list and the exact
+	// scalar contract every allowed field must satisfy. Each validator fails
+	// closed on a non-scalar or wrong-typed value so malformed or non-v0.62
+	// metadata (for example an object where a string belongs) can never be
+	// advertised as a qualified source. Fields whose value is additionally
+	// pinned (backend=="dolt", dolt_data_dir=="") are checked further in
+	// requiredMetadataShape / rejectDisallowedMetadataFields; the validator here
+	// still guarantees the underlying scalar type.
+	allowedV062MetadataFields = map[string]func(json.RawMessage) bool{
+		"backend":                  isJSONString,
+		"database":                 isJSONString,
+		"deletions_retention_days": isNonNegativeJSONInteger,
+		"dolt_data_dir":            isJSONString,
+		"dolt_database":            isJSONString,
+		"dolt_mode":                isJSONString,
+		"dolt_remotesapi_port":     isJSONPort,
+		"dolt_server_host":         isJSONString,
+		"dolt_server_port":         isJSONPort,
+		"dolt_server_tls":          isJSONBool,
+		"dolt_server_user":         isJSONString,
+		"last_bd_version":          isJSONString,
+		"project_id":               isJSONString,
+		"stale_closed_issues_days": isNonNegativeJSONInteger,
 	}
 )
 
@@ -518,12 +526,20 @@ func requiredMetadataShape(values map[string]json.RawMessage) (string, error) {
 }
 
 // rejectDisallowedMetadataFields fails closed on any field outside the allowed
-// v0.62 set, any foreign-provider metadata, and any non-empty custom data dir.
+// v0.62 set, any allowed field whose value is not the exact v0.62 scalar shape,
+// any foreign-provider metadata, and any non-empty custom data dir.
 func rejectDisallowedMetadataFields(values map[string]json.RawMessage) error {
 	for key, raw := range values {
-		if _, allowed := allowedV062MetadataFields[key]; !allowed {
+		validate, allowed := allowedV062MetadataFields[key]
+		if !allowed {
 			return errors.New("unknown v0.62 metadata field")
 		}
+		if !validate(raw) {
+			return errors.New("malformed v0.62 metadata field")
+		}
+		// Deliberate defense-in-depth: the allow-list above admits no key with
+		// these prefixes, so this branch is currently unreachable, but it fails
+		// closed if a future allow-list edit ever adds a foreign-provider field.
 		lower := strings.ToLower(key)
 		if strings.HasPrefix(lower, "postgres") || strings.HasPrefix(lower, "mysql") ||
 			strings.HasPrefix(lower, "sqlite") || strings.HasPrefix(lower, "proxied") {
@@ -590,8 +606,36 @@ func requiredInteger(values map[string]json.RawMessage, key string) (int64, bool
 	if !ok {
 		return 0, false
 	}
+	return parseJSONInteger(raw)
+}
+
+func parseJSONInteger(raw json.RawMessage) (int64, bool) {
 	value, err := strconv.ParseInt(string(raw), 10, 64)
 	return value, err == nil
+}
+
+// isJSONString, isJSONBool, isNonNegativeJSONInteger, and isJSONPort are the
+// per-field scalar validators referenced by allowedV062MetadataFields. Each
+// rejects any value that is not exactly the required v0.62 scalar type, closing
+// the gap where a malformed optional field could be advertised as qualified.
+func isJSONString(raw json.RawMessage) bool {
+	var value string
+	return json.Unmarshal(raw, &value) == nil
+}
+
+func isJSONBool(raw json.RawMessage) bool {
+	var value bool
+	return json.Unmarshal(raw, &value) == nil
+}
+
+func isNonNegativeJSONInteger(raw json.RawMessage) bool {
+	value, ok := parseJSONInteger(raw)
+	return ok && value >= 0
+}
+
+func isJSONPort(raw json.RawMessage) bool {
+	value, ok := parseJSONInteger(raw)
+	return ok && value >= 1 && value <= 65535
 }
 
 func (fs sourceFS) inspectTree(root *os.File, rootStat unix.Stat_t, includeContent bool) (treeSnapshot, error) {

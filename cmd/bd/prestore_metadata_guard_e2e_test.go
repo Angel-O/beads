@@ -96,6 +96,52 @@ func TestListRejectsV0620ServerWorkspaceBeforeMutation(t *testing.T) {
 	}
 }
 
+// TestDoctorDoesNotClobberV0620WitnessOrMigrate proves the doctor path, which
+// skips PersistentPreRunE (and therefore the store-init legacy guard), does not
+// rewrite the .local_version witness or migrate a genuine v0.62 server
+// workspace. bd doctor calls trackBdVersion()/autoMigrateOnVersionBump()
+// directly; before PR #4835 that rewrote the witness to the current version,
+// permanently flipping refuseLegacyDoltServerWorkspace fail-open for every later
+// command. The witness must survive byte-for-byte so the guard keeps refusing.
+func TestDoctorDoesNotClobberV0620WitnessOrMigrate(t *testing.T) {
+	bd := buildBDUnderTest(t)
+	repoDir, beadsDir := newV0620ServerWorkspace(t)
+
+	// The witness and metadata are the classification surface the store-init
+	// guard reads; the dolt state files are what a migration would rewrite. None
+	// may change. (bd doctor legitimately writes an unrelated dolt-server.port
+	// hint via a pre-existing check, so this asserts the migration-critical files
+	// rather than the whole tree.)
+	protected := []string{
+		".local_version",
+		"metadata.json",
+		filepath.Join("dolt", ".dolt", "repo_state.json"),
+		filepath.Join("dolt", "smoke", ".dolt", "repo_state.json"),
+	}
+	before := make(map[string]string, len(protected))
+	for _, rel := range protected {
+		data, err := os.ReadFile(filepath.Join(beadsDir, rel))
+		if err != nil {
+			t.Fatalf("read %s before doctor: %v", rel, err)
+		}
+		before[rel] = string(data)
+	}
+
+	// bd doctor may surface errors for the (unreachable) legacy store, but it
+	// must not rewrite the witness or migrate the workspace on its way there.
+	_, _, _ = runPrestoreGuardCommand(t, bd, repoDir, "doctor")
+
+	for _, rel := range protected {
+		data, err := os.ReadFile(filepath.Join(beadsDir, rel))
+		if err != nil {
+			t.Fatalf("read %s after doctor: %v", rel, err)
+		}
+		if string(data) != before[rel] {
+			t.Errorf("bd doctor mutated %s on a legacy v0.62.0 workspace: before=%q after=%q", rel, before[rel], data)
+		}
+	}
+}
+
 func TestIncompatibleMetadataStillAllowsStoreFreeCommands(t *testing.T) {
 	bd := buildBDUnderTest(t)
 	tests := []struct {

@@ -231,6 +231,22 @@ func trackBdVersion() {
 		return
 	}
 
+	// PR #4835: never rewrite the version witness on a legacy v0.59-v0.62
+	// Dolt-server workspace. The store-init path already refuses such a workspace
+	// before reaching here, but guard-skipping callers (notably bd doctor, which
+	// is in noDbCommands) run this directly. Clobbering .local_version to the
+	// current version would flip refuseLegacyDoltServerWorkspace fail-open for
+	// every later command. Returning before both upgrade detection and the
+	// witness write also keeps versionUpgradeDetected false, so the version-bump
+	// migration (gated on it) stays inert on this path too. Best-effort,
+	// read-only classification: an unreadable config cannot prove legacy, so fall
+	// through to normal tracking.
+	if cfg, err := configfile.LoadReadOnly(beadsDir); err == nil {
+		if refuseLegacyDoltServerWorkspace(beadsDir, cfg) != nil {
+			return
+		}
+	}
+
 	// Read last version from local (gitignored) file
 	localVersionPath := filepath.Join(beadsDir, localVersionFile)
 	lastVersion := readLocalVersion(localVersionPath)
