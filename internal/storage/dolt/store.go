@@ -696,6 +696,21 @@ func (s *DoltStore) withRetryTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 		if err == nil {
 			return nil
 		}
+		// A rotating credential revoked before its cached expiry surfaces as a
+		// server auth rejection (MySQL 1045) when a write dials a fresh pooled
+		// connection. Mirror withRetry: drop the cached token so the retry's new
+		// dial re-mints via BeforeConnect, only on the credential-command path (a
+		// static user has nothing to refresh). A pre-commit rejection is safe to
+		// replay; a commit-phase rejection stays permanent for the same
+		// double-apply reason as a commit-phase connection loss below.
+		if s.credCommand != "" && isAuthError(err) {
+			invalidateCredentialToken(s.credCommand)
+			if errors.Is(err, errCommitPhase) {
+				return backoff.Permanent(fmt.Errorf("write commit result indeterminate after auth rejection (not retried to avoid double-apply): %w", err))
+			}
+			doltMetrics.writeRetries.Add(ctx, 1, metric.WithAttributes(attribute.String("type", "auth")))
+			return err // pre-commit auth rejection: retryable after cache invalidation
+		}
 		// Serialization failures (1213/1205) guarantee a server-side rollback,
 		// so the write never landed — safe to replay at any phase.
 		if isSerializationError(err) {

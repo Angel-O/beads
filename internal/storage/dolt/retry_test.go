@@ -2,8 +2,13 @@ package dolt
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
+	"time"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	mysql "github.com/go-sql-driver/mysql"
 )
 
 func TestIsRetryableError(t *testing.T) {
@@ -181,5 +186,103 @@ func TestWithRetry_NonRetryableError(t *testing.T) {
 	}
 	if callCount != 1 {
 		t.Errorf("expected 1 call for non-retryable error, got %d", callCount)
+	}
+}
+
+// TestWithRetryTx_AuthErrorInvalidatesAndRetries is the write-path analogue of
+// withRetry's credential recovery: a MySQL 1045 from a write transaction's dial
+// (a rotating token revoked before its cached expiry) must drop the cached token
+// and retry, not fail permanently. Before withRetryTx learned this, it
+// classified 1045 as non-retryable and surfaced it, so hosted-credential writes
+// could fail for the whole life of a stale-but-unexpired cache entry.
+func TestWithRetryTx_AuthErrorInvalidatesAndRetries(t *testing.T) {
+	const cmd = "rotating-helper"
+	credCacheMu.Lock()
+	credCache = map[string]cachedCred{cmd: {token: "revoked", expires: time.Now().Add(time.Hour)}}
+	credCacheMu.Unlock()
+	t.Cleanup(func() {
+		credCacheMu.Lock()
+		credCache = map[string]cachedCred{}
+		credCacheMu.Unlock()
+	})
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	// First dial rejects the revoked token; the retry's dial succeeds and commits.
+	mock.ExpectBegin().WillReturnError(&mysql.MySQLError{Number: 1045, Message: "Access denied for user"})
+	mock.ExpectBegin()
+	mock.ExpectCommit()
+
+	store := &DoltStore{db: db, credCommand: cmd, serverMode: true}
+
+	bodyRuns := 0
+	if err := store.withRetryTx(context.Background(), func(tx *sql.Tx) error {
+		bodyRuns++
+		return nil
+	}); err != nil {
+		t.Fatalf("withRetryTx must retry past the auth rejection, got: %v", err)
+	}
+	if bodyRuns != 1 {
+		t.Fatalf("tx body should run once (only after the successful retry), ran %d times", bodyRuns)
+	}
+
+	credCacheMu.Lock()
+	_, stillCached := credCache[cmd]
+	credCacheMu.Unlock()
+	if stillCached {
+		t.Fatal("auth rejection must invalidate the cached credential so the retry re-mints")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestWithRetryTx_CommitPhaseAuthErrorNotRetried guards the double-apply
+// invariant: an auth rejection observed during tx.Commit is ambiguous (the
+// commit may have landed), so — exactly like a commit-phase connection loss — it
+// must surface permanently rather than replay the write, even though the cached
+// token is still dropped so future dials re-mint.
+func TestWithRetryTx_CommitPhaseAuthErrorNotRetried(t *testing.T) {
+	const cmd = "rotating-helper"
+	credCacheMu.Lock()
+	credCache = map[string]cachedCred{cmd: {token: "revoked", expires: time.Now().Add(time.Hour)}}
+	credCacheMu.Unlock()
+	t.Cleanup(func() {
+		credCacheMu.Lock()
+		credCache = map[string]cachedCred{}
+		credCacheMu.Unlock()
+	})
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mock.ExpectBegin()
+	mock.ExpectCommit().WillReturnError(&mysql.MySQLError{Number: 1045, Message: "Access denied for user"})
+
+	store := &DoltStore{db: db, credCommand: cmd, serverMode: true}
+
+	bodyRuns := 0
+	err = store.withRetryTx(context.Background(), func(tx *sql.Tx) error {
+		bodyRuns++
+		return nil
+	})
+	if err == nil {
+		t.Fatal("a commit-phase auth rejection must surface, not be silently retried")
+	}
+	if !errors.Is(err, errCommitPhase) {
+		t.Fatalf("commit-phase failure must stay tagged errCommitPhase, got: %v", err)
+	}
+	if bodyRuns != 1 {
+		t.Fatalf("commit-phase failure must not replay the write; body ran %d times", bodyRuns)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sqlmock expectations: %v", err)
 	}
 }
