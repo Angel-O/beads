@@ -30,6 +30,11 @@ type Transaction = beads.Transaction
 // paying the recursive per-edge cycle query — which cannot finish inside a
 // per-command budget on molecule-sized graphs (observed: a 67-node/100-edge
 // batch blowing a 120s deadline mid-transaction, gascity 2026-07-17).
+//
+// Callers that set SkipCycleCheck MUST run Transaction.CycleThroughEdges before
+// commit and fail on new blocks/conditional-blocks/parent-child cycles
+// (waits-for is excluded); skipping the per-edge check trades per-edge cost for
+// one whole-graph check, never graph integrity.
 type DependencyAddOptions = storage.DependencyAddOptions
 
 // RemoteStore provides dolt remote management and replication operations.
