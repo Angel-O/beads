@@ -95,24 +95,8 @@ func Inspect(project, targetVersion string) (result Result, returnErr error) {
 }
 
 func inspectWithHooks(project, targetVersion string, hooks inspectHooks) (result Result, returnErr error) {
-	if runtime.GOARCH != "amd64" {
-		return Result{}, refuse(CodePlatformUnsupported, false, nil)
-	}
-	wsl, err := runningUnderWSL()
-	if err != nil {
-		return Result{}, refuse(CodeSourceUnverifiable, true, err)
-	}
-	if wsl {
-		return Result{}, refuse(CodePlatformUnsupported, false, nil)
-	}
-	if !embeddedBuildCapable {
-		return Result{}, refuse(CodeEmbeddedTargetUnavailable, false, nil)
-	}
-	if project == "" || !filepath.IsAbs(project) {
-		return Result{}, refuse(CodeWorkspaceInvalid, false, nil)
-	}
-	if filepath.Clean(project) != project {
-		return Result{}, refuse(CodeWorkspaceNotCanonical, false, nil)
+	if err := checkInspectPreconditions(project); err != nil {
+		return Result{}, err
 	}
 
 	readMountID := hooks.mountIDAt
@@ -136,33 +120,19 @@ func inspectWithHooks(project, targetVersion string, hooks inspectHooks) (result
 		return Result{}, err
 	}
 
-	versionFile, versionStat, err := fs.openWitnessAt(beadsFile, ".local_version", CodeSourceVersionMissing, CodeSourceVersionAmbiguous)
+	versionFile, versionStat, version, err := fs.readBoundedWitness(beadsFile, ".local_version", CodeSourceVersionMissing, CodeSourceVersionAmbiguous, maxVersionBytes, CodeSourceVersionMismatch)
+	defer closeForInspection(&result, &returnErr, versionFile)
 	if err != nil {
 		return Result{}, err
-	}
-	defer closeForInspection(&result, &returnErr, versionFile)
-	version, err := readStableBounded(versionFile, versionStat, maxVersionBytes)
-	if err != nil {
-		if errors.Is(err, errWitnessOutsideBound) {
-			return Result{}, refuse(CodeSourceVersionMismatch, false, err)
-		}
-		return Result{}, classifyWitnessReadFailure(err)
 	}
 	if !bytes.Equal(version, []byte(versionWitness)) {
 		return Result{}, refuse(CodeSourceVersionMismatch, false, nil)
 	}
 
-	metadataFile, metadataStat, err := fs.openWitnessAt(beadsFile, "metadata.json", CodeSourceMetadataMissing, CodeUnsafeSourceSymlink)
+	metadataFile, metadataStat, metadata, err := fs.readBoundedWitness(beadsFile, "metadata.json", CodeSourceMetadataMissing, CodeUnsafeSourceSymlink, maxMetadataBytes, CodeSourceMetadataMismatch)
+	defer closeForInspection(&result, &returnErr, metadataFile)
 	if err != nil {
 		return Result{}, err
-	}
-	defer closeForInspection(&result, &returnErr, metadataFile)
-	metadata, err := readStableBounded(metadataFile, metadataStat, maxMetadataBytes)
-	if err != nil {
-		if errors.Is(err, errWitnessOutsideBound) {
-			return Result{}, refuse(CodeSourceMetadataMismatch, false, err)
-		}
-		return Result{}, classifyWitnessReadFailure(err)
 	}
 	shape, err := parseMetadata(metadata)
 	if err != nil {
@@ -195,6 +165,31 @@ func inspectWithHooks(project, targetVersion string, hooks inspectHooks) (result
 	}
 
 	return QualifiedResult(project, targetVersion, first.treeSHA256), nil
+}
+
+// checkInspectPreconditions rejects environments and workspace arguments that
+// the descriptor-bound inspector cannot admit before any source is opened.
+func checkInspectPreconditions(project string) error {
+	if runtime.GOARCH != "amd64" {
+		return refuse(CodePlatformUnsupported, false, nil)
+	}
+	wsl, err := runningUnderWSL()
+	if err != nil {
+		return refuse(CodeSourceUnverifiable, true, err)
+	}
+	if wsl {
+		return refuse(CodePlatformUnsupported, false, nil)
+	}
+	if !embeddedBuildCapable {
+		return refuse(CodeEmbeddedTargetUnavailable, false, nil)
+	}
+	if project == "" || !filepath.IsAbs(project) {
+		return refuse(CodeWorkspaceInvalid, false, nil)
+	}
+	if filepath.Clean(project) != project {
+		return refuse(CodeWorkspaceNotCanonical, false, nil)
+	}
+	return nil
 }
 
 func runningUnderWSL() (bool, error) {
@@ -392,6 +387,26 @@ func (fs sourceFS) openWitnessAt(parent *os.File, name string, missingCode, syml
 	return file, opened, nil
 }
 
+// readBoundedWitness opens a required regular-file witness under the retained
+// beads descriptor and reads it under the stable-size contract. An oversized
+// but stable witness is a non-retryable mismatch. The file is returned even on
+// a read failure so the caller can register its deferred close; it is nil only
+// when the open itself failed.
+func (fs sourceFS) readBoundedWitness(beads *os.File, name string, missingCode, symlinkCode Code, limit int64, mismatchCode Code) (*os.File, unix.Stat_t, []byte, error) {
+	file, stat, err := fs.openWitnessAt(beads, name, missingCode, symlinkCode)
+	if err != nil {
+		return nil, unix.Stat_t{}, nil, err
+	}
+	data, err := readStableBounded(file, stat, limit)
+	if err != nil {
+		if errors.Is(err, errWitnessOutsideBound) {
+			return file, stat, nil, refuse(mismatchCode, false, err)
+		}
+		return file, stat, nil, classifyWitnessReadFailure(err)
+	}
+	return file, stat, data, nil
+}
+
 func classifyBeadsOpen(err error) error {
 	if _, ok := AsRefusal(err); ok {
 		return err
@@ -460,55 +475,68 @@ func parseMetadata(data []byte) (metadataShape, error) {
 	if err != nil {
 		return metadataShape{}, err
 	}
-	backend, ok := requiredString(values, "backend")
-	if !ok || backend != "dolt" {
-		return metadataShape{}, errors.New("backend")
+	database, err := requiredMetadataShape(values)
+	if err != nil {
+		return metadataShape{}, err
 	}
-	databaseKind, ok := requiredString(values, "database")
-	if !ok || databaseKind != "dolt" {
-		return metadataShape{}, errors.New("database")
+	if err := rejectDisallowedMetadataFields(values); err != nil {
+		return metadataShape{}, err
 	}
-	mode, ok := requiredString(values, "dolt_mode")
-	if !ok || mode != "server" {
-		return metadataShape{}, errors.New("dolt_mode")
+	return metadataShape{database: database}, nil
+}
+
+// requiredMetadataShape enforces the exact scalar contract of a v0.62 local
+// Dolt-server metadata document and returns the validated dolt database name.
+func requiredMetadataShape(values map[string]json.RawMessage) (string, error) {
+	for _, field := range []struct{ key, want string }{
+		{"backend", "dolt"},
+		{"database", "dolt"},
+		{"dolt_mode", "server"},
+	} {
+		if got, ok := requiredString(values, field.key); !ok || got != field.want {
+			return "", errors.New(field.key)
+		}
 	}
 	if _, present := values["dolt_server_host"]; present {
-		host, ok := requiredString(values, "dolt_server_host")
-		if !ok || host != "127.0.0.1" {
-			return metadataShape{}, errors.New("dolt_server_host")
+		if host, ok := requiredString(values, "dolt_server_host"); !ok || host != "127.0.0.1" {
+			return "", errors.New("dolt_server_host")
 		}
 	}
 	database, ok := requiredString(values, "dolt_database")
 	if !ok || !databaseNamePattern.MatchString(database) {
-		return metadataShape{}, errors.New("dolt_database")
+		return "", errors.New("dolt_database")
 	}
-	projectID, ok := requiredString(values, "project_id")
-	if !ok || !projectIDPattern.MatchString(projectID) {
-		return metadataShape{}, errors.New("project_id")
+	if projectID, ok := requiredString(values, "project_id"); !ok || !projectIDPattern.MatchString(projectID) {
+		return "", errors.New("project_id")
 	}
 	if _, present := values["dolt_server_port"]; present {
-		port, ok := requiredInteger(values, "dolt_server_port")
-		if !ok || port < 1 || port > 65535 {
-			return metadataShape{}, errors.New("dolt_server_port")
+		if port, ok := requiredInteger(values, "dolt_server_port"); !ok || port < 1 || port > 65535 {
+			return "", errors.New("dolt_server_port")
 		}
 	}
+	return database, nil
+}
+
+// rejectDisallowedMetadataFields fails closed on any field outside the allowed
+// v0.62 set, any foreign-provider metadata, and any non-empty custom data dir.
+func rejectDisallowedMetadataFields(values map[string]json.RawMessage) error {
 	for key, raw := range values {
 		if _, allowed := allowedV062MetadataFields[key]; !allowed {
-			return metadataShape{}, errors.New("unknown v0.62 metadata field")
+			return errors.New("unknown v0.62 metadata field")
 		}
 		lower := strings.ToLower(key)
 		if strings.HasPrefix(lower, "postgres") || strings.HasPrefix(lower, "mysql") ||
 			strings.HasPrefix(lower, "sqlite") || strings.HasPrefix(lower, "proxied") {
-			return metadataShape{}, errors.New("foreign provider metadata")
+			return errors.New("foreign provider metadata")
 		}
-		if key == "dolt_data_dir" || key == "dolt_server_socket" {
+		if key == "dolt_data_dir" {
 			var value string
 			if err := json.Unmarshal(raw, &value); err != nil || value != "" {
-				return metadataShape{}, errors.New("custom server path")
+				return errors.New("custom server path")
 			}
 		}
 	}
-	return metadataShape{database: database}, nil
+	return nil
 }
 
 func decodeUniqueObject(data []byte) (map[string]json.RawMessage, error) {
@@ -602,80 +630,111 @@ func (fs sourceFS) inspectDirectory(dir *os.File, relative string, includeConten
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		path := name
-		if relative != "" {
-			path = relative + "/" + name
-		}
-		var named unix.Stat_t
-		if err := unix.Fstatat(int(dir.Fd()), name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESTALE) {
-				return refuse(CodeSourceChanged, true, err)
-			}
-			return refuse(CodeSourceUnverifiable, true, err)
-		}
-		if err := checkDevice(named.Dev, fs.device); err != nil {
-			return err
-		}
-		if err := fs.checkMountAt(int(dir.Fd()), name, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		path := joinRelative(relative, name)
+		named, err := fs.statTreeEntry(dir, name)
+		if err != nil {
 			return err
 		}
 		switch named.Mode & unix.S_IFMT {
 		case unix.S_IFLNK:
 			return refuse(CodeUnsafeSourceSymlink, false, nil)
 		case unix.S_IFDIR:
-			child, opened, err := fs.openDirectoryAt(dir, name)
-			if err != nil {
-				return classifyTreeOpen(err)
-			}
-			kinds[path] = 'd'
-			writeTreeRecord(treeHash, 'd', path, opened, nil)
-			writeStructureRecord(structureHash, 'd', path, opened)
-			err = fs.inspectDirectory(child, path, includeContent, treeHash, structureHash, kinds)
-			closeErr := child.Close()
-			if err != nil {
+			if err := fs.inspectSubdirectory(dir, name, path, includeContent, treeHash, structureHash, kinds); err != nil {
 				return err
-			}
-			if closeErr != nil {
-				return refuse(CodeSourceUnverifiable, true, closeErr)
 			}
 		case unix.S_IFREG:
-			if named.Nlink != 1 {
-				return refuse(CodeUnsafeSourceHardlink, false, nil)
-			}
-			file, opened, err := fs.openRegularTreeFile(dir, name, named)
-			if err != nil {
+			if err := fs.hashRegularTreeEntry(dir, name, path, named, includeContent, treeHash, structureHash, kinds); err != nil {
 				return err
 			}
-			var contentDigest []byte
-			if includeContent {
-				contentHash := sha256.New()
-				if _, err := io.Copy(contentHash, file); err != nil {
-					_ = file.Close()
-					return refuse(CodeSourceUnverifiable, true, err)
-				}
-				contentDigest = contentHash.Sum(nil)
-			}
-			var after unix.Stat_t
-			statErr := unix.Fstat(int(file.Fd()), &after)
-			closeErr := file.Close()
-			if statErr != nil {
-				return refuse(CodeSourceUnverifiable, true, statErr)
-			}
-			if !sameStat(opened, after) {
-				return refuse(CodeSourceChanged, true, nil)
-			}
-			if closeErr != nil {
-				return refuse(CodeSourceUnverifiable, true, closeErr)
-			}
-			kinds[path] = 'f'
-			if includeContent {
-				writeTreeRecord(treeHash, 'f', path, opened, contentDigest)
-			}
-			writeStructureRecord(structureHash, 'f', path, opened)
 		default:
 			return refuse(CodeUnsafeSourceObject, false, nil)
 		}
 	}
+	return nil
+}
+
+func joinRelative(relative, name string) string {
+	if relative == "" {
+		return name
+	}
+	return relative + "/" + name
+}
+
+// statTreeEntry stats a directory entry without following symlinks and binds it
+// to the retained source device and mount before the caller inspects its kind.
+func (fs sourceFS) statTreeEntry(dir *os.File, name string) (unix.Stat_t, error) {
+	var named unix.Stat_t
+	if err := unix.Fstatat(int(dir.Fd()), name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESTALE) {
+			return unix.Stat_t{}, refuse(CodeSourceChanged, true, err)
+		}
+		return unix.Stat_t{}, refuse(CodeSourceUnverifiable, true, err)
+	}
+	if err := checkDevice(named.Dev, fs.device); err != nil {
+		return unix.Stat_t{}, err
+	}
+	if err := fs.checkMountAt(int(dir.Fd()), name, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return unix.Stat_t{}, err
+	}
+	return named, nil
+}
+
+func (fs sourceFS) inspectSubdirectory(dir *os.File, name, path string, includeContent bool, treeHash, structureHash hash.Hash, kinds map[string]byte) error {
+	child, opened, err := fs.openDirectoryAt(dir, name)
+	if err != nil {
+		return classifyTreeOpen(err)
+	}
+	kinds[path] = 'd'
+	writeTreeRecord(treeHash, 'd', path, opened, nil)
+	writeStructureRecord(structureHash, 'd', path, opened)
+	err = fs.inspectDirectory(child, path, includeContent, treeHash, structureHash, kinds)
+	closeErr := child.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return refuse(CodeSourceUnverifiable, true, closeErr)
+	}
+	return nil
+}
+
+// hashRegularTreeEntry opens a regular tree file under its retained descriptor,
+// folds its content and structure into the running digests, and re-stats it to
+// prove it did not change during the read.
+func (fs sourceFS) hashRegularTreeEntry(dir *os.File, name, path string, named unix.Stat_t, includeContent bool, treeHash, structureHash hash.Hash, kinds map[string]byte) error {
+	if named.Nlink != 1 {
+		return refuse(CodeUnsafeSourceHardlink, false, nil)
+	}
+	file, opened, err := fs.openRegularTreeFile(dir, name, named)
+	if err != nil {
+		return err
+	}
+	var contentDigest []byte
+	if includeContent {
+		contentHash := sha256.New()
+		if _, err := io.Copy(contentHash, file); err != nil {
+			_ = file.Close()
+			return refuse(CodeSourceUnverifiable, true, err)
+		}
+		contentDigest = contentHash.Sum(nil)
+	}
+	var after unix.Stat_t
+	statErr := unix.Fstat(int(file.Fd()), &after)
+	closeErr := file.Close()
+	if statErr != nil {
+		return refuse(CodeSourceUnverifiable, true, statErr)
+	}
+	if !sameStat(opened, after) {
+		return refuse(CodeSourceChanged, true, nil)
+	}
+	if closeErr != nil {
+		return refuse(CodeSourceUnverifiable, true, closeErr)
+	}
+	kinds[path] = 'f'
+	if includeContent {
+		writeTreeRecord(treeHash, 'f', path, opened, contentDigest)
+	}
+	writeStructureRecord(structureHash, 'f', path, opened)
 	return nil
 }
 
@@ -856,6 +915,13 @@ func (fs sourceFS) revalidateSource(projectPath string, project *os.File, projec
 	if canonical != projectPath {
 		return refuse(CodeSourceChanged, true, nil)
 	}
+	return fs.reverifyProjectIdentity(projectPath, projectStat)
+}
+
+// reverifyProjectIdentity reopens the canonical project path and proves the
+// fresh descriptor still names the same inode on the same source mount, closing
+// the residual window between the retained descriptor and a path-based reopen.
+func (fs sourceFS) reverifyProjectIdentity(projectPath string, projectStat unix.Stat_t) error {
 	reopened, reopenedStat, reopenedMountID, err := openProject(projectPath, fs.readMountID)
 	if err != nil {
 		if refusal, ok := AsRefusal(err); ok && refusal.Code == CodeSourceUnverifiable {

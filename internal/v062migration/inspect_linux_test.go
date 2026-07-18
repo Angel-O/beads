@@ -348,6 +348,139 @@ func TestInspectRefusesUnsafeAndMixedSourceShapes(t *testing.T) {
 	}
 }
 
+func TestInspectRefusesMissingRequiredLayoutEntries(t *testing.T) {
+	// The required-layout gate is one of the two central admission decisions.
+	// Deleting any required layout entry must fail closed with a stable
+	// source_layout_missing code, never admit a partial Dolt-server tree.
+	tests := []struct {
+		name   string
+		remove string
+		want   Code
+	}{
+		{"beads directory", ".beads", CodeSourceLayoutMissing},
+		{"dolt root", ".beads/dolt", CodeSourceLayoutMissing},
+		{"dolt config", ".beads/dolt/config.yaml", CodeSourceLayoutMissing},
+		{"server dolt directory", ".beads/dolt/.dolt", CodeSourceLayoutMissing},
+		{"server config", ".beads/dolt/.dolt/config.json", CodeSourceLayoutMissing},
+		{"server repo state", ".beads/dolt/.dolt/repo_state.json", CodeSourceLayoutMissing},
+		{"database dolt directory", ".beads/dolt/smoke/.dolt", CodeSourceLayoutMissing},
+		{"database config", ".beads/dolt/smoke/.dolt/config.json", CodeSourceLayoutMissing},
+		{"database repo state", ".beads/dolt/smoke/.dolt/repo_state.json", CodeSourceLayoutMissing},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			project := newV062Project(t)
+			if err := os.RemoveAll(filepath.Join(project, filepath.FromSlash(tt.remove))); err != nil {
+				t.Fatal(err)
+			}
+			before := snapshotTree(t, project)
+			_, err := Inspect(project, "1.1.0")
+			assertRefusalCode(t, err, tt.want)
+			if after := snapshotTree(t, project); after != before {
+				t.Fatalf("refusal mutated source tree")
+			}
+		})
+	}
+}
+
+func TestInspectRefusesMissingMetadata(t *testing.T) {
+	project := newV062Project(t)
+	if err := os.Remove(filepath.Join(project, ".beads", "metadata.json")); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotTree(t, project)
+	_, err := Inspect(project, "1.1.0")
+	assertRefusalCode(t, err, CodeSourceMetadataMissing)
+	if after := snapshotTree(t, project); after != before {
+		t.Fatalf("refusal mutated source tree")
+	}
+}
+
+func TestInspectRefusesMalformedV062Metadata(t *testing.T) {
+	// parseMetadata is the second central admission gate. Every rejected field,
+	// pattern, and JSON-shape branch must collapse to a non-retryable
+	// source_metadata_mismatch rather than admit a foreign or ambiguous source.
+	tests := []struct {
+		name string
+		edit func(*testing.T, string)
+	}{
+		{
+			name: "backend not dolt",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "backend", "sqlite") },
+		},
+		{
+			name: "database not dolt",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "database", "sqlite") },
+		},
+		{
+			name: "dolt mode not server",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "dolt_mode", "embedded") },
+		},
+		{
+			name: "non-loopback server host",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "dolt_server_host", "10.0.0.5") },
+		},
+		{
+			name: "invalid dolt database name",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "dolt_database", "smoke;drop") },
+		},
+		{
+			name: "non-uuid project id",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "project_id", "not-a-uuid") },
+		},
+		{
+			name: "server port below range",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "dolt_server_port", 0) },
+		},
+		{
+			name: "server port above range",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "dolt_server_port", 70000) },
+		},
+		{
+			name: "non-empty custom data dir",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "dolt_data_dir", "/srv/dolt") },
+		},
+		{
+			name: "unknown metadata field",
+			edit: func(t *testing.T, project string) { setV062MetadataField(t, project, "shared_server", "true") },
+		},
+		{
+			name: "duplicate metadata key",
+			edit: func(t *testing.T, project string) {
+				mustWrite(t, filepath.Join(project, ".beads", "metadata.json"),
+					`{"backend":"dolt","backend":"dolt","database":"dolt","dolt_mode":"server","dolt_database":"smoke","project_id":"7ef372b4-4c3c-4e2c-a6cc-29dd2d0a28c6"}`)
+			},
+		},
+		{
+			name: "trailing content after object",
+			edit: func(t *testing.T, project string) {
+				mustWrite(t, filepath.Join(project, ".beads", "metadata.json"),
+					`{"backend":"dolt","database":"dolt","dolt_mode":"server","dolt_database":"smoke","project_id":"7ef372b4-4c3c-4e2c-a6cc-29dd2d0a28c6"}{}`)
+			},
+		},
+		{
+			name: "not a json object",
+			edit: func(t *testing.T, project string) {
+				mustWrite(t, filepath.Join(project, ".beads", "metadata.json"), `["dolt"]`)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			project := newV062Project(t)
+			tt.edit(t, project)
+			before := snapshotTree(t, project)
+			_, err := Inspect(project, "1.1.0")
+			assertRefusalCode(t, err, CodeSourceMetadataMismatch)
+			if after := snapshotTree(t, project); after != before {
+				t.Fatalf("refusal mutated source tree")
+			}
+		})
+	}
+}
+
 func TestInspectClassifiesStableOversizedWitnessesAsNonRetryableMismatch(t *testing.T) {
 	tests := []struct {
 		name    string

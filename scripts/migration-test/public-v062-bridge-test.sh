@@ -613,4 +613,32 @@ jq -e '
 assert_unchanged "$real_negative_ws" "$real_negative_before" \
     "real negative source refusal"
 
+# The version gate above is not a safety refusal. Prove that the real inspector
+# also fails closed on the safety-critical shapes end to end, through the public
+# wrapper and the descriptor-relative Go walk, not only the fake target.
+assert_real_target_refused() {
+    local label="$1" ws="$2" code="$3" before
+    before=$(tree_fingerprint "$ws")
+    BRIDGE_TEST_TARGET="$REAL_TARGET_BD" \
+        run_bridge "$label" "$ws" --inspect --workspace "$ws"
+    [ "$RUN_STATUS" -eq 1 ] ||
+        fail "$label exit=$RUN_STATUS, want fail-closed refusal exit 1"
+    assert_common_json inspect refused none
+    jq -e --arg code "$code" '.retryable == false and .code == $code' \
+        <<< "$RUN_STDOUT" >/dev/null ||
+        fail "$label did not preserve its typed safety refusal"
+    assert_unchanged "$ws" "$before" "$label refusal"
+}
+
+real_symlink_ws="$tmp/real-current-symlink"
+new_v062_workspace "$real_symlink_ws"
+mv -f -- "$real_symlink_ws/.beads/dolt" "$real_symlink_ws/.beads/dolt-real"
+ln -s dolt-real "$real_symlink_ws/.beads/dolt"
+assert_real_target_refused real-current-symlink "$real_symlink_ws" unsafe_source_symlink
+
+real_mixed_ws="$tmp/real-current-mixed"
+new_v062_workspace "$real_mixed_ws"
+printf 'sqlite-like bytes\n' > "$real_mixed_ws/.beads/beads.db"
+assert_real_target_refused real-current-mixed "$real_mixed_ws" mixed_storage_layout
+
 printf 'public-v062-bridge-test: PASS\n'
