@@ -104,33 +104,68 @@ func resolveInitIssuePrefix(gateway bool, existing, dbName, prefix string, readE
 	return strings.ReplaceAll(prefix, ".", "_"), true, nil
 }
 
-// resolveInitProjectID decides init's project identity. adoptedFromDB is the
-// _project_id read from the database (empty when absent or not consulted); readErr
-// is the error (if any) from that read.
+// resolveInitProjectID decides init's project identity by reconciling the local
+// metadata.json id (localID; "" when none is set yet) with the _project_id read
+// from the database (adoptedFromDB; "" when absent or not consulted). readErr is
+// the error, if any, from that read. changed reports whether the resolved id
+// differs from localID, so the caller can surface the reconciliation.
 //
-// An adopted id always wins (another rig — or the hosted server — already chose
-// it; minting a new one would break cross-project verification). Otherwise:
-// non-gateway generates a fresh identity (legacy behavior, readErr ignored exactly
-// as before); gateway refuses — a hosted database's identity is server-authoritative
-// and its absence is a provisioning-contract violation, not something bd may mint
-// over. That violation is reported only when the read genuinely succeeded and found
-// nothing: a read error is surfaced as the transient failure it is, so a flaky
-// connection is not misdiagnosed as an unprovisioned database.
-func resolveInitProjectID(gateway bool, adoptedFromDB, dbName string, readErr error) (string, error) {
-	if adoptedFromDB != "" {
-		return adoptedFromDB, nil
-	}
+// Gateway: the hosted database's identity is server-authoritative, so an adopted
+// server id always wins and is reconciled onto local even when localID is already
+// set. A re-init or orchestrator-preseeded workspace must not keep a stale local
+// id: init opens with CreateIfMissing, which skips the storage identity verifier
+// (store.go verifyProjectIdentity), so a stale id would be saved as success and
+// every later normal open would then hard-fail with PROJECT IDENTITY MISMATCH. A
+// missing server id is a provisioning-contract violation bd will not mint over —
+// even when a local id already exists — and a read error is surfaced as the
+// transient failure it is, so a flaky connection is not misdiagnosed as an
+// unprovisioned database.
+//
+// Non-gateway (legacy, unchanged): a non-empty localID is kept as-is (readErr
+// ignored, exactly as before); otherwise an adopted id wins (another rig already
+// chose it; minting a new one would break cross-project verification), else a
+// fresh identity is generated.
+func resolveInitProjectID(gateway bool, localID, adoptedFromDB, dbName string, readErr error) (value string, changed bool, err error) {
 	if gateway {
+		if adoptedFromDB != "" {
+			return adoptedFromDB, adoptedFromDB != localID, nil
+		}
 		if readErr != nil {
-			return "", fmt.Errorf(
+			return "", false, fmt.Errorf(
 				"reading project identity (_project_id) from hosted database %q: %w", dbName, readErr)
 		}
-		return "", fmt.Errorf(
+		return "", false, fmt.Errorf(
 			"hosted database %q has no provisioned project identity (_project_id) -- "+
 				"provisioning-contract violation; bd will not mint an identity for a hosted database",
 			dbName)
 	}
-	return configfile.GenerateProjectID(), nil
+	if localID != "" {
+		return localID, false, nil
+	}
+	if adoptedFromDB != "" {
+		return adoptedFromDB, true, nil
+	}
+	return configfile.GenerateProjectID(), true, nil
+}
+
+// shouldConsultInitProjectID reports whether init must read _project_id from the
+// database before resolving the local identity.
+//
+// Gateway: always — the hosted server owns the identity, so init reconciles it on
+// every run, including a re-init or preseeded metadata.json that already carries a
+// project_id. Skipping the read when a local id was already set was the bug that
+// let init save a stale id and made every later normal open hard-fail PROJECT
+// IDENTITY MISMATCH.
+//
+// Non-gateway (legacy, unchanged): only when no local id exists yet and the
+// database is a pre-existing shared/bootstrapped one worth adopting from
+// (--database set or bootstrapped-from-remote). A fresh local-only init mints its
+// own id without a read.
+func shouldConsultInitProjectID(gateway bool, localID, database string, bootstrappedFromRemote bool) bool {
+	if gateway {
+		return true
+	}
+	return localID == "" && (database != "" || bootstrappedFromRemote)
 }
 
 // shouldWriteProjectIDLocally reports whether init should write _project_id back
@@ -157,6 +192,24 @@ func shouldWriteProjectIDLocally(gateway bool, projectID string) bool {
 // as shouldWriteProjectIDLocally already suppresses the _project_id write-back.
 func shouldWriteInitStateToDB(gateway bool) bool {
 	return !gateway
+}
+
+// shouldInitSharedGlobalDB reports whether init should manage the local shared
+// Dolt server and provision its beads_global database — starting the server,
+// creating the global database, initializing its schema, and seeding its config.
+//
+// Shared-server mode owns that local infrastructure, so it does. Gateway mode
+// does not: a gateway connects to a remote authenticating server that provisions
+// databases server-side under no-create/no-schema/no-write semantics. Running the
+// shared-global path there would either start a shadow local server or drive
+// create/schema/write operations against the gateway — the global initializer
+// rebuilds its own dolt.Config without the Gateway flag and with CreateIfMissing
+// set, so it cannot preserve gateway semantics. init therefore skips the whole
+// shared-global path whenever the connection is gateway-managed, mirroring how
+// shouldWriteInitStateToDB / shouldWriteProjectIDLocally already suppress
+// server-owned writes.
+func shouldInitSharedGlobalDB(sharedServer, sharedServerMode, gateway bool) bool {
+	return (sharedServer || sharedServerMode) && !gateway
 }
 
 var initCmd = &cobra.Command{
@@ -1122,7 +1175,11 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// --external skips this: the server is managed outside bd (e.g.
 		// Docker, systemd, testcontainers). The caller is responsible for
 		// ensuring the server is reachable and the port file exists.
-		if !externalServer && (sharedServer || doltserver.IsSharedServerMode()) {
+		//
+		// Gateway mode also skips this: it connects to a remote authenticating
+		// server and must not start a local shared server or create/write
+		// beads_global (see shouldInitSharedGlobalDB).
+		if !externalServer && shouldInitSharedGlobalDB(sharedServer, doltserver.IsSharedServerMode(), doltCfg.Gateway) {
 			if sharedDir, err := doltserver.SharedServerDir(); err == nil {
 				state, _ := doltserver.IsRunning(sharedDir)
 				if state == nil || !state.Running {
@@ -1199,7 +1256,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// Initialize global database schema and config in shared-server mode.
 		// Opens a separate store connection to beads_global with CreateIfMissing
 		// to trigger schema migration, then seeds the issue prefix and project ID.
-		if sharedServer || doltserver.IsSharedServerMode() {
+		// Skipped in gateway mode: initGlobalDatabaseConfig rebuilds its config
+		// without the Gateway flag, so it would run create/schema/write operations
+		// against the authenticating gateway (see shouldInitSharedGlobalDB).
+		if shouldInitSharedGlobalDB(sharedServer, doltserver.IsSharedServerMode(), doltCfg.Gateway) {
 			initGlobalDatabaseConfig(ctx, doltCfg, quiet)
 		}
 
@@ -1207,8 +1267,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// immediately after init/bootstrap. A git origin is a valid Dolt
 		// remote even before refs/dolt/data exists; the first bd dolt push
 		// creates that ref. This keeps the default path durable without
-		// falling back to JSONL-as-sync.
-		if shouldConfigureInitDoltRemote(syncURL, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin, isDoltLocalOnly()) {
+		// falling back to JSONL-as-sync. Gateway mode skips it: the hosted
+		// server owns the database, so DOLT_REMOTE('add', ...) must not run
+		// against it (see shouldWriteInitDoltRemote).
+		if shouldWriteInitDoltRemote(doltCfg.Gateway, syncURL, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin, isDoltLocalOnly()) {
 			configureInitDoltRemote(ctx, store, syncURL, quiet)
 		}
 
@@ -1294,11 +1356,11 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				cfg = configfile.DefaultConfig()
 			}
 
-			// Generate project identity UUID if not already set (GH#2372).
-			// This UUID is stored in both metadata.json and the database,
-			// and verified on every connection to detect cross-project leakage.
+			// Resolve the project identity UUID (GH#2372). It is stored in both
+			// metadata.json and the database and verified on every connection to
+			// detect cross-project leakage.
 			//
-			// Adopt the existing _project_id from the database when:
+			// Consult the database _project_id and adopt it when:
 			//   - --database is set and the database already exists on a
 			//     shared remote Dolt server (GH#2922), or
 			//   - we just bootstrapped from a remote whose Dolt history
@@ -1308,29 +1370,38 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			// In all cases another rig — or the hosted server — has already
 			// chosen an identity; minting a new one and writing it back would
 			// overwrite the source identity and cause cross-project verification
-			// to fail on subsequent pulls. In gateway mode bd refuses to mint
-			// one at all: a missing identity is a provisioning-contract violation.
-			if cfg.ProjectID == "" {
-				adoptedFromDB := ""
-				var adoptReadErr error
-				if store != nil && (database != "" || bootstrappedFromRemote || doltCfg.Gateway) {
-					existingID, err := store.GetMetadata(ctx, "_project_id")
-					if err != nil {
-						adoptReadErr = err
-					} else if existingID != "" {
-						adoptedFromDB = existingID
-					}
-				}
-				resolvedID, err := resolveInitProjectID(doltCfg.Gateway, adoptedFromDB, dbName, adoptReadErr)
+			// to fail on subsequent pulls. In gateway mode bd refuses to mint one
+			// at all (a missing identity is a provisioning-contract violation),
+			// and because the hosted server is authoritative it reconciles the
+			// identity on every init — even a re-init or preseeded workspace whose
+			// metadata.json already carries a stale project_id. Otherwise init
+			// (which opens with CreateIfMissing, skipping the storage identity
+			// verifier) would save the stale id as success and every later normal
+			// open would hard-fail with PROJECT IDENTITY MISMATCH.
+			adoptedFromDB := ""
+			var adoptReadErr error
+			if store != nil && shouldConsultInitProjectID(doltCfg.Gateway, cfg.ProjectID, database, bootstrappedFromRemote) {
+				existingID, err := store.GetMetadata(ctx, "_project_id")
 				if err != nil {
-					_ = store.Close()
-					return err
+					adoptReadErr = err
+				} else if existingID != "" {
+					adoptedFromDB = existingID
 				}
-				if adoptedFromDB != "" && !quiet {
-					fmt.Printf("  %s Adopted project identity from existing database\n", ui.RenderPass("✓"))
-				}
-				cfg.ProjectID = resolvedID
 			}
+			localID := cfg.ProjectID
+			resolvedID, identityChanged, err := resolveInitProjectID(doltCfg.Gateway, localID, adoptedFromDB, dbName, adoptReadErr)
+			if err != nil {
+				_ = store.Close()
+				return err
+			}
+			if identityChanged && adoptedFromDB != "" && !quiet {
+				if localID == "" {
+					fmt.Printf("  %s Adopted project identity from existing database\n", ui.RenderPass("✓"))
+				} else {
+					fmt.Printf("  %s Reconciled local project identity with hosted database\n", ui.RenderPass("✓"))
+				}
+			}
+			cfg.ProjectID = resolvedID
 
 			// Always store backend explicitly in metadata.json
 			cfg.Backend = backend
@@ -1879,9 +1950,19 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				fmt.Fprintf(os.Stderr, "    If your Dolt server is remote, set BEADS_DOLT_SERVER_HOST or pass --server-host.\n")
 			}
 		}
+		// Advertise the prefix that issue IDs will actually use. When the database
+		// already carries a provisioned issue_prefix — gateway adoption of a
+		// server-provisioned value, or a shared database another rig already
+		// configured — that value, not the caller-derived local prefix, is what
+		// appears in IDs, so the summary must show it instead of a prefix that
+		// will never be minted.
+		effectivePrefix := prefix
+		if existing != "" {
+			effectivePrefix = existing
+		}
 		fmt.Printf("  Database: %s\n", ui.RenderAccent(dbName))
-		fmt.Printf("  Issue prefix: %s\n", ui.RenderAccent(prefix))
-		fmt.Printf("  Issues will be named: %s\n\n", ui.RenderAccent(prefix+"-<hash> (e.g., "+prefix+"-a3f2dd)"))
+		fmt.Printf("  Issue prefix: %s\n", ui.RenderAccent(effectivePrefix))
+		fmt.Printf("  Issues will be named: %s\n\n", ui.RenderAccent(effectivePrefix+"-<hash> (e.g., "+effectivePrefix+"-a3f2dd)"))
 		fmt.Printf("Run %s to get started.\n\n", ui.RenderAccent("bd quickstart"))
 
 		// Detect backup files from a previous session (GH#2327).
@@ -2553,6 +2634,20 @@ func shouldWireInitRemote(syncURL string, syncFromRemote, syncURLFromConfig, syn
 
 func shouldConfigureInitDoltRemote(syncURL string, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin, localOnly bool) bool {
 	return !localOnly && shouldWireInitRemote(syncURL, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin)
+}
+
+// shouldWriteInitDoltRemote reports whether init should actually configure (write)
+// the Dolt "origin" remote on the store. It layers gateway suppression on top of
+// shouldConfigureInitDoltRemote: a gateway is a passive client of a server-owned
+// database, so AddRemote's CALL DOLT_REMOTE('add', ...) would mutate shared remote
+// state on a writable credential (or merely warn per-init on a read-only one) —
+// exactly the server-owned write the other gateway gates (shouldInitSharedGlobalDB,
+// shouldWriteInitStateToDB, shouldWriteProjectIDLocally) already suppress. The
+// rendered agent-instruction HasRemote flag intentionally keeps using the raw
+// shouldConfigureInitDoltRemote decision, since the git remote still exists for
+// documentation even when gateway sync does not use dolt push.
+func shouldWriteInitDoltRemote(gateway bool, syncURL string, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin, localOnly bool) bool {
+	return !gateway && shouldConfigureInitDoltRemote(syncURL, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin, localOnly)
 }
 
 // handleRemoteSafetyDecision applies a CheckRemoteSafety decision at an init
