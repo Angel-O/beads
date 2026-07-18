@@ -10,6 +10,15 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
+// ErrSelfDependency is returned when a dependency edge would point an issue at
+// itself. It is the static prefix of the formatted message, wrapped so callers
+// can errors.Is it while the human-readable text is preserved byte-for-byte.
+var ErrSelfDependency = errors.New("cannot add self-dependency")
+
+// ErrDependencyCycle is returned when adding a dependency edge would introduce a
+// scheduling cycle.
+var ErrDependencyCycle = errors.New("adding dependency would create a cycle")
+
 // DependencyTypeConflictError is returned when an edge already exists between
 // the same pair with a DIFFERENT type. Its message is byte-identical to the
 // embedded issueops path (issueops/dependencies.go) so `bd dep add` surfaces
@@ -194,7 +203,7 @@ func (u *dependencyUseCaseImpl) add(ctx context.Context, dep *types.Dependency, 
 	// dedicated self-dep message. A blocking self-edge otherwise trips HasCycle
 	// and would report the wrong (cycle) error (#4547 F-1).
 	if dep.IssueID == dep.DependsOnID {
-		return fmt.Errorf("cannot add self-dependency: %s cannot depend on itself", dep.IssueID)
+		return fmt.Errorf("%w: %s cannot depend on itself", ErrSelfDependency, dep.IssueID)
 	}
 	if err := u.depRepo.ValidateBlockingHierarchy(ctx, dep); err != nil {
 		var hierarchyConflict *DependencyHierarchyConflictError
@@ -213,7 +222,7 @@ func (u *dependencyUseCaseImpl) add(ctx context.Context, dep *types.Dependency, 
 			// Match the embedded store's user-facing wording verbatim (no ids
 			// prefix) so gc code that string-matches this error behaves the same
 			// on both plumbings (#4547 F-1).
-			return fmt.Errorf("adding dependency would create a cycle")
+			return ErrDependencyCycle
 		}
 	}
 
@@ -552,7 +561,7 @@ func (u *dependencyUseCaseImpl) addBulk(ctx context.Context, deps []*types.Depen
 					return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: cycle check: %w", i, err)
 				}
 				if cycle {
-					return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: adding %s -> %s would create a cycle", i, dep.IssueID, dep.DependsOnID)
+					return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: adding %s -> %s: %w", i, dep.IssueID, dep.DependsOnID, ErrDependencyCycle)
 				}
 			}
 			if err := u.depRepo.Insert(ctx, dep, actor, insertOpts); err != nil {

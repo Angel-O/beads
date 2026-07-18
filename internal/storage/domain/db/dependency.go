@@ -67,7 +67,7 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 		return errors.New("db: DependencySQLRepository.Insert: DependsOnID must not be empty")
 	}
 	if dep.IssueID == dep.DependsOnID {
-		return fmt.Errorf("db: DependencySQLRepository.Insert: %s cannot depend on itself", dep.IssueID)
+		return fmt.Errorf("db: DependencySQLRepository.Insert: %s cannot depend on itself: %w", dep.IssueID, domain.ErrSelfDependency)
 	}
 
 	metadata := dep.Metadata
@@ -86,7 +86,7 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 			return fmt.Errorf("db: DependencySQLRepository.Insert: cycle check: %w", err)
 		}
 		if cycle {
-			return fmt.Errorf("adding dependency would create a cycle")
+			return domain.ErrDependencyCycle
 		}
 	}
 	table := pickDepTable(opts.UseWispsTable)
