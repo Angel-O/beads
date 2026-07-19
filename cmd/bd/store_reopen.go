@@ -89,7 +89,12 @@ func resolveBeadsDirForDBPath(dbPath string) string {
 	}
 
 	for _, beadsDir := range candidates {
-		cfg, err := configfile.Load(beadsDir)
+		// Discovery-only: resolveCommandBeadsDir runs before
+		// guardWorkspaceMetadata, so mapping a db path back to its .beads dir must
+		// not migrate a legacy config.json as a side effect. LoadForDiscovery is
+		// lenient (so incompatible candidates still match by database path and are
+		// refused by the guard) but never writes.
+		cfg, err := configfile.LoadForDiscovery(beadsDir)
 		if err != nil || cfg == nil {
 			continue
 		}

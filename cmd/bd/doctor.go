@@ -387,6 +387,30 @@ func runDiagnostics(path string) doctorResult {
 	// Check 1b: Metadata config file (GH#2478)
 	// Must come before database checks since they depend on metadata.json.
 	beadsDir := doctor.ResolveBeadsDirForRepo(path)
+
+	// Refuse to diagnose an incompatible workspace through the lenient,
+	// migrating store opens below. doctor is in noDbCommands, so it skips the
+	// PersistentPreRun pre-store guard; without this, an incompatible
+	// metadata.json (or legacy config.json) would be version-tracked,
+	// auto-migrated, and opened by NewSharedStore before the incompatibility is
+	// reported. This mirrors guardWorkspaceMetadata's read-only probe but stays
+	// non-fatal: doctor is the documented repair path (see
+	// TestCorruptMetadataDiagnosticsRunAndDataFailsLoud), so it surfaces the
+	// problem and points at --force instead of exiting like a data command, and
+	// it does not flip OverallOK. Retired same-lineage keys are tolerated by the
+	// probe and handled as a separate cleanup warning below; a concurrent atomic
+	// rewrite is a transient race, not incompatibility.
+	if err := workspaceMetadataCompatibility(beadsDir); err != nil && !configfile.IsConcurrentMetadataChange(err) {
+		result.Checks = append(result.Checks, doctorCheck{
+			Name:     "Metadata Compatibility",
+			Status:   statusWarning,
+			Message:  fmt.Sprintf("metadata is incompatible with this bd version: %v", err),
+			Fix:      "Upgrade bd if this workspace was created by a newer bd, or run 'bd init --force' to regenerate metadata.json ('bd doctor --fix' only strips retired same-lineage keys, not foreign fields)",
+			Category: doctor.CategoryCore,
+		})
+		return result
+	}
+
 	configPath := configfile.ConfigPath(beadsDir)
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		metaCheck := doctorCheck{
@@ -399,12 +423,28 @@ func runDiagnostics(path string) doctorResult {
 		result.Checks = append(result.Checks, metaCheck)
 		result.OverallOK = false
 	} else {
-		result.Checks = append(result.Checks, doctorCheck{
+		metaCheck := doctorCheck{
 			Name:     "Metadata Config",
 			Status:   statusOK,
 			Message:  "metadata.json present",
 			Category: doctor.CategoryCore,
-		})
+		}
+		// Surface obsolete keys a newer bd retired from Config so 'bd doctor
+		// --fix' can strip them. These are tolerated by the pre-store guard, so
+		// this is cleanup, not a lockout — but leaving them makes the metadata
+		// harder to reason about and can confuse older tooling.
+		if retired := configfile.RetiredMetadataFields(beadsDir); len(retired) > 0 {
+			metaCheck.Status = statusWarning
+			metaCheck.Message = fmt.Sprintf("metadata.json carries retired field(s): %s", strings.Join(retired, ", "))
+			metaCheck.Fix = "Run 'bd doctor --fix' to remove obsolete metadata keys"
+			// A retired same-lineage key is tolerated by the pre-store guard, so
+			// the workspace opens fine and is not unhealthy: surface it as a
+			// cleanup warning without flipping OverallOK, so automation that gates
+			// on doctor's exit status is not newly failed by benign cruft. (This
+			// also keeps the severity ordering sane: genuinely incompatible
+			// metadata above is a non-fatal warning too.)
+		}
+		result.Checks = append(result.Checks, metaCheck)
 	}
 
 	// Check 1c: Managed-city handoff port conflict (GH#3926)

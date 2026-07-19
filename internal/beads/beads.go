@@ -804,8 +804,13 @@ func findLocalBeadsDir() string {
 // directory (where the embedded engine stores data) and the legacy dolt/ path.
 // Returns empty string if no database is found.
 func findDatabaseInBeadsDir(beadsDir string, _ bool) string {
-	// Check for metadata.json first (single source of truth)
-	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil {
+	// Check for metadata.json first (single source of truth). Use the discovery
+	// loader: database discovery runs before the CLI's pre-store incompatibility
+	// guard, so it must never migrate a legacy config.json or otherwise mutate
+	// the workspace as a side effect. It stays lenient so an incompatible
+	// workspace still resolves to its database path and is refused by the guard,
+	// not by a misleading "no beads database found".
+	if cfg, err := configfile.LoadForDiscovery(beadsDir); err == nil && cfg != nil {
 		// For Dolt server mode, database is on the server - no local directory required
 		if cfg.IsDoltServerMode() {
 			return cfg.DatabasePath(beadsDir)
