@@ -286,3 +286,111 @@ func TestWithRetryTx_CommitPhaseAuthErrorNotRetried(t *testing.T) {
 		t.Fatalf("unmet sqlmock expectations: %v", err)
 	}
 }
+
+// TestExecWithLongTimeout_RevokedTokenRecovers proves the long-timeout side pool —
+// which dials outside withRetry/withRetryTx — recovers from a rotating credential
+// revoked before its cached expiry. The first dial's MySQL 1045 must invalidate the
+// cached token so the re-dial re-mints, and the wrapped pull operation must then run
+// exactly once: the auth retry recovers the dial without replaying committed work.
+// The migration and pull side pools (openMigrationDB, openLongTimeoutConn) share the
+// same primeCredentialedConn path.
+func TestExecWithLongTimeout_RevokedTokenRecovers(t *testing.T) {
+	const cmd = "rotating-helper"
+	credCacheMu.Lock()
+	credCache = map[string]cachedCred{cmd: {token: "revoked", expires: time.Now().Add(time.Hour)}}
+	credCacheMu.Unlock()
+	t.Cleanup(func() {
+		credCacheMu.Lock()
+		credCache = map[string]cachedCred{}
+		credCacheMu.Unlock()
+	})
+
+	db, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	origOpener := sideConnOpener
+	sideConnOpener = func(dsn, credCmd string) (*sql.DB, error) { return db, nil }
+	t.Cleanup(func() { sideConnOpener = origOpener })
+
+	// Prime dials first: the revoked token is rejected (1045), then the re-minted
+	// dial succeeds. Only afterward does the single pull operation run — once.
+	mock.ExpectPing().WillReturnError(&mysql.MySQLError{Number: 1045, Message: "Access denied for user"})
+	mock.ExpectPing()
+	mock.ExpectBegin()
+	mock.ExpectExec("CALL DOLT_PULL").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	store := &DoltStore{connStr: "user:pass@tcp(127.0.0.1:3306)/beads", credCommand: cmd}
+	if err := store.execWithLongTimeout(context.Background(), "CALL DOLT_PULL(?, ?)", "origin", "main"); err != nil {
+		t.Fatalf("execWithLongTimeout must recover past the revoked-token dial, got: %v", err)
+	}
+
+	credCacheMu.Lock()
+	_, stillCached := credCache[cmd]
+	credCacheMu.Unlock()
+	if stillCached {
+		t.Fatal("revoked-token dial must invalidate the cached credential so the retry re-mints")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestPrimeCredentialedConn_StaticPathIsNoOp verifies the static-user/local path
+// (empty credCommand) is left byte-for-byte unchanged: priming adds no dial.
+func TestPrimeCredentialedConn_StaticPathIsNoOp(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	// No ping is expected; a stray dial would surface here and fail the check.
+	store := &DoltStore{} // credCommand == ""
+	if err := store.primeCredentialedConn(context.Background(), db); err != nil {
+		t.Fatalf("static path must be a no-op, got: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("static path must not dial: %v", err)
+	}
+}
+
+// TestPrimeCredentialedConn_NonAuthErrorNotRetried verifies a non-auth dial error
+// surfaces immediately without dropping the cached credential or re-dialing — only a
+// MySQL 1045 triggers the invalidate-and-retry recovery.
+func TestPrimeCredentialedConn_NonAuthErrorNotRetried(t *testing.T) {
+	const cmd = "rotating-helper"
+	credCacheMu.Lock()
+	credCache = map[string]cachedCred{cmd: {token: "live", expires: time.Now().Add(time.Hour)}}
+	credCacheMu.Unlock()
+	t.Cleanup(func() {
+		credCacheMu.Lock()
+		credCache = map[string]cachedCred{}
+		credCacheMu.Unlock()
+	})
+
+	db, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mock.ExpectPing().WillReturnError(errors.New("driver: bad connection"))
+
+	store := &DoltStore{credCommand: cmd}
+	if err := store.primeCredentialedConn(context.Background(), db); err == nil {
+		t.Fatal("a non-auth dial error must surface")
+	}
+	credCacheMu.Lock()
+	_, stillCached := credCache[cmd]
+	credCacheMu.Unlock()
+	if !stillCached {
+		t.Fatal("a non-auth error must not invalidate the cached credential")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("must not re-dial after a non-auth error: %v", err)
+	}
+}

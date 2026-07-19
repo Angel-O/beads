@@ -488,6 +488,10 @@ func (s *DoltStore) withRetry(ctx context.Context, op func() error) error {
 		// re-mints a fresh one via BeforeConnect; only on the credential-command path
 		// (a static user has nothing to refresh). Bounded by the retry backoff, so a
 		// genuinely dead credential fails after a few attempts rather than looping.
+		// Unlike withRetryTx this retries unconditionally (no errCommitPhase guard):
+		// a 1045 is a dial-time rejection — it can only surface where a new physical
+		// connection authenticates, which is strictly before any commit on it — so the
+		// RunInTransaction write path this also wraps can never replay a committed write here.
 		if err != nil && s.credCommand != "" && isAuthError(err) {
 			invalidateCredentialToken(s.credCommand)
 			return err
@@ -1355,6 +1359,40 @@ func buildServerDSN(cfg *Config, database string) string {
 	return parsed.FormatDSN()
 }
 
+// sideConnOpener opens the one-shot *sql.DB used by the long-timeout (push/pull)
+// and schema-migration side pools. Like credRunner, it is a package var so tests
+// can substitute a mock connection without a live server; production always
+// resolves to openSQLDB.
+var sideConnOpener = openSQLDB
+
+// primeCredentialedConn forces the single physical dial of a one-shot side-pool
+// *sql.DB to happen up front, recovering once from a rotating credential revoked
+// before its cached expiry. The long-timeout and migration side pools dial outside
+// withRetry/withRetryTx, so without this a revoked-token MySQL 1045 on the pool's
+// first dial would surface as a permanent failure until another path evicts the
+// cached token or it naturally expires. Mirroring withRetry/withRetryTx, it drops
+// the cached token (invalidateCredentialToken) so the retry's dial re-mints a fresh
+// one via BeforeConnect. Only the credential-command path can refresh; static-user
+// and local paths are left byte-for-byte unchanged (no extra dial).
+//
+// Priming deliberately isolates the retryable dial from the operation that follows.
+// A 1045 can only surface when a new physical connection authenticates — strictly
+// before any statement runs on it — so once the ping authenticates, the caller's
+// Begin/Exec/Commit reuses this connection (these pools pin MaxOpenConns=1) and is
+// never re-dialed. The operation therefore runs exactly once, and the auth retry
+// never replays committed side-pool work.
+func (s *DoltStore) primeCredentialedConn(ctx context.Context, db *sql.DB) error {
+	if s.credCommand == "" {
+		return nil
+	}
+	err := db.PingContext(ctx)
+	if err != nil && isAuthError(err) {
+		invalidateCredentialToken(s.credCommand)
+		err = db.PingContext(ctx)
+	}
+	return err
+}
+
 // execWithLongTimeout opens a one-shot database connection with readTimeout=5m
 // and executes the given query. Push/pull operations can exceed the default
 // readTimeout when the server performs network I/O to git remotes.
@@ -1369,12 +1407,15 @@ func (s *DoltStore) execWithLongTimeout(ctx context.Context, query string, args 
 		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
 	cfg.ReadTimeout = 5 * time.Minute
-	db, err := openSQLDB(cfg.FormatDSN(), s.credCommand)
+	db, err := sideConnOpener(cfg.FormatDSN(), s.credCommand)
 	if err != nil {
 		return fmt.Errorf("failed to open long-timeout connection: %w", err)
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
+	if err := s.primeCredentialedConn(ctx, db); err != nil {
+		return fmt.Errorf("failed to establish long-timeout connection: %w", err)
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -1396,12 +1437,15 @@ func (s *DoltStore) execWithLongTimeoutNoTx(ctx context.Context, query string, a
 		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
 	cfg.ReadTimeout = 5 * time.Minute
-	db, err := openSQLDB(cfg.FormatDSN(), s.credCommand)
+	db, err := sideConnOpener(cfg.FormatDSN(), s.credCommand)
 	if err != nil {
 		return fmt.Errorf("failed to open long-timeout connection: %w", err)
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
+	if err := s.primeCredentialedConn(ctx, db); err != nil {
+		return fmt.Errorf("failed to establish long-timeout connection: %w", err)
+	}
 	_, err = db.ExecContext(ctx, query, args...)
 	return err
 }
@@ -1645,7 +1689,7 @@ func (s *DoltStore) initSchema(ctx context.Context) error {
 	// which then blocks every subsequent migration attempt. Run the migration
 	// pass over a dedicated connection with no read/write timeout. Cancellation
 	// is governed by the caller's context, not a fixed deadline.
-	migDB, err := s.openMigrationDB()
+	migDB, err := s.openMigrationDB(ctx)
 	if err != nil {
 		return err
 	}
@@ -1670,7 +1714,7 @@ func (s *DoltStore) initSchema(ctx context.Context) error {
 // per-database advisory lock, with retry for transient lock contention.
 // Implements storage.SchemaMigrator.
 func (s *DoltStore) ApplySchemaMigrations(ctx context.Context) (int, error) {
-	migDB, err := s.openMigrationDB()
+	migDB, err := s.openMigrationDB(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -1682,18 +1726,22 @@ func (s *DoltStore) ApplySchemaMigrations(ctx context.Context) (int, error) {
 // read/write timeout. Migrations may run far longer than the default 10s pool
 // timeout, and timing out part-way leaves the database in a dirty, half-migrated
 // state. The single connection is closed by the caller once migration completes.
-func (s *DoltStore) openMigrationDB() (*sql.DB, error) {
+func (s *DoltStore) openMigrationDB(ctx context.Context) (*sql.DB, error) {
 	cfg, err := mysql.ParseDSN(s.connStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse DSN for migration connection: %w", err)
 	}
 	cfg.ReadTimeout = 0
 	cfg.WriteTimeout = 0
-	db, err := openSQLDB(cfg.FormatDSN(), s.credCommand)
+	db, err := sideConnOpener(cfg.FormatDSN(), s.credCommand)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open migration connection: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+	if err := s.primeCredentialedConn(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to establish migration connection: %w", err)
+	}
 	return db, nil
 }
 
@@ -2654,17 +2702,21 @@ func (s *DoltStore) pullTransport(ctx context.Context, remote string) error {
 // openLongTimeoutConn opens a dedicated single-connection *sql.DB to this store's
 // database with a long read timeout, for merge/pull/conflict operations that can run
 // longer than the default connection timeout. The caller must Close the returned DB.
-func (s *DoltStore) openLongTimeoutConn() (*sql.DB, error) {
+func (s *DoltStore) openLongTimeoutConn(ctx context.Context) (*sql.DB, error) {
 	cfg, err := mysql.ParseDSN(s.connStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
 	cfg.ReadTimeout = 5 * time.Minute
-	db, err := openSQLDB(cfg.FormatDSN(), s.credCommand)
+	db, err := sideConnOpener(cfg.FormatDSN(), s.credCommand)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open long-timeout connection: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+	if err := s.primeCredentialedConn(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to establish long-timeout connection: %w", err)
+	}
 	return db, nil
 }
 
@@ -2672,7 +2724,7 @@ func (s *DoltStore) openLongTimeoutConn() (*sql.DB, error) {
 // fallback targets it directly, so pulls from non-default remotes (PullRemote,
 // federation peers) no longer fall back to s.remote.
 func (s *DoltStore) pullWithAutoResolve(ctx context.Context, remote string, query string, args ...any) error {
-	db, err := s.openLongTimeoutConn()
+	db, err := s.openLongTimeoutConn(ctx)
 	if err != nil {
 		return err
 	}
