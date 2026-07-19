@@ -248,6 +248,7 @@ type IssueUseCase interface {
 	ClaimIssue(ctx context.Context, id, actor string) (ClaimResult, error)
 	ClaimIssueIfOpen(ctx context.Context, id, actor string) (ClaimResult, error)
 	CloseIssue(ctx context.Context, id string, params CloseIssueParams, actor string) (CloseIssueResult, error)
+	CloseIssueChecked(ctx context.Context, id string, params CloseIssueParams, actor string, force bool) (CloseIssueResult, error)
 	ReopenIssue(ctx context.Context, id string, params ReopenIssueParams, actor string) (ReopenIssueResult, error)
 	CountOpenChildren(ctx context.Context, id string) (int, error)
 	GetNewlyUnblockedByClose(ctx context.Context, closedID string) ([]*types.Issue, error)
@@ -269,6 +270,7 @@ type IssueUseCase interface {
 	ClaimWisp(ctx context.Context, id, actor string) (ClaimResult, error)
 	ClaimWispIfOpen(ctx context.Context, id, actor string) (ClaimResult, error)
 	CloseWisp(ctx context.Context, id string, params CloseIssueParams, actor string) (CloseIssueResult, error)
+	CloseWispChecked(ctx context.Context, id string, params CloseIssueParams, actor string, force bool) (CloseIssueResult, error)
 	ReopenWisp(ctx context.Context, id string, params ReopenIssueParams, actor string) (ReopenIssueResult, error)
 	CountOpenWispChildren(ctx context.Context, id string) (int, error)
 	GetNewlyUnblockedByCloseWisp(ctx context.Context, closedID string) ([]*types.Issue, error)
@@ -1309,6 +1311,48 @@ func (u *issueUseCaseImpl) CloseIssue(ctx context.Context, id string, params Clo
 
 func (u *issueUseCaseImpl) CloseWisp(ctx context.Context, id string, params CloseIssueParams, actor string) (CloseIssueResult, error) {
 	return u.close(ctx, id, params, actor, true)
+}
+
+// CloseIssueChecked closes an issue, refusing with storage.ErrCloseBlocked when
+// the issue has a live, open direct blocker unless force is set. The blocker
+// check (IsBlocked) and the close (CloseIssue) run through the same unit-of-work
+// transaction, so this is a single enforcement point rather than a re-check of
+// separate reads. When force is set or the guard passes it delegates to the
+// unchecked CloseIssue, preserving its CloseIssueResult semantics exactly.
+func (u *issueUseCaseImpl) CloseIssueChecked(ctx context.Context, id string, params CloseIssueParams, actor string, force bool) (CloseIssueResult, error) {
+	return u.closeChecked(ctx, id, params, actor, force, false)
+}
+
+// CloseWispChecked is the wisp twin of CloseIssueChecked: it applies the same
+// live-direct-blocker guard (via IsWispBlocked) before delegating to the
+// unchecked CloseWisp.
+func (u *issueUseCaseImpl) CloseWispChecked(ctx context.Context, id string, params CloseIssueParams, actor string, force bool) (CloseIssueResult, error) {
+	return u.closeChecked(ctx, id, params, actor, force, true)
+}
+
+func (u *issueUseCaseImpl) closeChecked(ctx context.Context, id string, params CloseIssueParams, actor string, force, useWisp bool) (CloseIssueResult, error) {
+	if !force {
+		var (
+			blocked  bool
+			blockers []string
+			err      error
+		)
+		if useWisp {
+			blocked, blockers, err = u.depUC.IsWispBlocked(ctx, id)
+		} else {
+			blocked, blockers, err = u.depUC.IsBlocked(ctx, id)
+		}
+		if err != nil {
+			return CloseIssueResult{}, err
+		}
+		// Refuse only on a live, open direct blocker. A bare is_blocked=1 with no
+		// live direct blocker (a purely transitive block) closes — matching the
+		// historical `bd close` predicate and the embedded checked-close path.
+		if blocked && len(blockers) > 0 {
+			return CloseIssueResult{}, fmt.Errorf("%w: %s is blocked by %v", storage.ErrCloseBlocked, id, blockers)
+		}
+	}
+	return u.close(ctx, id, params, actor, useWisp)
 }
 
 func (u *issueUseCaseImpl) close(ctx context.Context, id string, params CloseIssueParams, actor string, useWisp bool) (CloseIssueResult, error) {
