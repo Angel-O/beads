@@ -219,8 +219,9 @@ type Config struct {
 	// CredentialCommand is the helper command re-run at each new physical
 	// connection dial (the hosted credential-command path). Empty means the
 	// static ServerUser is baked into the DSN and connections use plain
-	// sql.Open. Set by applyResolvedConfig from the dolt_credential_command
-	// config when no explicit ServerUser is configured.
+	// sql.Open. Set by applyResolvedConfig from a trusted user-local source
+	// (BEADS_DOLT_CREDENTIAL_COMMAND or the central server config) when no
+	// explicit ServerUser is configured — never from tracked project metadata.
 	CredentialCommand string
 
 	// Remote auth for Hosted Dolt push/pull (optional)
