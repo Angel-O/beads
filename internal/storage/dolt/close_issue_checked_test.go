@@ -96,6 +96,41 @@ func TestCloseIssueChecked(t *testing.T) {
 		return id
 	}
 
+	// mkClosedBlockedStale creates a closed issue and then forces is_blocked=1
+	// back onto the closed row via direct SQL + DOLT_COMMIT. This reproduces the
+	// stale denormalization a cross-clone Dolt merge can leave: the schema
+	// explicitly models closed+is_blocked=1 rows (GetStatistics filters
+	// `is_blocked = 1 AND status <> 'closed'`), and a hand-resolved merge conflict
+	// can leave the flag stale indefinitely. No single-clone store API path can
+	// otherwise reach this state, because every in-process close recomputes and
+	// clears is_blocked for the closed row — so it is seeded the same way
+	// blocked_merge_test.go seeds merged state.
+	mkClosedBlockedStale := func(t *testing.T, id string) string {
+		t.Helper()
+		createPerm(t, ctx, store, id)
+		if _, err := store.CloseIssueChecked(ctx, id, "tester",
+			storage.CloseIssueOptions{Reason: "done"}); err != nil {
+			t.Fatalf("initial CloseIssueChecked(%s): %v", id, err)
+		}
+		if _, err := store.db.ExecContext(ctx,
+			"UPDATE issues SET is_blocked = 1 WHERE id = ?", id); err != nil {
+			t.Fatalf("force stale is_blocked=1 on %s: %v", id, err)
+		}
+		if _, err := store.db.ExecContext(ctx,
+			"CALL DOLT_COMMIT('-Am', 'simulate merged stale is_blocked')"); err != nil && !isDoltNothingToCommit(err) {
+			t.Fatalf("commit stale is_blocked for %s: %v", id, err)
+		}
+		// Guard the fixture itself: the row must be closed AND carry the stale
+		// is_blocked=1 the regression depends on.
+		if got := getStatus(t, id); got != types.StatusClosed {
+			t.Fatalf("%s should be closed for the regression fixture, got %q", id, got)
+		}
+		if !getIsBlocked(t, ctx, store, "issues", id) {
+			t.Fatalf("%s should carry stale is_blocked=1 for the regression fixture", id)
+		}
+		return id
+	}
+
 	tests := []struct {
 		name  string
 		setup func(t *testing.T) string
@@ -161,6 +196,31 @@ func TestCloseIssueChecked(t *testing.T) {
 			setup: func(t *testing.T) string { return mkClosed(t, "cic-idem") },
 			opts:  storage.CloseIssueOptions{Reason: "again"},
 			check: func(t *testing.T, id string, res storage.CloseIssueResult, err error) {
+				if err != nil {
+					t.Fatalf("re-close err = %v, want nil", err)
+				}
+				if !res.Unchanged {
+					t.Fatalf("res.Unchanged = false, want true (already closed)")
+				}
+				if got := getStatus(t, id); got != types.StatusClosed {
+					t.Fatalf("issue %s status = %q, want closed", id, got)
+				}
+			},
+		},
+		{
+			// Regression: a non-force re-close of an ALREADY-CLOSED row that still
+			// carries a stale is_blocked=1 must stay idempotent (Unchanged=true).
+			// The guard only has meaning for an open→closed transition, so it must
+			// not fire on a row that is already closed — otherwise the documented
+			// idempotency contract breaks once bd close is wired to this primitive.
+			name:  "already closed with stale is_blocked=1 is idempotent, not refused",
+			setup: func(t *testing.T) string { return mkClosedBlockedStale(t, "cic-idem-stale") },
+			opts:  storage.CloseIssueOptions{Reason: "again"},
+			check: func(t *testing.T, id string, res storage.CloseIssueResult, err error) {
+				if errors.Is(err, storage.ErrCloseBlocked) {
+					t.Fatalf("re-close of already-closed %s refused with ErrCloseBlocked; "+
+						"the guard must not fire on an already-closed row (stale is_blocked=1)", id)
+				}
 				if err != nil {
 					t.Fatalf("re-close err = %v, want nil", err)
 				}
