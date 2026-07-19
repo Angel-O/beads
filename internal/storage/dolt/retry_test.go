@@ -394,3 +394,174 @@ func TestPrimeCredentialedConn_NonAuthErrorNotRetried(t *testing.T) {
 		t.Fatalf("must not re-dial after a non-auth error: %v", err)
 	}
 }
+
+// TestRetryStaleCredentialOpen covers the store-open credential recovery primitive
+// used by openServerConnection's first dials (SHOW DATABASES, CREATE DATABASE, and the
+// test-connection ping), which run before the DoltStore's own withRetry/withRetryTx/
+// primeCredentialedConn handlers exist. On the credential-command path a MySQL 1045
+// must drop the cached token and retry the op exactly once; the static path and
+// non-auth errors must run the op once and leave the cache untouched.
+func TestRetryStaleCredentialOpen(t *testing.T) {
+	authErr := &mysql.MySQLError{Number: 1045, Message: "Access denied for user"}
+
+	t.Run("static path runs once and never invalidates", func(t *testing.T) {
+		runs := 0
+		err := retryStaleCredentialOpen("", func() error {
+			runs++
+			return authErr
+		})
+		if !errors.Is(err, authErr) {
+			t.Fatalf("static path must surface the error, got: %v", err)
+		}
+		if runs != 1 {
+			t.Fatalf("static path must run op exactly once, ran %d", runs)
+		}
+	})
+
+	t.Run("auth error invalidates cached token and retries once", func(t *testing.T) {
+		const cmd = "rotating-helper"
+		credCacheMu.Lock()
+		credCache = map[string]cachedCred{cmd: {token: "revoked", expires: time.Now().Add(time.Hour)}}
+		credCacheMu.Unlock()
+		t.Cleanup(func() {
+			credCacheMu.Lock()
+			credCache = map[string]cachedCred{}
+			credCacheMu.Unlock()
+		})
+
+		runs := 0
+		err := retryStaleCredentialOpen(cmd, func() error {
+			runs++
+			if runs == 1 {
+				return authErr
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("must recover on the retry, got: %v", err)
+		}
+		if runs != 2 {
+			t.Fatalf("auth error must retry the op exactly once (2 runs), ran %d", runs)
+		}
+		credCacheMu.Lock()
+		_, stillCached := credCache[cmd]
+		credCacheMu.Unlock()
+		if stillCached {
+			t.Fatal("auth rejection must invalidate the cached credential so the retry re-mints")
+		}
+	})
+
+	t.Run("non-auth error runs once and keeps the cache", func(t *testing.T) {
+		const cmd = "rotating-helper"
+		credCacheMu.Lock()
+		credCache = map[string]cachedCred{cmd: {token: "live", expires: time.Now().Add(time.Hour)}}
+		credCacheMu.Unlock()
+		t.Cleanup(func() {
+			credCacheMu.Lock()
+			credCache = map[string]cachedCred{}
+			credCacheMu.Unlock()
+		})
+
+		runs := 0
+		wantErr := errors.New("driver: bad connection")
+		err := retryStaleCredentialOpen(cmd, func() error {
+			runs++
+			return wantErr
+		})
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("non-auth error must surface, got: %v", err)
+		}
+		if runs != 1 {
+			t.Fatalf("non-auth error must not retry; ran %d", runs)
+		}
+		credCacheMu.Lock()
+		_, stillCached := credCache[cmd]
+		credCacheMu.Unlock()
+		if !stillCached {
+			t.Fatal("a non-auth error must not invalidate the cached credential")
+		}
+	})
+}
+
+// TestOpenServerConnection_StaleCredentialRecovers proves store construction itself
+// recovers from a rotating credential revoked before its cached expiry — the exact gap
+// the DoltStore's retry handlers cannot cover because they do not exist yet during open.
+// openServerConnection dials two independent pools that share the process credential
+// cache: initDB (no database in the DSN) runs SHOW DATABASES, and db (database in the
+// DSN) runs the open-time catalog ping. With a stale cached token, each pool's first
+// dial is rejected with MySQL 1045; store-open must drop the token and re-dial rather
+// than fail permanently with "failed to check if database" or a ping error.
+func TestOpenServerConnection_StaleCredentialRecovers(t *testing.T) {
+	const cmd = "rotating-helper"
+	credCacheMu.Lock()
+	credCache = map[string]cachedCred{cmd: {token: "revoked", expires: time.Now().Add(time.Hour)}}
+	credCacheMu.Unlock()
+	t.Cleanup(func() {
+		credCacheMu.Lock()
+		credCache = map[string]cachedCred{}
+		credCacheMu.Unlock()
+	})
+
+	mainDB, mainMock, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
+	if err != nil {
+		t.Fatalf("sqlmock.New (main): %v", err)
+	}
+	t.Cleanup(func() { _ = mainDB.Close() })
+	initDB, initMock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New (init): %v", err)
+	}
+	t.Cleanup(func() { _ = initDB.Close() })
+
+	// Route the main vs init pool by the DSN's database name, exactly as
+	// openServerConnection builds them (buildServerDSN(cfg, cfg.Database) vs "").
+	origOpener := serverConnOpener
+	serverConnOpener = func(dsn, credCmd string) (*sql.DB, error) {
+		parsed, perr := mysql.ParseDSN(dsn)
+		if perr != nil {
+			t.Fatalf("unexpected DSN %q: %v", dsn, perr)
+		}
+		if parsed.DBName == "" {
+			return initDB, nil
+		}
+		return mainDB, nil
+	}
+	t.Cleanup(func() { serverConnOpener = origOpener })
+
+	authErr := &mysql.MySQLError{Number: 1045, Message: "Access denied for user"}
+	// Each pool's first dial presents the revoked token and is rejected; the
+	// invalidate-and-re-dial retry then succeeds.
+	initMock.ExpectQuery("SHOW DATABASES").WillReturnError(authErr)
+	initMock.ExpectQuery("SHOW DATABASES").WillReturnRows(sqlmock.NewRows([]string{"Database"}).AddRow("beads"))
+	mainMock.ExpectPing().WillReturnError(authErr)
+	mainMock.ExpectPing()
+
+	cfg := &Config{
+		Database:          "beads",
+		ServerHost:        "127.0.0.1",
+		ServerPort:        3999,
+		ServerUser:        "placeholder",
+		CredentialCommand: cmd,
+		CreateIfMissing:   true,
+	}
+	db, _, err := openServerConnection(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("store-open must recover past the revoked-token dials, got: %v", err)
+	}
+	if db == nil {
+		t.Fatal("store-open must return a live connection on recovery")
+	}
+
+	credCacheMu.Lock()
+	_, stillCached := credCache[cmd]
+	credCacheMu.Unlock()
+	if stillCached {
+		t.Fatal("store-open auth rejection must invalidate the cached credential so the re-dial re-mints")
+	}
+	if err := initMock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet init-pool expectations: %v", err)
+	}
+	if err := mainMock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet main-pool expectations: %v", err)
+	}
+}

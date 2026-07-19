@@ -335,6 +335,11 @@ func isAuthError(err error) bool {
 	if errors.As(err, &myErr) {
 		return myErr.Number == 1045
 	}
+	// Backstop for a 1045 that reached us without its typed *mysql.MySQLError (e.g.
+	// stringified across a boundary). The driver always types real server auth
+	// rejections, so callers must not route remote/git auth failures (DOLT_PULL/PUSH
+	// "access denied") through here, or this would invalidate the credential cache
+	// for an unrelated error.
 	return strings.Contains(strings.ToLower(err.Error()), "access denied")
 }
 
@@ -1181,8 +1186,13 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 		return nil, err
 	}
 
-	// Test connection
-	if err := db.PingContext(ctx); err != nil {
+	// Test connection. Wrap in the same stale-credential recovery as the open-time
+	// dials above: this is the last credentialed dial before the DoltStore (and its
+	// retry handlers) exists, so a rotating token revoked before its cached expiry
+	// must invalidate-and-re-dial here too rather than fail store construction.
+	if err := retryStaleCredentialOpen(cfg.CredentialCommand, func() error {
+		return db.PingContext(ctx)
+	}); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to ping Dolt database: %w", err)
 	}
@@ -1365,6 +1375,11 @@ func buildServerDSN(cfg *Config, database string) string {
 // resolves to openSQLDB.
 var sideConnOpener = openSQLDB
 
+// serverConnOpener opens the main and init *sql.DB handles in openServerConnection.
+// Like sideConnOpener it is a package var so tests can substitute a mock connection
+// without a live server; production always resolves to openSQLDB.
+var serverConnOpener = openSQLDB
+
 // primeCredentialedConn forces the single physical dial of a one-shot side-pool
 // *sql.DB to happen up front, recovering once from a rotating credential revoked
 // before its cached expiry. The long-timeout and migration side pools dial outside
@@ -1489,11 +1504,32 @@ func applyPoolLimits(db *sql.DB, cfg *Config) {
 	db.SetConnMaxIdleTime(idle)
 }
 
+// retryStaleCredentialOpen runs a store-open operation that performs a credentialed
+// dial, recovering once from a rotating credential revoked before its cached expiry.
+// The first store-open dials — databaseExistsOnServer's SHOW DATABASES, CREATE
+// DATABASE, and the open-time ping — happen before the DoltStore, and therefore its
+// withRetry/withRetryTx/primeCredentialedConn handlers, exist. Without this a
+// revoked-token MySQL 1045 on those dials would surface as a permanent store-open
+// failure until the cached token naturally expires. Mirroring primeCredentialedConn,
+// it drops the cached token (invalidateCredentialToken) so the retry's dial re-mints a
+// fresh one via BeforeConnect; only the credential-command path can refresh, so
+// static-user and local paths run op exactly once with no extra dial. Every wrapped
+// store-open op is idempotent (a read, CREATE ... IF NOT EXISTS, or a ping), so the
+// single retry never duplicates an effect.
+func retryStaleCredentialOpen(credCommand string, op func() error) error {
+	err := op()
+	if err != nil && credCommand != "" && isAuthError(err) {
+		invalidateCredentialToken(credCommand)
+		err = op()
+	}
+	return err
+}
+
 // openServerConnection opens a connection to a dolt sql-server via MySQL protocol
 func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, error) {
 	connStr := buildServerDSN(cfg, cfg.Database)
 
-	db, err := openSQLDB(connStr, cfg.CredentialCommand)
+	db, err := serverConnOpener(connStr, cfg.CredentialCommand)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to open Dolt server connection: %w", err)
 	}
@@ -1508,7 +1544,7 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, er
 	// Ensure database exists (may need to create it)
 	// First connect without database to create it
 	initConnStr := buildServerDSN(cfg, "")
-	initDB, err := openSQLDB(initConnStr, cfg.CredentialCommand)
+	initDB, err := serverConnOpener(initConnStr, cfg.CredentialCommand)
 	if err != nil {
 		_ = db.Close()
 		return nil, "", fmt.Errorf("failed to open init connection: %w", err)
@@ -1540,7 +1576,12 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, er
 	// because LIKE treats _ and % as wildcards and Dolt does not support backslash
 	// escaping. Database names like "beads_vulcan" contain underscores which would
 	// match unrelated databases with LIKE.
-	dbExists, checkErr := databaseExistsOnServer(ctx, initDB, cfg.Database)
+	var dbExists bool
+	checkErr := retryStaleCredentialOpen(cfg.CredentialCommand, func() error {
+		var e error
+		dbExists, e = databaseExistsOnServer(ctx, initDB, cfg.Database)
+		return e
+	})
 	if checkErr != nil {
 		_ = db.Close()
 		return nil, "", fmt.Errorf("failed to check if database %q exists on server %s:%d: %w",
@@ -1553,7 +1594,10 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, er
 			return nil, "", databaseNotFoundError(cfg)
 		}
 
-		_, err = initDB.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", cfg.Database)) //nolint:gosec // G201: cfg.Database validated by ValidateDatabaseName above
+		err = retryStaleCredentialOpen(cfg.CredentialCommand, func() error {
+			_, e := initDB.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", cfg.Database)) //nolint:gosec // G201: cfg.Database validated by ValidateDatabaseName above
+			return e
+		})
 		if err != nil {
 			// Dolt may return error 1007 even with IF NOT EXISTS - ignore if database already exists
 			errLower := strings.ToLower(err.Error())
@@ -1580,13 +1624,21 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, er
 	bo.MaxElapsedTime = 10 * time.Second
 	if err := backoff.Retry(func() error {
 		pingErr := db.PingContext(ctx)
-		if pingErr != nil && isRetryableError(pingErr) {
-			return pingErr // retryable — backoff will retry
+		if pingErr == nil {
+			return nil
 		}
-		if pingErr != nil {
-			return backoff.Permanent(pingErr)
+		// A rotating credential revoked before its cached expiry surfaces as MySQL
+		// 1045 on this open-time dial too, before the DoltStore's retry handlers
+		// exist. Drop the cached token so the next ping re-mints via BeforeConnect;
+		// only on the credential-command path (a static user has nothing to refresh).
+		if cfg.CredentialCommand != "" && isAuthError(pingErr) {
+			invalidateCredentialToken(cfg.CredentialCommand)
+			return pingErr // retryable — the re-dial re-mints
 		}
-		return nil
+		if isRetryableError(pingErr) {
+			return pingErr // retryable — backoff will retry (catalog race, GH-1851)
+		}
+		return backoff.Permanent(pingErr)
 	}, backoff.WithContext(bo, ctx)); err != nil {
 		_ = db.Close()
 		return nil, "", fmt.Errorf("database %q not available after CREATE DATABASE: %w", cfg.Database, err)
