@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/steveyegge/beads/cmd/bd/doctor"
@@ -12,6 +14,7 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/doltserver"
+	"github.com/steveyegge/beads/internal/safefile"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
@@ -19,6 +22,100 @@ import (
 // This prevents the upgrade notification from firing repeatedly when git operations
 // reset the tracked metadata.json file.
 const localVersionFile = ".local_version"
+
+// refuseLegacyDoltServerWorkspace recognizes the durable on-disk contract of a
+// pre-project-identity Dolt server workspace: canonical metadata with an
+// explicit persisted dolt_mode=server, no project identity, and an existing
+// persisted Dolt server data root. This is the shape written by the v0.57.0-era
+// external SQL server, the release gated by the migration-test harness. It keys
+// on the persisted metadata mode, so a workspace whose server mode is only
+// implicit (empty dolt_mode, supplied by config.yaml or the environment) is not
+// classified here; strict metadata loading and normal store open handle those.
+// The gitignored local version and the compatibility marker are deliberately
+// not discriminators: an earlier failed upgrade can rewrite both before timing
+// out. This check is store-free and has no migration side effects.
+func refuseLegacyDoltServerWorkspace(beadsDir string, cfg *configfile.Config) error {
+	if cfg == nil || cfg.GetBackend() != configfile.BackendDolt ||
+		!strings.EqualFold(cfg.DoltMode, configfile.DoltModeServer) {
+		return nil
+	}
+	if cfg.ProjectID != "" {
+		return nil
+	}
+	doltDir := cfg.PersistedDoltDataPath(beadsDir)
+	if doltDir == "" {
+		return nil
+	}
+	info, err := os.Lstat(doltDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("cannot safely classify possible legacy Dolt-server workspace at %s: %w (refusing to open or modify it)", doltDir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("possible legacy Dolt-server workspace has an ambiguous non-directory data root at %s; preserve it and run a version-specific explicit migration (refusing to open or modify it)", doltDir)
+	}
+
+	// Validate the effective database name only after confirming an existing
+	// persisted Dolt data root. An empty dolt_database is a valid default that
+	// resolves to the default database, so validate GetDoltDatabase() rather
+	// than the raw field to avoid misdiagnosing a defaulted name as invalid.
+	database := cfg.GetDoltDatabase()
+	if err := dolt.ValidateDatabaseName(database); err != nil {
+		return fmt.Errorf("possible legacy Dolt-server workspace at %s has an invalid database name %q: %v; preserve a byte-for-byte backup of .beads and use the matching historical bd binary for explicit migration (refusing to open or modify it)", doltDir, database, err)
+	}
+
+	source := safeLegacyDoltVersionLabel(beadsDir)
+	return fmt.Errorf("legacy %s Dolt-server workspace requires explicit migration before bd %s can open it; first preserve a byte-for-byte backup of .beads and keep/use the matching historical bd binary for a qualified version-specific migration bridge; this build refuses automatic modification of %s",
+		source, Version, beadsDir)
+}
+
+const maxLegacyVersionWitnessBytes = 64
+
+// legacyDoltEraLabel is the human-readable provenance used in the refusal
+// message when no trustworthy .local_version witness is available. It names the
+// population the guard actually classifies (pre-project-identity Dolt server
+// workspaces) without asserting a specific unqualified release range.
+const legacyDoltEraLabel = "pre-project-identity"
+
+func safeLegacyDoltVersionLabel(beadsDir string) string {
+	path := filepath.Join(beadsDir, localVersionFile)
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxLegacyVersionWitnessBytes {
+		return legacyDoltEraLabel
+	}
+	file, err := safefile.OpenReadOnlyNoFollow(path)
+	if err != nil {
+		return legacyDoltEraLabel
+	}
+	defer func() { _ = file.Close() }()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || openedInfo.Size() != info.Size() {
+		return legacyDoltEraLabel
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxLegacyVersionWitnessBytes+1))
+	if err != nil || len(data) > maxLegacyVersionWitnessBytes {
+		return legacyDoltEraLabel
+	}
+	version := strings.TrimSpace(string(data))
+	if !isLegacyDoltVersionWitness(version) {
+		return legacyDoltEraLabel
+	}
+	return "bd " + version
+}
+
+func isLegacyDoltVersionWitness(version string) bool {
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	major, majorErr := strconv.Atoi(parts[0])
+	minor, minorErr := strconv.Atoi(parts[1])
+	patch, patchErr := strconv.Atoi(parts[2])
+	return majorErr == nil && minorErr == nil && patchErr == nil &&
+		major == 0 && minor >= 50 && minor <= 58 && patch >= 0
+}
 
 // trackBdVersion checks if bd version has changed since last run and updates the local version file.
 // This function is best-effort - failures are silent to avoid disrupting commands.

@@ -1069,8 +1069,12 @@ var rootCmd = &cobra.Command{
 		beadsDir := resolveCommandBeadsDir(dbPath)
 		// Refuse incompatible metadata before version tracking, migration, or store open.
 		// Canonicalize first because supported .beads roots may themselves be symlinks.
-		if _, err := configfile.LoadReadOnly(utils.CanonicalizePath(beadsDir)); err != nil {
-			return HandleError("workspace metadata is incompatible with this bd version: %v (refusing to open or modify %s)", err, beadsDir)
+		readOnlyCfg, configErr := configfile.LoadReadOnly(utils.CanonicalizePath(beadsDir))
+		if configErr != nil {
+			return HandleError("workspace metadata is incompatible with this bd version: %v (refusing to open or modify %s)", configErr, beadsDir)
+		}
+		if err := refuseLegacyDoltServerWorkspace(beadsDir, readOnlyCfg); err != nil {
+			return HandleError("%v", err)
 		}
 		prepareSelectedCommandContext(beadsDir, true)
 		refreshBoundCommandConfig(cmd)

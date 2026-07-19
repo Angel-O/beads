@@ -28,6 +28,22 @@ record_result() {
     RESULT_VIOLATIONS+=("$violations")
 }
 
+record_result_after_workspace_cleanup() {
+    local ws="$1"
+    local path="$2"
+    local status="$3"
+    local detail="$4"
+    local recipe="${5:-}"
+    local violations="${6:-0}"
+
+    if ! cleanup_workspace "$ws"; then
+        record_result "$path" "BLOCKED" \
+            "could not prove isolated workspace cleanup; preserved at $ws" "" "$violations"
+        return 1
+    fi
+    record_result "$path" "$status" "$detail" "$recipe" "$violations"
+}
+
 print_results_table() {
     echo ""
     echo -e "${BOLD}Migration Test Results${NC}"

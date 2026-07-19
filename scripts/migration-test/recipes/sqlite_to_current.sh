@@ -182,7 +182,10 @@ recipe_sqlite_to_current() {
     fi
 
     # Stop any old dolt server
-    stop_dolt_server "$ws"
+    if ! stop_dolt_server "$ws"; then
+        echo "  FAILED: could not prove the workspace server stopped"
+        return 1
+    fi
 
     # Remove active old artifacts now that the byte-identical rollback copies
     # and JSONL export are durable. This lets the candidate's

@@ -1,20 +1,21 @@
 #!/bin/bash
-# Recipe: qualified v0.55.4 legacy Dolt directory → current embedded Dolt.
+# Recipe: qualified legacy Dolt directory → current embedded Dolt.
 #
-# Other v0.50.0–v0.58.0 releases need release-specific extraction: v0.56.1
-# has no export command, while v0.57/v0.58 exports omit comment bodies. Do not
-# extend this recipe to those releases without a lossless fixture-backed path.
+# Each server-era release needs an explicit extraction strategy. v0.55.4 has
+# a lossless native export for the qualified fixture. v0.57.0 needs its native
+# export enriched with comment bodies from one-item show queries. v0.56.1 and
+# v0.58.0 remain unqualified.
 #
 # Strategy:
 #   1. Stop any running Dolt server
-#   2. Export all data via old binary (which auto-starts its own server)
+#   2. Extract the qualified core fixture via the old binary
 #   3. Stop server, clear stale metadata, init with candidate
 #   4. If candidate DB is empty, reimport from JSONL export
 #
 # User-facing instructions:
-#   Use the pinned migration harness for v0.55.4. It stops the historical
-#   server, retains a byte-verified rollback tree, exports with the historical
-#   binary, validates the JSONL, and only then initializes the candidate.
+#   Use the pinned migration harness for qualified v0.55.4 and v0.57.0 core
+#   fixtures. It stops the historical server, retains a byte-verified rollback
+#   tree, extracts and validates JSONL, and only then initializes the candidate.
 
 publish_legacy_dolt_rollback() {
     mv --no-target-directory --no-clobber --no-copy -- "$1" "$2"
@@ -96,6 +97,196 @@ migration_jsonl_is_snapshot_subset() {
         <(printf '%s\n' "$existing_ids" | LC_ALL=C sort) \
         <(printf '%s\n' "$expected_ids" | LC_ALL=C sort)) || return 1
     [ -z "$extra_ids" ]
+}
+
+v057_export_matches_snapshot() {
+    local export_path="$1"
+    local before_snapshot="$2"
+
+    jq -en \
+        --slurpfile exports "$export_path" \
+        --slurpfile before "$before_snapshot" '
+        def by_id: map({key: .id, value: .}) | from_entries;
+        def core:
+            del(
+                .labels,
+                .dependencies,
+                .dependents,
+                .comments,
+                .comment_count,
+                .dependency_count,
+                .dependent_count,
+                .parent
+            );
+        def has_unsupported_issue_data:
+            has("crystallizes") or
+            has("creator") or
+            has("quality_score") or
+            has("validations") or
+            has("hook_bead") or
+            has("role_bead") or
+            has("agent_state") or
+            has("last_activity") or
+            has("role_type") or
+            has("rig") or
+            has("holder") or
+            has("closed_by_session");
+        ($exports | by_id) as $export |
+        ($before[0] | by_id) as $expected |
+        (($export | keys | sort) == ($expected | keys | sort)) and
+        ([($export | keys[]) as $id |
+            ($export[$id].labels // []) as $export_labels |
+            ($expected[$id].labels // []) as $expected_labels |
+            ($export[$id].dependencies // []) as $export_dependencies |
+            ($expected[$id].dependencies // []) as $expected_dependencies |
+            ($export[$id].dependency_count) as $dependency_count |
+            ($export[$id].comment_count) as $comment_count |
+            (($export[$id] | core) == ($expected[$id] | core)) and
+            (($export[$id] | has_unsupported_issue_data) | not) and
+            (($export_labels | type) == "array") and
+            (all($export_labels[]; type == "string")) and
+            (($export_labels | length) == ($export_labels | unique | length)) and
+            (($export_labels | sort) == ($expected_labels | sort)) and
+            (($export_dependencies | type) == "array") and
+            (all($export_dependencies[];
+                type == "object" and
+                .issue_id == $id and
+                ((.depends_on_id? | type) == "string") and
+                ((.depends_on_id? | length) > 0) and
+                ((.type? | type) == "string") and
+                ((.type? | length) > 0) and
+                ((.metadata? // "{}") as $metadata |
+                    (($metadata | type) == "string") and
+                    ((try ($metadata | fromjson) catch null) == {})) and
+                ((.thread_id? // "") == ""))) and
+            (($dependency_count | type) == "number") and
+            ($dependency_count >= 0) and
+            (($dependency_count | floor) == $dependency_count) and
+            ($dependency_count ==
+                ([$export_dependencies[] | select(.type == "blocks")] | length)) and
+            (([$export_dependencies[] | {id: .depends_on_id, type: .type}] |
+                sort_by(.id, .type)) ==
+             ([$expected_dependencies[] | {id: .id, type: .dependency_type}] |
+                sort_by(.id, .type))) and
+            (($comment_count | type) == "number") and
+            ($comment_count >= 0) and
+            (($comment_count | floor) == $comment_count)
+        ] | all)
+    ' >/dev/null 2>&1
+}
+
+v057_export_and_show_comments_agree() {
+    local export_path="$1"
+    local show_path="$2"
+    local before_snapshot="$3"
+
+    jq -en \
+        --slurpfile exports "$export_path" \
+        --slurpfile shows "$show_path" \
+        --slurpfile before "$before_snapshot" '
+        def by_id: map({key: .id, value: .}) | from_entries;
+        ($exports | by_id) as $export |
+        ($shows | by_id) as $show |
+        ($before[0] | by_id) as $expected |
+        (($export | keys | sort) == ($show | keys | sort)) and
+        (($export | keys | sort) == ($expected | keys | sort)) and
+        ([($export | keys[]) as $id |
+            ($export[$id].comment_count) as $count |
+            ($show[$id].comments // []) as $comments |
+            ($expected[$id].comments // []) as $expected_comments |
+            (($count | type) == "number") and
+            ($count >= 0) and
+            (($count | floor) == $count) and
+            (($comments | type) == "array") and
+            ($count == ($comments | length)) and
+            ($comments == $expected_comments) and
+            ($show[$id] == $expected[$id])
+        ] | all)
+    ' >/dev/null 2>&1
+}
+
+enrich_v057_export_comments() {
+    local ws="$1"
+    local old_bin="$2"
+    local export_path="$3"
+    local before_snapshot="$4"
+    local enriched_path="$5"
+    local show_path ids encoded_id id show_json show_record
+    local extraction_ok=true
+
+    [ -f "$export_path" ] && [ ! -L "$export_path" ] || return 1
+    [ -f "$before_snapshot" ] && [ ! -L "$before_snapshot" ] || return 1
+    [ -f "$enriched_path" ] && [ ! -L "$enriched_path" ] || return 1
+    migration_jsonl_matches_snapshot "$export_path" "$before_snapshot" || return 1
+    v057_export_matches_snapshot "$export_path" "$before_snapshot" || return 1
+
+    show_path=$(mktemp "$ws/.beads/.issues.jsonl.show.tmp.XXXXXX") || return 1
+    ids=$(jq -ce '.[] | .id' "$before_snapshot" 2>/dev/null) || extraction_ok=false
+
+    if $extraction_ok; then
+        while IFS= read -r encoded_id; do
+            id=$(jq -er 'if type == "string" and length > 0 then . else error("invalid id") end' \
+                <<< "$encoded_id" 2>/dev/null) || {
+                extraction_ok=false
+                break
+            }
+            if ! show_json=$(bd_in "$ws" "$old_bin" show --id="$id" --json 2>/dev/null); then
+                extraction_ok=false
+                break
+            fi
+            show_record=$(jq -ce --arg id "$id" '
+                if type == "array" and length == 1 and
+                    (.[0] | type) == "object" and
+                    ((.[0].id? | type) == "string") and
+                    .[0].id == $id and
+                    ((.[0].comments? // []) | type) == "array"
+                then .[0]
+                else error("invalid one-item show result")
+                end
+            ' <<< "$show_json" 2>/dev/null) || {
+                extraction_ok=false
+                break
+            }
+            if ! printf '%s\n' "$show_record" >> "$show_path"; then
+                extraction_ok=false
+                break
+            fi
+        done <<< "$ids"
+    fi
+
+    if $extraction_ok && \
+        migration_jsonl_matches_snapshot "$show_path" "$before_snapshot" && \
+        v057_export_and_show_comments_agree \
+            "$export_path" "$show_path" "$before_snapshot"; then
+        if ! jq -cn \
+            --slurpfile exports "$export_path" \
+            --slurpfile shows "$show_path" '
+            def by_id: map({key: .id, value: .}) | from_entries;
+            ($shows | by_id) as $show |
+            $exports[] |
+            ($show[.id].comments // []) as $comments |
+            if ($comments | length) > 0
+            then .comments = $comments
+            else del(.comments)
+            end
+        ' > "$enriched_path"; then
+            extraction_ok=false
+        fi
+    else
+        extraction_ok=false
+    fi
+
+    if $extraction_ok && \
+        ! migration_jsonl_matches_snapshot "$enriched_path" "$before_snapshot"; then
+        extraction_ok=false
+    fi
+    if ! remove_file_and_verify_absent "$show_path"; then
+        extraction_ok=false
+    fi
+    if ! $extraction_ok; then
+        remove_file_and_verify_absent "$enriched_path" >/dev/null 2>&1 || true
+        return 1
+    fi
 }
 
 preserve_legacy_dolt_source() {
@@ -184,7 +375,14 @@ recipe_server_to_embedded() {
         echo "  FAILED: no lossless server→embedded recipe is qualified for $version"
         return 1
     }
-    if [ "$strategy" != "native_export" ] || [ ! -f "$before_snapshot" ]; then
+    case "$strategy" in
+        native_export|native_export_show_comments) ;;
+        *)
+            echo "  FAILED: incomplete server→embedded inputs for $version"
+            return 1
+            ;;
+    esac
+    if [ ! -f "$before_snapshot" ] || [ -L "$before_snapshot" ]; then
         echo "  FAILED: incomplete server→embedded inputs for $version"
         return 1
     fi
@@ -199,7 +397,10 @@ recipe_server_to_embedded() {
     fi
 
     # Step 1: Stop any running server (we'll restart via old binary as needed)
-    stop_dolt_server "$ws"
+    if ! stop_dolt_server "$ws"; then
+        echo "  FAILED: could not prove the historical server stopped before rollback capture"
+        return 1
+    fi
 
     # Preserve the stopped source before an old export command or candidate
     # probe can update its Dolt working set or metadata.
@@ -216,13 +417,35 @@ recipe_server_to_embedded() {
     # previously) makes the old binary unable to find its data. (GH#3071)
     echo "  exporting data via old binary..."
     local export_ok=false
-    local export_tmp
+    local historical_export_ok=false
+    local export_tmp enriched_tmp="" export_publish_source
     export_tmp=$(mktemp "$ws/.beads/.issues.jsonl.migration.tmp.XXXXXX") || {
         echo "  FAILED: could not create a safe historical export destination"
         return 1
     }
-    if bd_in "$ws" "$old_bin" export --format jsonl \
-        -o "$export_tmp" >/dev/null 2>&1; then
+    export_publish_source="$export_tmp"
+    case "$strategy" in
+        native_export)
+            if bd_in "$ws" "$old_bin" export --format jsonl \
+                -o "$export_tmp" >/dev/null 2>&1; then
+                historical_export_ok=true
+            fi
+            ;;
+        native_export_show_comments)
+            if bd_in "$ws" "$old_bin" export -o "$export_tmp" >/dev/null 2>&1; then
+                enriched_tmp=$(mktemp "$ws/.beads/.issues.jsonl.enriched.tmp.XXXXXX") || true
+                if [ -n "$enriched_tmp" ] && \
+                    enrich_v057_export_comments \
+                        "$ws" "$old_bin" "$export_tmp" \
+                        "$before_snapshot" "$enriched_tmp"; then
+                    export_publish_source="$enriched_tmp"
+                    historical_export_ok=true
+                fi
+            fi
+            ;;
+    esac
+
+    if $historical_export_ok; then
         local export_destination_unchanged=false
         if [ "$existing_export_state" = "present" ]; then
             if [ -f "$export_path" ] && [ ! -L "$export_path" ] && \
@@ -233,8 +456,8 @@ recipe_server_to_embedded() {
             export_destination_unchanged=true
         fi
         if $export_destination_unchanged && \
-            migration_jsonl_matches_snapshot "$export_tmp" "$before_snapshot" && \
-            mv --no-target-directory --force -- "$export_tmp" "$export_path" && \
+            migration_jsonl_matches_snapshot "$export_publish_source" "$before_snapshot" && \
+            mv --no-target-directory --force -- "$export_publish_source" "$export_path" && \
             migration_jsonl_matches_snapshot "$export_path" "$before_snapshot"; then
             local export_count
             export_count=$(jq -s 'length' "$export_path" 2>/dev/null) || export_count=0
@@ -242,11 +465,21 @@ recipe_server_to_embedded() {
             export_ok=true
         fi
     fi
+    local staging_cleanup_ok=true
     if ! remove_file_and_verify_absent "$export_tmp"; then
         echo "  FAILED: could not remove the historical export staging file"
+        staging_cleanup_ok=false
+    fi
+    if [ -n "$enriched_tmp" ] && \
+        ! remove_file_and_verify_absent "$enriched_tmp"; then
+        echo "  FAILED: could not remove the enriched export staging file"
+        staging_cleanup_ok=false
+    fi
+    if ! stop_dolt_server "$ws"; then
+        echo "  FAILED: could not prove the historical server stopped after export"
         return 1
     fi
-    stop_dolt_server "$ws"
+    $staging_cleanup_ok || return 1
     if ! $export_ok; then
         echo "  FAILED: historical export did not produce a nonempty JSONL file"
         return 1
@@ -280,7 +513,10 @@ recipe_server_to_embedded() {
     # Remove active storage only after the verified rollback copy and JSONL
     # export exist. The old dolt/ is legacy data; embeddeddolt/ (if any) was
     # just created empty by step 3.
-    stop_dolt_server "$ws"
+    if ! stop_dolt_server "$ws"; then
+        echo "  FAILED: could not prove all workspace servers stopped before active-source removal"
+        return 1
+    fi
     if ! verify_legacy_dolt_rollback_root \
         "$ws/.beads/legacy-dolt.pre-migration" "$rollback_manifest"; then
         echo "  FAILED: retained rollback source changed before active-source removal"

@@ -51,6 +51,10 @@ jobs:
             version: v0.55.4
             expected: MANUAL
             cache-identity: legacy-dolt-v0.55.4-e0fa25456dd82890230eef17653448a0bf995104c78864be91c5ed84426a5f49
+          - qualification: Legacy Dolt-dir v0.57.0
+            version: v0.57.0
+            expected: MANUAL
+            cache-identity: legacy-dolt-v0.57.0-f8629d5627bed7d25f06f92334addc171d679f9aed9d08c5d42a9684205dc04b
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
@@ -63,6 +67,27 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq sqlite3
+
+      - name: Install pinned Dolt runtime for v0.57.0
+        if: matrix.version == 'v0.57.0'
+        env:
+          HISTORICAL_VERSION: ${{ matrix.version }}
+        run: |
+          source scripts/migration-test/lib/versions.sh
+          DOLT_VERSION=$(strict_required_dolt_version "$HISTORICAL_VERSION")
+          DOLT_SHA256=$(strict_required_dolt_sha256 "$HISTORICAL_VERSION" linux amd64)
+          archive="$RUNNER_TEMP/dolt-linux-amd64.tar.gz"
+          extract_dir="$RUNNER_TEMP/dolt-${DOLT_VERSION}"
+          curl --fail --location --silent --show-error --retry 3 \
+            "https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-linux-amd64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$DOLT_SHA256" "$archive" | sha256sum --check --strict
+          mkdir -p "$extract_dir"
+          tar -xzf "$archive" -C "$extract_dir"
+          dolt_bin=$(find "$extract_dir" -type f -path '*/bin/dolt' -print -quit)
+          test -n "$dolt_bin"
+          sudo install -m 0755 "$dolt_bin" /usr/local/bin/dolt
+          test "$(dolt version | head -1)" = "dolt version ${DOLT_VERSION}"
 
       - name: Configure Git
         run: |
