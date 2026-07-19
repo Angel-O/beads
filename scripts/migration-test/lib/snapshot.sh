@@ -149,7 +149,7 @@ strict_snapshot_has_expected_fixture() {
     local snapshot="$2"
 
     case "$version" in
-        v0.49.6|v0.55.4|v0.57.0)
+        v0.49.6|v0.55.4|v0.57.0|v0.62.0|v0.63.3)
             local epic_id="${DATASET_IDS[epic]:-}"
             local standalone_id="${DATASET_IDS[standalone]:-}"
             local closed_id="${DATASET_IDS[closed]:-}"
@@ -170,7 +170,8 @@ strict_snapshot_has_expected_fixture() {
                     .description == "Epic for migration testing" and
                     .priority == 2 and
                     .issue_type == "epic" and
-                    .status == "open") and
+                    .status == "open" and
+                    ((.dependencies // []) | length == 0)) and
                 any(.[];
                     .id == $standalone and
                     .title == "Standalone detailed task" and
@@ -178,16 +179,34 @@ strict_snapshot_has_expected_fixture() {
                     .notes == "Historical notes must survive the upgrade." and
                     .design == "Historical design must survive the upgrade." and
                     .acceptance_criteria == "Historical acceptance criteria must survive the upgrade." and
-                    .external_ref == "legacy-upgrade-42") and
-                any(.[]; .id == $closed and .status == "closed") and
+                    .external_ref == "legacy-upgrade-42" and
+                    ((.dependencies // []) | length == 0)) and
+                any(.[];
+                    .id == $closed and
+                    .status == "closed" and
+                    ((.dependencies // []) | length == 0)) and
                 any(.[];
                     .id == $task and
+                    .parent == $epic and
+                    ((.dependencies // [] |
+                        map({
+                            id: (.id // .depends_on_id),
+                            type: (.dependency_type // .type)
+                        }) |
+                        sort_by(.id, .type)) ==
+                        [{id: $epic, type: "parent-child"}]) and
                     ((.labels // []) | index("urgent") != null) and
                     ((.comments // [] | map({author, text})) |
                         index({"author":"legacy-author","text":"Historical comment must survive the upgrade."}) != null)) and
                 any(.[];
                     .id == $bug and
-                    ((.dependencies // [] | map(.id // .)) | index($task) != null))
+                    ((.dependencies // [] |
+                        map({
+                            id: (.id // .depends_on_id),
+                            type: (.dependency_type // .type)
+                        }) |
+                        sort_by(.id, .type)) ==
+                        [{id: $task, type: "blocks"}]))
                 ' "$snapshot" >/dev/null 2>&1 || {
                     echo "  FIDELITY: $version source fixture is missing exact required values" >&2
                     return 1
@@ -400,7 +419,7 @@ check_fidelity() {
     # bd uses "issue_type" not "type" in its JSON output.
     local INVARIANTS=("title" "description" "priority" "issue_type")
     if ${STRICT_MODE:-false}; then
-        INVARIANTS+=("id" "notes" "design" "acceptance_criteria" "external_ref" "status")
+        INVARIANTS+=("id" "notes" "design" "acceptance_criteria" "external_ref" "status" "parent")
     fi
 
     local i=0
@@ -470,8 +489,21 @@ check_fidelity() {
 
         # Check dependency preservation
         local before_deps after_deps
-        before_deps=$(jq -r ".[$i].dependencies // [] | [.[].id // .] | sort | join(\",\")" "$before" 2>/dev/null)
-        after_deps=$(echo "$match" | jq -r ".dependencies // [] | [.[].id // .] | sort | join(\",\")" 2>/dev/null)
+        if ${STRICT_MODE:-false}; then
+            before_deps=$(jq -c ".[$i].dependencies // [] |
+                map({
+                    id: (.id // .depends_on_id),
+                    type: (.dependency_type // .type)
+                }) | sort_by(.id, .type)" "$before" 2>/dev/null)
+            after_deps=$(echo "$match" | jq -c '.dependencies // [] |
+                map({
+                    id: (.id // .depends_on_id),
+                    type: (.dependency_type // .type)
+                }) | sort_by(.id, .type)' 2>/dev/null)
+        else
+            before_deps=$(jq -r ".[$i].dependencies // [] | [.[].id // .] | sort | join(\",\")" "$before" 2>/dev/null)
+            after_deps=$(echo "$match" | jq -r ".dependencies // [] | [.[].id // .] | sort | join(\",\")" 2>/dev/null)
+        fi
         if { ${STRICT_MODE:-false} || [ -n "$before_deps" ]; } && [ "$before_deps" != "$after_deps" ]; then
             echo -e "  ${RED:-}FIDELITY VIOLATION: '$title' dependencies changed: '$before_deps' -> '$after_deps'${NC:-}"
             violations=$((violations + 1))

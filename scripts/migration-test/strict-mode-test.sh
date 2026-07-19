@@ -6,6 +6,7 @@ source "$SCRIPT_DIR/lib/report.sh"
 source "$SCRIPT_DIR/lib/versions.sh"
 source "$SCRIPT_DIR/lib/binary.sh"
 source "$SCRIPT_DIR/lib/workspace.sh"
+source "$SCRIPT_DIR/lib/features.sh"
 source "$SCRIPT_DIR/lib/snapshot.sh"
 source "$SCRIPT_DIR/lib/direct_probe.sh"
 source "$SCRIPT_DIR/recipes/sqlite_to_current.sh"
@@ -45,6 +46,36 @@ sha=$(strict_release_sha256 v0.57.0 linux amd64) || fail "missing v0.57.0 releas
 [ "$(strict_required_dolt_sha256 v0.57.0 linux amd64)" = \
     "f66318f08ed66e409fc39363ae0fff8ce6fbf6dba9f5bac632b91527b9632a74" ] ||
     fail "unexpected v0.57.0 Dolt runtime checksum"
+
+asset=$(strict_release_asset v0.62.0 linux amd64) || fail "missing v0.62.0 release asset"
+[ "$asset" = "beads_0.62.0_linux_amd64.tar.gz" ] || fail "unexpected v0.62.0 release asset"
+sha=$(strict_release_sha256 v0.62.0 linux amd64) || fail "missing v0.62.0 release checksum"
+[ "$sha" = "4cca7265b22e5c3ca8d62ab0b9752bec31f68b7f5fa636282a4c7e5454c35535" ] ||
+    fail "unexpected v0.62.0 release checksum"
+[ "$(strict_expected_status v0.62.0)" = "MANUAL" ] || fail "unexpected v0.62.0 status"
+[ "$(strict_expected_recipe v0.62.0)" = "server_to_embedded" ] || fail "unexpected v0.62.0 recipe"
+[ "$(strict_expected_features v0.62.0)" = "epic task bug dependency standalone closed label comment" ] ||
+    fail "unexpected v0.62.0 source features"
+[ "$(server_bridge_strategy v0.62.0)" = "native_export_show_comments" ] ||
+    fail "unexpected v0.62.0 bridge strategy"
+[ "$(server_bootstrap_strategy v0.62.0)" = "prestarted_server" ] ||
+    fail "unexpected v0.62.0 server bootstrap strategy"
+[ "$(strict_required_dolt_version v0.62.0)" = "1.84.0" ] ||
+    fail "unexpected v0.62.0 Dolt runtime version"
+[ "$(strict_required_dolt_sha256 v0.62.0 linux amd64)" = \
+    "afcdaa9530ae0b4f317ed6041a41d20096e156b2556eb0e03c7c57a624ccc0b3" ] ||
+    fail "unexpected v0.62.0 Dolt runtime checksum"
+[ "$(get_era v0.62.0)" = "dolt_server" ] || fail "v0.62.0 was not classified as server mode"
+
+asset=$(strict_release_asset v0.63.3 linux amd64) || fail "missing v0.63.3 release asset"
+[ "$asset" = "beads_0.63.3_linux_amd64.tar.gz" ] || fail "unexpected v0.63.3 release asset"
+sha=$(strict_release_sha256 v0.63.3 linux amd64) || fail "missing v0.63.3 release checksum"
+[ "$sha" = "5f4efd2e010209b3f381dbcd783b2a3a652f50ea72f40ef04c8ba434d408bf9e" ] ||
+    fail "unexpected v0.63.3 release checksum"
+[ "$(strict_expected_status v0.63.3)" = "AUTO" ] || fail "unexpected v0.63.3 status"
+[ "$(strict_expected_recipe v0.63.3)" = "" ] || fail "unexpected v0.63.3 recipe"
+[ "$(strict_expected_features v0.63.3)" = "epic task bug dependency standalone closed label comment" ] ||
+    fail "unexpected v0.63.3 source features"
 [ "${LEGACY_DOLT_ROLLBACK_FILES[*]}" = "metadata.json config.json config.yaml issues.jsonl" ] ||
     fail "unexpected legacy Dolt rollback file inventory"
 
@@ -224,6 +255,27 @@ kill -9 -- "$guard_server_pid" 2>/dev/null || true
 wait "$guard_server_pid" 2>/dev/null || true
 guard_server_pid=""
 
+legacy_child_dolt_cwd="$pid_guard_workspace/.beads/dolt/legacy-child"
+mkdir -p "$legacy_child_dolt_cwd"
+(
+    cd "$legacy_child_dolt_cwd"
+    exec -a 'dolt sql-server' sleep 600
+) &
+guard_server_pid=$!
+for _ in $(seq 1 50); do
+    if [ "$(readlink "/proc/$guard_server_pid/cwd" 2>/dev/null || true)" = \
+        "$legacy_child_dolt_cwd" ]; then
+        break
+    fi
+    sleep 0.02
+done
+migration_pid_belongs_to_workspace \
+    "$guard_server_pid" "$pid_guard_workspace" "dolt-server.pid" ||
+    fail "legacy Dolt cleanup lost its established child-cwd compatibility"
+kill -9 -- "$guard_server_pid" 2>/dev/null || true
+wait "$guard_server_pid" 2>/dev/null || true
+guard_server_pid=""
+
 fake_dolt_cwd="$pid_guard_workspace/.beads/dolt"
 mkdir -p "$fake_dolt_cwd"
 (
@@ -322,12 +374,583 @@ grep -Fqx 'BEADS_NO_DAEMON=1' <<< "$poisoned_env_output" ||
 grep -Fqx 'BEADS_DOLT_AUTO_START=1' <<< "$poisoned_env_output" ||
     fail "bd_in did not force the intended historical server auto-start behavior"
 
+timeout_probe_bin_dir="$tmp/timeout-probe-bin"
+mkdir -p "$timeout_probe_bin_dir"
+if ! migration_validate_operation_timeouts; then
+    fail "default migration operation timeouts were rejected"
+fi
+if BD_OP_TIMEOUT=0 migration_validate_operation_timeouts; then
+    fail "zero migration operation timeout was accepted"
+fi
+if BD_OP_TIMEOUT=301 migration_validate_operation_timeouts; then
+    fail "unbounded migration operation timeout was accepted"
+fi
+if BD_OP_KILL_AFTER=0s migration_validate_operation_timeouts; then
+    fail "zero migration kill-after timeout was accepted"
+fi
+if BD_OP_KILL_AFTER=61s migration_validate_operation_timeouts; then
+    fail "unbounded migration kill-after timeout was accepted"
+fi
+if ! migration_validate_readiness_settings 100 0.1 30; then
+    fail "default owned-server readiness settings were rejected"
+fi
+for invalid_readiness in '0 0.1 30' '201 0.1 30' '100 1.1 30' '100 0.1 0' '100 0.1 121'; do
+    read -r ready_attempts ready_delay ready_timeout <<< "$invalid_readiness"
+    if migration_validate_readiness_settings \
+        "$ready_attempts" "$ready_delay" "$ready_timeout"; then
+        fail "unsafe owned-server readiness settings were accepted: $invalid_readiness"
+    fi
+done
+cat > "$timeout_probe_bin_dir/timeout" <<'EOF'
+#!/bin/bash
+printf ' <%s>' "$@"
+printf '\n'
+EOF
+chmod +x "$timeout_probe_bin_dir/timeout"
+timeout_probe_output=$(PATH="$timeout_probe_bin_dir:$PATH" bd_in "$port_ws_one" /bin/true)
+[ "$timeout_probe_output" = \
+    " <--kill-after=$BD_OP_KILL_AFTER> <$BD_OP_TIMEOUT> </bin/true>" ] ||
+    fail "bd_in did not bound a stubborn historical command with timeout --kill-after"
+
 release_migration_server_port "$port_ws_one" ||
     fail "could not release the first isolated historical server port"
 release_migration_server_port "$port_ws_two" ||
     fail "could not release the second isolated historical server port"
 [ ! -e "$port_lock_one" ] && [ ! -e "$port_lock_two" ] ||
     fail "historical server port reservation leaked after release"
+
+if ! (
+    transition_pid=""
+    transition_state="$tmp/owned-exit-transition.state"
+    cleanup_transition_probe() {
+        [ -z "$transition_pid" ] || kill -9 -- "$transition_pid" 2>/dev/null || true
+        [ -z "$transition_pid" ] || wait "$transition_pid" 2>/dev/null || true
+    }
+    trap cleanup_transition_probe EXIT
+    rm -f -- "$transition_state"
+    (
+        trap 'printf "term\n" > "$transition_state"; sleep 0.2; exit 0' TERM
+        while :; do
+            sleep 0.05 &
+            wait "$!" || true
+        done
+    ) &
+    transition_pid=$!
+    transition_start=$(migration_process_start_time "$transition_pid")
+    transition_identity=(
+        "$transition_pid" "$transition_start" ignored-exe ignored-launch
+        ignored-launch-id binary ignored-cwd
+    )
+    kill -TERM -- "$transition_pid"
+    for ((attempt = 0; attempt < 50; attempt++)); do
+        [ -s "$transition_state" ] && break
+        sleep 0.01
+    done
+    [ -s "$transition_state" ]
+    migration_owned_process_matches_identity() { return 1; }
+    migration_wait_owned_process_exit \
+        "$transition_pid" "$tmp" transition_identity 40
+); then
+    fail "owned-process wait rejected a valid graceful-exit transition"
+fi
+
+owned_server_bin_dir="$tmp/owned-server-bin"
+owned_server_calls="$owned_server_bin_dir/calls"
+owned_server_env="$owned_server_bin_dir/environments"
+mkdir -p "$owned_server_bin_dir"
+cat > "$owned_server_bin_dir/dolt" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+bin_dir="$(cd "$(dirname "$0")" && pwd)"
+{
+    printf 'cwd=%s args=' "$PWD"
+    printf ' <%s>' "$@"
+    printf '\n'
+} >> "$bin_dir/calls"
+{
+    printf '%s\n' '---'
+    env | sort
+} >> "$bin_dir/environments"
+case "${1:-}" in
+    init)
+        mkdir -p .dolt
+        printf '{}\n' > .dolt/repo_state.json
+        ;;
+    sql-server)
+        [ ! -e "$bin_dir/fail-server" ] || exit 42
+        printf '%s\n' "$BASHPID" > "$bin_dir/last-server-pid"
+        if [ -e "$bin_dir/ignore-term" ]; then
+            trap '' TERM
+        else
+            trap 'exit 0' TERM
+        fi
+        while :; do
+            sleep 0.1 &
+            wait "$!" || true
+        done
+        ;;
+    --host)
+        [ ! -e "$bin_dir/fail-sql" ] || exit 43
+        [ "$2" = "127.0.0.1" ] && [ "$3" = "--port" ] &&
+            [[ "$4" =~ ^2[0-9]{4}$ ]] || exit 45
+        if [ "$#" -eq 8 ]; then
+            [ "$5" = "--no-tls" ] && [ "$6" = "sql" ] &&
+                [ "$7" = "-q" ] && [ "$8" = "SELECT 1" ]
+            if [ -e "$bin_dir/fail-final-validation" ]; then
+                git_dir="${XDG_RUNTIME_DIR%/bd-migration-runtime}"
+                printf '29999\n' > "$git_dir/bd-migration-prestarted-server"
+            fi
+        elif [ "$#" -eq 12 ]; then
+            [ "$5" = "--no-tls" ] && [ "$6" = "--use-db" ] &&
+                [ "$7" = "smoke" ] && [ "$8" = "sql" ] &&
+                [ "$9" = "-r" ] && [ "${10}" = "json" ] &&
+                [ "${11}" = "-q" ] &&
+                [ "${12}" = "SELECT value AS schema_version FROM config WHERE \`key\` = 'schema_version'" ]
+            printf '{"rows":[{"schema_version":"9"}]}\n'
+        else
+            exit 46
+        fi
+        ;;
+    *)
+        exit 44
+        ;;
+esac
+EOF
+chmod +x "$owned_server_bin_dir/dolt"
+
+owned_server_workspace=$(new_workspace) ||
+    fail "could not create an owned-server helper workspace"
+owned_server_port=$(cat "$owned_server_workspace/.git/bd-migration-server-port")
+if ! PATH="$owned_server_bin_dir:$PATH" \
+    HOME=/production/home \
+    XDG_CONFIG_HOME=/production/config \
+    DOLT_ROOT_PATH=/production/dolt-root \
+    start_owned_migration_dolt_server "$owned_server_workspace"; then
+    fail "owned historical Dolt server did not start"
+fi
+owned_server_pid_file="$owned_server_workspace/.git/bd-migration-owned-dolt-server.pid"
+owned_server_identity_file="$owned_server_workspace/.git/bd-migration-owned-dolt-server.identity"
+owned_server_mode_file="$owned_server_workspace/.git/bd-migration-prestarted-server"
+[ -f "$owned_server_pid_file" ] && [ ! -L "$owned_server_pid_file" ] ||
+    fail "owned historical Dolt server PID was not recorded safely"
+[ -f "$owned_server_identity_file" ] && [ ! -L "$owned_server_identity_file" ] ||
+    fail "owned historical Dolt server launch identity was not recorded safely"
+mapfile -t owned_server_recorded_identity < "$owned_server_identity_file"
+[ "${#owned_server_recorded_identity[@]}" -eq 7 ] ||
+    fail "owned historical Dolt server recorded redundant or incomplete identity fields"
+guard_server_pid=$(cat "$owned_server_pid_file")
+migration_pid_belongs_to_workspace \
+    "$guard_server_pid" "$owned_server_workspace" "bd-migration-owned-dolt-server.pid" ||
+    fail "recorded historical Dolt server PID failed ownership validation"
+declare -F migration_owned_process_matches_launch >/dev/null ||
+    fail "owned historical Dolt server has no exact argv validator"
+
+owned_identity_original="$tmp/owned-server.identity.original"
+owned_identity_tampered="$tmp/owned-server.identity.tampered"
+/bin/cp -f -- "$owned_server_identity_file" "$owned_identity_original"
+awk 'NR == 2 { $0 = $0 + 1 } { print }' \
+    "$owned_identity_original" > "$owned_identity_tampered"
+mv -f -- "$owned_identity_tampered" "$owned_server_identity_file"
+if migration_pid_belongs_to_workspace \
+    "$guard_server_pid" "$owned_server_workspace" "bd-migration-owned-dolt-server.pid"; then
+    fail "owned historical Dolt server trusted a mismatched process start time"
+fi
+/bin/cp -f -- "$owned_identity_original" "$owned_server_identity_file"
+migration_pid_belongs_to_workspace \
+    "$guard_server_pid" "$owned_server_workspace" "bd-migration-owned-dolt-server.pid" ||
+    fail "restored owned historical Dolt identity was rejected"
+
+(
+    cd "$owned_server_workspace/.beads/dolt"
+    exec -a "dolt sql-server --host 127.0.0.1 --port $owned_server_port" sleep 600
+) &
+spoof_server_pid=$!
+for _ in $(seq 1 50); do
+    [ "$(readlink "/proc/$spoof_server_pid/cwd" 2>/dev/null || true)" = \
+        "$owned_server_workspace/.beads/dolt" ] && break
+    sleep 0.02
+done
+spoof_server_accepted=false
+if migration_owned_process_matches_launch \
+    "$spoof_server_pid" "$owned_server_workspace" \
+    "$owned_server_bin_dir/dolt" "$owned_server_port"; then
+    spoof_server_accepted=true
+fi
+kill -9 -- "$spoof_server_pid" 2>/dev/null || true
+wait "$spoof_server_pid" 2>/dev/null || true
+$spoof_server_accepted &&
+    fail "owned historical Dolt server accepted substring-spoofed argv"
+[ "$(cat "$owned_server_mode_file")" = "$owned_server_port" ] ||
+    fail "prestarted-server marker did not bind to the reserved workspace port"
+[ -d "$owned_server_workspace/.beads/dolt/.dolt" ] ||
+    fail "owned historical Dolt server did not initialize its data root"
+grep -Fq "cwd=$owned_server_workspace/.beads/dolt args= <sql-server> <--host> <127.0.0.1> <--port> <$owned_server_port>" \
+    "$owned_server_calls" || fail "owned historical Dolt server used an unsafe command or cwd"
+grep -Fq "args= <--host> <127.0.0.1> <--port> <$owned_server_port> <--no-tls> <sql> <-q> <SELECT 1>" \
+    "$owned_server_calls" || fail "owned historical Dolt readiness did not execute a SQL query"
+if grep -Eq '^(HOME|XDG_CONFIG_HOME|DOLT_ROOT_PATH)=/production' "$owned_server_env"; then
+    fail "owned historical Dolt server inherited a poisoned host environment"
+fi
+grep -Fq "HOME=$owned_server_workspace/.git/bd-migration-home" "$owned_server_env" ||
+    fail "owned historical Dolt server did not use the isolated workspace HOME"
+for expected_server_env in \
+    "XDG_CONFIG_HOME=$owned_server_workspace/.git/bd-migration-home/.config" \
+    "XDG_CACHE_HOME=$owned_server_workspace/.git/bd-migration-home/.cache" \
+    "XDG_DATA_HOME=$owned_server_workspace/.git/bd-migration-home/.local/share" \
+    "XDG_STATE_HOME=$owned_server_workspace/.git/bd-migration-home/.local/state" \
+    "XDG_RUNTIME_DIR=$owned_server_workspace/.git/bd-migration-runtime" \
+    "TMPDIR=$owned_server_workspace/.git/bd-migration-tmp"; do
+    grep -Fq "$expected_server_env" "$owned_server_env" ||
+        fail "owned historical Dolt server did not isolate $expected_server_env"
+done
+owned_schema_json=$(PATH="$owned_server_bin_dir:$PATH" \
+    migration_owned_dolt_sql \
+        "$owned_server_workspace" smoke \
+        "SELECT value AS schema_version FROM config WHERE \`key\` = 'schema_version'") ||
+    fail "read-only owned-server SQL query failed"
+[ "$(jq -r '.rows[0].schema_version' <<< "$owned_schema_json")" = "9" ] ||
+    fail "read-only owned-server SQL query did not preserve JSON output"
+if PATH="$owned_server_bin_dir:$PATH" migration_owned_dolt_sql \
+    "$owned_server_workspace" smoke 'SELECT DOLT_COMMIT()' >/dev/null 2>&1; then
+    fail "read-only owned-server SQL helper accepted a mutating statement"
+fi
+grep -Fq "args= <--host> <127.0.0.1> <--port> <$owned_server_port> <--no-tls> <--use-db> <smoke> <sql> <-r> <json> <-q> <SELECT value AS schema_version FROM config WHERE \`key\` = 'schema_version'>" \
+    "$owned_server_calls" || fail "read-only owned-server SQL used an unsafe connection shape"
+
+owned_server_bd_env=$(bd_in "$owned_server_workspace" "$env_probe_bin")
+grep -Fqx 'BEADS_DOLT_AUTO_START=0' <<< "$owned_server_bd_env" ||
+    fail "bd_in did not disable auto-start for the prestarted historical server"
+if ! stop_dolt_server "$owned_server_workspace"; then
+    fail "could not stop the owned historical Dolt server"
+fi
+guard_server_pid=""
+[ ! -e "$owned_server_pid_file" ] && [ ! -L "$owned_server_pid_file" ] ||
+    fail "owned historical Dolt server PID marker survived shutdown"
+[ ! -e "$owned_server_identity_file" ] && [ ! -L "$owned_server_identity_file" ] ||
+    fail "owned historical Dolt server identity marker survived shutdown"
+[ "$(cat "$owned_server_mode_file")" = "$owned_server_port" ] ||
+    fail "prestarted-server mode was lost across a deliberate server stop"
+grep -Fqx 'BEADS_DOLT_AUTO_START=0' \
+    <<< "$(bd_in "$owned_server_workspace" "$env_probe_bin")" ||
+    fail "bd_in re-enabled auto-start after a prestarted server stopped"
+if PATH="$owned_server_bin_dir:$PATH" migration_owned_dolt_sql \
+    "$owned_server_workspace" smoke \
+    "SELECT value AS schema_version FROM config WHERE \`key\` = 'schema_version'" \
+    >/dev/null 2>&1; then
+    fail "read-only owned-server SQL trusted a stopped server"
+fi
+if ! PATH="$owned_server_bin_dir:$PATH" \
+    start_owned_migration_dolt_server "$owned_server_workspace"; then
+    fail "owned historical Dolt server did not restart"
+fi
+guard_server_pid=$(cat "$owned_server_pid_file")
+[ "$(grep -c 'args= <init>' "$owned_server_calls")" -eq 1 ] ||
+    fail "owned historical Dolt restart reinitialized an existing data root"
+cleanup_workspace "$owned_server_workspace" ||
+    fail "could not clean up the owned historical Dolt server workspace"
+guard_server_pid=""
+[ ! -e "$owned_server_workspace" ] ||
+    fail "owned historical Dolt server workspace survived verified cleanup"
+
+owned_server_final_failure_workspace=$(new_workspace) ||
+    fail "could not create an owned-server final-validation workspace"
+touch "$owned_server_bin_dir/fail-final-validation"
+final_validation_succeeded=false
+if PATH="$owned_server_bin_dir:$PATH" \
+    start_owned_migration_dolt_server "$owned_server_final_failure_workspace"; then
+    final_validation_succeeded=true
+fi
+rm -f "$owned_server_bin_dir/fail-final-validation"
+final_validation_pid=$(cat "$owned_server_bin_dir/last-server-pid")
+final_validation_live=false
+kill -0 "$final_validation_pid" 2>/dev/null && final_validation_live=true
+final_validation_markers=false
+for final_marker in \
+    "$owned_server_final_failure_workspace/.git/bd-migration-owned-dolt-server.pid" \
+    "$owned_server_final_failure_workspace/.git/bd-migration-owned-dolt-server.identity" \
+    "$owned_server_final_failure_workspace/.git/bd-migration-prestarted-server"; do
+    if [ -e "$final_marker" ] || [ -L "$final_marker" ]; then
+        final_validation_markers=true
+    fi
+done
+cleanup_workspace "$owned_server_final_failure_workspace" ||
+    fail "could not clean up the final-validation failure workspace"
+$final_validation_succeeded &&
+    fail "owned historical Dolt server accepted failed final validation"
+$final_validation_live &&
+    fail "failed final validation left an owned historical Dolt server live"
+$final_validation_markers &&
+    fail "failed final validation left owned-server trust markers"
+
+owned_server_capture_failure_workspace=$(new_workspace) ||
+    fail "could not create an owned-server capture-failure workspace"
+capture_failure_succeeded=false
+if (
+    PATH="$owned_server_bin_dir:$PATH"
+    migration_capture_owned_process_identity() { return 1; }
+    start_owned_migration_dolt_server "$owned_server_capture_failure_workspace"
+) >/dev/null 2>&1; then
+    capture_failure_succeeded=true
+fi
+capture_failure_pid=$(cat "$owned_server_bin_dir/last-server-pid")
+capture_failure_live=false
+if kill -0 "$capture_failure_pid" 2>/dev/null; then
+    capture_failure_live=true
+    kill -9 -- "$capture_failure_pid" 2>/dev/null || true
+fi
+capture_failure_markers=false
+for capture_failure_marker in \
+    "$owned_server_capture_failure_workspace/.git/bd-migration-owned-dolt-server.pid" \
+    "$owned_server_capture_failure_workspace/.git/bd-migration-owned-dolt-server.identity"; do
+    if [ -e "$capture_failure_marker" ] || [ -L "$capture_failure_marker" ]; then
+        capture_failure_markers=true
+    fi
+done
+cleanup_workspace "$owned_server_capture_failure_workspace" ||
+    fail "could not clean up the owned-server capture-failure workspace"
+$capture_failure_succeeded &&
+    fail "owned-server launch succeeded without a durable full identity"
+$capture_failure_live &&
+    fail "failed owned-server identity capture orphaned the launched process"
+$capture_failure_markers &&
+    fail "failed owned-server identity capture published trust markers"
+
+owned_server_publish_failure_workspace=$(new_workspace) ||
+    fail "could not create an owned-server publication-failure workspace"
+publication_failure_succeeded=false
+if (
+    PATH="$owned_server_bin_dir:$PATH"
+    migration_publish_owned_process_identity() {
+        local ws="$1"
+        local identity_name="$2"
+        local -n identity_ref="$identity_name"
+        printf '%s\n' "${identity_ref[@]}" > \
+            "$ws/.git/bd-migration-owned-dolt-server.identity"
+        printf '%s\n' "${identity_ref[0]}" > \
+            "$ws/.git/bd-migration-owned-dolt-server.pid"
+        return 1
+    }
+    start_owned_migration_dolt_server "$owned_server_publish_failure_workspace"
+) >/dev/null 2>&1; then
+    publication_failure_succeeded=true
+fi
+publication_failure_pid=$(cat "$owned_server_bin_dir/last-server-pid")
+publication_failure_live=false
+kill -0 "$publication_failure_pid" 2>/dev/null && publication_failure_live=true
+publication_failure_markers=false
+for publication_failure_marker in \
+    "$owned_server_publish_failure_workspace/.git/bd-migration-owned-dolt-server.pid" \
+    "$owned_server_publish_failure_workspace/.git/bd-migration-owned-dolt-server.identity"; do
+    if [ -e "$publication_failure_marker" ] || [ -L "$publication_failure_marker" ]; then
+        publication_failure_markers=true
+    fi
+done
+cleanup_workspace "$owned_server_publish_failure_workspace" ||
+    fail "could not clean up the owned-server publication-failure workspace"
+$publication_failure_succeeded &&
+    fail "owned-server launch accepted a failed identity publication"
+$publication_failure_live &&
+    fail "failed owned-server identity publication orphaned the launched process"
+$publication_failure_markers &&
+    fail "failed owned-server identity publication retained committed trust markers"
+
+owned_server_rollback_failure_workspace=$(new_workspace) ||
+    fail "could not create an owned-server rollback-failure workspace"
+touch "$owned_server_bin_dir/fail-final-validation"
+rollback_failure_output=$(
+    {
+        PATH="$owned_server_bin_dir:$PATH"
+        migration_signal_owned_process() { return 1; }
+        start_owned_migration_dolt_server "$owned_server_rollback_failure_workspace"
+    } 2>&1
+) && fail "owned-server rollback failure unexpectedly reported success"
+rm -f "$owned_server_bin_dir/fail-final-validation"
+rollback_failure_pid=$(cat \
+    "$owned_server_rollback_failure_workspace/.git/bd-migration-owned-dolt-server.pid")
+guard_server_pid="$rollback_failure_pid"
+kill -0 "$rollback_failure_pid" 2>/dev/null ||
+    fail "rollback cleanup failure lost the accounted owned server"
+[ -f "$owned_server_rollback_failure_workspace/.git/bd-migration-owned-dolt-server.identity" ] ||
+    fail "rollback cleanup failure lost the owned-server identity marker"
+migration_pid_belongs_to_workspace \
+    "$rollback_failure_pid" "$owned_server_rollback_failure_workspace" \
+    "bd-migration-owned-dolt-server.pid" ||
+    fail "rollback cleanup failure left an unverifiable owned server"
+grep -Fq 'rollback failed' <<< "$rollback_failure_output" ||
+    fail "owned-server rollback cleanup failure was not reported"
+cleanup_workspace "$owned_server_rollback_failure_workspace" ||
+    fail "could not clean up the accounted rollback-failure workspace"
+guard_server_pid=""
+
+ignored_cleanup_workspace=$(new_workspace) ||
+    fail "could not create an ignored-cleanup reporting workspace"
+ignored_cleanup_snapshots=$(mktemp -d /tmp/bd-snapshots-XXXXXX) ||
+    fail "could not create ignored-cleanup snapshot evidence"
+printf 'snapshot evidence\n' > "$ignored_cleanup_snapshots/before.json"
+ignored_cleanup_result=$(bash -c '
+    set -euo pipefail
+    export MIGRATION_TEST_RUN_LIBRARY_ONLY=1
+    source "$1"
+    migration_run_activate_workspace "$2" "$3"
+    cleanup_workspace() { return 1; }
+    if migration_run_record_result_after_cleanup \
+        "$2" "$3" "v0.62.0 → candidate" "BLOCKED" "earlier failure"; then
+        exit 1
+    fi
+    printf "%s\n%s\n%s\n" \
+        "${RESULT_STATUSES[-1]}" "${RESULT_DETAILS[-1]}" \
+        "$MIGRATION_RUN_ACTIVE_WORKSPACE"
+' migration-report-probe "$SCRIPT_DIR/run.sh" \
+    "$ignored_cleanup_workspace" "$ignored_cleanup_snapshots") ||
+    fail "cleanup refusal did not override the earlier result and retain evidence"
+mapfile -t ignored_cleanup_lines <<< "$ignored_cleanup_result"
+[ "${ignored_cleanup_lines[0]}" = "BLOCKED" ] &&
+    [[ "${ignored_cleanup_lines[1]}" == \
+        "could not prove isolated workspace cleanup; preserved at "* ]] &&
+    [ -z "${ignored_cleanup_lines[2]:-}" ] &&
+    [ -f "$ignored_cleanup_snapshots/before.json" ] ||
+    fail "cleanup refusal did not override the earlier result and retain evidence"
+cleanup_workspace "$ignored_cleanup_workspace" ||
+    fail "could not clean up the ignored-cleanup reporting workspace"
+rm -rf -- "$ignored_cleanup_snapshots"
+
+signal_cleanup_state="$tmp/signal-cleanup.state"
+(
+    exec bash -c '
+        set -euo pipefail
+        export MIGRATION_TEST_RUN_LIBRARY_ONLY=1
+        export PATH="$2:$PATH"
+        source "$1"
+        migration_run_install_cleanup_traps
+        ws=$(new_workspace)
+        snapshots=$(mktemp -d /tmp/bd-snapshots-XXXXXX)
+        migration_run_activate_workspace "$ws" "$snapshots"
+        start_owned_migration_dolt_server "$ws"
+        pid=$(cat "$ws/.git/bd-migration-owned-dolt-server.pid")
+        printf "%s\n%s\n" "$ws" "$pid" > "$3.tmp"
+        mv -f -- "$3.tmp" "$3"
+        while :; do sleep 1; done
+    ' migration-signal-probe "$SCRIPT_DIR/run.sh" \
+        "$owned_server_bin_dir" "$signal_cleanup_state"
+) &
+signal_cleanup_runner=$!
+for _ in $(seq 1 200); do
+    [ -s "$signal_cleanup_state" ] && break
+    kill -0 "$signal_cleanup_runner" 2>/dev/null || break
+    sleep 0.02
+done
+[ -s "$signal_cleanup_state" ] || {
+    kill -9 -- "$signal_cleanup_runner" 2>/dev/null || true
+    wait "$signal_cleanup_runner" 2>/dev/null || true
+    fail "signal-cleanup subprocess did not become ready"
+}
+mapfile -t signal_cleanup_identity < "$signal_cleanup_state"
+signal_cleanup_workspace="${signal_cleanup_identity[0]}"
+signal_cleanup_server_pid="${signal_cleanup_identity[1]}"
+kill -TERM -- "$signal_cleanup_runner"
+signal_cleanup_status=0
+wait "$signal_cleanup_runner" || signal_cleanup_status=$?
+[ "$signal_cleanup_status" -eq 143 ] ||
+    fail "signal-cleanup subprocess returned $signal_cleanup_status, want 143"
+kill -0 "$signal_cleanup_server_pid" 2>/dev/null &&
+    fail "signal cleanup left the owned historical Dolt server running"
+[ ! -e "$signal_cleanup_workspace" ] ||
+    fail "signal cleanup left the active migration workspace behind"
+
+owned_server_failure_workspace=$(new_workspace) ||
+    fail "could not create an owned-server failure workspace"
+touch "$owned_server_bin_dir/fail-sql"
+if PATH="$owned_server_bin_dir:$PATH" \
+    MIGRATION_DOLT_READY_ATTEMPTS=2 MIGRATION_DOLT_READY_DELAY=0 \
+    start_owned_migration_dolt_server "$owned_server_failure_workspace"; then
+    fail "owned historical Dolt server accepted failed SQL readiness"
+fi
+rm -f "$owned_server_bin_dir/fail-sql"
+[ ! -e "$owned_server_failure_workspace/.git/bd-migration-owned-dolt-server.pid" ] &&
+    [ ! -e "$owned_server_failure_workspace/.git/bd-migration-prestarted-server" ] ||
+    fail "failed SQL readiness left owned-server trust markers"
+cleanup_workspace "$owned_server_failure_workspace" ||
+    fail "could not clean up the failed owned-server workspace"
+
+owned_server_exit_workspace=$(new_workspace) ||
+    fail "could not create an owned-server early-exit workspace"
+touch "$owned_server_bin_dir/fail-server"
+if PATH="$owned_server_bin_dir:$PATH" \
+    start_owned_migration_dolt_server "$owned_server_exit_workspace"; then
+    fail "owned historical Dolt server accepted an exited sql-server process"
+fi
+rm -f "$owned_server_bin_dir/fail-server"
+[ ! -e "$owned_server_exit_workspace/.git/bd-migration-owned-dolt-server.pid" ] &&
+    [ ! -e "$owned_server_exit_workspace/.git/bd-migration-prestarted-server" ] ||
+    fail "early sql-server exit left owned-server trust markers"
+cleanup_workspace "$owned_server_exit_workspace" ||
+    fail "could not clean up the early-exit owned-server workspace"
+
+owned_server_crash_workspace=$(new_workspace) ||
+    fail "could not create an owned-server crash workspace"
+if ! PATH="$owned_server_bin_dir:$PATH" \
+    start_owned_migration_dolt_server "$owned_server_crash_workspace"; then
+    fail "could not start the owned historical Dolt crash fixture"
+fi
+guard_server_pid=$(cat \
+    "$owned_server_crash_workspace/.git/bd-migration-owned-dolt-server.pid")
+kill -9 -- "$guard_server_pid" 2>/dev/null || true
+wait "$guard_server_pid" 2>/dev/null || true
+guard_server_pid=""
+cleanup_workspace "$owned_server_crash_workspace" ||
+    fail "cleanup stranded a workspace after its owned Dolt server exited"
+[ ! -e "$owned_server_crash_workspace" ] ||
+    fail "crashed owned-server workspace survived port-verified cleanup"
+
+tampered_mode_workspace=$(new_workspace) ||
+    fail "could not create a prestarted-marker tamper workspace"
+printf '29999\n' > "$tampered_mode_workspace/.git/bd-migration-prestarted-server"
+if bd_in "$tampered_mode_workspace" /bin/true; then
+    fail "bd_in trusted a prestarted-server marker for another port"
+fi
+rm -f "$tampered_mode_workspace/.git/bd-migration-prestarted-server"
+ln -s /dev/null "$tampered_mode_workspace/.git/bd-migration-prestarted-server"
+if bd_in "$tampered_mode_workspace" /bin/true; then
+    fail "bd_in followed a prestarted-server marker symlink"
+fi
+rm -f "$tampered_mode_workspace/.git/bd-migration-prestarted-server"
+cleanup_workspace "$tampered_mode_workspace" ||
+    fail "could not clean up the prestarted-marker tamper workspace"
+
+tampered_pid_workspace=$(new_workspace) ||
+    fail "could not create an owned-PID tamper workspace"
+tampered_pid_external_cwd="$tmp/owned-pid-external-cwd"
+mkdir -p "$tampered_pid_workspace/.beads/dolt" "$tampered_pid_external_cwd"
+tampered_pid_port=$(cat "$tampered_pid_workspace/.git/bd-migration-server-port")
+(
+    cd "$tampered_pid_external_cwd"
+    exec -a "dolt sql-server --host 127.0.0.1 --port $tampered_pid_port" sleep 600
+) &
+guard_server_pid=$!
+for _ in $(seq 1 50); do
+    if [ "$(readlink "/proc/$guard_server_pid/cwd" 2>/dev/null || true)" = \
+        "$tampered_pid_external_cwd" ]; then
+        break
+    fi
+    sleep 0.02
+done
+printf '%s\n' "$guard_server_pid" > \
+    "$tampered_pid_workspace/.git/bd-migration-owned-dolt-server.pid"
+if cleanup_workspace "$tampered_pid_workspace"; then
+    fail "cleanup trusted an owned-server PID rooted outside its workspace"
+fi
+[ -d "$tampered_pid_workspace" ] ||
+    fail "cleanup deleted a workspace after owned-server PID validation failed"
+kill -0 "$guard_server_pid" 2>/dev/null || {
+    guard_server_pid=""
+    fail "cleanup killed a process after owned-server PID validation failed"
+}
+kill -9 -- "$guard_server_pid" 2>/dev/null || true
+wait "$guard_server_pid" 2>/dev/null || true
+guard_server_pid=""
+rm -f "$tampered_pid_workspace/.git/bd-migration-owned-dolt-server.pid"
+cleanup_workspace "$tampered_pid_workspace" ||
+    fail "could not clean up the rejected owned-PID workspace safely"
 
 port_unknown_ws="$tmp/port-workspace-unknown-occupancy"
 mkdir -p "$port_unknown_ws/.git"
@@ -356,6 +979,14 @@ if PATH="$runtime_bin_dir:$PATH" FAKE_DOLT_VERSION=2.1.9 \
     verify_strict_historical_runtime v0.57.0 >/dev/null 2>&1; then
     fail "unqualified v0.57.0 Dolt runtime was accepted"
 fi
+if ! PATH="$runtime_bin_dir:$PATH" FAKE_DOLT_VERSION=1.84.0 \
+    verify_strict_historical_runtime v0.62.0; then
+    fail "qualified v0.62.0 Dolt runtime was rejected"
+fi
+if PATH="$runtime_bin_dir:$PATH" FAKE_DOLT_VERSION=1.84.1 \
+    verify_strict_historical_runtime v0.62.0 >/dev/null 2>&1; then
+    fail "unqualified v0.62.0 Dolt runtime was accepted"
+fi
 verify_strict_historical_runtime v0.49.6 ||
     fail "a release without an external Dolt requirement was rejected"
 
@@ -369,6 +1000,12 @@ fi
 if OS=linux ARCH=amd64 verify_release_archive v0.57.0 "$tmp/archive.tar.gz" >/dev/null 2>&1; then
     fail "tampered v0.57.0 release archive was accepted"
 fi
+if OS=linux ARCH=amd64 verify_release_archive v0.62.0 "$tmp/archive.tar.gz" >/dev/null 2>&1; then
+    fail "tampered v0.62.0 release archive was accepted"
+fi
+if OS=linux ARCH=amd64 verify_release_archive v0.63.3 "$tmp/archive.tar.gz" >/dev/null 2>&1; then
+    fail "tampered v0.63.3 release archive was accepted"
+fi
 
 strict_fixture_has_expected_features v0.49.6 epic task bug dependency standalone closed label comment ||
     fail "complete source fixture was rejected"
@@ -376,12 +1013,100 @@ strict_fixture_has_expected_features v0.55.4 epic task bug dependency standalone
     fail "complete v0.55.4 source fixture was rejected"
 strict_fixture_has_expected_features v0.57.0 epic task bug dependency standalone closed label comment ||
     fail "complete v0.57.0 source fixture was rejected"
+strict_fixture_has_expected_features v0.62.0 epic task bug dependency standalone closed label comment ||
+    fail "complete v0.62.0 source fixture was rejected"
+strict_fixture_has_expected_features v0.63.3 epic task bug dependency standalone closed label comment ||
+    fail "complete v0.63.3 source fixture was rejected"
 if strict_fixture_has_expected_features v0.49.6 epic task bug standalone closed label >/dev/null 2>&1; then
     fail "source fixture without dependency was accepted"
 fi
 if strict_fixture_has_expected_features v0.49.6 epic task bug dependency standalone closed label >/dev/null 2>&1; then
     fail "source fixture without comment was accepted"
 fi
+if strict_fixture_has_expected_features v0.62.0 epic task bug standalone closed label comment >/dev/null 2>&1; then
+    fail "v0.62.0 source fixture without dependency was accepted"
+fi
+if strict_fixture_has_expected_features v0.62.0 epic task bug dependency standalone closed label >/dev/null 2>&1; then
+    fail "v0.62.0 source fixture without comment was accepted"
+fi
+
+# A strict fixture must construct its canonical parent relationship directly.
+# Keep this hermetic: a fake bd proves a clean cache cannot introduce a probe,
+# and that a qualified release which rejects --parent blocks fixture creation.
+(
+    strict_fixture_ws="$tmp/strict-fixture-workspace"
+    strict_fixture_bin_dir="$tmp/strict-fixture-bin"
+    strict_fixture_bin="$strict_fixture_bin_dir/bd"
+    strict_fixture_calls="$strict_fixture_bin_dir/calls"
+    GATES_CACHE="$tmp/strict-fixture-cache/feature-gates.cache"
+    mkdir -p "$strict_fixture_ws" "$strict_fixture_bin_dir" "$(dirname "$GATES_CACHE")"
+    cat > "$strict_fixture_bin" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+bin_dir="$(cd "$(dirname "$0")" && pwd)"
+printf ' <%s>' "$@" >> "$bin_dir/calls"
+printf '\n' >> "$bin_dir/calls"
+
+case "${1:-}" in
+    create)
+        if [ -e "$bin_dir/reject-parent" ] && [[ " $* " == *" --parent "* ]]; then
+            exit 71
+        fi
+        case "$*" in
+            *"__probe__"*) printf '%s\n' 'strict-probe' ;;
+            *"Migration epic"*) printf '%s\n' 'strict-epic' ;;
+            *"Migration task alpha"*) printf '%s\n' 'strict-task' ;;
+            *"Migration bug beta"*) printf '%s\n' 'strict-bug' ;;
+            *"Standalone detailed task"*) printf '%s\n' 'strict-standalone' ;;
+            *"Already closed issue"*) printf '%s\n' 'strict-closed' ;;
+            *) exit 72 ;;
+        esac
+        ;;
+    dep|close|label|comments)
+        ;;
+    *)
+        exit 73
+        ;;
+esac
+EOF
+    chmod +x "$strict_fixture_bin"
+
+    STRICT_MODE=true
+    create_dataset "$strict_fixture_ws" "$strict_fixture_bin" v0.62.0 >/dev/null ||
+        fail "strict fixture construction rejected direct parent creation"
+    [ "${DATASET_FEATURES[*]}" = "epic task bug dependency standalone closed label comment" ] ||
+        fail "strict fixture construction changed the public eight-feature manifest"
+    [ ! -e "$GATES_CACHE" ] ||
+        fail "strict fixture construction consulted or populated the feature-gate cache"
+    if grep -Fq '__probe__' "$strict_fixture_calls"; then
+        fail "strict fixture construction created a parent-support probe"
+    fi
+    grep -Fq '<create> <--silent> <--title> <Migration task alpha> <--type> <task> <--priority> <1> <--parent> <strict-epic>' \
+        "$strict_fixture_calls" ||
+        fail "strict fixture did not construct its canonical task with --parent directly"
+
+    printf '%s\n' 'v0.62.0:parent_child=no' > "$GATES_CACHE"
+    : > "$strict_fixture_calls"
+    create_dataset "$strict_fixture_ws" "$strict_fixture_bin" v0.62.0 >/dev/null ||
+        fail "strict fixture construction trusted a negative feature-cache entry"
+    grep -Fq '<create> <--silent> <--title> <Migration task alpha> <--type> <task> <--priority> <1> <--parent> <strict-epic>' \
+        "$strict_fixture_calls" ||
+        fail "strict fixture omitted --parent after a negative feature-cache entry"
+    if grep -Fq '__probe__' "$strict_fixture_calls"; then
+        fail "strict fixture probed after a negative feature-cache entry"
+    fi
+    [ "$(cat "$GATES_CACHE")" = 'v0.62.0:parent_child=no' ] ||
+        fail "strict fixture construction rewrote the feature-gate cache"
+
+    : > "$strict_fixture_calls"
+    touch "$strict_fixture_bin_dir/reject-parent"
+    if create_dataset "$strict_fixture_ws" "$strict_fixture_bin" v0.62.0 >/dev/null 2>&1; then
+        fail "strict fixture ignored a qualified release rejecting --parent"
+    fi
+    if grep -Fq '__probe__' "$strict_fixture_calls"; then
+        fail "strict unsupported-parent failure ran a feature probe"
+    fi
+)
 
 declare -gA DATASET_IDS=(
     [epic]="old-epic"
@@ -394,8 +1119,8 @@ printf '%s\n' '[
   {"id":"old-epic","title":"Migration epic","description":"Epic for migration testing","priority":2,"issue_type":"epic","status":"open"},
   {"id":"old-standalone","title":"Standalone detailed task","description":"This task has a detailed description for fidelity testing.","notes":"Historical notes must survive the upgrade.","design":"Historical design must survive the upgrade.","acceptance_criteria":"Historical acceptance criteria must survive the upgrade.","external_ref":"legacy-upgrade-42","status":"open"},
   {"id":"old-closed","title":"Already closed issue","status":"closed"},
-  {"id":"old-task","title":"Implement core feature","status":"open","labels":["urgent"],"comments":[{"author":"legacy-author","text":"Historical comment must survive the upgrade."}]},
-  {"id":"old-bug","title":"Fix migration blocker","status":"open","dependencies":[{"id":"old-task"}]}
+  {"id":"old-task","title":"Implement core feature","status":"open","parent":"old-epic","dependencies":[{"id":"old-epic","dependency_type":"parent-child"}],"labels":["urgent"],"comments":[{"author":"legacy-author","text":"Historical comment must survive the upgrade."}]},
+  {"id":"old-bug","title":"Fix migration blocker","status":"open","dependencies":[{"id":"old-task","dependency_type":"blocks"}]}
 ]' > "$tmp/fixture.json"
 strict_snapshot_has_expected_fixture v0.49.6 "$tmp/fixture.json" ||
     fail "exact v0.49.6 source fixture was rejected"
@@ -403,22 +1128,69 @@ strict_snapshot_has_expected_fixture v0.55.4 "$tmp/fixture.json" ||
     fail "exact v0.55.4 source fixture was rejected"
 strict_snapshot_has_expected_fixture v0.57.0 "$tmp/fixture.json" ||
     fail "exact v0.57.0 source fixture was rejected"
+strict_snapshot_has_expected_fixture v0.62.0 "$tmp/fixture.json" ||
+    fail "exact v0.62.0 source fixture was rejected"
+strict_snapshot_has_expected_fixture v0.63.3 "$tmp/fixture.json" ||
+    fail "exact v0.63.3 source fixture was rejected"
+jq 'map(if .id == "old-task" then del(.parent) else . end)' \
+    "$tmp/fixture.json" > "$tmp/fixture-parentless-task.json"
+if strict_snapshot_has_expected_fixture v0.62.0 "$tmp/fixture-parentless-task.json" >/dev/null 2>&1; then
+    fail "v0.62.0 source fixture with a parentless canonical task was accepted"
+fi
+jq 'map(if .id == "old-task" then
+        .dependencies[0].dependency_type = "blocks"
+    else . end)' \
+    "$tmp/fixture.json" > "$tmp/fixture-wrong-parent-child-type.json"
+if strict_snapshot_has_expected_fixture v0.62.0 "$tmp/fixture-wrong-parent-child-type.json" >/dev/null 2>&1; then
+    fail "v0.62.0 source fixture with the wrong parent-child dependency type was accepted"
+fi
+jq 'map(if .id == "old-bug" then
+        .dependencies[0].dependency_type = "related"
+    else . end)' \
+    "$tmp/fixture.json" > "$tmp/fixture-wrong-blocks-type.json"
+if strict_snapshot_has_expected_fixture v0.62.0 "$tmp/fixture-wrong-blocks-type.json" >/dev/null 2>&1; then
+    fail "v0.62.0 source fixture with the wrong blocks dependency type was accepted"
+fi
+jq 'map(if .id == "old-task" then
+        .dependencies += [{"id":"old-closed","dependency_type":"related"}]
+    else . end)' \
+    "$tmp/fixture.json" > "$tmp/fixture-extra-task-dependency.json"
+if strict_snapshot_has_expected_fixture v0.62.0 "$tmp/fixture-extra-task-dependency.json" >/dev/null 2>&1; then
+    fail "v0.62.0 source fixture with an extra task dependency was accepted"
+fi
+jq 'map(if .id == "old-bug" then
+        .dependencies += [{"id":"old-closed","dependency_type":"related"}]
+    else . end)' \
+    "$tmp/fixture.json" > "$tmp/fixture-extra-bug-dependency.json"
+if strict_snapshot_has_expected_fixture v0.62.0 "$tmp/fixture-extra-bug-dependency.json" >/dev/null 2>&1; then
+    fail "v0.62.0 source fixture with an extra bug dependency was accepted"
+fi
+for issue_id in old-epic old-standalone old-closed; do
+    jq --arg id "$issue_id" 'map(if .id == $id then
+            .dependencies = [{"id":"old-task","dependency_type":"related"}]
+        else . end)' \
+        "$tmp/fixture.json" > "$tmp/fixture-unexpected-$issue_id-dependency.json"
+    if strict_snapshot_has_expected_fixture \
+        v0.62.0 "$tmp/fixture-unexpected-$issue_id-dependency.json" >/dev/null 2>&1; then
+        fail "v0.62.0 source fixture accepted an unexpected dependency on $issue_id"
+    fi
+done
 jq 'map(select(.id != "old-epic"))' "$tmp/fixture.json" > "$tmp/fixture-four-items.json"
-for version in v0.49.6 v0.55.4 v0.57.0; do
+for version in v0.49.6 v0.55.4 v0.57.0 v0.62.0 v0.63.3; do
     if strict_snapshot_has_expected_fixture "$version" "$tmp/fixture-four-items.json" >/dev/null 2>&1; then
         fail "$version source fixture with four items was accepted"
     fi
 done
 jq '. + [{"id":"old-extra","title":"Unexpected extra issue"}]' \
     "$tmp/fixture.json" > "$tmp/fixture-six-items.json"
-for version in v0.49.6 v0.55.4 v0.57.0; do
+for version in v0.49.6 v0.55.4 v0.57.0 v0.62.0 v0.63.3; do
     if strict_snapshot_has_expected_fixture "$version" "$tmp/fixture-six-items.json" >/dev/null 2>&1; then
         fail "$version source fixture with six items was accepted"
     fi
 done
 jq 'map(if .id == "old-epic" then .issue_type = "task" else . end)' \
     "$tmp/fixture.json" > "$tmp/fixture-wrong-epic.json"
-for version in v0.49.6 v0.55.4 v0.57.0; do
+for version in v0.49.6 v0.55.4 v0.57.0 v0.62.0 v0.63.3; do
     if strict_snapshot_has_expected_fixture "$version" "$tmp/fixture-wrong-epic.json" >/dev/null 2>&1; then
         fail "$version source fixture with an inexact epic was accepted"
     fi
@@ -434,6 +1206,12 @@ fi
 if strict_snapshot_has_expected_fixture v0.57.0 "$tmp/fixture-missing-rich-field.json" >/dev/null 2>&1; then
     fail "v0.57.0 source fixture without the exact rich fields was accepted"
 fi
+if strict_snapshot_has_expected_fixture v0.62.0 "$tmp/fixture-missing-rich-field.json" >/dev/null 2>&1; then
+    fail "v0.62.0 source fixture without the exact rich fields was accepted"
+fi
+if strict_snapshot_has_expected_fixture v0.63.3 "$tmp/fixture-missing-rich-field.json" >/dev/null 2>&1; then
+    fail "v0.63.3 source fixture without the exact rich fields was accepted"
+fi
 jq 'map(if .id == "old-task" then .labels = [] else . end)' \
     "$tmp/fixture.json" > "$tmp/fixture-missing-label.json"
 if strict_snapshot_has_expected_fixture v0.49.6 "$tmp/fixture-missing-label.json" >/dev/null 2>&1; then
@@ -445,6 +1223,12 @@ fi
 if strict_snapshot_has_expected_fixture v0.57.0 "$tmp/fixture-missing-label.json" >/dev/null 2>&1; then
     fail "v0.57.0 source fixture without the exact label was accepted"
 fi
+if strict_snapshot_has_expected_fixture v0.62.0 "$tmp/fixture-missing-label.json" >/dev/null 2>&1; then
+    fail "v0.62.0 source fixture without the exact label was accepted"
+fi
+if strict_snapshot_has_expected_fixture v0.63.3 "$tmp/fixture-missing-label.json" >/dev/null 2>&1; then
+    fail "v0.63.3 source fixture without the exact label was accepted"
+fi
 jq 'map(if .id == "old-bug" then .dependencies = [] else . end)' \
     "$tmp/fixture.json" > "$tmp/fixture-missing-dependency.json"
 if strict_snapshot_has_expected_fixture v0.49.6 "$tmp/fixture-missing-dependency.json" >/dev/null 2>&1; then
@@ -455,6 +1239,12 @@ if strict_snapshot_has_expected_fixture v0.55.4 "$tmp/fixture-missing-dependency
 fi
 if strict_snapshot_has_expected_fixture v0.57.0 "$tmp/fixture-missing-dependency.json" >/dev/null 2>&1; then
     fail "v0.57.0 source fixture without the exact dependency was accepted"
+fi
+if strict_snapshot_has_expected_fixture v0.62.0 "$tmp/fixture-missing-dependency.json" >/dev/null 2>&1; then
+    fail "v0.62.0 source fixture without the exact dependency was accepted"
+fi
+if strict_snapshot_has_expected_fixture v0.63.3 "$tmp/fixture-missing-dependency.json" >/dev/null 2>&1; then
+    fail "v0.63.3 source fixture without the exact dependency was accepted"
 fi
 
 mkdir -p "$tmp/source/.beads"
@@ -692,6 +1482,39 @@ fi
 [ ! -e "$stop_refusal_ws/.beads/legacy-dolt.pre-migration" ] ||
     fail "server-stop verification failure created a rollback tree"
 
+restart_refusal_ws="$tmp/restart-refusal-workspace"
+restart_refusal_calls="$tmp/restart-refusal.calls"
+restart_refusal_binary_calls="$tmp/restart-refusal-binary.calls"
+mkdir -p "$restart_refusal_ws/.beads/dolt"
+printf 'active restart-refusal data' > "$restart_refusal_ws/.beads/dolt/table.dat"
+printf 'active restart-refusal metadata' > "$restart_refusal_ws/.beads/metadata.json"
+restart_refusal_manifest=$(legacy_dolt_artifact_manifest "$restart_refusal_ws/.beads")
+export LEGACY_RACE_CALLS="$restart_refusal_binary_calls"
+: > "$restart_refusal_calls"
+: > "$restart_refusal_binary_calls"
+if (
+    stop_dolt_server() { :; }
+    start_owned_migration_dolt_server() {
+        printf '%s\n' "$1" >> "$restart_refusal_calls"
+        return 1
+    }
+    recipe_server_to_embedded \
+        "$restart_refusal_ws" "$legacy_race_old_bin" "$legacy_race_candidate_bin" \
+        v0.62.0 "$legacy_race_before"
+) >/dev/null 2>&1; then
+    fail "v0.62.0 server bridge continued after owned-server restart failed"
+fi
+[ "$(cat "$restart_refusal_calls")" = "$restart_refusal_ws" ] ||
+    fail "v0.62.0 server bridge did not attempt exactly one owned-server restart"
+[ ! -s "$restart_refusal_binary_calls" ] ||
+    fail "owned-server restart failure invoked a historical or candidate binary"
+[ "$(legacy_dolt_artifact_manifest "$restart_refusal_ws/.beads")" = \
+    "$restart_refusal_manifest" ] ||
+    fail "owned-server restart failure mutated the active historical source"
+verify_retained_legacy_dolt_source \
+    "$restart_refusal_ws/.beads" "$restart_refusal_manifest" ||
+    fail "owned-server restart failure did not retain an exact rollback source"
+
 [ "$(server_bridge_strategy v0.55.4)" = "native_export" ] ||
     fail "v0.55.4 did not select its pinned server bridge strategy"
 [ "$(server_bridge_strategy v0.57.0)" = "native_export_show_comments" ] ||
@@ -778,6 +1601,34 @@ printf '%s\n' \
 if check_fidelity v0.49.6 "$tmp/before-comment.json" "$tmp/after-comment.json" >/dev/null 2>&1; then
     fail "strict fidelity accepted changed comment text"
 fi
+printf '%s\n' \
+    '[{"id":"old-task","title":"Child","description":"","priority":2,"issue_type":"task","status":"open","parent":"old-epic","dependencies":[{"id":"old-epic","dependency_type":"parent-child"}],"labels":[],"comments":[]}]' \
+    > "$tmp/before-relationships.json"
+printf '%s\n' \
+    '[{"id":"old-task","title":"Child","description":"","priority":2,"issue_type":"task","status":"open","dependencies":[{"depends_on_id":"old-epic","type":"parent-child"}],"labels":[],"comments":[]}]' \
+    > "$tmp/after-parent-lost.json"
+if check_fidelity v0.62.0 "$tmp/before-relationships.json" "$tmp/after-parent-lost.json" >/dev/null 2>&1; then
+    fail "strict fidelity accepted post-upgrade parent loss"
+fi
+printf '%s\n' \
+    '[{"id":"old-task","title":"Child","description":"","priority":2,"issue_type":"task","status":"open","parent":"old-epic","dependencies":[{"depends_on_id":"old-epic","type":"blocks"}],"labels":[],"comments":[]}]' \
+    > "$tmp/after-dependency-type-drift.json"
+if check_fidelity v0.62.0 "$tmp/before-relationships.json" "$tmp/after-dependency-type-drift.json" >/dev/null 2>&1; then
+    fail "strict fidelity accepted dependency-type drift"
+fi
+printf '%s\n' \
+    '[{"id":"old-task","title":"Child","description":"","priority":2,"issue_type":"task","status":"open","parent":"old-epic","dependencies":[{"depends_on_id":"old-epic","type":"parent-child"}],"labels":[],"comments":[]}]' \
+    > "$tmp/after-normalized-relationships.json"
+check_fidelity v0.62.0 "$tmp/before-relationships.json" "$tmp/after-normalized-relationships.json" >/dev/null ||
+    fail "strict fidelity rejected equivalent historical dependency shapes"
+
+printf '%s\n' \
+    '[{"id":"old-task","title":"Child","description":"","priority":2,"issue_type":"task","status":"open","dependencies":[{"id":"old-epic","dependency_type":"blocks"}],"labels":[],"comments":[]}]' \
+    > "$tmp/after-nonstrict-relationship-drift.json"
+STRICT_MODE=false
+check_fidelity v0.62.0 "$tmp/before-relationships.json" "$tmp/after-nonstrict-relationship-drift.json" >/dev/null ||
+    fail "non-strict fidelity started enforcing parent or dependency types"
+STRICT_MODE=true
 
 snapshot_contract_ws="$tmp/snapshot-contract-workspace"
 snapshot_contract_bin="$tmp/fake-snapshot-contract-bd"
@@ -900,6 +1751,52 @@ printf '%s\n' '{"id":"jsonl-1"} {"id":"jsonl-2"}' > "$jsonl_contract_file"
 if migration_jsonl_matches_snapshot \
     "$jsonl_contract_file" "$jsonl_contract_snapshot" >/dev/null 2>&1; then
     fail "historical JSONL contract accepted two records on one line"
+fi
+
+v062_derived_before="$tmp/v062-derived-before.json"
+v062_derived_export="$tmp/v062-derived-export.jsonl"
+v062_derived_show="$tmp/v062-derived-show.jsonl"
+v062_changed_export="$tmp/v062-changed-export.jsonl"
+v062_changed_show="$tmp/v062-changed-show.jsonl"
+printf '%s\n' '[
+  {"id":"v62-epic","title":"Legacy epic","issue_type":"epic","epic_closeable":true,"epic_closed_children":1,"epic_total_children":2,"comments":[]}
+]' > "$v062_derived_before"
+printf '%s\n' \
+    '{"id":"v62-epic","title":"Legacy epic","issue_type":"epic","dependency_count":0,"comment_count":0}' \
+    > "$v062_derived_export"
+printf '%s\n' \
+    '{"id":"v62-epic","title":"Legacy epic","issue_type":"epic","epic_closeable":false,"epic_closed_children":0,"epic_total_children":3,"comments":[]}' \
+    > "$v062_derived_show"
+
+v057_export_matches_snapshot \
+    "$v062_derived_export" "$v062_derived_before" v0.62.0 ||
+    fail "v0.62.0 export comparison rejected differences limited to derived epic fields"
+if v057_export_matches_snapshot \
+    "$v062_derived_export" "$v062_derived_before" v0.57.0 >/dev/null 2>&1; then
+    fail "v0.57.0 export comparison normalized v0.62.0-only derived epic fields"
+fi
+v057_export_and_show_comments_agree \
+    "$v062_derived_export" "$v062_derived_show" \
+    "$v062_derived_before" v0.62.0 ||
+    fail "v0.62.0 show comparison rejected differences limited to derived epic fields"
+if v057_export_and_show_comments_agree \
+    "$v062_derived_export" "$v062_derived_show" \
+    "$v062_derived_before" v0.57.0 >/dev/null 2>&1; then
+    fail "v0.57.0 show comparison normalized v0.62.0-only derived epic fields"
+fi
+
+jq -c '.title = "Changed epic"' \
+    "$v062_derived_export" > "$v062_changed_export"
+if v057_export_matches_snapshot \
+    "$v062_changed_export" "$v062_derived_before" v0.62.0 >/dev/null 2>&1; then
+    fail "v0.62.0 export comparison normalized a non-derived title change"
+fi
+jq -c '.title = "Changed epic"' \
+    "$v062_derived_show" > "$v062_changed_show"
+if v057_export_and_show_comments_agree \
+    "$v062_derived_export" "$v062_changed_show" \
+    "$v062_derived_before" v0.62.0 >/dev/null 2>&1; then
+    fail "v0.62.0 show comparison normalized a non-derived title change"
 fi
 
 # v0.57.0's native export preserves issue/label/dependency records and a

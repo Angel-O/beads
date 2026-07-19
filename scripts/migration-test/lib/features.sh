@@ -71,7 +71,12 @@ create_dataset() {
 
     # 2. Task (will be child of epic if supported)
     local task_args=(--title "Migration task alpha" --type task --priority 1)
-    if try_feature "parent_child" "$version" "$ws" "$bin" create --silent --title "__probe__" --parent "$epic_id" --type task; then
+    if ${STRICT_MODE:-false}; then
+        # Qualified strict fixtures require this relationship. Construct it
+        # directly so a stale feature cache or a retained probe cannot turn a
+        # broken source fixture into an apparent fidelity pass.
+        task_args+=(--parent "$epic_id")
+    elif try_feature "parent_child" "$version" "$ws" "$bin" create --silent --title "__probe__" --parent "$epic_id" --type task; then
         task_args+=(--parent "$epic_id")
         # clean up probe issue — best effort
         bd_in "$ws" "$bin" close "$(__last_created_id "$ws" "$bin")" 2>/dev/null || true
