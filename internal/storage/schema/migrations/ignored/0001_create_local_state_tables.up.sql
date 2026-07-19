@@ -106,7 +106,13 @@ CREATE TABLE __temp__wisp_comments (
     author VARCHAR(255) DEFAULT '',
     text TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_wisp_comments_issue (issue_id)
+    INDEX idx_wisp_comments_issue (issue_id),
+    -- Keyset comment-page index (issue_id, created_at, id), the wisp twin of
+    -- migration 0056's addition to durable comments. Baked into the canonical
+    -- wisp schema so fresh clones — which materialize wisp_comments here, after
+    -- the main migrations have already run — get the indexed page-read plan;
+    -- 0056 upgrades already-materialized workspaces.
+    INDEX idx_wisp_comments_issue_created_id (issue_id, created_at, id)
 );
 
 DROP TABLE IF EXISTS __temp__repo_mtimes;
