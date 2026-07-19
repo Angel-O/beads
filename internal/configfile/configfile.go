@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -241,6 +242,21 @@ func Load(beadsDir string) (*Config, error) {
 	return cfg, nil
 }
 
+// LoadForDiscovery decodes current or legacy workspace metadata for the path
+// discovery and storage-mode probes that run BEFORE the pre-store
+// incompatibility guard (cmd/bd's guardWorkspaceMetadata) and before bd doctor's
+// own metadata check. Like Load it decodes leniently, so a forward-incompatible
+// workspace still resolves to a database path and is refused by the strict guard
+// with a precise message instead of a misleading "no beads database found".
+// Unlike Load it NEVER migrates a legacy config.json or writes anything:
+// discovery must not mutate a workspace before the guard has decided whether it
+// is safe to open. Compatibility migration still happens later, at store-open
+// time, through Load.
+func LoadForDiscovery(beadsDir string) (*Config, error) {
+	cfg, _, err := loadConfig(beadsDir, os.ReadFile, decodeConfigCompatible, isCompatibleConfigAbsent)
+	return cfg, err
+}
+
 func decodeConfigCompatible(data []byte, cfg *Config) error {
 	return json.Unmarshal(data, cfg)
 }
@@ -251,6 +267,19 @@ func isCompatibleConfigAbsent(err error) bool {
 
 func isStrictConfigAbsent(err error) bool {
 	return errors.Is(err, errStrictConfigAbsent)
+}
+
+// retiredConfigFields are metadata.json keys this lineage persisted under an
+// older bd version and has since removed from Config (dolt_proxied_server_* were
+// removed in 5a7cc3e1a). The strict metadata guard tolerates them as ignorable,
+// matching the lenient store-open loader, so deleting a Config field never
+// silently locks out an existing same-lineage workspace. Only add genuinely
+// retired same-lineage keys here — never a typo or a field a newer bd
+// introduced, or the guard would stop refusing forward-incompatible workspaces.
+var retiredConfigFields = map[string]struct{}{
+	"dolt_proxied_server_config":    {},
+	"dolt_proxied_server_log":       {},
+	"dolt_proxied_server_root_path": {},
 }
 
 func decodeConfigStrict(data []byte, cfg *Config) error {
@@ -292,7 +321,18 @@ func decodeConfigStrict(data []byte, cfg *Config) error {
 		}
 		seen[folded] = key
 		if _, ok := allowed[key]; !ok {
-			return fmt.Errorf("unknown or noncanonical metadata field %q", key)
+			if _, retired := retiredConfigFields[key]; !retired {
+				return fmt.Errorf("unknown or noncanonical metadata field %q", key)
+			}
+			// A field this lineage persisted under an older bd version and has
+			// since removed from Config. The lenient store-open loader has always
+			// ignored such keys, so tolerate them here too instead of locking out
+			// an otherwise-openable same-lineage workspace. Consume and skip the
+			// value; genuinely foreign or newer fields are still rejected above.
+			if err := decoder.Decode(new(json.RawMessage)); err != nil {
+				return err
+			}
+			continue
 		}
 		var raw json.RawMessage
 		if err := decoder.Decode(&raw); err != nil {
@@ -337,9 +377,77 @@ func decodeConfigStrict(data []byte, cfg *Config) error {
 		return errors.New("metadata must contain exactly one JSON object")
 	}
 
-	decoder = json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	return decoder.Decode(cfg)
+	// The loop above is the authoritative field gate: it rejects unknown,
+	// duplicate, case-variant, and null fields, tolerating only known-retired
+	// keys. Bind the recognized fields with a plain decode so those tolerated
+	// retired keys are ignored (exactly as the lenient loader ignores them)
+	// instead of re-tripping DisallowUnknownFields. Config is a flat struct, so
+	// there are no nested objects a DisallowUnknownFields pass would have guarded.
+	return json.Unmarshal(data, cfg)
+}
+
+// IsConcurrentMetadataChange reports whether err was caused by metadata.json
+// changing identity mid-read — an atomic temp-then-rename Save racing the read —
+// rather than by incompatible or malformed metadata. Such an error is transient
+// and safe to retry; callers must not report it as workspace incompatibility.
+func IsConcurrentMetadataChange(err error) bool {
+	return errors.Is(err, errConfigChanged)
+}
+
+// RetiredMetadataFields returns the keys present in beadsDir's metadata.json
+// that this bd version has retired from Config, sorted. It reads leniently and
+// never mutates the workspace; an absent or undecodable file yields no names.
+// Callers use it to detect obsolete cruft that RemoveRetiredMetadataFields strips.
+func RetiredMetadataFields(beadsDir string) []string {
+	names, _ := retiredFieldsInFile(ConfigPath(beadsDir))
+	return names
+}
+
+// RemoveRetiredMetadataFields rewrites metadata.json in beadsDir to drop any
+// keys this bd version has retired from Config, preserving every other key —
+// including genuinely-unknown ones, so a workspace written by a newer bd stays
+// refused by the strict guard. It never opens the store. It returns the names
+// removed (nil when there were none) so callers can report the cleanup.
+func RemoveRetiredMetadataFields(beadsDir string) ([]string, error) {
+	configPath := ConfigPath(beadsDir)
+	names, fields := retiredFieldsInFile(configPath)
+	if len(names) == 0 {
+		return nil, nil
+	}
+	for _, name := range names {
+		delete(fields, name)
+	}
+	data, err := json.MarshalIndent(fields, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshaling metadata: %w", err)
+	}
+	if err := writeFileAtomic(configPath, data, 0o600); err != nil {
+		return nil, fmt.Errorf("writing metadata: %w", err)
+	}
+	return names, nil
+}
+
+// retiredFieldsInFile reads path as a JSON object and returns the retired keys
+// present (sorted) alongside the full decoded field map. It uses the same
+// bounded, no-follow reader as the strict guard, so an absent, symlinked, or
+// undecodable file yields no names and a nil map (a safe no-op for cleanup).
+func retiredFieldsInFile(path string) ([]string, map[string]json.RawMessage) {
+	data, err := readStableConfigFile(path)
+	if err != nil {
+		return nil, nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, nil
+	}
+	var names []string
+	for key := range fields {
+		if _, retired := retiredConfigFields[key]; retired {
+			names = append(names, key)
+		}
+	}
+	sort.Strings(names)
+	return names, fields
 }
 
 func validateReadOnlyConfigRoot(beadsDir string) (bool, error) {

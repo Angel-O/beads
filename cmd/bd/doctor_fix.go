@@ -269,6 +269,11 @@ func applyFixList(path string, fixes []doctorCheck) {
 		switch check.Name {
 		case "Metadata Config":
 			err = fix.FixMissingMetadataJSON(path)
+			// Also strip retired metadata keys from an existing metadata.json so
+			// obsolete cruft (e.g. removed proxied-server paths) is cleaned up.
+			if rErr := fix.FixRetiredMetadataKeys(path); rErr != nil && err == nil {
+				err = rErr
+			}
 		case "Gitignore":
 			err = doctor.FixGitignore(path)
 		case "Project Gitignore":

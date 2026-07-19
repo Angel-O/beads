@@ -207,6 +207,14 @@ classic_sqlite_artifact_manifest() {
 
     for relative in "${CLASSIC_SQLITE_ROLLBACK_FILES[@]}"; do
         path="$beads_dir/${relative}${suffix}"
+        # Reject symlinks with no-follow (lstat) semantics before the -e/-f tests,
+        # which follow links: a symlinked artifact can resolve outside the
+        # workspace, so checksumming its target would let a non-self-contained
+        # rollback copy pass strict verification. Mirrors legacy_dolt_artifact_manifest.
+        if [ -L "$path" ]; then
+            echo "  FIDELITY: rollback artifact is a symlink: $path" >&2
+            return 1
+        fi
         if [ -e "$path" ]; then
             if [ ! -f "$path" ]; then
                 echo "  FIDELITY: rollback artifact is not a regular file: $path" >&2

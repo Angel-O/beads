@@ -318,7 +318,13 @@ func loadServerModeFromBeadsDir(beadsDir string) error {
 	if beadsDir == "" {
 		return nil
 	}
-	cfg, err := configfile.Load(beadsDir)
+	// Storage-mode probe, not a migration point. For store-free commands (e.g.
+	// bd doctor via loadServerModeFromConfig) this runs before
+	// guardWorkspaceMetadata, so it must never migrate a legacy config.json as a
+	// side effect of reading the mode. LoadForDiscovery preserves the existing
+	// lenient behavior (a parse-unloadable metadata.json is still a hard error)
+	// while never writing.
+	cfg, err := configfile.LoadForDiscovery(beadsDir)
 	if err != nil {
 		return fmt.Errorf("load %s: %w (storage mode unknown; data commands will refuse to run rather than fall back to the embedded store)", configfile.ConfigPath(beadsDir), err)
 	}
@@ -680,6 +686,47 @@ func restoreChangeDirSelection() {
 	changeDirEnvSnapshot = nil
 }
 
+// workspaceMetadataCompatibility reports whether this bd version can safely
+// decode beadsDir's workspace metadata without mutating it. It returns nil when
+// the metadata is absent or compatible. A non-nil error is classified: when
+// configfile.IsConcurrentMetadataChange reports true it is a transient
+// atomic-rewrite race (already retried once here); any other non-nil error is a
+// genuine incompatibility. It canonicalizes first because supported .beads roots
+// may themselves be symlinks. The fatal pre-store guard and bd doctor's
+// non-fatal metadata report share this probe so they classify incompatibility
+// identically.
+func workspaceMetadataCompatibility(beadsDir string) error {
+	canonicalBeadsDir := utils.CanonicalizePath(beadsDir)
+	_, err := configfile.LoadReadOnly(canonicalBeadsDir)
+	if err != nil && configfile.IsConcurrentMetadataChange(err) {
+		_, err = configfile.LoadReadOnly(canonicalBeadsDir)
+	}
+	return err
+}
+
+// guardWorkspaceMetadata refuses to open or modify a workspace whose metadata
+// this bd version cannot safely decode, before any version tracking, migration,
+// or store open. A concurrent atomic metadata rewrite can change the file's
+// identity mid-read; that is a transient race, not incompatibility, so it is
+// retried once (in workspaceMetadataCompatibility) and, if it persists, reported
+// distinctly rather than as a version mismatch. For genuine incompatibility the
+// message names the offending field (via the wrapped error) and points at
+// concrete recovery paths that do not require opening the store.
+func guardWorkspaceMetadata(beadsDir string) error {
+	err := workspaceMetadataCompatibility(beadsDir)
+	if err == nil {
+		return nil
+	}
+	if configfile.IsConcurrentMetadataChange(err) {
+		return HandleError("workspace metadata.json in %s is being modified concurrently; retry the command: %v", beadsDir, err)
+	}
+	return HandleError("workspace metadata is incompatible with this bd version: %v\n"+
+		"Refusing to open or modify %s. If this workspace was created by a newer bd, upgrade bd; "+
+		"if metadata.json carries an obsolete or hand-edited key, run 'bd doctor --fix' or "+
+		"'bd init --force' to regenerate it. Store-free commands (e.g. 'bd version', 'bd doctor') still work.",
+		err, beadsDir)
+}
+
 var rootCmd = &cobra.Command{
 	Use:   "bd",
 	Short: "bd - Dependency-aware issue tracker",
@@ -989,7 +1036,12 @@ var rootCmd = &cobra.Command{
 
 		if dbPath == "" {
 			if bd := beads.FindBeadsDir(); bd != "" {
-				if cfg, _ := configfile.Load(bd); cfg != nil && (cfg.IsDoltProxiedServerMode() || cfg.GetBackend() == configfile.BackendPostgres || cfg.GetBackend() == configfile.BackendMySQL || cfg.GetBackend() == configfile.BackendSQLite) {
+				// Discovery probe: this runs before guardWorkspaceMetadata, so it
+				// must never migrate a legacy config.json or otherwise mutate the
+				// workspace. LoadForDiscovery is lenient (an incompatible workspace
+				// still resolves so the guard below refuses it with a precise
+				// message) but non-migrating.
+				if cfg, _ := configfile.LoadForDiscovery(bd); cfg != nil && (cfg.IsDoltProxiedServerMode() || cfg.GetBackend() == configfile.BackendPostgres || cfg.GetBackend() == configfile.BackendMySQL || cfg.GetBackend() == configfile.BackendSQLite) {
 					// A non-Dolt SQL (or proxied-server) workspace has no local Dolt
 					// database file; the .beads dir with metadata.json IS the workspace.
 					dbPath = bd
@@ -1069,8 +1121,8 @@ var rootCmd = &cobra.Command{
 		beadsDir := resolveCommandBeadsDir(dbPath)
 		// Refuse incompatible metadata before version tracking, migration, or store open.
 		// Canonicalize first because supported .beads roots may themselves be symlinks.
-		if _, err := configfile.LoadReadOnly(utils.CanonicalizePath(beadsDir)); err != nil {
-			return HandleError("workspace metadata is incompatible with this bd version: %v (refusing to open or modify %s)", err, beadsDir)
+		if guardErr := guardWorkspaceMetadata(beadsDir); guardErr != nil {
+			return guardErr
 		}
 		prepareSelectedCommandContext(beadsDir, true)
 		refreshBoundCommandConfig(cmd)

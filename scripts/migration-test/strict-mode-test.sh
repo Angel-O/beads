@@ -153,6 +153,38 @@ fi
 [ ! -e "$tmp/collision/.beads/beads.db.pre-migration" ] ||
     fail "rollback preflight left a partial backup before reporting collision"
 
+# A symlinked rollback artifact must be rejected with no-follow semantics. A
+# .pre-migration copy (or active source) that resolves outside the workspace is
+# not self-contained, so following it would let strict rollback verification
+# pass after the real source is deleted. Mirrors the legacy Dolt recipe.
+mkdir -p "$tmp/symlink-retained/.beads"
+printf 'outside retained bytes' > "$tmp/outside-retained.db"
+ln -s "$tmp/outside-retained.db" "$tmp/symlink-retained/.beads/beads.db.pre-migration"
+if classic_sqlite_artifact_manifest "$tmp/symlink-retained/.beads" ".pre-migration" >/dev/null 2>&1; then
+    fail "symlinked retained SQLite rollback artifact was accepted"
+fi
+
+mkdir -p "$tmp/symlink-source/.beads"
+printf 'outside source bytes' > "$tmp/outside-source.db"
+ln -s "$tmp/outside-source.db" "$tmp/symlink-source/.beads/beads.db"
+if preserve_sqlite_source_artifacts "$tmp/symlink-source" >/dev/null 2>&1; then
+    fail "symlinked active SQLite source was accepted"
+fi
+[ -L "$tmp/symlink-source/.beads/beads.db" ] ||
+    fail "symlinked active SQLite source preflight mutated the source link"
+[ ! -e "$tmp/symlink-source/.beads/beads.db.pre-migration" ] ||
+    fail "symlinked active SQLite source preflight left a backup"
+
+mkdir -p "$tmp/symlink-backup/.beads"
+printf 'active bytes' > "$tmp/symlink-backup/.beads/beads.db"
+printf 'outside backup bytes' > "$tmp/outside-backup.db"
+ln -s "$tmp/outside-backup.db" "$tmp/symlink-backup/.beads/beads.db.pre-migration"
+if preserve_sqlite_source_artifacts "$tmp/symlink-backup" >/dev/null 2>&1; then
+    fail "symlinked SQLite rollback artifact was accepted"
+fi
+[ "$(cat "$tmp/symlink-backup/.beads/beads.db")" = "active bytes" ] ||
+    fail "symlinked rollback preflight mutated the active source"
+
 fingerprint_root="$tmp/fingerprint-source/.beads"
 mkdir -p "$fingerprint_root/nested"
 printf 'stable bytes' > "$fingerprint_root/nested/data"

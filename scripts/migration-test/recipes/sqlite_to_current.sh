@@ -29,6 +29,21 @@ preserve_sqlite_source_artifacts() {
         source_file="$ws/.beads/$relative"
         backup_file="${source_file}.pre-migration"
 
+        # Reject symlinks with no-follow (lstat) semantics before any -e/-f test,
+        # which follow links. A symlinked active source or .pre-migration rollback
+        # artifact can point outside the workspace, so the retained "rollback" copy
+        # would not be self-contained and strict rollback verification could pass
+        # after the real source is deleted. Mirror the server->embedded recipe,
+        # which likewise rejects symlinked rollback artifacts.
+        if [ -L "$source_file" ]; then
+            echo "  FAILED: SQLite source artifact is a symlink: $source_file"
+            return 1
+        fi
+        if [ -L "$backup_file" ]; then
+            echo "  FAILED: SQLite rollback artifact is a symlink: $backup_file"
+            return 1
+        fi
+
         if [ ! -e "$source_file" ]; then
             if [ -e "$backup_file" ]; then
                 echo "  FAILED: stale rollback artifact has no active source: $backup_file"
