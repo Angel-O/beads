@@ -23,12 +23,17 @@ import (
 // reset the tracked metadata.json file.
 const localVersionFile = ".local_version"
 
-// refuseLegacyDoltServerWorkspace recognizes the durable storage contract used
-// by v0.50-v0.58: canonical pre-project-identity server metadata and an existing
-// persisted Dolt server data root. The gitignored local version
-// and the compatibility marker are deliberately not discriminators: an earlier
-// failed upgrade can rewrite both before timing out. This check is store-free
-// and has no migration side effects.
+// refuseLegacyDoltServerWorkspace recognizes the durable on-disk contract of a
+// pre-project-identity Dolt server workspace: canonical metadata with an
+// explicit persisted dolt_mode=server, no project identity, and an existing
+// persisted Dolt server data root. This is the shape written by the v0.57.0-era
+// external SQL server, the release gated by the migration-test harness. It keys
+// on the persisted metadata mode, so a workspace whose server mode is only
+// implicit (empty dolt_mode, supplied by config.yaml or the environment) is not
+// classified here; strict metadata loading and normal store open handle those.
+// The gitignored local version and the compatibility marker are deliberately
+// not discriminators: an earlier failed upgrade can rewrite both before timing
+// out. This check is store-free and has no migration side effects.
 func refuseLegacyDoltServerWorkspace(beadsDir string, cfg *configfile.Config) error {
 	if cfg == nil || cfg.GetBackend() != configfile.BackendDolt ||
 		!strings.EqualFold(cfg.DoltMode, configfile.DoltModeServer) {
@@ -36,9 +41,6 @@ func refuseLegacyDoltServerWorkspace(beadsDir string, cfg *configfile.Config) er
 	}
 	if cfg.ProjectID != "" {
 		return nil
-	}
-	if err := dolt.ValidateDatabaseName(cfg.DoltDatabase); err != nil {
-		return fmt.Errorf("possible legacy Dolt-server workspace has an invalid database name %q: %v; preserve a byte-for-byte backup of .beads and use the matching historical bd binary for explicit migration (refusing to open or modify it)", cfg.DoltDatabase, err)
 	}
 	doltDir := cfg.PersistedDoltDataPath(beadsDir)
 	if doltDir == "" {
@@ -55,6 +57,15 @@ func refuseLegacyDoltServerWorkspace(beadsDir string, cfg *configfile.Config) er
 		return fmt.Errorf("possible legacy Dolt-server workspace has an ambiguous non-directory data root at %s; preserve it and run a version-specific explicit migration (refusing to open or modify it)", doltDir)
 	}
 
+	// Validate the effective database name only after confirming an existing
+	// persisted Dolt data root. An empty dolt_database is a valid default that
+	// resolves to the default database, so validate GetDoltDatabase() rather
+	// than the raw field to avoid misdiagnosing a defaulted name as invalid.
+	database := cfg.GetDoltDatabase()
+	if err := dolt.ValidateDatabaseName(database); err != nil {
+		return fmt.Errorf("possible legacy Dolt-server workspace at %s has an invalid database name %q: %v; preserve a byte-for-byte backup of .beads and use the matching historical bd binary for explicit migration (refusing to open or modify it)", doltDir, database, err)
+	}
+
 	source := safeLegacyDoltVersionLabel(beadsDir)
 	return fmt.Errorf("legacy %s Dolt-server workspace requires explicit migration before bd %s can open it; first preserve a byte-for-byte backup of .beads and keep/use the matching historical bd binary for a qualified version-specific migration bridge; this build refuses automatic modification of %s",
 		source, Version, beadsDir)
@@ -62,28 +73,34 @@ func refuseLegacyDoltServerWorkspace(beadsDir string, cfg *configfile.Config) er
 
 const maxLegacyVersionWitnessBytes = 64
 
+// legacyDoltEraLabel is the human-readable provenance used in the refusal
+// message when no trustworthy .local_version witness is available. It names the
+// population the guard actually classifies (pre-project-identity Dolt server
+// workspaces) without asserting a specific unqualified release range.
+const legacyDoltEraLabel = "pre-project-identity"
+
 func safeLegacyDoltVersionLabel(beadsDir string) string {
 	path := filepath.Join(beadsDir, localVersionFile)
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxLegacyVersionWitnessBytes {
-		return "v0.50-v0.58-era"
+		return legacyDoltEraLabel
 	}
 	file, err := safefile.OpenReadOnlyNoFollow(path)
 	if err != nil {
-		return "v0.50-v0.58-era"
+		return legacyDoltEraLabel
 	}
 	defer func() { _ = file.Close() }()
 	openedInfo, err := file.Stat()
 	if err != nil || !openedInfo.Mode().IsRegular() || openedInfo.Size() != info.Size() {
-		return "v0.50-v0.58-era"
+		return legacyDoltEraLabel
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxLegacyVersionWitnessBytes+1))
 	if err != nil || len(data) > maxLegacyVersionWitnessBytes {
-		return "v0.50-v0.58-era"
+		return legacyDoltEraLabel
 	}
 	version := strings.TrimSpace(string(data))
 	if !isLegacyDoltVersionWitness(version) {
-		return "v0.50-v0.58-era"
+		return legacyDoltEraLabel
 	}
 	return "bd " + version
 }
