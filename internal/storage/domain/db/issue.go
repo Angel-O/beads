@@ -68,11 +68,17 @@ func (r *issueSQLRepositoryImpl) Insert(ctx context.Context, issue *types.Issue,
 	if err := insertIssueRow(ctx, r.runner, table, issue); err != nil {
 		return err
 	}
-	return r.events.Record(ctx, domain.Event{
+	if err := r.events.Record(ctx, domain.Event{
 		IssueID: issue.ID,
 		Type:    types.EventCreated,
 		Actor:   actor,
-	}, domain.RecordEventOpts{UseWispsTable: opts.UseWispsTable})
+	}, domain.RecordEventOpts{UseWispsTable: opts.UseWispsTable}); err != nil {
+		return err
+	}
+	// Journal the create in the same transaction. The UOW plumbing reimplements
+	// the insert here rather than routing through issueops.CreateIssueInTx, so
+	// emission lives here for this plumbing.
+	return issueops.RecordMutationInTx(ctx, r.runner, issueops.MutationCreate, issue.ID)
 }
 
 func (r *issueSQLRepositoryImpl) InsertBatch(ctx context.Context, issues []*types.Issue, actor string, opts domain.InsertIssueOpts) error {
@@ -173,6 +179,12 @@ func (r *issueSQLRepositoryImpl) Update(ctx context.Context, id string, updates 
 	}
 	if rows == 0 {
 		return fmt.Errorf("db: Update %s: %w", id, sql.ErrNoRows)
+	}
+
+	// Journal the update in the same transaction. The UOW plumbing reimplements
+	// the row UPDATE here rather than routing through issueops.UpdateIssueInTx.
+	if err := issueops.RecordMutationInTx(ctx, r.runner, issueops.MutationUpdate, id); err != nil {
+		return err
 	}
 
 	// Event-type parity: embedded records EventClosed / EventReopened /
@@ -329,6 +341,13 @@ func (r *issueSQLRepositoryImpl) Claim(ctx context.Context, id, actor string, op
 			StartedAtWasZero:      startedWasZero,
 			OldIssue:              oldIssue,
 		}, nil
+	}
+
+	// Journal the claim as an update in the same transaction. Reached only when
+	// the CAS won (rows != 0). The UOW plumbing reimplements the claim rather
+	// than routing through issueops.ClaimIssueInTx.
+	if err := issueops.RecordMutationInTx(ctx, r.runner, issueops.MutationUpdate, id); err != nil {
+		return domain.ClaimRowResult{}, err
 	}
 
 	// Grant the lease in the ephemeral leases table, mirroring
@@ -744,6 +763,10 @@ func (r *issueSQLRepositoryImpl) Delete(ctx context.Context, id string, opts dom
 	if rows == 0 {
 		return fmt.Errorf("issue not found: %s", id)
 	}
+	// Journal the delete in the same transaction.
+	if err := issueops.RecordDeleteInTx(ctx, r.runner, id); err != nil {
+		return err
+	}
 	// A deleted issue holds no lease (no-op for wisps, which are never leased).
 	if err := issueops.DeleteLeaseInTx(ctx, r.runner, id); err != nil {
 		return err
@@ -784,6 +807,13 @@ func (r *issueSQLRepositoryImpl) DeleteByIDs(ctx context.Context, ids []string, 
 			return total, fmt.Errorf("db: IssueSQLRepository.DeleteByIDs rows affected: %w", err)
 		}
 		total += int(n)
+		// Journal each deleted id in the same transaction. The delete use case
+		// passes the cascade-expanded set, so this records cascade deletes too.
+		for _, id := range batch {
+			if err := issueops.RecordDeleteInTx(ctx, r.runner, id); err != nil {
+				return total, err
+			}
+		}
 		if !opts.UseWispsTable {
 			// Deleted issues hold no leases.
 			//nolint:gosec // G201: placeholders are ?.

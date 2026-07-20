@@ -237,6 +237,12 @@ func AddDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 		return fmt.Errorf("failed to add dependency: %w", err)
 	}
 
+	// Journal the dependency add in the same transaction (both is_blocked
+	// branches below return from here, so emitting once here covers them).
+	if err := RecordDepMutationInTx(ctx, tx, MutationDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID); err != nil {
+		return err
+	}
+
 	srcIsWisp := writeTable == "wisp_dependencies"
 	var affectedIssues, affectedWisps []string
 	var aerr error
@@ -848,6 +854,12 @@ func RemoveDependencyInTx(ctx context.Context, tx *sql.Tx, issueID, dependsOnID 
 		`DELETE FROM %s WHERE issue_id = ? AND %s = ?`, depTable, DepTargetExpr),
 		issueID, dependsOnID); err != nil {
 		return fmt.Errorf("remove dependency: %w", err)
+	}
+
+	// Journal the dependency remove in the same transaction (the no-match path
+	// returned earlier, so reaching here means an edge was deleted).
+	if err := RecordDepMutationInTx(ctx, tx, MutationDepRemove, issueID, depType, dependsOnID); err != nil {
+		return err
 	}
 
 	var affectedIssues, affectedWisps []string

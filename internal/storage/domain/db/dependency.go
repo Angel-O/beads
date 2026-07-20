@@ -142,6 +142,12 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 		return fmt.Errorf("db: DependencySQLRepository.Insert: %w", err)
 	}
 
+	// Journal the dependency add in the same transaction (new-edge path only;
+	// the same-type metadata refresh above returns earlier without a new edge).
+	if err := issueops.RecordDepMutationInTx(ctx, r.runner, issueops.MutationDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID); err != nil {
+		return err
+	}
+
 	// is_blocked maintenance mirrors the classic AddDependencyInTx flow
 	// (issueops/dependencies.go): the affected set expands the source by its
 	// parent-child descendants (plus, for parent-child edges, waiters on the
@@ -251,6 +257,12 @@ func (r *dependencySQLRepositoryImpl) Delete(ctx context.Context, issueID, depen
 		issueID, dependsOnID,
 	); err != nil {
 		return domain.DepDeleteResult{}, fmt.Errorf("db: DependencySQLRepository.Delete: %s -> %s: %w", issueID, dependsOnID, err)
+	}
+
+	// Journal the dependency remove in the same transaction (only reached when
+	// the edge existed — the no-match path returned earlier).
+	if err := issueops.RecordDepMutationInTx(ctx, r.runner, issueops.MutationDepRemove, issueID, depType, dependsOnID); err != nil {
+		return domain.DepDeleteResult{}, err
 	}
 
 	dt := types.DependencyType(depType)

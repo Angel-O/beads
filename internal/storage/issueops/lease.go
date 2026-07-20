@@ -357,6 +357,11 @@ func ReclaimExpiredLeasesInTx(ctx context.Context, tx DBTX, cutoff time.Time, ac
 			r.PreviousOwner, ""); err != nil {
 			return nil, fmt.Errorf("record reclaim event for %s: %w", r.ID, err)
 		}
+		// Journal the lease reclaim as an update (assignee cleared, status
+		// reverted to open) so a replayer sees the claim released.
+		if err := RecordMutationInTx(ctx, tx, MutationUpdate, r.ID); err != nil {
+			return nil, err
+		}
 		reclaimed = append(reclaimed, r)
 	}
 	return reclaimed, nil

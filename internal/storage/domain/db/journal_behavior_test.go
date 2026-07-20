@@ -1,0 +1,156 @@
+package db
+
+import (
+	"encoding/json"
+
+	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/internal/types"
+)
+
+// journalRow is one decoded bd_mutations_journal row.
+type journalRow struct {
+	Seq      int64
+	Op       string
+	IssueID  string
+	Issue    *types.Issue
+	Dep      *issueops.MutationDep
+	HasIssue bool
+}
+
+// enableJournalForTest turns the journal on, clears any rows left by earlier
+// tests (the table is dolt-ignored, so DOLT_RESET does not clear it), and turns
+// it back off on cleanup.
+func (s *testSuite) enableJournalForTest() {
+	issueops.SetJournalEnabled(true)
+	_, err := s.Runner().ExecContext(s.Ctx(), "DELETE FROM bd_mutations_journal")
+	s.Require().NoError(err)
+	s.T().Cleanup(func() { issueops.SetJournalEnabled(false) })
+}
+
+func (s *testSuite) readJournal() []journalRow {
+	rows, err := s.Runner().QueryContext(s.Ctx(),
+		`SELECT seq, op, issue_id, issue_json, dep_json FROM bd_mutations_journal ORDER BY seq ASC`)
+	s.Require().NoError(err)
+	defer rows.Close()
+
+	var out []journalRow
+	for rows.Next() {
+		var (
+			jr      journalRow
+			issueJS []byte
+			depJS   []byte
+		)
+		s.Require().NoError(rows.Scan(&jr.Seq, &jr.Op, &jr.IssueID, &issueJS, &depJS))
+		if len(issueJS) > 0 {
+			jr.HasIssue = true
+			var iss types.Issue
+			s.Require().NoError(json.Unmarshal(issueJS, &iss))
+			jr.Issue = &iss
+		}
+		if len(depJS) > 0 {
+			var d issueops.MutationDep
+			s.Require().NoError(json.Unmarshal(depJS, &d))
+			jr.Dep = &d
+		}
+		out = append(out, jr)
+	}
+	s.Require().NoError(rows.Err())
+	return out
+}
+
+// TestMutationsJournal_UOWPlumbing drives every op kind through the unit-of-work
+// repository write path (which reimplements create/update/claim/delete/dep/label
+// and delegates close/reopen to issueops) against real Dolt, and asserts the
+// journal records each op with an engine-assigned monotonic seq.
+func (s *testSuite) TestMutationsJournal_UOWPlumbing() {
+	s.enableJournalForTest()
+	ctx := s.Ctx()
+	ir := s.issueRepo()
+	dr := s.depRepo()
+	lr := s.labelRepo()
+
+	s.Require().NoError(ir.Insert(ctx, newTestIssue("bd-mj-1", "t"), "actor", domain.InsertIssueOpts{}))
+	s.Require().NoError(ir.Insert(ctx, newTestIssue("bd-mj-2", "t"), "actor", domain.InsertIssueOpts{}))
+	s.Require().NoError(ir.Update(ctx, "bd-mj-1", map[string]any{"title": "renamed"}, "actor", domain.IssueTableOpts{}))
+	s.Require().NoError(lr.Insert(ctx, "bd-mj-1", "urgent", "actor", domain.LabelOpts{}))
+	_, err := ir.Claim(ctx, "bd-mj-1", "worker", domain.IssueTableOpts{})
+	s.Require().NoError(err)
+	s.Require().NoError(dr.Insert(ctx, &types.Dependency{IssueID: "bd-mj-1", DependsOnID: "bd-mj-2", Type: types.DepBlocks}, "actor", domain.DepInsertOpts{}))
+	_, err = dr.Delete(ctx, "bd-mj-1", "bd-mj-2", "actor", domain.DepInsertOpts{})
+	s.Require().NoError(err)
+	_, err = ir.Close(ctx, "bd-mj-1", domain.CloseRowParams{Reason: "done"}, "actor", domain.IssueTableOpts{})
+	s.Require().NoError(err)
+	s.Require().NoError(ir.Delete(ctx, "bd-mj-2", domain.IssueTableOpts{}))
+
+	got := s.readJournal()
+	wantOps := []string{"create", "create", "update", "update", "update", "dep_add", "dep_remove", "close", "delete"}
+	s.Require().Len(got, len(wantOps), "journal rows: %+v", got)
+
+	var prev int64
+	for i, want := range wantOps {
+		s.Equalf(want, got[i].Op, "row %d op", i)
+		s.Greaterf(got[i].Seq, prev, "row %d seq must be strictly increasing", i)
+		prev = got[i].Seq
+	}
+	// Update snapshot reflects the post-mutation title.
+	s.Require().True(got[2].HasIssue)
+	s.Equal("renamed", got[2].Issue.Title)
+	// dep_add carries the edge details.
+	s.Require().NotNil(got[5].Dep)
+	s.Equal(string(types.DepBlocks), got[5].Dep.Kind)
+	s.Equal("bd-mj-2", got[5].Dep.Target)
+	// dep_remove carries the edge details.
+	s.Require().NotNil(got[6].Dep)
+	s.Equal("bd-mj-2", got[6].Dep.Target)
+	// delete carries a null issue payload.
+	s.Equal("delete", got[8].Op)
+	s.False(got[8].HasIssue, "delete row must have null issue")
+}
+
+// TestMutationsJournal_CascadeDelete asserts a cascade delete journals every
+// affected bead — the finding the decorator design could not cover.
+func (s *testSuite) TestMutationsJournal_CascadeDelete() {
+	s.enableJournalForTest()
+	ctx := s.Ctx()
+	ir := s.issueRepo()
+	dr := s.depRepo()
+
+	s.Require().NoError(ir.Insert(ctx, newTestIssue("bd-cd-parent", "t"), "actor", domain.InsertIssueOpts{}))
+	s.Require().NoError(ir.Insert(ctx, newTestIssue("bd-cd-child", "t"), "actor", domain.InsertIssueOpts{}))
+	// child depends on parent via parent-child, so deleting the parent cascades.
+	s.Require().NoError(dr.Insert(ctx, &types.Dependency{IssueID: "bd-cd-child", DependsOnID: "bd-cd-parent", Type: types.DepParentChild}, "actor", domain.DepInsertOpts{}))
+
+	// clear the setup rows so we assert only on the cascade delete.
+	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_mutations_journal")
+	s.Require().NoError(err)
+
+	uc := s.issueUseCase()
+	res, err := uc.DeleteIssues(ctx, domain.DeleteIssuesParams{IDs: []string{"bd-cd-parent"}, Cascade: true}, "actor")
+	s.Require().NoError(err)
+	s.Require().GreaterOrEqual(res.DeletedCount, 2)
+
+	deleted := map[string]bool{}
+	for _, r := range s.readJournal() {
+		if r.Op == "delete" {
+			deleted[r.IssueID] = true
+		}
+	}
+	s.True(deleted["bd-cd-parent"], "parent delete must be journaled")
+	s.True(deleted["bd-cd-child"], "cascade-deleted child must be journaled, got %v", deleted)
+}
+
+// TestMutationsJournal_DisabledWritesNothing asserts the default-off knob writes
+// no rows.
+func (s *testSuite) TestMutationsJournal_DisabledWritesNothing() {
+	issueops.SetJournalEnabled(false)
+	ctx := s.Ctx()
+	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_mutations_journal")
+	s.Require().NoError(err)
+
+	s.Require().NoError(s.issueRepo().Insert(ctx, newTestIssue("bd-off-1", "t"), "actor", domain.InsertIssueOpts{}))
+
+	var n int
+	s.Require().NoError(s.Runner().QueryRowContext(ctx, "SELECT COUNT(*) FROM bd_mutations_journal").Scan(&n))
+	s.Equal(0, n, "disabled journal must write nothing")
+}

@@ -174,6 +174,15 @@ func Initialize() error {
 	v.SetDefault("audit.enabled", false)
 	v.SetDefault("no-db", false)
 	v.SetDefault("no-hooks", false)
+	// Durable mutations journal (bd_mutations_journal table). OFF by default;
+	// enable per-workspace via `bd config set mutations-journal true` or
+	// BD_MUTATIONS_JOURNAL=1. Read it with `bd mutations tail/export`.
+	v.SetDefault("mutations-journal", false)
+	// Retention floors for `bd mutations prune`. 0 disables a floor. retain-days
+	// keeps rows younger than N days; retain-rows always keeps the newest N rows.
+	// Env: BD_MUTATIONS_JOURNAL_RETAIN_DAYS / BD_MUTATIONS_JOURNAL_RETAIN_ROWS.
+	v.SetDefault("mutations-journal-retain-days", 0)
+	v.SetDefault("mutations-journal-retain-rows", 0)
 	v.SetDefault("db", "")
 	v.SetDefault("actor", "")
 	v.SetDefault("issue-prefix", "")

@@ -60,6 +60,13 @@ func deleteIssueRowInTx(ctx context.Context, tx *sql.Tx, id string, isWisp bool)
 		// this parity across not-found paths.
 		return fmt.Errorf("%w: issue %s", storage.ErrNotFound, id)
 	}
+	// Journal the delete in the same transaction. This worker backs single
+	// deletes (DeleteIssueInTx) and the per-wisp cascade branch of the bulk
+	// delete (DeleteIssuesInTx); the bulk regular-issue branch journals its own
+	// ids directly.
+	if err := RecordDeleteInTx(ctx, tx, id); err != nil {
+		return err
+	}
 	if isWisp {
 		if err := DeleteWispFromDependenciesInTx(ctx, tx, id); err != nil {
 			return err
@@ -274,6 +281,16 @@ func DeleteIssuesInTx(ctx context.Context, tx *sql.Tx, ids []string, cascade boo
 		}
 	}
 	result.DeletedCount = totalRegularsDeleted + len(allWispIDs)
+
+	// Journal every regular issue deleted by this bulk/cascade operation. Wisps
+	// were deleted through deleteIssueRowInTx above, which journals each itself;
+	// finalRegularIDs is the cascade-expanded set of regular ids removed by the
+	// direct batched DELETE, so this records cascade deletes too.
+	for _, id := range finalRegularIDs {
+		if err := RecordDeleteInTx(ctx, tx, id); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := RecomputeIsBlockedInTx(ctx, tx, affectedIssues, affectedWisps); err != nil {
 		return nil, fmt.Errorf("recompute is_blocked after batch delete: %w", err)

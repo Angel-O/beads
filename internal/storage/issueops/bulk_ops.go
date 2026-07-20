@@ -214,6 +214,14 @@ func DeleteIssuesBySourceRepoInTx(ctx context.Context, tx *sql.Tx, sourceRepo st
 		return 0, fmt.Errorf("rows affected: %w", err)
 	}
 
+	// Journal each deleted issue in the same transaction. issueIDs is the exact
+	// set removed by the DELETE above (both were scoped to source_repo).
+	for _, id := range issueIDs {
+		if err := RecordDeleteInTx(ctx, tx, id); err != nil {
+			return int(rowsAffected), err
+		}
+	}
+
 	if err := RecomputeIsBlockedInTx(ctx, tx, affectedIssues, affectedWisps); err != nil {
 		return int(rowsAffected), fmt.Errorf("recompute is_blocked after source-repo delete: %w", err)
 	}
@@ -224,9 +232,15 @@ func DeleteIssuesBySourceRepoInTx(ctx context.Context, tx *sql.Tx, sourceRepo st
 //nolint:gosec // G201: table names are hardcoded
 func UpdateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, issue *types.Issue, actor string) error {
 	if IsActiveWispInTx(ctx, tx, oldID) {
-		return updateWispIDInTx(ctx, tx, oldID, newID, issue, actor)
+		if err := updateWispIDInTx(ctx, tx, oldID, newID, issue, actor); err != nil {
+			return err
+		}
+	} else if err := updateIssueIDInTx(ctx, tx, oldID, newID, issue, actor); err != nil {
+		return err
 	}
-	return updateIssueIDInTx(ctx, tx, oldID, newID, issue, actor)
+	// Journal the rename as an update keyed on the new id (the post-rename
+	// snapshot). The 'renamed' history event carries the old->new link.
+	return RecordMutationInTx(ctx, tx, MutationUpdate, newID)
 }
 
 func updateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, issue *types.Issue, actor string) error {

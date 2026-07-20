@@ -165,6 +165,14 @@ func CreateIssueInTxWithResult(ctx context.Context, tx *sql.Tx, bc *BatchContext
 		return result, err
 	}
 	result.ChangedTables = mergeChangedTables(result.ChangedTables, commentResult.ChangedTables)
+
+	// Journal the create in the same transaction. Reaching here means the row
+	// was persisted (stale-reject and skip paths return earlier). Bulk create
+	// funnels through this leaf, so instrumenting it covers CreateIssueInTx,
+	// CreateIssuesInTx, and CreateIssuesInTxWithResult too.
+	if err := RecordMutationInTx(ctx, tx, MutationCreate, issue.ID); err != nil {
+		return result, err
+	}
 	return result, nil
 }
 
@@ -824,6 +832,11 @@ func PersistDependenciesWithOptionsResult(ctx context.Context, tx *sql.Tx, issue
 			}
 			if rowsAffected > 0 {
 				result.markChanged(item.depTable)
+				// Journal creation-time dependencies as dep_add edges so a
+				// replayer sees the graph the issue was created with.
+				if err := RecordDepMutationInTx(ctx, tx, MutationDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID); err != nil {
+					return result, err
+				}
 			}
 		}
 	}

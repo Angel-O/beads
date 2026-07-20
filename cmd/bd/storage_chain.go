@@ -16,6 +16,11 @@ import (
 // legacy BD_OTEL_* selector is set). The hook layer sits outermost so
 // storage spans measure pure DB time without hook-firing overhead.
 //
+// The durable mutations journal is NOT a decorator here: it is written at the
+// issueops seam inside the mutation's own transaction (see
+// issueops.RecordMutationInTx), so it covers this plumbing structurally without
+// a wrapper.
+//
 // Extracted from main.go's PersistentPreRunE so the chain composition is
 // unit-testable — the bug this PR fixes was a missing WrapStorage call,
 // and the regression class deserves test coverage.
