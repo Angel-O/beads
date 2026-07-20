@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -296,13 +297,13 @@ func TestEventsSincePlanIsIndexed(t *testing.T) {
 	}
 
 	const cur = "2023-01-01 00:00:00"
-	// Mirror EventsSinceInTx's SARGABLE predicate with literals.
-	plan := explainPlan(t, ctx, store.db, `
-		SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
-		FROM events
-		WHERE created_at >= '`+cur+`' AND ((created_at > '`+cur+`') OR (id > ''))
-		ORDER BY created_at ASC, id ASC
-		LIMIT 100`)
+	// Single-source the guarded SQL from production: EXPLAIN the exact string
+	// EventsSinceInTx runs (issueID="" => three ? placeholders: the created_at
+	// lower bound, the strict created_at, and the id tie-break), with the
+	// placeholders replaced by literals for the plan. A change to the SARGABLE
+	// predicate in issueops.EventsSinceQuery then breaks this guard.
+	prod := issueops.EventsSinceQuery("", 100)
+	plan := explainPlan(t, ctx, store.db, literalizeParams(prod, "'"+cur+"'", "'"+cur+"'", "''"))
 
 	if !looksLikeDoltPlan(plan) {
 		t.Skipf("EXPLAIN output not in a recognized Dolt plan format, skipping sargability assertion; plan=\n%s", plan)
