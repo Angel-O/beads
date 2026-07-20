@@ -1,6 +1,7 @@
 package issueops
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -61,4 +62,63 @@ func TestBuildMutationsPruneWhere(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestComputeMutationsPruneWhere pins the shared retain-floor orchestration both
+// prune plumbings (the DBTX path and the proxied raw-SQL path) run through, so
+// they can never drift on the retain-rows short-circuit or which rows a floor
+// protects.
+func TestComputeMutationsPruneWhere(t *testing.T) {
+	now := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+
+	t.Run("no retain-rows skips ceil read", func(t *testing.T) {
+		called := false
+		where, args, skip, err := ComputeMutationsPruneWhere(500, 7, 0, now, func() (int64, bool, error) {
+			called = true
+			return 0, false, nil
+		})
+		if err != nil || skip {
+			t.Fatalf("err=%v skip=%v, want nil/false", err, skip)
+		}
+		if called {
+			t.Error("readCeil must not be called when retainRows == 0")
+		}
+		if where != "seq < ? AND ts < ?" || len(args) != 2 {
+			t.Errorf("where=%q args=%v", where, args)
+		}
+	})
+
+	t.Run("retain-rows not found skips prune", func(t *testing.T) {
+		_, _, skip, err := ComputeMutationsPruneWhere(500, 0, 10, now, func() (int64, bool, error) {
+			return 0, false, nil
+		})
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		if !skip {
+			t.Error("skip must be true when the whole journal is inside the retained window")
+		}
+	})
+
+	t.Run("retain-rows floor applied", func(t *testing.T) {
+		where, args, skip, err := ComputeMutationsPruneWhere(500, 0, 10, now, func() (int64, bool, error) {
+			return 480, true, nil
+		})
+		if err != nil || skip {
+			t.Fatalf("err=%v skip=%v", err, skip)
+		}
+		if where != "seq < ? AND seq <= ?" || len(args) != 2 || args[1] != int64(480) {
+			t.Errorf("where=%q args=%v", where, args)
+		}
+	})
+
+	t.Run("ceil read error propagates", func(t *testing.T) {
+		sentinel := errors.New("boom")
+		_, _, _, err := ComputeMutationsPruneWhere(500, 0, 10, now, func() (int64, bool, error) {
+			return 0, false, sentinel
+		})
+		if !errors.Is(err, sentinel) {
+			t.Errorf("err = %v, want %v", err, sentinel)
+		}
+	})
 }

@@ -140,6 +140,34 @@ func (s *testSuite) TestMutationsJournal_CascadeDelete() {
 	s.True(deleted["bd-cd-child"], "cascade-deleted child must be journaled, got %v", deleted)
 }
 
+// TestMutationsJournal_NoPhantomDeletes asserts DeleteByIDs journals a delete
+// only for ids that actually removed a row — never a phantom delete for an id
+// that matched nothing (the batched DELETE reports only a per-batch total).
+func (s *testSuite) TestMutationsJournal_NoPhantomDeletes() {
+	s.enableJournalForTest()
+	ctx := s.Ctx()
+	ir := s.issueRepo()
+
+	s.Require().NoError(ir.Insert(ctx, newTestIssue("bd-pd-1", "t"), "actor", domain.InsertIssueOpts{}))
+	s.Require().NoError(ir.Insert(ctx, newTestIssue("bd-pd-2", "t"), "actor", domain.InsertIssueOpts{}))
+	// clear setup rows so we assert only on the delete.
+	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_mutations_journal")
+	s.Require().NoError(err)
+
+	// Delete a mix: two real ids and two that do not exist.
+	n, err := ir.DeleteByIDs(ctx, []string{"bd-pd-1", "bd-pd-missing-a", "bd-pd-2", "bd-pd-missing-b"}, domain.IssueTableOpts{})
+	s.Require().NoError(err)
+	s.Equal(2, n, "only the two present ids are deleted")
+
+	deleted := map[string]bool{}
+	for _, r := range s.readJournal() {
+		s.Equal("delete", r.Op, "only delete rows expected: %+v", r)
+		deleted[r.IssueID] = true
+	}
+	s.Equal(map[string]bool{"bd-pd-1": true, "bd-pd-2": true}, deleted,
+		"journal must record a delete only for ids that removed a row, no phantoms")
+}
+
 // TestMutationsJournal_DisabledWritesNothing asserts the default-off knob writes
 // no rows.
 func (s *testSuite) TestMutationsJournal_DisabledWritesNothing() {

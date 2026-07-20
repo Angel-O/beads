@@ -1,136 +1,178 @@
 package issueops
 
 import (
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"io/fs"
-	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/storage/journalscan"
 )
 
-// TestEveryMutationFunctionJournals is the completeness guard for the durable
-// mutations journal. It parses this package's source, builds the intra-package
-// call graph, and asserts that every mutation entry point either records a
-// journal row directly (calls one of the Record*InTx emit helpers) or calls a
-// function that transitively does.
+// The emit helpers a function calls to journal a row directly.
+var journalEmitHelpers = map[string]bool{
+	"RecordMutationInTx":    true,
+	"RecordDeleteInTx":      true,
+	"RecordDepMutationInTx": true,
+	"insertMutationRow":     true,
+}
+
+// mutationEntryPoints are the issueops functions that must result in a journal
+// row. Every write plumbing bottoms out in one of these. The structural
+// cross-check below (TestEveryBeadMutatorJournalsOrIsExempt) guarantees this
+// list stays complete: any exported function that writes a work-bead table must
+// appear here or in beadDMLExemptions, so a new mutation path cannot be added
+// without being accounted for.
+var mutationEntryPoints = []string{
+	"CreateIssueInTx",
+	"CreateIssueInTxWithResult",
+	"CreateIssuesInTx",
+	"CreateIssuesInTxWithResult",
+	"PersistDependenciesWithOptionsResult", // creation-time dependency edges
+	"UpdateIssueInTx",
+	"UpdateIssueWithoutEventInTx",
+	"CloseIssueInTx",
+	"CloseIssueWithoutEventInTx",
+	"ReopenIssueInTx",
+	"DeleteIssueInTx",
+	"DeleteIssuesInTx",
+	"DeleteIssuesBySourceRepoInTx",
+	"ClaimIssueInTx",
+	"ClaimReadyIssueInTx",
+	"UnclaimIssueInTx",
+	"UnclaimIssueIfAssigneeInTx",
+	"ReclaimExpiredLeasesInTx",
+	"PromoteFromEphemeralInTx",
+	"AddDependencyInTx",
+	"RemoveDependencyInTx",
+	"AddLabelInTx",
+	"RemoveLabelInTx",
+	"UpdateIssueIDInTx",
+	"AddIssueCommentInTx",
+	"ImportIssueCommentInTx",
+}
+
+// beadDMLExemptions are exported functions the DML detector flags as writing a
+// work-bead table but which legitimately do NOT journal, each with a reason.
+// They fall into four buckets: (1) derived is_blocked maintenance; (2) aux-table
+// writers the templated-%s heuristic can't distinguish from a bead table (events,
+// child counters); (3) constituent sub-helpers of a create/rename/promote/delete
+// whose top-level entry point journals the whole mutation once; (4) compaction
+// maintenance outside the create/update/close/delete/dep/label op vocabulary. The
+// staleness check fails if any stops being flagged, so an exemption cannot rot.
+var beadDMLExemptions = map[string]string{
+	// (1) is_blocked is a denormalized/derived column recomputed as a side effect
+	// of the graph mutation that changed it (which journals).
+	"MarkIsBlockedInTx":                "maintains the derived is_blocked column, not a bead mutation",
+	"RecomputeIsBlockedInTx":           "recomputes the derived is_blocked column, not a bead mutation",
+	"RecomputeAllIsBlockedInTx":        "recomputes the derived is_blocked column, not a bead mutation",
+	"RecomputeIsBlockedForIDsInTx":     "recomputes the derived is_blocked column, not a bead mutation",
+	"RecomputeIsBlockedForWispIDsInTx": "recomputes the derived is_blocked column, not a bead mutation",
+	"RecomputeIsBlockedAfterMergeInTx": "recomputes the derived is_blocked column, not a bead mutation",
+
+	// (2) aux tables matched via templated %s, not work-bead state.
+	"RecordEventInTable":     "writes the events audit table (templated %s), not work-bead state",
+	"RecordFullEventInTable": "writes the events audit table (templated %s), not work-bead state",
+	"AddCommentEventInTx":    "writes the events audit table (templated %s), not work-bead state",
+	"GetNextChildIDTx":       "writes the child_counters allocation table (templated %s), not work-bead state",
+
+	// (3) constituent sub-helpers; the calling entry point journals the whole
+	// mutation once (a create/rename/promote/delete emits a single row).
+	"InsertIssueIntoTable":                   "raw issue insert; the calling create entry point journals the create",
+	"InsertIssueIfNew":                       "raw issue insert; the calling create entry point journals the create",
+	"PersistLabels":                          "constituent label write of a create; the create entry point journals it",
+	"PersistComments":                        "constituent comment write of a create; the create entry point journals it",
+	"UpdateWispIDInDependenciesInTx":         "rewrites dep rows during a rename; UpdateIssueIDInTx journals the rename",
+	"UpdateIssueIDInDependenciesInTx":        "rewrites dep rows during a rename; UpdateIssueIDInTx journals the rename",
+	"RetargetInboundDependenciesToWispInTx":  "rewrites dep rows during promote; PromoteFromEphemeralInTx journals it",
+	"RetargetInboundDependenciesToIssueInTx": "rewrites dep rows during promote; PromoteFromEphemeralInTx journals it",
+	"DeleteWispFromDependenciesInTx":         "cleans up dep rows during a delete that journals the delete",
+	"DeleteWispsFromDependenciesInTx":        "cleans up dep rows during a delete that journals the delete",
+
+	// (4) compaction maintenance — a lossy content rewrite outside the mutation
+	// op vocabulary; not currently journaled.
+	"ApplyCompactionInTx":     "compaction content rewrite (maintenance), outside the mutation op vocabulary",
+	"RestoreFromSnapshotInTx": "restores a compacted issue (maintenance), outside the mutation op vocabulary",
+}
+
+// TestEveryMutationFunctionJournals parses this package's source, builds the
+// intra-package call graph, and asserts every mutation entry point either
+// records a journal row directly (calls one of the Record*InTx emit helpers) or
+// calls a function that transitively does.
 //
 // This kills the enumeration-drift class that sank the decorator design: there,
 // coverage was a hand-maintained list of overridden methods, and new mutation
-// paths (ClaimReadyIssue, wisp ops, lease reclaim, cascade delete, …) silently
-// slipped through. Here, if a listed mutation function stops emitting — directly
-// or through its delegates — this test fails. When you add a NEW mutation entry
-// point to issueops, add it to mutationEntryPoints below and make it emit.
+// paths silently slipped through. Here, if a listed mutation function stops
+// emitting — directly or through its delegates — this test fails.
 func TestEveryMutationFunctionJournals(t *testing.T) {
-	// The mutation entry points that must result in a journal row. Every write
-	// plumbing bottoms out in one of these; see the emission sites for where
-	// each records (some via a lowercase worker or a delegate, which the
-	// transitive check below follows).
-	mutationEntryPoints := []string{
-		"CreateIssueInTx",
-		"CreateIssueInTxWithResult",
-		"CreateIssuesInTx",
-		"CreateIssuesInTxWithResult",
-		"PersistDependenciesWithOptionsResult", // creation-time dependency edges
-		"UpdateIssueInTx",
-		"UpdateIssueWithoutEventInTx",
-		"CloseIssueInTx",
-		"CloseIssueWithoutEventInTx",
-		"ReopenIssueInTx",
-		"DeleteIssueInTx",
-		"DeleteIssuesInTx",
-		"DeleteIssuesBySourceRepoInTx",
-		"ClaimIssueInTx",
-		"ClaimReadyIssueInTx",
-		"UnclaimIssueInTx",
-		"UnclaimIssueIfAssigneeInTx",
-		"ReclaimExpiredLeasesInTx",
-		"PromoteFromEphemeralInTx",
-		"AddDependencyInTx",
-		"RemoveDependencyInTx",
-		"AddLabelInTx",
-		"RemoveLabelInTx",
-		"UpdateIssueIDInTx",
-	}
-
-	// The emit helpers a function calls to journal a row directly.
-	emitHelpers := map[string]bool{
-		"RecordMutationInTx":    true,
-		"RecordDeleteInTx":      true,
-		"RecordDepMutationInTx": true,
-		"insertMutationRow":     true,
-	}
-
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
+	fns, err := journalscan.ParsePackage(".")
 	if err != nil {
 		t.Fatalf("parse issueops package: %v", err)
 	}
 
-	// calls[fn] = set of intra-package function names fn calls (including the
-	// emit helpers). directlyEmits[fn] = fn calls an emit helper.
-	calls := map[string]map[string]bool{}
-	directlyEmits := map[string]bool{}
-
-	for _, pkg := range pkgs {
-		for _, file := range pkg.Files {
-			for _, decl := range file.Decls {
-				fn, ok := decl.(*ast.FuncDecl)
-				if !ok {
-					continue
-				}
-				name := fn.Name.Name
-				callset := map[string]bool{}
-				ast.Inspect(fn, func(n ast.Node) bool {
-					call, ok := n.(*ast.CallExpr)
-					if !ok {
-						return true
-					}
-					// Intra-package calls are bare identifiers: foo(...).
-					if ident, ok := call.Fun.(*ast.Ident); ok {
-						callset[ident.Name] = true
-						if emitHelpers[ident.Name] {
-							directlyEmits[name] = true
-						}
-					}
-					return true
-				})
-				calls[name] = callset
-			}
-		}
-	}
-
-	// Fixpoint: a function emits if it directly emits or calls a function that
-	// emits.
-	emits := map[string]bool{}
-	for name := range directlyEmits {
-		emits[name] = true
-	}
-	for changed := true; changed; {
-		changed = false
-		for name, callset := range calls {
-			if emits[name] {
-				continue
-			}
-			for callee := range callset {
-				if emits[callee] {
-					emits[name] = true
-					changed = true
-					break
-				}
-			}
-		}
-	}
+	emits := journalscan.Fixpoint(fns,
+		func(f *journalscan.FuncInfo) bool { return f.CallsAnyOf(journalEmitHelpers) },
+		func(f *journalscan.FuncInfo) []string { return f.AllCallNames() })
 
 	for _, entry := range mutationEntryPoints {
-		if _, defined := calls[entry]; !defined {
+		if _, defined := fns[entry]; !defined {
 			t.Errorf("mutation entry point %q not found in issueops — was it renamed? update mutationEntryPoints", entry)
 			continue
 		}
 		if !emits[entry] {
 			t.Errorf("mutation entry point %q does not journal: it neither calls a Record*InTx emit helper nor a function that transitively does", entry)
+		}
+	}
+}
+
+// TestEveryBeadMutatorJournalsOrIsExempt is the STRUCTURAL completeness
+// cross-check. It detects, by DML rather than by name, every EXPORTED function
+// that writes a work-bead table (INSERT / UPDATE / DELETE against issues, wisps,
+// dependencies, labels, comments, and their wisp variants — literal or templated
+// table name), and asserts each one journals (calls an emit helper directly or
+// transitively) OR is an explicitly-exempted derived-state / aux / sub-helper.
+// A new exported mutator that writes a bead table therefore cannot ship without
+// either journaling or being justified in beadDMLExemptions, closing the "named
+// outside the pattern, silently un-journaled" hole the hand list alone left open.
+func TestEveryBeadMutatorJournalsOrIsExempt(t *testing.T) {
+	fns, err := journalscan.ParsePackage(".")
+	if err != nil {
+		t.Fatalf("parse issueops package: %v", err)
+	}
+
+	// A function writes a bead table if its own body does, or a free function it
+	// calls transitively does.
+	beadDML := journalscan.Fixpoint(fns,
+		func(f *journalscan.FuncInfo) bool { return f.OwnBeadDML },
+		func(f *journalscan.FuncInfo) []string { return f.IdentCalls })
+
+	// A function emits if it calls an emit helper directly or transitively.
+	emits := journalscan.Fixpoint(fns,
+		func(f *journalscan.FuncInfo) bool { return f.CallsAnyOf(journalEmitHelpers) },
+		func(f *journalscan.FuncInfo) []string { return f.AllCallNames() })
+
+	seenExempt := map[string]bool{}
+	var checked int
+	for key, f := range fns {
+		if f.Recv != "" || !f.Exported || !beadDML[key] {
+			continue
+		}
+		if reason, ok := beadDMLExemptions[f.Name]; ok {
+			if reason == "" {
+				t.Errorf("%s has an empty exemption reason", f.Name)
+			}
+			seenExempt[f.Name] = true
+			continue
+		}
+		checked++
+		if !emits[key] {
+			t.Errorf("exported function %q writes a work-bead table but does not journal (no Record*InTx emit helper directly or transitively) and is not exempted — make it journal, or add it to beadDMLExemptions with a reason", f.Name)
+		}
+	}
+
+	if checked == 0 {
+		t.Fatal("cross-check found no exported bead mutators — DML detection or parsing changed; the guard is not actually running")
+	}
+	for m := range beadDMLExemptions {
+		if !seenExempt[m] {
+			t.Errorf("exemption %q no longer matches an exported bead-writing function — remove it", m)
 		}
 	}
 }

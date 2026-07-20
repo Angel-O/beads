@@ -37,7 +37,18 @@ var mutationsCmd = &cobra.Command{
 
 The journal records every committed issue mutation as an ordered, replayable
 row. Enable it with 'bd config set mutations-journal true' (or
-BD_MUTATIONS_JOURNAL=1). Records are emitted only while it is enabled.`,
+BD_MUTATIONS_JOURNAL=1). Records are emitted only while it is enabled.
+
+Coverage and scope:
+  - Every mutation through bd's normal write paths (create, update, close,
+    reopen, delete, claim, dependency add/remove, label add/remove, comment) is
+    journaled in the same transaction as the change. Raw DML run through
+    'bd sql' bypasses those paths and is NOT journaled — a known non-coverage.
+  - The journal is per-branch working-set state (dolt_ignored): it records the
+    mutations committed on the writer's active branch. Rows arrive by direct
+    write, not by merge, so a consumer must read the journal on the same branch
+    the writer commits to; a branch checkout or merge does not carry journal
+    rows across branches.`,
 }
 
 var mutationsTailCmd = &cobra.Command{
@@ -50,8 +61,9 @@ Each line is a JSON record:
    "issue_id":"...","issue":{...|null},"dep":{"kind":..,"target":..}}
 
 Record contract (stable for external consumers):
-  seq       int64   engine-assigned, strictly increasing, never reused or reset
-  ts        string  UTC timestamp the row was committed
+  seq       int64   counter-assigned inside the mutation's transaction; gapless,
+                    strictly increasing in commit order, never reused or reset
+  ts        string  UTC insert time, stamped inside the committing transaction
   op        string  one of the six ops above
   issue_id  string  the mutated issue's id
   issue     object  full issue state AFTER the mutation; null on delete
@@ -91,16 +103,20 @@ var mutationsPruneCmd = &cobra.Command{
 Use after a consumer has durably processed everything up to that seq. The
 journal is clone-local operational state, so pruning never affects issue data.
 
-Two retention floors protect recent history and can only reduce what a prune
-removes (a lagging consumer is never cut off by an over-eager --before):
+Two retention floors compose onto --before and can only reduce what a prune
+removes:
   mutations-journal-retain-days   keep every row younger than N days
   mutations-journal-retain-rows   always keep the newest N rows
 
+Note the floors are time-based and count-based — they are NOT a consumer
+watermark. They protect only the recent window; a consumer that has fallen
+further behind than both floors allow can still be pruned past and lose records.
 Consumers are responsible for tracking their own watermark (the highest seq they
-have durably processed). Pruned history cannot be recovered from the workspace —
-the journal is the only local copy. On a Dolt backend, pair a prune with
-'dolt gc' to reclaim the space, since the table is working-set (dolt_ignored)
-state that ordinary Dolt commits never garbage-collect.`,
+have durably processed) and for pruning no further than they have consumed.
+Pruned history cannot be recovered from the workspace — the journal is the only
+local copy. On a Dolt backend, pair a prune with 'dolt gc' to reclaim the space,
+since the table is working-set (dolt_ignored) state that ordinary Dolt commits
+never garbage-collect.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, _ []string) error {
@@ -271,29 +287,30 @@ func readJournalProxied(ctx context.Context, query string, args ...any) ([]mutat
 }
 
 // pruneJournalProxied applies the retain floors through the proxied-server unit
-// of work, reusing the shared floor helpers.
+// of work. The floor orchestration lives in issueops.ComputeMutationsPruneWhere;
+// only the ceil read and the DELETE are expressed in raw SQL here.
 func pruneJournalProxied(ctx context.Context, before int64, retainDays, retainRows int) (int64, error) {
 	if uowProvider == nil {
 		return 0, fmt.Errorf("proxied-server UOW provider not initialized")
 	}
-	var (
-		rowsCeil   int64
-		rowsCeilOK bool
-	)
-	if retainRows > 0 {
+	where, args, skip, err := issueops.ComputeMutationsPruneWhere(before, retainDays, retainRows, time.Now().UTC(), func() (int64, bool, error) {
 		res, err := uow.RunTxRead(ctx, uowProvider, func(ctx context.Context, uw uow.UnitOfWork) (*domain.RawSQLResult, error) {
 			return uw.RawSQLUseCase().Query(ctx, issueops.MutationsPruneRowsCeilQuery(), retainRows)
 		})
 		if err != nil {
-			return 0, err
+			return 0, false, err
 		}
 		if res == nil || len(res.Rows) == 0 || len(res.Rows[0]) == 0 {
-			// The whole journal is inside the retained window: nothing to prune.
-			return 0, nil
+			return 0, false, nil
 		}
-		rowsCeil, rowsCeilOK = toInt64(res.Rows[0][0]), true
+		return toInt64(res.Rows[0][0]), true, nil
+	})
+	if err != nil {
+		return 0, err
 	}
-	where, args := issueops.BuildMutationsPruneWhere(before, retainDays, time.Now().UTC(), rowsCeil, rowsCeilOK)
+	if skip {
+		return 0, nil
+	}
 	return uow.RunTxResult(ctx, uowProvider, func(ctx context.Context, uw uow.UnitOfWork) (int64, string, error) {
 		n, err := uw.RawSQLUseCase().Exec(ctx, "DELETE FROM bd_mutations_journal WHERE "+where, args...)
 		if err != nil {

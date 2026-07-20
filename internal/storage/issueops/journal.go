@@ -16,9 +16,20 @@ import (
 // The durable mutations journal records every committed issue mutation as a row
 // in the clone-local bd_mutations_journal table, written in the SAME
 // transaction as the mutation itself. Because the row and the mutation commit
-// atomically, the journal can never lag the data, produce a false record, or
-// collide on a sequence number: the seq is an engine-assigned AUTO_INCREMENT PK,
-// serialized across every connection to the shared database.
+// atomically, the journal can never lag the data or produce a false record.
+//
+// The seq is NOT an AUTO_INCREMENT. AUTO_INCREMENT assigns a value at INSERT,
+// not at commit, so under concurrent transactions (the shared SQL server)
+// commit-visibility order can invert seq order: a lower seq can commit after a
+// higher seq is already visible, and a consumer tailing WHERE seq > cursor
+// would permanently skip it. Instead each seq is drawn from the single-row
+// counter table bd_mutations_seq inside the mutation's own transaction (see
+// nextMutationSeq). The shared counter row makes concurrent allocators conflict,
+// so exactly one commit order survives; the surviving seqs are gapless and
+// commit-ordered (a rolled-back allocator burns no seq — the increment rolls
+// back with it). This holds on both of bd's Dolt concurrency models: the SQL
+// server aborts the losing commit with a serialization error (retried by the
+// write path), while the embedded engine serializes writers on the counter row.
 //
 // External tooling reads the journal through `bd mutations tail --since <seq>`
 // and `bd mutations export`, replaying the exact mutation history of the
@@ -26,10 +37,12 @@ import (
 //
 // Emission lives here, at the issueops seam, because both write plumbings — the
 // DoltStorage decorator chain and the unit-of-work path — bottom out in these
-// *InTx functions. Instrumenting the seam makes coverage structural: every
-// mutation path (including wisps, ready-claims, lease reclaim, renames, and
-// cascade deletes) flows through it. TestEveryMutationFunctionJournals guards
-// against a new mutation path silently skipping the journal.
+// *InTx functions, and both funnel their INSERT through insertMutationRow, so
+// the seq mechanism is shared by construction and cannot drift between plumbings.
+// Instrumenting the seam makes coverage structural: every mutation path
+// (including wisps, ready-claims, lease reclaim, renames, and cascade deletes)
+// flows through it. TestEveryMutationFunctionJournals guards against a new
+// mutation path silently skipping the journal.
 
 // MutationOp names the kind of mutation a journal row records.
 type MutationOp string
@@ -109,8 +122,11 @@ func RecordDepMutationInTx(ctx context.Context, tx DBTX, op MutationOp, issueID,
 	return insertMutationRow(ctx, tx, op, issueID, issue, &MutationDep{Kind: kind, Target: target})
 }
 
-// insertMutationRow performs the actual INSERT. A nil issue is stored as SQL
-// NULL (deletes); a nil dep is stored as SQL NULL (non-dependency ops).
+// insertMutationRow performs the actual INSERT. It is the ONE seam both write
+// plumbings funnel through, so the seq mechanism cannot drift between them. A
+// nil issue is stored as SQL NULL (deletes); a nil dep is stored as SQL NULL
+// (non-dependency ops). ts is the insert time, stamped inside the committing
+// transaction.
 func insertMutationRow(ctx context.Context, tx DBTX, op MutationOp, issueID string, issue *types.Issue, dep *MutationDep) error {
 	var issueJSON any
 	if issue != nil {
@@ -128,14 +144,66 @@ func insertMutationRow(ctx context.Context, tx DBTX, op MutationOp, issueID stri
 		}
 		depJSON = string(b)
 	}
-	_, err := tx.ExecContext(ctx, `
-		INSERT INTO bd_mutations_journal (ts, op, issue_id, issue_json, dep_json)
-		VALUES (?, ?, ?, ?, ?)
-	`, time.Now().UTC(), string(op), issueID, issueJSON, depJSON)
+	seq, err := nextMutationSeq(ctx, tx)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO bd_mutations_journal (seq, ts, op, issue_id, issue_json, dep_json)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, seq, time.Now().UTC(), string(op), issueID, issueJSON, depJSON)
 	if err != nil {
 		return fmt.Errorf("journal: record %s for %s: %w", op, issueID, err)
 	}
 	return nil
+}
+
+// nextMutationSeq allocates the next journal sequence number from the single-row
+// bd_mutations_seq counter, INSIDE the caller's transaction. Incrementing the
+// shared counter row is what serializes seq assignment: two transactions that
+// both allocate a seq contend on the one row, so only one commit order survives.
+// The value becomes the journal row's seq, yielding gapless, commit-ordered seqs
+// (a rolled-back transaction rolls back its increment, burning no seq). The
+// counter persists across restart and prune never touches it, so seq never
+// resets. The seed row is created by migration 0056 / ignored 0014; the
+// self-heal below re-creates it at the journal's high-water mark if it is ever
+// missing, so a re-seed can never collide with an existing seq.
+func nextMutationSeq(ctx context.Context, tx DBTX) (int64, error) {
+	advance := func() (int64, error) {
+		res, err := tx.ExecContext(ctx, "UPDATE bd_mutations_seq SET next_seq = next_seq + 1 WHERE id = 0")
+		if err != nil {
+			return 0, fmt.Errorf("journal: advance seq counter: %w", err)
+		}
+		return res.RowsAffected()
+	}
+	n, err := advance()
+	if err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		// Seed the row (idempotent), then raise it past any existing journal seq so
+		// the re-seed can never collide. VALUES + GREATEST, not INSERT ... SELECT
+		// MAX(): in Dolt a literal+aggregate SELECT over an empty table yields zero
+		// rows, so an INSERT ... SELECT would seed nothing on a fresh journal.
+		if _, err := tx.ExecContext(ctx, "INSERT IGNORE INTO bd_mutations_seq (id, next_seq) VALUES (0, 0)"); err != nil {
+			return 0, fmt.Errorf("journal: seed seq counter: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE bd_mutations_seq
+			SET next_seq = GREATEST(next_seq, COALESCE((SELECT MAX(seq) FROM bd_mutations_journal), 0))
+			WHERE id = 0
+		`); err != nil {
+			return 0, fmt.Errorf("journal: raise seq counter to high-water mark: %w", err)
+		}
+		if _, err := advance(); err != nil {
+			return 0, err
+		}
+	}
+	var seq int64
+	if err := tx.QueryRowContext(ctx, "SELECT next_seq FROM bd_mutations_seq WHERE id = 0").Scan(&seq); err != nil {
+		return 0, fmt.Errorf("journal: read seq counter: %w", err)
+	}
+	return seq, nil
 }
 
 // compile-time assurance that *sql.Tx satisfies DBTX (the emit helpers accept

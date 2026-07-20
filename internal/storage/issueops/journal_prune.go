@@ -89,26 +89,57 @@ func ReadMutationsInTx(ctx context.Context, tx DBTX, since int64, limit int) ([]
 	return out, rows.Err()
 }
 
-// PruneMutationsInTx deletes journal rows with seq below before, honoring the
-// retain-days and retain-rows floors (0 disables a floor), and returns the
-// number of rows deleted. It runs inside the caller's transaction.
-func PruneMutationsInTx(ctx context.Context, tx DBTX, before int64, retainDays, retainRows int, now time.Time) (int64, error) {
+// ComputeMutationsPruneWhere resolves the retain-rows floor via readCeil and
+// returns the full DELETE predicate (without the "WHERE" keyword) plus its bind
+// args, or skip=true when the whole journal is inside the retained window and
+// nothing may be pruned. readCeil reports (ceil, found, err): found is false
+// when the journal holds retainRows or fewer rows. It is only invoked when
+// retainRows > 0.
+//
+// This is the ONE place the retain-floor orchestration lives. Both prune
+// plumbings — the DBTX path (PruneMutationsInTx) and the proxied raw-SQL path in
+// cmd/bd — call it, so the two can never drift on which rows a floor protects.
+// Only the substrate-specific ceil read and the DELETE execution differ.
+func ComputeMutationsPruneWhere(before int64, retainDays, retainRows int, now time.Time, readCeil func() (ceil int64, found bool, err error)) (where string, args []any, skip bool, err error) {
 	var (
 		rowsCeil   int64
 		rowsCeilOK bool
 	)
 	if retainRows > 0 {
-		err := tx.QueryRowContext(ctx, MutationsPruneRowsCeilQuery(), retainRows).Scan(&rowsCeil)
-		if errors.Is(err, sql.ErrNoRows) {
-			// The whole journal is inside the retained window: nothing to prune.
-			return 0, nil
+		ceil, found, cerr := readCeil()
+		if cerr != nil {
+			return "", nil, false, cerr
 		}
-		if err != nil {
-			return 0, fmt.Errorf("journal: compute retain-rows floor: %w", err)
+		if !found {
+			return "", nil, true, nil
 		}
-		rowsCeilOK = true
+		rowsCeil, rowsCeilOK = ceil, true
 	}
-	where, args := BuildMutationsPruneWhere(before, retainDays, now, rowsCeil, rowsCeilOK)
+	where, args = BuildMutationsPruneWhere(before, retainDays, now, rowsCeil, rowsCeilOK)
+	return where, args, false, nil
+}
+
+// PruneMutationsInTx deletes journal rows with seq below before, honoring the
+// retain-days and retain-rows floors (0 disables a floor), and returns the
+// number of rows deleted. It runs inside the caller's transaction.
+func PruneMutationsInTx(ctx context.Context, tx DBTX, before int64, retainDays, retainRows int, now time.Time) (int64, error) {
+	where, args, skip, err := ComputeMutationsPruneWhere(before, retainDays, retainRows, now, func() (int64, bool, error) {
+		var ceil int64
+		scanErr := tx.QueryRowContext(ctx, MutationsPruneRowsCeilQuery(), retainRows).Scan(&ceil)
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			return 0, false, nil
+		}
+		if scanErr != nil {
+			return 0, false, fmt.Errorf("journal: compute retain-rows floor: %w", scanErr)
+		}
+		return ceil, true, nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if skip {
+		return 0, nil
+	}
 	res, err := tx.ExecContext(ctx, "DELETE FROM bd_mutations_journal WHERE "+where, args...)
 	if err != nil {
 		return 0, fmt.Errorf("journal: prune below %d: %w", before, err)

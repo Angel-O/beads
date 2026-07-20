@@ -9,22 +9,27 @@ import (
 // TestMutationsJournal_PruneFloors exercises the real prune predicate
 // (issueops.BuildMutationsPruneWhere + MutationsPruneRowsCeilQuery) against Dolt:
 // retain-rows keeps the newest N rows, retain-days keeps rows within the window,
-// both floors compose, and the AUTO_INCREMENT seq keeps climbing after a prune
-// (never resets). Rows are inserted directly with controlled ts so age-based
+// both floors compose, and the seq keeps climbing after a prune (never resets,
+// because it is drawn from the durable bd_mutations_seq counter, which prune
+// never touches). Rows are inserted directly with controlled ts so age-based
 // pruning is deterministic.
 func (s *testSuite) TestMutationsJournal_PruneFloors() {
 	ctx := s.Ctx()
 	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_mutations_journal")
 	s.Require().NoError(err)
 
+	// insert allocates seq from the durable counter (mirroring
+	// issueops.nextMutationSeq) so seq never resets across the DELETEs below.
 	insert := func(id string, ts time.Time) int64 {
-		_, err := s.Runner().ExecContext(ctx,
-			`INSERT INTO bd_mutations_journal (ts, op, issue_id, issue_json, dep_json) VALUES (?, 'create', ?, NULL, NULL)`,
-			ts.UTC(), id)
+		_, err := s.Runner().ExecContext(ctx, "UPDATE bd_mutations_seq SET next_seq = next_seq + 1 WHERE id = 0")
 		s.Require().NoError(err)
 		var seq int64
 		s.Require().NoError(s.Runner().QueryRowContext(ctx,
-			"SELECT seq FROM bd_mutations_journal WHERE issue_id = ?", id).Scan(&seq))
+			"SELECT next_seq FROM bd_mutations_seq WHERE id = 0").Scan(&seq))
+		_, err = s.Runner().ExecContext(ctx,
+			`INSERT INTO bd_mutations_journal (seq, ts, op, issue_id, issue_json, dep_json) VALUES (?, ?, 'create', ?, NULL, NULL)`,
+			seq, ts.UTC(), id)
+		s.Require().NoError(err)
 		return seq
 	}
 	remaining := func() []string {
@@ -85,5 +90,5 @@ func (s *testSuite) TestMutationsJournal_PruneFloors() {
 
 	// Seq never resets: a fresh insert after pruning gets a seq above everything.
 	after := insert("d6", now)
-	s.Greater(after, dLast, "AUTO_INCREMENT seq must keep climbing after a prune (never reset)")
+	s.Greater(after, dLast, "counter-drawn seq must keep climbing after a prune (never reset)")
 }

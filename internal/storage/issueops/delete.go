@@ -256,6 +256,10 @@ func DeleteIssuesInTx(ctx context.Context, tx *sql.Tx, ids []string, cascade boo
 	}
 
 	totalRegularsDeleted := 0
+	// deletedRegularIDs is the set of ids that actually removed a row, so the
+	// journal records a delete only for those — never a phantom delete for an id
+	// that matched nothing (the batched DELETE reports only a per-batch total).
+	var deletedRegularIDs []string
 	for i := 0; i < len(finalRegularIDs); i += deleteBatchSize {
 		end := i + deleteBatchSize
 		if end > len(finalRegularIDs) {
@@ -263,6 +267,13 @@ func DeleteIssuesInTx(ctx context.Context, tx *sql.Tx, ids []string, cascade boo
 		}
 		batch := finalRegularIDs[i:end]
 		batchInClause, batchArgs := buildSQLInClause(batch)
+
+		// Which ids in this batch actually exist? In this transaction nothing else
+		// removes them, so the present set is exactly the set the DELETE removes.
+		present, err := existingIDsInTx(ctx, tx, "issues", batchInClause, batchArgs)
+		if err != nil {
+			return nil, err
+		}
 
 		deleteResult, err := tx.ExecContext(ctx,
 			fmt.Sprintf(`DELETE FROM issues WHERE id IN (%s)`, batchInClause),
@@ -272,6 +283,7 @@ func DeleteIssuesInTx(ctx context.Context, tx *sql.Tx, ids []string, cascade boo
 		}
 		rowsAffected, _ := deleteResult.RowsAffected()
 		totalRegularsDeleted += int(rowsAffected)
+		deletedRegularIDs = append(deletedRegularIDs, present...)
 
 		// Deleted issues hold no leases.
 		if _, err := tx.ExecContext(ctx,
@@ -282,11 +294,11 @@ func DeleteIssuesInTx(ctx context.Context, tx *sql.Tx, ids []string, cascade boo
 	}
 	result.DeletedCount = totalRegularsDeleted + len(allWispIDs)
 
-	// Journal every regular issue deleted by this bulk/cascade operation. Wisps
-	// were deleted through deleteIssueRowInTx above, which journals each itself;
-	// finalRegularIDs is the cascade-expanded set of regular ids removed by the
-	// direct batched DELETE, so this records cascade deletes too.
-	for _, id := range finalRegularIDs {
+	// Journal every regular issue this bulk/cascade operation actually removed.
+	// Wisps were deleted through deleteIssueRowInTx above, which journals each
+	// itself; deletedRegularIDs is the cascade-expanded set of regular ids that
+	// truly had a row removed, so this records cascade deletes without phantoms.
+	for _, id := range deletedRegularIDs {
 		if err := RecordDeleteInTx(ctx, tx, id); err != nil {
 			return nil, err
 		}
@@ -403,6 +415,29 @@ func findExternalDependentsBatchedInTx(ctx context.Context, tx *sql.Tx, ids []st
 		result = append(result, id)
 	}
 	return result, nil
+}
+
+// existingIDsInTx returns the subset of the batch (already rendered as inClause
+// + args) whose ids exist in table, so a caller can journal a delete only for
+// rows that were actually present. table is a hardcoded issue/wisp constant.
+//
+//nolint:gosec // G201: table is a hardcoded issue/wisp constant; inClause is ? placeholders.
+func existingIDsInTx(ctx context.Context, tx DBTX, table, inClause string, args []any) ([]string, error) {
+	rows, err := tx.QueryContext(ctx,
+		fmt.Sprintf("SELECT id FROM %s WHERE id IN (%s)", table, inClause), args...)
+	if err != nil {
+		return nil, fmt.Errorf("check existing ids in %s: %w", table, err)
+	}
+	defer rows.Close()
+	var present []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan existing id in %s: %w", table, err)
+		}
+		present = append(present, id)
+	}
+	return present, rows.Err()
 }
 
 //nolint:gosec // G201: table is selected by callers from fixed issue/wisp auxiliary tables.

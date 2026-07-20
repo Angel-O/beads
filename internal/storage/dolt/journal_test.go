@@ -10,7 +10,7 @@ import (
 // TestMutationsJournal_EmbeddedPlumbing drives mutations through the DoltStore
 // (the embedded/DoltStorage write plumbing, which bottoms out in the issueops
 // *InTx functions) against real Dolt and asserts the journal at the issueops
-// seam records each op with an engine-assigned monotonic seq. This is the second
+// seam records each op with a counter-assigned monotonic seq. This is the second
 // of the two plumbings; the first is exercised in domain/db.
 func TestMutationsJournal_EmbeddedPlumbing(t *testing.T) {
 	store, cleanup := setupTestStore(t)
@@ -73,5 +73,57 @@ func TestMutationsJournal_EmbeddedPlumbing(t *testing.T) {
 			t.Fatalf("row %d: seq %d not strictly greater than prev %d", i, got[i].seq, prev)
 		}
 		prev = got[i].seq
+	}
+}
+
+// TestMutationsJournal_NoPhantomDeletes asserts the bulk delete (DeleteIssuesInTx)
+// journals a delete only for ids that actually removed a row — never a phantom
+// for an id that matched nothing.
+func TestMutationsJournal_NoPhantomDeletes(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	enableJournalForTest(t)
+
+	mk := func(id string) *types.Issue {
+		return &types.Issue{ID: id, Title: "t-" + id, IssueType: types.TypeTask, Status: types.StatusOpen}
+	}
+	if err := store.CreateIssue(ctx, mk("bd-pd-1"), "actor"); err != nil {
+		t.Fatalf("create 1: %v", err)
+	}
+	if err := store.CreateIssue(ctx, mk("bd-pd-2"), "actor"); err != nil {
+		t.Fatalf("create 2: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, "DELETE FROM bd_mutations_journal"); err != nil {
+		t.Fatalf("clear journal: %v", err)
+	}
+
+	// Delete a mix of present and absent ids; force avoids the dependent gate.
+	if _, err := store.DeleteIssues(ctx, []string{"bd-pd-1", "bd-pd-missing-a", "bd-pd-2", "bd-pd-missing-b"}, false, true, false); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	rows, err := store.db.QueryContext(ctx, "SELECT op, issue_id FROM bd_mutations_journal ORDER BY seq ASC")
+	if err != nil {
+		t.Fatalf("query journal: %v", err)
+	}
+	defer rows.Close()
+	deleted := map[string]bool{}
+	for rows.Next() {
+		var op, id string
+		if err := rows.Scan(&op, &id); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if op != "delete" {
+			t.Fatalf("unexpected op %q for %s", op, id)
+		}
+		deleted[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows err: %v", err)
+	}
+	if len(deleted) != 2 || !deleted["bd-pd-1"] || !deleted["bd-pd-2"] {
+		t.Fatalf("journal must record deletes only for present ids, got %v", deleted)
 	}
 }

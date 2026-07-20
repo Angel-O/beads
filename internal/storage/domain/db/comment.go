@@ -10,6 +10,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -138,6 +139,12 @@ func (r *commentSQLRepositoryImpl) Insert(ctx context.Context, issueID, author, 
 		fmt.Sprintf("INSERT INTO %s (id, issue_id, author, text, created_at) VALUES (?, ?, ?, ?, ?)", commentTable),
 		id, issueID, author, text, createdAt); err != nil {
 		return nil, fmt.Errorf("db: CommentSQLRepository.Insert: %w", err)
+	}
+
+	// Journal the comment as an update to the issue in the same transaction — a
+	// comment mutates the issue's bead state, recorded like a label change.
+	if err := issueops.RecordMutationInTx(ctx, r.runner, issueops.MutationUpdate, issueID); err != nil {
+		return nil, err
 	}
 
 	return &types.Comment{

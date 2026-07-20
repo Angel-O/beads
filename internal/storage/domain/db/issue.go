@@ -795,9 +795,19 @@ func (r *issueSQLRepositoryImpl) DeleteByIDs(ctx context.Context, ids []string, 
 			placeholders[i] = "?"
 			args[i] = id
 		}
+		inClause := strings.Join(placeholders, ",")
+
+		// Which ids in this batch actually exist? In this transaction nothing else
+		// removes them, so the present set is exactly the set the DELETE removes —
+		// journal a delete only for those, never a phantom for an absent id.
+		present, err := r.presentIDs(ctx, table, inClause, args)
+		if err != nil {
+			return total, err
+		}
+
 		//nolint:gosec // G201: table is a hardcoded constant; placeholders are ?.
 		res, err := r.runner.ExecContext(ctx,
-			fmt.Sprintf("DELETE FROM %s WHERE id IN (%s)", table, strings.Join(placeholders, ",")),
+			fmt.Sprintf("DELETE FROM %s WHERE id IN (%s)", table, inClause),
 			args...)
 		if err != nil {
 			return total, fmt.Errorf("db: IssueSQLRepository.DeleteByIDs from %s: %w", table, err)
@@ -807,9 +817,9 @@ func (r *issueSQLRepositoryImpl) DeleteByIDs(ctx context.Context, ids []string, 
 			return total, fmt.Errorf("db: IssueSQLRepository.DeleteByIDs rows affected: %w", err)
 		}
 		total += int(n)
-		// Journal each deleted id in the same transaction. The delete use case
-		// passes the cascade-expanded set, so this records cascade deletes too.
-		for _, id := range batch {
+		// Journal each actually-deleted id in the same transaction. The delete use
+		// case passes the cascade-expanded set, so this records cascade deletes too.
+		for _, id := range present {
 			if err := issueops.RecordDeleteInTx(ctx, r.runner, id); err != nil {
 				return total, err
 			}
@@ -825,6 +835,29 @@ func (r *issueSQLRepositoryImpl) DeleteByIDs(ctx context.Context, ids []string, 
 		}
 	}
 	return total, nil
+}
+
+// presentIDs returns the subset of a batch (rendered as inClause + args) whose
+// ids exist in table, so DeleteByIDs journals a delete only for rows actually
+// removed. table is a hardcoded issue/wisp constant.
+//
+//nolint:gosec // G201: table is a hardcoded constant; inClause is ? placeholders.
+func (r *issueSQLRepositoryImpl) presentIDs(ctx context.Context, table, inClause string, args []any) ([]string, error) {
+	rows, err := r.runner.QueryContext(ctx,
+		fmt.Sprintf("SELECT id FROM %s WHERE id IN (%s)", table, inClause), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: IssueSQLRepository.DeleteByIDs check existing from %s: %w", table, err)
+	}
+	defer rows.Close()
+	var present []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("db: IssueSQLRepository.DeleteByIDs scan existing: %w", err)
+		}
+		present = append(present, id)
+	}
+	return present, rows.Err()
 }
 
 func (r *issueSQLRepositoryImpl) PartitionWispIDs(ctx context.Context, ids []string) ([]string, []string, error) {

@@ -8,18 +8,26 @@
 --
 -- The table is clone-local (registered dolt_ignored, seeded by MigrateUp's
 -- doltIgnorePatterns before this migration runs): it is operational state, never
--- versioned or federated, so its AUTO_INCREMENT seq stays monotonic and
--- collision-free without ever producing a merge conflict. That is exactly why
--- the federation-conflict reasoning behind migration 0037 (which dropped
--- AUTO_INCREMENT from the *versioned* tables) does not apply here.
+-- versioned or federated, so its seq stays monotonic without ever producing a
+-- merge conflict.
+--
+-- seq is NOT AUTO_INCREMENT. AUTO_INCREMENT assigns at INSERT, not at commit, so
+-- under concurrent transactions (the shared SQL server) a lower seq can commit
+-- AFTER a higher seq becomes visible, and a consumer tailing WHERE seq > cursor
+-- permanently skips it. Instead seq is drawn from the single-row counter table
+-- bd_mutations_seq inside the mutation's own transaction (issueops.nextMutationSeq):
+-- the shared counter row makes concurrent allocators conflict, so exactly one
+-- commit order survives and the surviving seqs are gapless and commit-ordered
+-- (a rolled-back allocator burns no seq). The counter table is dolt_ignored too,
+-- so it shares the journal's working-set locality.
 --
 -- Fresh clones never run this migration (the schema_migrations cursor arrives
--- at-latest); they materialize the table via ignored migration 0014. The
--- __temp__ + conditional RENAME dance keeps the CREATE idempotent so a re-run,
--- or a run against a workspace that already has the table, is a no-op.
+-- at-latest); they materialize both tables via ignored migration 0014. The
+-- __temp__ + conditional RENAME dance keeps each CREATE idempotent so a re-run,
+-- or a run against a workspace that already has the tables, is a no-op.
 DROP TABLE IF EXISTS __temp__bd_mutations_journal;
 CREATE TABLE __temp__bd_mutations_journal (
-    seq BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    seq BIGINT NOT NULL PRIMARY KEY,
     ts DATETIME NOT NULL,
     op VARCHAR(32) NOT NULL,
     issue_id VARCHAR(255) NOT NULL,
@@ -30,3 +38,21 @@ CREATE TABLE __temp__bd_mutations_journal (
 SET @exists = (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bd_mutations_journal');
 SET @sql = IF(@exists = 0, 'RENAME TABLE __temp__bd_mutations_journal TO bd_mutations_journal', 'DROP TABLE __temp__bd_mutations_journal');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+DROP TABLE IF EXISTS __temp__bd_mutations_seq;
+CREATE TABLE __temp__bd_mutations_seq (
+    id INT NOT NULL PRIMARY KEY,
+    next_seq BIGINT NOT NULL
+);
+SET @seq_exists = (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bd_mutations_seq');
+SET @seq_sql = IF(@seq_exists = 0, 'RENAME TABLE __temp__bd_mutations_seq TO bd_mutations_seq', 'DROP TABLE __temp__bd_mutations_seq');
+PREPARE stmt FROM @seq_sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+-- Seed the counter row (idempotent), then raise it to the journal's current
+-- high-water mark so seq never resets or collides (0 on a fresh table). Done as
+-- VALUES + a GREATEST update rather than INSERT ... SELECT MAX(): in Dolt a
+-- SELECT that mixes a literal with an aggregate over an EMPTY table yields zero
+-- rows, so an INSERT ... SELECT would seed nothing on a fresh workspace.
+INSERT IGNORE INTO bd_mutations_seq (id, next_seq) VALUES (0, 0);
+UPDATE bd_mutations_seq
+    SET next_seq = GREATEST(next_seq, COALESCE((SELECT MAX(seq) FROM bd_mutations_journal), 0))
+    WHERE id = 0;

@@ -1,48 +1,45 @@
 package db
 
 import (
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"io/fs"
-	"regexp"
-	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/storage/journalscan"
 )
 
 // TestEveryRepositoryMutatorJournals is the completeness guard for the
 // unit-of-work write plumbing. Unlike the DoltStorage plumbing, several of this
 // package's repository mutators reimplement their own SQL instead of routing
-// through issueops, so the issueops seam alone does NOT cover them. This test
-// enumerates every mutator method on the issue/dependency/label repositories and
-// asserts each one journals — either by calling an issueops.Record*InTx emit
-// helper directly, or by delegating to an issueops function that emits
-// (CloseIssueInTx / ReopenIssueInTx / ClaimReadyIssueInTx /
-// ReclaimExpiredLeasesInTx), or by delegating to a sibling repository method
-// that does.
+// through issueops, so the issueops seam alone does NOT cover them.
 //
-// A new reimplemented mutator that forgets to journal fails this test.
+// The guard is STRUCTURAL, not name-based: it does not trust a verb regex on the
+// method name or a broad "Insert" coverage token (either of which could let a
+// mutator named off-pattern, or a false delegation, ship un-journaled). Instead
+// it detects a mutator by BEHAVIOR — any method on a work-bead repository whose
+// body (directly, or through a free function it calls) executes an INSERT /
+// UPDATE / DELETE against a work-bead table — and asserts each one journals.
+//
+// A new reimplemented mutator that writes a bead table and forgets to journal
+// fails this test even if it is named nothing like a mutator.
 func TestEveryRepositoryMutatorJournals(t *testing.T) {
-	// Repository receiver types whose mutator methods must journal.
-	mutatorReceivers := map[string]bool{
+	// Repository receiver types that own work-bead state. issue/dependency/label
+	// reimplement issueops SQL; comment writes the comments bead table.
+	beadReceivers := map[string]bool{
 		"issueSQLRepositoryImpl":      true,
 		"dependencySQLRepositoryImpl": true,
 		"labelSQLRepositoryImpl":      true,
+		"commentSQLRepositoryImpl":    true,
 	}
 
-	// A method name is a mutator when it starts with one of these verbs.
-	mutatorVerb := regexp.MustCompile(`^(Insert|Update|Delete|Claim|Close|Reopen|Unclaim|Reclaim|Promote|Reparent|Rename|Add|Remove|Set)`)
-
-	// Methods that are legitimately not journalled: bulk cascade cleanups run
-	// while their parent issue delete (already journalled) removes the rows.
-	allowNoJournal := map[string]bool{
-		"DeleteAllForIDs": true,
+	// Bead-mutating methods that legitimately do NOT journal, each with a reason.
+	// The staleness check below fails if any of these stops being a bead mutator,
+	// so a rename or refactor cannot silently strand an exemption.
+	exempt := map[string]string{
+		"DeleteAllForIDs":         "bulk edge/label cleanup runs under a parent issue delete that already journals each removed bead",
+		"markDirectBlockedSource": "maintains the derived is_blocked column as a side effect of a journaled dependency insert",
 	}
 
-	// Calls that count as journalling coverage: the direct emit helpers, the
-	// issueops functions that emit internally, and delegation to a sibling repo
-	// method (matched loosely by the "Insert" method name for InsertBatch).
-	coverageCalls := map[string]bool{
+	// Direct emit helpers and the issueops functions that journal internally.
+	emitCalls := map[string]bool{
 		"RecordMutationInTx":       true,
 		"RecordDeleteInTx":         true,
 		"RecordDepMutationInTx":    true,
@@ -50,66 +47,53 @@ func TestEveryRepositoryMutatorJournals(t *testing.T) {
 		"ReopenIssueInTx":          true,
 		"ClaimReadyIssueInTx":      true,
 		"ReclaimExpiredLeasesInTx": true,
-		"Insert":                   true, // InsertBatch delegates to Insert
 	}
 
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
+	fns, err := journalscan.ParsePackage(".")
 	if err != nil {
 		t.Fatalf("parse domain/db package: %v", err)
 	}
 
-	var checked int
-	for _, pkg := range pkgs {
-		for _, file := range pkg.Files {
-			for _, decl := range file.Decls {
-				fn, ok := decl.(*ast.FuncDecl)
-				if !ok || fn.Recv == nil || len(fn.Recv.List) == 0 {
-					continue
-				}
-				recv := receiverTypeName(fn.Recv.List[0].Type)
-				if !mutatorReceivers[recv] {
-					continue
-				}
-				name := fn.Name.Name
-				if !mutatorVerb.MatchString(name) || allowNoJournal[name] {
-					continue
-				}
+	// beadDML: fn writes a bead table directly, or calls a free function that
+	// transitively does (e.g. Insert -> insertIssueRow). Only free-function
+	// (bare-identifier) calls propagate DML, so an events/leases write reached
+	// through a selector (r.events.Record) does not count as a bead mutation.
+	beadDML := journalscan.Fixpoint(fns,
+		func(f *journalscan.FuncInfo) bool { return f.OwnBeadDML },
+		func(f *journalscan.FuncInfo) []string { return f.IdentCalls })
 
-				covered := false
-				ast.Inspect(fn, func(n ast.Node) bool {
-					call, ok := n.(*ast.CallExpr)
-					if !ok {
-						return true
-					}
-					if sel, ok := call.Fun.(*ast.SelectorExpr); ok && coverageCalls[sel.Sel.Name] {
-						covered = true
-					}
-					return true
-				})
-				checked++
-				if !covered {
-					t.Errorf("%s.%s is a mutator that does not journal: it neither calls an issueops.Record*InTx emit helper, nor delegates to an emitting issueops function, nor to a sibling mutator that journals", recv, name)
-				}
+	// emits: fn calls an emit helper directly, or calls any package function
+	// (free or method-by-name) that emits.
+	emits := journalscan.Fixpoint(fns,
+		func(f *journalscan.FuncInfo) bool { return f.CallsAnyOf(emitCalls) },
+		func(f *journalscan.FuncInfo) []string { return f.AllCallNames() })
+
+	seenExempt := map[string]bool{}
+	var checked int
+	for name, f := range fns {
+		if !beadReceivers[f.Recv] || !beadDML[name] {
+			continue
+		}
+		if reason, ok := exempt[f.Name]; ok {
+			if reason == "" {
+				t.Errorf("%s has an empty exemption reason", f.Name)
 			}
+			seenExempt[f.Name] = true
+			continue
+		}
+		checked++
+		if !emits[name] {
+			t.Errorf("%s.%s writes a work-bead table but does not journal: it neither calls a Record*InTx emit helper, nor delegates to an emitting issueops function, nor to a sibling mutator that journals", f.Recv, f.Name)
 		}
 	}
 
 	if checked == 0 {
-		t.Fatal("guard found no mutator methods — receiver names or parsing changed; the completeness guard is not actually running")
+		t.Fatal("guard found no bead-mutating repository methods — receiver names, DML detection, or parsing changed; the completeness guard is not actually running")
 	}
-}
-
-// receiverTypeName returns the bare type name of a method receiver
-// (e.g. *issueSQLRepositoryImpl -> issueSQLRepositoryImpl).
-func receiverTypeName(expr ast.Expr) string {
-	if star, ok := expr.(*ast.StarExpr); ok {
-		expr = star.X
+	// Staleness: every exemption must still name a real bead mutator.
+	for m := range exempt {
+		if !seenExempt[m] {
+			t.Errorf("exemption %q no longer matches a bead-mutating repository method — remove it", m)
+		}
 	}
-	if ident, ok := expr.(*ast.Ident); ok {
-		return ident.Name
-	}
-	return ""
 }

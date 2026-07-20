@@ -242,8 +242,8 @@ type RawDBAccessor interface {
 
 // MutationsJournalRow is one raw bd_mutations_journal row surfaced to the
 // `bd mutations` CLI. IssueJSON is empty when the op is a delete (no surviving
-// row); DepJSON is empty for non-dependency ops. TS is the committed-at
-// timestamp normalized to a string.
+// row); DepJSON is empty for non-dependency ops. TS is the insert-time timestamp
+// (stamped inside the committing transaction) normalized to a string.
 type MutationsJournalRow struct {
 	Seq       int64
 	TS        string
