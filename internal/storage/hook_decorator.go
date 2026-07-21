@@ -178,9 +178,27 @@ func (h *HookFiringStore) AddDependency(ctx context.Context, dep *types.Dependen
 	return nil
 }
 
+// AddDependencyWithOptions adds a dependency with options and fires on_update.
+func (h *HookFiringStore) AddDependencyWithOptions(ctx context.Context, dep *types.Dependency, actor string, opts DependencyAddOptions) error {
+	if err := h.inner.AddDependencyWithOptions(ctx, dep, actor, opts); err != nil {
+		return err
+	}
+	h.fireDependencyHookByID(ctx, hooks.EventUpdate, dep.IssueID)
+	return nil
+}
+
 // RemoveDependency removes a dependency and fires on_update for the issue.
 func (h *HookFiringStore) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
 	if err := h.inner.RemoveDependency(ctx, issueID, dependsOnID, actor); err != nil {
+		return err
+	}
+	h.fireDependencyHookByID(ctx, hooks.EventUpdate, issueID)
+	return nil
+}
+
+// RemoveDependencyWithOptions removes a dependency with options and fires on_update.
+func (h *HookFiringStore) RemoveDependencyWithOptions(ctx context.Context, issueID, dependsOnID string, actor string, opts DependencyRemoveOptions) error {
+	if err := h.inner.RemoveDependencyWithOptions(ctx, issueID, dependsOnID, actor, opts); err != nil {
 		return err
 	}
 	h.fireDependencyHookByID(ctx, hooks.EventUpdate, issueID)
@@ -520,7 +538,11 @@ func (t *hookTrackingTransaction) AddDependencyWithOptions(ctx context.Context, 
 }
 
 func (t *hookTrackingTransaction) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
-	if err := t.Transaction.RemoveDependency(ctx, issueID, dependsOnID, actor); err != nil {
+	return t.RemoveDependencyWithOptions(ctx, issueID, dependsOnID, actor, DependencyRemoveOptions{})
+}
+
+func (t *hookTrackingTransaction) RemoveDependencyWithOptions(ctx context.Context, issueID, dependsOnID string, actor string, opts DependencyRemoveOptions) error {
+	if err := t.Transaction.RemoveDependencyWithOptions(ctx, issueID, dependsOnID, actor, opts); err != nil {
 		return err
 	}
 	if issue, err := dependencySnapshot(ctx, issueID, t.Transaction.GetIssue, t.Transaction.GetDependencyRecords); err == nil {

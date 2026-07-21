@@ -59,6 +59,12 @@ var ErrVersionMismatch = errors.New("version mismatch")
 // Storage is the interface satisfied by *dolt.DoltStore.
 // Consumers depend on this interface rather than on the concrete type so that
 // alternative implementations (mocks, proxies, etc.) can be substituted.
+//
+// External implementers note: this contract includes the optimistic-concurrency
+// helper UpdateIssueChecked and the atomic MergeMetadata method as required
+// members. Adding a required method is a breaking change for out-of-tree
+// implementations; such additions are called out in CHANGELOG.md and the
+// examples/library-usage guide so implementers have a migration path.
 type Storage interface {
 	// Issue CRUD
 	CreateIssue(ctx context.Context, issue *types.Issue, actor string) error
@@ -103,7 +109,17 @@ type Storage interface {
 
 	// Dependencies
 	AddDependency(ctx context.Context, dep *types.Dependency, actor string) error
+	// AddDependencyWithOptions adds a dependency with explicit options. The
+	// explicit dependency verbs (bd dep add / bd link) pass EmitEvent to record
+	// a dependency_added history event; AddDependency is the no-event default
+	// used by create-with-deps and structural callers.
+	AddDependencyWithOptions(ctx context.Context, dep *types.Dependency, actor string, opts DependencyAddOptions) error
 	RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error
+	// RemoveDependencyWithOptions removes a dependency with explicit options. The
+	// explicit dependency verb (bd dep remove) passes EmitEvent to record a
+	// dependency_removed history event; RemoveDependency is the no-event default
+	// used by structural callers (issue delete, reparent, batch, duplicate cleanup).
+	RemoveDependencyWithOptions(ctx context.Context, issueID, dependsOnID string, actor string, opts DependencyRemoveOptions) error
 	GetDependencies(ctx context.Context, issueID string) ([]*types.Issue, error)
 	GetDependents(ctx context.Context, issueID string) ([]*types.Issue, error)
 	GetDependenciesWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error)
@@ -462,6 +478,10 @@ type Transaction interface {
 	AddDependency(ctx context.Context, dep *types.Dependency, actor string) error
 	AddDependencyWithOptions(ctx context.Context, dep *types.Dependency, actor string, opts DependencyAddOptions) error
 	RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error
+	// RemoveDependencyWithOptions removes a dependency with explicit options.
+	// EmitEvent records a dependency_removed history event for the explicit
+	// bd dep remove verb; RemoveDependency stays silent for structural teardown.
+	RemoveDependencyWithOptions(ctx context.Context, issueID, dependsOnID string, actor string, opts DependencyRemoveOptions) error
 	GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error)
 	// CycleThroughEdges reports a rendered cycle in the static scheduling set
 	// (blocks, conditional-blocks, parent-child; not waits-for) that traverses
@@ -498,7 +518,8 @@ type Transaction interface {
 	GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error)
 }
 
-// DependencyAddOptions controls transaction-scoped dependency insertion.
+// DependencyAddOptions controls dependency insertion for both the store-level
+// AddDependencyWithOptions and the transaction-scoped AddDependencyWithOptions.
 type DependencyAddOptions struct {
 	// SkipCycleCheck bypasses the recursive pre-insert cycle check. Callers
 	// that set it MUST run Transaction.CycleThroughEdges before commit and fail
@@ -506,4 +527,21 @@ type DependencyAddOptions struct {
 	// per-edge cost for one whole-graph check, never graph integrity
 	// (bd-6dnrw.8).
 	SkipCycleCheck bool
+	// EmitEvent records a dependency_added history event on the source's event
+	// table for a genuine new edge. Only the explicit dependency verbs set it;
+	// create-with-deps and structural edge wiring leave it unset so implicit
+	// edges stay quiet, matching the proxied DepInsertOpts.EmitEvent gate.
+	EmitEvent bool
+}
+
+// DependencyRemoveOptions controls dependency removal for both the store-level
+// RemoveDependencyWithOptions and the transaction-scoped RemoveDependencyWithOptions.
+type DependencyRemoveOptions struct {
+	// EmitEvent records a dependency_removed history event on the source's event
+	// table when a genuine edge is removed. Only the explicit bd dep remove verb
+	// sets it; structural removals (issue delete, reparent, batch, duplicate
+	// cleanup) leave it unset so they wire edges away quietly, matching the
+	// proxied DepInsertOpts.EmitEvent gate so both backends record identical
+	// history.
+	EmitEvent bool
 }

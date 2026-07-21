@@ -578,7 +578,7 @@ func (s *DoltStore) getWispsByIDs(ctx context.Context, ids []string) ([]*types.I
 }
 
 // addWispDependency adds a dependency to the wisp_dependencies table.
-func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency, actor string, isCrossPrefix bool) error {
+func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency, actor string, isCrossPrefix, emitEvent bool) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -586,11 +586,14 @@ func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency
 	defer func() { _ = tx.Rollback() }()
 
 	kind := issueops.ClassifyDepTarget(ctx, tx, dep, isCrossPrefix)
-	if err := issueops.AddDependencyInTx(ctx, tx, dep, actor, issueops.AddDependencyOpts{
+	// Wisp source/event tables are dolt_ignored (committed with the SQL tx, not
+	// via selective doltAddAndCommit), so the event-written flag is not needed here.
+	if _, err := issueops.AddDependencyInTx(ctx, tx, dep, actor, issueops.AddDependencyOpts{
 		SourceTable:   "wisps",
 		WriteTable:    "wisp_dependencies",
 		IsCrossPrefix: isCrossPrefix,
 		TargetKind:    &kind,
+		EmitEvent:     emitEvent,
 	}); err != nil {
 		return err
 	}

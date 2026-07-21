@@ -145,19 +145,41 @@ func (s *DoltStore) GetIssueByExternalRef(ctx context.Context, externalRef strin
 	return s.GetIssue(ctx, id)
 }
 
+// validateUpdateMetadata validates an inbound metadata update value against the
+// configured schema (GH#1416 Phase 2) before any wisp routing. It is a no-op
+// when the update carries no "metadata" key. Shared by UpdateIssue and
+// UpdateIssueChecked so both apply the identical pre-write validation.
+func validateUpdateMetadata(updates map[string]interface{}) error {
+	rawMeta, ok := updates["metadata"]
+	if !ok {
+		return nil
+	}
+	metadataStr, err := storage.NormalizeMetadataValue(rawMeta)
+	if err != nil {
+		return fmt.Errorf("invalid metadata: %w", err)
+	}
+	return validateMetadataIfConfigured(json.RawMessage(metadataStr))
+}
+
+// checkExpectedVersionInTx enforces the optional ExpectedVersion CAS
+// precondition inside tx: when expectedVersion is non-nil the row's current
+// RowVersion (row_lock) must still equal it, else the caller's transaction
+// returns storage.ErrVersionMismatch and rolls back with the issue unchanged. A
+// nil expectedVersion disables the check (an unconditional update).
+func checkExpectedVersionInTx(ctx context.Context, tx *sql.Tx, id string, expectedVersion *int64) error {
+	if expectedVersion == nil {
+		return nil
+	}
+	return issueops.CheckVersionInTx(ctx, tx, id, *expectedVersion)
+}
+
 // UpdateIssue updates fields on an issue.
 // Delegates SQL work to issueops.UpdateIssueInTx; handles Dolt-specific concerns
 // (metadata validation, DemoteToWisp, DOLT_ADD/COMMIT, cache invalidation).
 func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[string]interface{}, actor string) error {
-	// Validate metadata against schema before wisp routing (GH#1416 Phase 2)
-	if rawMeta, ok := updates["metadata"]; ok {
-		metadataStr, err := storage.NormalizeMetadataValue(rawMeta)
-		if err != nil {
-			return fmt.Errorf("invalid metadata: %w", err)
-		}
-		if err := validateMetadataIfConfigured(json.RawMessage(metadataStr)); err != nil {
-			return err
-		}
+	// Validate metadata against schema before wisp routing (GH#1416 Phase 2).
+	if err := validateUpdateMetadata(updates); err != nil {
+		return err
 	}
 
 	// Route ephemeral IDs to wisps table (falls through for promoted wisps).
@@ -210,14 +232,8 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 // hot path and is left untouched.
 func (s *DoltStore) UpdateIssueChecked(ctx context.Context, id string, updates map[string]interface{}, actor string, opts storage.UpdateIssueOptions) error {
 	// Validate metadata against schema before wisp routing (GH#1416 Phase 2).
-	if rawMeta, ok := updates["metadata"]; ok {
-		metadataStr, err := storage.NormalizeMetadataValue(rawMeta)
-		if err != nil {
-			return fmt.Errorf("invalid metadata: %w", err)
-		}
-		if err := validateMetadataIfConfigured(json.RawMessage(metadataStr)); err != nil {
-			return err
-		}
+	if err := validateUpdateMetadata(updates); err != nil {
+		return err
 	}
 
 	// Route ephemeral IDs to wisps table (falls through for promoted wisps).
@@ -233,10 +249,8 @@ func (s *DoltStore) UpdateIssueChecked(ctx context.Context, id string, updates m
 	_, settingWisp := updates["wisp"]
 	if settingNoHistory || settingWisp {
 		return s.withRetryTx(ctx, func(tx *sql.Tx) error {
-			if opts.ExpectedVersion != nil {
-				if err := issueops.CheckVersionInTx(ctx, tx, id, *opts.ExpectedVersion); err != nil {
-					return err
-				}
+			if err := checkExpectedVersionInTx(ctx, tx, id, opts.ExpectedVersion); err != nil {
+				return err
 			}
 			return s.demoteToWispInTx(ctx, tx, id, updates, actor)
 		})
@@ -252,10 +266,8 @@ func (s *DoltStore) UpdateIssueChecked(ctx context.Context, id string, updates m
 	// and is replayed by withRetryTx, which re-reads the new version here and
 	// refuses. withRetryTx owns BeginTx and the final Commit.
 	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
-		if opts.ExpectedVersion != nil {
-			if err := issueops.CheckVersionInTx(ctx, tx, id, *opts.ExpectedVersion); err != nil {
-				return err
-			}
+		if err := checkExpectedVersionInTx(ctx, tx, id, opts.ExpectedVersion); err != nil {
+			return err
 		}
 		if _, err := issueops.UpdateIssueInTx(ctx, tx, id, updates, actor); err != nil {
 			return err

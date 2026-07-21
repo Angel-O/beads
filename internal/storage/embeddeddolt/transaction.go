@@ -111,16 +111,21 @@ func (t *embeddedTransaction) AddDependency(ctx context.Context, dep *types.Depe
 
 func (t *embeddedTransaction) AddDependencyWithOptions(ctx context.Context, dep *types.Dependency, actor string, addOpts storage.DependencyAddOptions) error {
 	_, _, eventTable, depTable := issueops.WispTableRouting(issueops.IsActiveWispInTx(ctx, t.tx, dep.IssueID))
-	if err := issueops.AddDependencyInTx(ctx, t.tx, dep, actor, issueops.AddDependencyOpts{
+	eventWritten, err := issueops.AddDependencyInTx(ctx, t.tx, dep, actor, issueops.AddDependencyOpts{
 		IsCrossPrefix:  types.ExtractPrefix(dep.IssueID) != types.ExtractPrefix(dep.DependsOnID),
 		SkipCycleCheck: addOpts.SkipCycleCheck,
-	}); err != nil {
+		EmitEvent:      addOpts.EmitEvent,
+	})
+	if err != nil {
 		return err
 	}
 	t.dirty.MarkDirty(depTable)
 	// AddDependencyInTx records a dependency_added event on the source's event
-	// table; stage it so the event commits with the edge.
-	t.dirty.MarkDirty(eventTable)
+	// table only for a genuine emit (explicit verb + new edge); stage it so the
+	// event commits with the edge. A structural or idempotent add writes no event.
+	if eventWritten {
+		t.dirty.MarkDirty(eventTable)
+	}
 	return nil
 }
 
@@ -136,14 +141,26 @@ func (t *embeddedTransaction) CycleThroughEdges(ctx context.Context, edges [][2]
 }
 
 func (t *embeddedTransaction) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
+	return t.RemoveDependencyWithOptions(ctx, issueID, dependsOnID, actor, storage.DependencyRemoveOptions{})
+}
+
+func (t *embeddedTransaction) RemoveDependencyWithOptions(ctx context.Context, issueID, dependsOnID string, actor string, rmOpts storage.DependencyRemoveOptions) error {
 	// Route dirty marking on the source's wisp status: a wisp-source remove
 	// stages wisp_dependencies/wisp_events, a permanent one dependencies/events.
-	// RemoveDependencyInTx records a dependency_removed event on the source's
-	// event table when a row is deleted; stage it so it commits with the edge.
 	_, _, eventTable, depTable := issueops.WispTableRouting(issueops.IsActiveWispInTx(ctx, t.tx, issueID))
+	eventWritten, err := issueops.RemoveDependencyInTx(ctx, t.tx, issueID, dependsOnID, actor, rmOpts.EmitEvent)
+	if err != nil {
+		return err
+	}
 	t.dirty.MarkDirty(depTable)
-	t.dirty.MarkDirty(eventTable)
-	return issueops.RemoveDependencyInTx(ctx, t.tx, issueID, dependsOnID, actor)
+	// RemoveDependencyInTx records a dependency_removed event on the source's
+	// event table only for a genuine emit (explicit verb + edge removal); stage
+	// it so it commits with the edge. A structural or missing-edge remove writes
+	// no event.
+	if eventWritten {
+		t.dirty.MarkDirty(eventTable)
+	}
+	return nil
 }
 
 func (t *embeddedTransaction) GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error) {

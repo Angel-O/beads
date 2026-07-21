@@ -48,6 +48,13 @@ type Transaction = beads.Transaction
 // one whole-graph check, never graph integrity.
 type DependencyAddOptions = storage.DependencyAddOptions
 
+// DependencyRemoveOptions controls transaction-scoped dependency removal for
+// Transaction.RemoveDependencyWithOptions. Exported so embedders can request the
+// dependency_removed history event on an explicit edge removal; the plain
+// RemoveDependency default stays silent for structural edge teardown, mirroring
+// the DependencyAddOptions/AddDependencyWithOptions split.
+type DependencyRemoveOptions = storage.DependencyRemoveOptions
+
 // CloseIssueOptions carries the optional inputs to Storage.CloseIssueChecked —
 // an atomic, guarded close that refuses a still-blocked issue with
 // ErrCloseBlocked unless Force is set. Exported so consumers can name it without

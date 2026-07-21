@@ -151,8 +151,12 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 	// observe the same history from either write plumbing. Reached only on the
 	// genuine new-edge path; the idempotent same-type refresh returned earlier.
 	// Gated on EmitEvent so only the explicit dep verbs emit: create-with-deps
-	// calls Insert directly without it, so an implicit parent-child / --deps /
-	// waits-for edge produces no event (parity with embedded PersistDependencies).
+	// and reparent call Insert directly without it, so an implicit parent-child /
+	// --deps / waits-for edge produces no event. The embedded structural paths
+	// (createIssueWithDeps, reparent) match this by calling the plain,
+	// no-event AddDependency/tx.AddDependency, whose issueops.AddDependencyInTx
+	// EmitEvent gate is likewise unset — so both backends stay silent on implicit
+	// edges and emit only for the explicit bd dep add / bd link verbs.
 	if opts.EmitEvent {
 		if err := r.events.Record(ctx, domain.Event{
 			IssueID:  dep.IssueID,

@@ -13,6 +13,7 @@ func (s *testSuite) TestIssueUseCase_CloseIssueChecked() {
 	s.Run("TransitivelyBlockedChildClosesWithoutForce", s.uccCloseCheckedTransitiveCloses)
 	s.Run("ForceClosesDespiteDirectBlocker", s.uccCloseCheckedForceCloses)
 	s.Run("AlreadyClosedMatchesUncheckedSemantics", s.uccCloseCheckedAlreadyClosed)
+	s.Run("AlreadyClosedWithStaleBlockerReClosesIdempotently", s.uccCloseCheckedAlreadyClosedStaleBlocker)
 	s.Run("UnblockedClosesAndReturnsIssue", s.uccCloseCheckedUnblockedCloses)
 	s.Run("WispDirectBlockerRefuses", s.uccCloseWispCheckedDirectBlockerRefuses)
 	s.Run("WispForceClosesDespiteDirectBlocker", s.uccCloseWispCheckedForceCloses)
@@ -100,6 +101,42 @@ func (s *testSuite) uccCloseCheckedAlreadyClosed() {
 	s.False(second.Closed)
 	s.Require().NotNil(second.Issue)
 	s.Equal(types.StatusClosed, second.Issue.Status)
+}
+
+func (s *testSuite) uccCloseCheckedAlreadyClosedStaleBlocker() {
+	// Regression for PR #4911 (proxied checked-close parity): an already-closed row that still carries
+	// a live direct blocker with is_blocked=1 (e.g. force-closed while depending
+	// on an open issue, or a stale is_blocked after a cross-clone Dolt merge) must
+	// re-close idempotently, NOT refuse with ErrCloseBlocked. The proxied checked
+	// close skips the block guard for already-closed rows, mirroring the embedded
+	// issueops.CloseIssueCheckedInTx path. The prior AlreadyClosed test seeded an
+	// unblocked row, so it never exercised the closed + live-blocker interaction.
+	s.seedIssueRow("bd-ucc-clc-stale-src")
+	s.seedIssueRow("bd-ucc-clc-stale-tgt")
+	s.Require().NoError(s.depRepo().Insert(s.Ctx(),
+		newDep("bd-ucc-clc-stale-src", "bd-ucc-clc-stale-tgt", types.DepBlocks), "tester", domain.DepInsertOpts{}))
+
+	// The guard reads IsBlocked; a live direct blocker here proves that without the
+	// already-closed short-circuit the checked close below would refuse.
+	blocked, blockers, err := s.depUseCase().IsBlocked(s.Ctx(), "bd-ucc-clc-stale-src")
+	s.Require().NoError(err)
+	s.Require().True(blocked)
+	s.Require().Contains(blockers, "bd-ucc-clc-stale-tgt")
+
+	// Close the source directly, leaving the live blocker edge and is_blocked=1 in
+	// place — the stale "closed but still blocked" state.
+	_, err = s.Runner().ExecContext(s.Ctx(),
+		"UPDATE issues SET status = ? WHERE id = ?", string(types.StatusClosed), "bd-ucc-clc-stale-src")
+	s.Require().NoError(err)
+	s.Require().True(s.isBlocked("bd-ucc-clc-stale-src"), "is_blocked stays 1 on the closed row")
+
+	// A checked re-close without force must be idempotent, not ErrCloseBlocked.
+	res, err := s.issueUseCase().CloseIssueChecked(s.Ctx(), "bd-ucc-clc-stale-src",
+		domain.CloseIssueParams{Reason: "re-close"}, "tester", false)
+	s.Require().NoError(err, "already-closed row must re-close idempotently despite a live blocker")
+	s.False(res.Closed, "idempotent re-close reports Closed=false")
+	s.Require().NotNil(res.Issue)
+	s.Equal(types.StatusClosed, res.Issue.Status)
 }
 
 func (s *testSuite) uccCloseCheckedUnblockedCloses() {

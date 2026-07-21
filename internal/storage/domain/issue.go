@@ -1330,26 +1330,62 @@ func (u *issueUseCaseImpl) CloseWispChecked(ctx context.Context, id string, para
 	return u.closeChecked(ctx, id, params, actor, force, true)
 }
 
+// isClosed reports whether the issue (or wisp) identified by id is already in
+// the closed status, read in the same unit of work as the close so the check
+// and the close cannot straddle a concurrent state change. A missing row (or,
+// for a wisp source, a missing optional wisps table) reports not-closed so
+// closeChecked falls through to u.close, whose repo Close surfaces the not-found
+// result — mirroring issueops.isClosedInTx on the embedded checked-close path.
+func (u *issueUseCaseImpl) isClosed(ctx context.Context, id string, useWisp bool) (bool, error) {
+	issue, err := u.issueRepo.Get(ctx, id, IssueTableOpts{UseWispsTable: useWisp})
+	if err != nil {
+		if dberrors.IsNoRows(err) || dberrors.IsTableNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if issue == nil {
+		return false, nil
+	}
+	return issue.Status == types.StatusClosed, nil
+}
+
 func (u *issueUseCaseImpl) closeChecked(ctx context.Context, id string, params CloseIssueParams, actor string, force, useWisp bool) (CloseIssueResult, error) {
 	if !force {
-		var (
-			blocked  bool
-			blockers []string
-			err      error
-		)
-		if useWisp {
-			blocked, blockers, err = u.depUC.IsWispBlocked(ctx, id)
-		} else {
-			blocked, blockers, err = u.depUC.IsBlocked(ctx, id)
-		}
+		// The blocked guard only has meaning for an open→closed transition. An
+		// already-closed row is an idempotent no-op (Closed=false per the
+		// Storage.CloseIssueChecked contract), so detect that first: a closed row
+		// can still carry a stale is_blocked=1 (e.g. after a cross-clone Dolt
+		// merge, a state GetStatistics filters as `is_blocked = 1 AND status <>
+		// 'closed'`) whose live direct blocker would otherwise refuse the
+		// idempotent re-close with ErrCloseBlocked. This mirrors
+		// issueops.CloseIssueCheckedInTx, which runs isClosedInTx before the
+		// is_blocked guard; u.close below is the sole detector of the
+		// already-closed no-op (matching the Force path, which reaches
+		// Closed=false by skipping the guard).
+		closed, err := u.isClosed(ctx, id, useWisp)
 		if err != nil {
 			return CloseIssueResult{}, err
 		}
-		// Refuse only on a live, open direct blocker. A bare is_blocked=1 with no
-		// live direct blocker (a purely transitive block) closes — matching the
-		// historical `bd close` predicate and the embedded checked-close path.
-		if blocked && len(blockers) > 0 {
-			return CloseIssueResult{}, fmt.Errorf("%w: %s is blocked by %v", storage.ErrCloseBlocked, id, blockers)
+		if !closed {
+			var (
+				blocked  bool
+				blockers []string
+			)
+			if useWisp {
+				blocked, blockers, err = u.depUC.IsWispBlocked(ctx, id)
+			} else {
+				blocked, blockers, err = u.depUC.IsBlocked(ctx, id)
+			}
+			if err != nil {
+				return CloseIssueResult{}, err
+			}
+			// Refuse only on a live, open direct blocker. A bare is_blocked=1 with no
+			// live direct blocker (a purely transitive block) closes — matching the
+			// historical `bd close` predicate and the embedded checked-close path.
+			if blocked && len(blockers) > 0 {
+				return CloseIssueResult{}, fmt.Errorf("%w: %s is blocked by %v", storage.ErrCloseBlocked, id, blockers)
+			}
 		}
 	}
 	return u.close(ctx, id, params, actor, useWisp)

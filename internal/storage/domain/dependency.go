@@ -103,9 +103,12 @@ type DepInsertOpts struct {
 	// EmitEvent records a dependency_added / dependency_removed event on the
 	// source's event table for a genuine edge add/remove. Only the explicit dep
 	// verbs (AddDependency/AddDependencies/RemoveDependency and their wisp twins)
-	// set it; create-with-deps calls Insert directly with it unset so an implicit
-	// parent-child / --deps / waits-for edge produces no event, matching the
-	// embedded plumbing (issueops PersistDependencies emits nothing on create).
+	// set it; create-with-deps and reparent call Insert/Delete directly with it
+	// unset so an implicit parent-child / --deps / waits-for edge produces no
+	// event. The embedded plumbing matches edge-for-edge: its structural paths
+	// wire edges through the plain AddDependency/tx.AddDependency, whose
+	// issueops.AddDependencyInTx EmitEvent gate is unset, while only the explicit
+	// bd dep add / bd link / bd dep remove verbs pass EmitEvent.
 	EmitEvent bool
 }
 

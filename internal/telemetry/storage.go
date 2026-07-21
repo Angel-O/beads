@@ -289,6 +289,18 @@ func (s *InstrumentedStorage) AddDependency(ctx context.Context, dep *types.Depe
 	return err
 }
 
+func (s *InstrumentedStorage) AddDependencyWithOptions(ctx context.Context, dep *types.Dependency, actor string, opts storage.DependencyAddOptions) error {
+	attrs := []attribute.KeyValue{
+		attribute.String("bd.dep.from", dep.IssueID),
+		attribute.String("bd.dep.to", dep.DependsOnID),
+		attribute.String("bd.dep.type", string(dep.Type)),
+	}
+	ctx, span, t := s.op(ctx, "AddDependency", attrs...)
+	err := s.inner.AddDependencyWithOptions(ctx, dep, actor, opts)
+	s.done(ctx, span, t, err, attrs...)
+	return err
+}
+
 func (s *InstrumentedStorage) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
 	attrs := []attribute.KeyValue{
 		attribute.String("bd.dep.from", issueID),
@@ -296,6 +308,17 @@ func (s *InstrumentedStorage) RemoveDependency(ctx context.Context, issueID, dep
 	}
 	ctx, span, t := s.op(ctx, "RemoveDependency", attrs...)
 	err := s.inner.RemoveDependency(ctx, issueID, dependsOnID, actor)
+	s.done(ctx, span, t, err, attrs...)
+	return err
+}
+
+func (s *InstrumentedStorage) RemoveDependencyWithOptions(ctx context.Context, issueID, dependsOnID string, actor string, opts storage.DependencyRemoveOptions) error {
+	attrs := []attribute.KeyValue{
+		attribute.String("bd.dep.from", issueID),
+		attribute.String("bd.dep.to", dependsOnID),
+	}
+	ctx, span, t := s.op(ctx, "RemoveDependency", attrs...)
+	err := s.inner.RemoveDependencyWithOptions(ctx, issueID, dependsOnID, actor, opts)
 	s.done(ctx, span, t, err, attrs...)
 	return err
 }
