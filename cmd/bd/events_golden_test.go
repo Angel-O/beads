@@ -21,11 +21,18 @@ const goldenPath = "testdata/events_journal_records.jsonl"
 // events journal. It marshals REAL beads types.Issue and EventDep values
 // through the same buildRecord path `bd events tail` uses, so the golden
 // captures bd's actual field marshaling — issue_type, omitempty elision, and the
-// real dependency fields — that external consumers parse. A change to the wire
-// shape (a renamed/added/removed field, a lost omitempty) fails this test until
-// the golden is regenerated deliberately.
+// top-level dep edge (kind/target) — that external consumers parse. A change to
+// the wire shape (a renamed/added/removed field, a lost omitempty) fails this
+// test until the golden is regenerated deliberately.
 func TestEventsJournalGolden(t *testing.T) {
 	got := renderGoldenLines(t)
+
+	// The runtime snapshot comes from issueops.GetIssueInTx, which loads the
+	// issue row and its labels only — never its Dependencies. So no journal
+	// record can carry an inline "dependencies" array; dependency edges surface
+	// solely through the top-level "dep" field on dep_add / dep_remove records.
+	// Enforce that here so the golden pins what bd actually writes.
+	assertNoInlineDependencies(t, got)
 
 	if os.Getenv("BD_UPDATE_GOLDEN") == "1" {
 		if err := os.MkdirAll(filepath.Dir(goldenPath), 0o755); err != nil {
@@ -62,8 +69,12 @@ func renderGoldenLines(t *testing.T) []byte {
 		ID: "bd-100", Title: "wire the seam", Status: types.StatusOpen,
 		IssueType: types.TypeTask, Priority: 1, CreatedAt: created, UpdatedAt: updated,
 	}
-	// A richly populated feature with a real dependency edge, labels, metadata,
-	// and an external ref — exercises the full field surface consumers may read.
+	// A richly populated feature with labels, metadata, and an external ref —
+	// exercises the full field surface consumers may read. It deliberately omits
+	// Dependencies: the runtime snapshot (issueops.GetIssueInTx) loads the issue
+	// row and its labels only, so a real journal record never carries an inline
+	// "dependencies" array. Dependency edges are recorded solely through the
+	// top-level "dep" field on the dep_add / dep_remove records below.
 	full := &types.Issue{
 		ID: "bd-101", Title: "durable journal", Description: "append-only record",
 		AcceptanceCriteria: "replayable", Status: types.StatusInProgress,
@@ -72,10 +83,6 @@ func renderGoldenLines(t *testing.T) []byte {
 		CreatedBy: "author", UpdatedAt: updated, ExternalRef: strptr("gh-9"),
 		SourceSystem: "github", Metadata: json.RawMessage(`{"k":"v"}`),
 		Labels: []string{"infra", "urgent"},
-		Dependencies: []*types.Dependency{{
-			IssueID: "bd-101", DependsOnID: "bd-100", Type: types.DepBlocks,
-			CreatedAt: created, CreatedBy: "author",
-		}},
 	}
 	// A closed issue — exercises close_reason / closed_at marshaling.
 	closedIssue := &types.Issue{
@@ -110,6 +117,36 @@ func renderGoldenLines(t *testing.T) []byte {
 		}
 	}
 	return buf.Bytes()
+}
+
+// assertNoInlineDependencies fails if any record's issue snapshot carries a
+// "dependencies" array. The runtime snapshot (GetIssueInTx: issue + labels
+// only) never populates Dependencies, so a real record cannot contain one; a
+// fixture that does would pin a shape bd never emits.
+func assertNoInlineDependencies(t *testing.T, jsonl []byte) {
+	t.Helper()
+	for _, line := range bytes.Split(bytes.TrimSpace(jsonl), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var rec struct {
+			Seq   int64           `json:"seq"`
+			Issue json.RawMessage `json:"issue"`
+		}
+		if err := json.Unmarshal(line, &rec); err != nil {
+			t.Fatalf("unmarshal record: %v", err)
+		}
+		if len(rec.Issue) == 0 || string(rec.Issue) == "null" {
+			continue
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(rec.Issue, &fields); err != nil {
+			t.Fatalf("unmarshal issue for seq %d: %v", rec.Seq, err)
+		}
+		if _, ok := fields["dependencies"]; ok {
+			t.Errorf("record seq %d carries an inline \"dependencies\" array, but the runtime snapshot (GetIssueInTx loads issue + labels only) never emits one; dependency edges belong only in the top-level \"dep\" field", rec.Seq)
+		}
+	}
 }
 
 func mustJSON(t *testing.T, v any) string {
