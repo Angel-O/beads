@@ -220,8 +220,8 @@ var (
 // pollutes dolt_status and feeds the dirty-table migration gates. MigrateUp
 // re-asserts the full set idempotently at the top of every write-mode open.
 var doltIgnorePatterns = []string{
-	"bd_mutations_journal",
-	"bd_mutations_seq",
+	"bd_events_journal",
+	"bd_events_seq",
 	"ignored_schema_migrations",
 	"leases",
 	"local_metadata",

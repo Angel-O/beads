@@ -7,18 +7,18 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// TestMutationsJournal_EmbeddedPlumbing drives mutations through the DoltStore
+// TestEventsJournal_EmbeddedPlumbing drives mutations through the DoltStore
 // (the embedded/DoltStorage write plumbing, which bottoms out in the issueops
 // *InTx functions) against real Dolt and asserts the journal at the issueops
 // seam records each op with a counter-assigned monotonic seq. This is the second
 // of the two plumbings; the first is exercised in domain/db.
-func TestMutationsJournal_EmbeddedPlumbing(t *testing.T) {
+func TestEventsJournal_EmbeddedPlumbing(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 	ctx := context.Background()
 
 	enableJournalForTest(t)
-	if _, err := store.db.ExecContext(ctx, "DELETE FROM bd_mutations_journal"); err != nil {
+	if _, err := store.db.ExecContext(ctx, "DELETE FROM bd_events_journal"); err != nil {
 		t.Fatalf("clear journal: %v", err)
 	}
 
@@ -48,7 +48,7 @@ func TestMutationsJournal_EmbeddedPlumbing(t *testing.T) {
 		id  string
 	}
 	rows, err := store.db.QueryContext(ctx,
-		`SELECT seq, op, issue_id FROM bd_mutations_journal ORDER BY seq ASC`)
+		`SELECT seq, op, issue_id FROM bd_events_journal ORDER BY seq ASC`)
 	must(err, "query journal")
 	defer rows.Close()
 
@@ -76,10 +76,10 @@ func TestMutationsJournal_EmbeddedPlumbing(t *testing.T) {
 	}
 }
 
-// TestMutationsJournal_NoPhantomDeletes asserts the bulk delete (DeleteIssuesInTx)
+// TestEventsJournal_NoPhantomDeletes asserts the bulk delete (DeleteIssuesInTx)
 // journals a delete only for ids that actually removed a row — never a phantom
 // for an id that matched nothing.
-func TestMutationsJournal_NoPhantomDeletes(t *testing.T) {
+func TestEventsJournal_NoPhantomDeletes(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -95,7 +95,7 @@ func TestMutationsJournal_NoPhantomDeletes(t *testing.T) {
 	if err := store.CreateIssue(ctx, mk("bd-pd-2"), "actor"); err != nil {
 		t.Fatalf("create 2: %v", err)
 	}
-	if _, err := store.db.ExecContext(ctx, "DELETE FROM bd_mutations_journal"); err != nil {
+	if _, err := store.db.ExecContext(ctx, "DELETE FROM bd_events_journal"); err != nil {
 		t.Fatalf("clear journal: %v", err)
 	}
 
@@ -104,7 +104,7 @@ func TestMutationsJournal_NoPhantomDeletes(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 
-	rows, err := store.db.QueryContext(ctx, "SELECT op, issue_id FROM bd_mutations_journal ORDER BY seq ASC")
+	rows, err := store.db.QueryContext(ctx, "SELECT op, issue_id FROM bd_events_journal ORDER BY seq ASC")
 	if err != nil {
 		t.Fatalf("query journal: %v", err)
 	}

@@ -1,4 +1,4 @@
-// Package journalscan provides the static-analysis primitives the mutations
+// Package journalscan provides the static-analysis primitives the events
 // journal completeness guards share. Both the issueops seam and the domain/db
 // unit-of-work seam must journal every mutation that writes a work-bead table;
 // their guard tests detect such mutators STRUCTURALLY — by the DML a function

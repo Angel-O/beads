@@ -97,7 +97,7 @@ func closeIssueInTx(ctx context.Context, tx DBTX, id string, reason, actor, sess
 	// Journal the close in the same transaction. Only reached when a row was
 	// actually closed (the already-closed path returns earlier). Covers both
 	// CloseIssueInTx and CloseIssueWithoutEventInTx (both delegate here).
-	if err := RecordMutationInTx(ctx, tx, MutationClose, id); err != nil {
+	if err := RecordEventInTx(ctx, tx, EventClose, id); err != nil {
 		return nil, err
 	}
 

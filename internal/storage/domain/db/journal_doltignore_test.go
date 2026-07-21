@@ -5,18 +5,18 @@ import (
 	"github.com/steveyegge/beads/internal/storage/issueops"
 )
 
-// TestMutationsJournal_IsDoltIgnored asserts the journal table is registered in
+// TestEventsJournal_IsDoltIgnored asserts the journal table is registered in
 // dolt_ignore (so it is node-local working-set state) and therefore never shows
 // up in dolt_status — the signal bd's auto-commit path uses to decide what to
 // stage/commit.
-func (s *testSuite) TestMutationsJournal_IsDoltIgnored() {
+func (s *testSuite) TestEventsJournal_IsDoltIgnored() {
 	ctx := s.Ctx()
 
 	var ignored bool
 	err := s.Runner().QueryRowContext(ctx,
-		"SELECT ignored FROM dolt_ignore WHERE pattern = 'bd_mutations_journal'").Scan(&ignored)
-	s.Require().NoError(err, "bd_mutations_journal must be registered in dolt_ignore")
-	s.True(ignored, "bd_mutations_journal must be ignored=true in dolt_ignore")
+		"SELECT ignored FROM dolt_ignore WHERE pattern = 'bd_events_journal'").Scan(&ignored)
+	s.Require().NoError(err, "bd_events_journal must be registered in dolt_ignore")
+	s.True(ignored, "bd_events_journal must be ignored=true in dolt_ignore")
 
 	// Write a journal row, then confirm the ignored table never surfaces in
 	// dolt_status (which is what the auto-commit/add path consults).
@@ -26,26 +26,26 @@ func (s *testSuite) TestMutationsJournal_IsDoltIgnored() {
 
 	var statusCount int
 	s.Require().NoError(s.Runner().QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM dolt_status WHERE table_name = 'bd_mutations_journal'").Scan(&statusCount))
+		"SELECT COUNT(*) FROM dolt_status WHERE table_name = 'bd_events_journal'").Scan(&statusCount))
 	s.Equal(0, statusCount, "ignored journal table must not appear in dolt_status")
 }
 
-// TestMutationsJournal_SurvivesCommitAndReset proves the journal rows are
+// TestEventsJournal_SurvivesCommitAndReset proves the journal rows are
 // node-local: they survive a dolt commit cycle AND a `dolt reset --hard` (like
 // git-untracked state), because the table is dolt-ignored. If reset destroyed
 // them, the outbox design would be unsound — this is the guard for that.
-func (s *testSuite) TestMutationsJournal_SurvivesCommitAndReset() {
+func (s *testSuite) TestEventsJournal_SurvivesCommitAndReset() {
 	ctx := s.Ctx()
 	issueops.SetJournalEnabled(true)
 	defer issueops.SetJournalEnabled(false)
 
-	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_mutations_journal")
+	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_events_journal")
 	s.Require().NoError(err)
 	s.Require().NoError(s.issueRepo().Insert(ctx, newTestIssue("bd-sv-1", "t"), "actor", domain.InsertIssueOpts{}))
 
 	count := func() int {
 		var n int
-		s.Require().NoError(s.Runner().QueryRowContext(ctx, "SELECT COUNT(*) FROM bd_mutations_journal").Scan(&n))
+		s.Require().NoError(s.Runner().QueryRowContext(ctx, "SELECT COUNT(*) FROM bd_events_journal").Scan(&n))
 		return n
 	}
 	s.Require().Equal(1, count(), "one journal row after the create")
@@ -65,22 +65,22 @@ func (s *testSuite) TestMutationsJournal_SurvivesCommitAndReset() {
 	s.Equal(1, count(), "journal row must survive `dolt reset --hard` (ignored table is working-set state)")
 }
 
-// TestMutationsJournal_TxAtomicity proves the journal insert and the issue
+// TestEventsJournal_TxAtomicity proves the journal insert and the issue
 // mutation share the transaction even though the journal table is ignored: a
 // rollback drops both, a commit keeps both.
-func (s *testSuite) TestMutationsJournal_TxAtomicity() {
+func (s *testSuite) TestEventsJournal_TxAtomicity() {
 	ctx := s.Ctx()
 	issueops.SetJournalEnabled(true)
 	defer issueops.SetJournalEnabled(false)
 
-	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_mutations_journal")
+	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_events_journal")
 	s.Require().NoError(err)
 	s.seedIssueRow("bd-atom-1")
 
 	journalCount := func() int {
 		var n int
 		s.Require().NoError(s.Runner().QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM bd_mutations_journal WHERE issue_id = 'bd-atom-1'").Scan(&n))
+			"SELECT COUNT(*) FROM bd_events_journal WHERE issue_id = 'bd-atom-1'").Scan(&n))
 		return n
 	}
 	statusOf := func() string {

@@ -11,11 +11,11 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 )
 
-// Pruning the durable mutations journal (bd_mutations_journal) deletes old rows
+// Pruning the durable events journal (bd_events_journal) deletes old rows
 // below a caller-supplied sequence number, but never below a configurable
 // retention floor. Two independent floors compose: keep every row younger than
-// mutations-journal-retain-days, and always keep the newest
-// mutations-journal-retain-rows rows regardless of age. The floors are pure
+// events-journal-retain-days, and always keep the newest
+// events-journal-retain-rows rows regardless of age. The floors are pure
 // "keep" constraints AND-ed onto the delete predicate, so they can only ever
 // reduce what a prune removes — a consumer that has not advanced its watermark
 // stays protected even against `prune --before <huge>`.
@@ -25,24 +25,24 @@ import (
 // state only — the journal table is dolt_ignored — so pruning never touches
 // versioned issue data.
 
-// MutationsPruneRowsCeilQuery returns the query that finds the highest seq a
+// EventsPruneRowsCeilQuery returns the query that finds the highest seq a
 // retain-rows floor is allowed to delete: the seq of the (retainRows+1)-th
 // newest row. Bind retainRows as the OFFSET. It returns no row when the journal
 // holds retainRows or fewer rows, meaning the whole journal is inside the
 // retained window and nothing may be pruned by the rows floor.
-func MutationsPruneRowsCeilQuery() string {
-	return `SELECT seq FROM bd_mutations_journal ORDER BY seq DESC LIMIT 1 OFFSET ?`
+func EventsPruneRowsCeilQuery() string {
+	return `SELECT seq FROM bd_events_journal ORDER BY seq DESC LIMIT 1 OFFSET ?`
 }
 
-// BuildMutationsPruneWhere builds the WHERE predicate (without the "WHERE"
+// BuildEventsPruneWhere builds the WHERE predicate (without the "WHERE"
 // keyword) and its bind args for a journal prune. before is the primary bound:
 // only rows with seq strictly below it are eligible. retainDays > 0 adds a
 // keep-recent floor (rows with ts at or after now-retainDays survive). When
 // rowsCeilOK is true, rowsCeil is the highest seq the retain-rows floor permits
-// deleting (from MutationsPruneRowsCeilQuery); rows above it are the retained
+// deleting (from EventsPruneRowsCeilQuery); rows above it are the retained
 // newest window and survive. Every clause is AND-ed, so a row is deleted only
 // when it clears the bound and both floors.
-func BuildMutationsPruneWhere(before int64, retainDays int, now time.Time, rowsCeil int64, rowsCeilOK bool) (string, []any) {
+func BuildEventsPruneWhere(before int64, retainDays int, now time.Time, rowsCeil int64, rowsCeilOK bool) (string, []any) {
 	where := "seq < ?"
 	args := []any{before}
 	if retainDays > 0 {
@@ -56,13 +56,13 @@ func BuildMutationsPruneWhere(before int64, retainDays int, now time.Time, rowsC
 	return where, args
 }
 
-// ReadMutationsInTx returns journal rows with seq greater than since, ordered by
+// ReadEventsInTx returns journal rows with seq greater than since, ordered by
 // seq ascending. limit > 0 caps the result. It runs inside the caller's
 // transaction so it works on every store plumbing (embedded, server, proxied).
-func ReadMutationsInTx(ctx context.Context, tx DBTX, since int64, limit int) ([]storage.MutationsJournalRow, error) {
+func ReadEventsInTx(ctx context.Context, tx DBTX, since int64, limit int) ([]storage.EventsJournalRow, error) {
 	// CAST(ts AS CHAR) normalizes the DATETIME to a stable string across drivers.
 	q := `SELECT seq, CAST(ts AS CHAR), op, issue_id, issue_json, dep_json
-	      FROM bd_mutations_journal WHERE seq > ? ORDER BY seq ASC`
+	      FROM bd_events_journal WHERE seq > ? ORDER BY seq ASC`
 	if limit > 0 {
 		q += " LIMIT " + strconv.Itoa(limit)
 	}
@@ -72,10 +72,10 @@ func ReadMutationsInTx(ctx context.Context, tx DBTX, since int64, limit int) ([]
 	}
 	defer rows.Close()
 
-	var out []storage.MutationsJournalRow
+	var out []storage.EventsJournalRow
 	for rows.Next() {
 		var (
-			r       storage.MutationsJournalRow
+			r       storage.EventsJournalRow
 			issueJS sql.NullString
 			depJS   sql.NullString
 		)
@@ -89,7 +89,7 @@ func ReadMutationsInTx(ctx context.Context, tx DBTX, since int64, limit int) ([]
 	return out, rows.Err()
 }
 
-// ComputeMutationsPruneWhere resolves the retain-rows floor via readCeil and
+// ComputeEventsPruneWhere resolves the retain-rows floor via readCeil and
 // returns the full DELETE predicate (without the "WHERE" keyword) plus its bind
 // args, or skip=true when the whole journal is inside the retained window and
 // nothing may be pruned. readCeil reports (ceil, found, err): found is false
@@ -97,10 +97,10 @@ func ReadMutationsInTx(ctx context.Context, tx DBTX, since int64, limit int) ([]
 // retainRows > 0.
 //
 // This is the ONE place the retain-floor orchestration lives. Both prune
-// plumbings — the DBTX path (PruneMutationsInTx) and the proxied raw-SQL path in
+// plumbings — the DBTX path (PruneEventsInTx) and the proxied raw-SQL path in
 // cmd/bd — call it, so the two can never drift on which rows a floor protects.
 // Only the substrate-specific ceil read and the DELETE execution differ.
-func ComputeMutationsPruneWhere(before int64, retainDays, retainRows int, now time.Time, readCeil func() (ceil int64, found bool, err error)) (where string, args []any, skip bool, err error) {
+func ComputeEventsPruneWhere(before int64, retainDays, retainRows int, now time.Time, readCeil func() (ceil int64, found bool, err error)) (where string, args []any, skip bool, err error) {
 	var (
 		rowsCeil   int64
 		rowsCeilOK bool
@@ -115,17 +115,17 @@ func ComputeMutationsPruneWhere(before int64, retainDays, retainRows int, now ti
 		}
 		rowsCeil, rowsCeilOK = ceil, true
 	}
-	where, args = BuildMutationsPruneWhere(before, retainDays, now, rowsCeil, rowsCeilOK)
+	where, args = BuildEventsPruneWhere(before, retainDays, now, rowsCeil, rowsCeilOK)
 	return where, args, false, nil
 }
 
-// PruneMutationsInTx deletes journal rows with seq below before, honoring the
+// PruneEventsInTx deletes journal rows with seq below before, honoring the
 // retain-days and retain-rows floors (0 disables a floor), and returns the
 // number of rows deleted. It runs inside the caller's transaction.
-func PruneMutationsInTx(ctx context.Context, tx DBTX, before int64, retainDays, retainRows int, now time.Time) (int64, error) {
-	where, args, skip, err := ComputeMutationsPruneWhere(before, retainDays, retainRows, now, func() (int64, bool, error) {
+func PruneEventsInTx(ctx context.Context, tx DBTX, before int64, retainDays, retainRows int, now time.Time) (int64, error) {
+	where, args, skip, err := ComputeEventsPruneWhere(before, retainDays, retainRows, now, func() (int64, bool, error) {
 		var ceil int64
-		scanErr := tx.QueryRowContext(ctx, MutationsPruneRowsCeilQuery(), retainRows).Scan(&ceil)
+		scanErr := tx.QueryRowContext(ctx, EventsPruneRowsCeilQuery(), retainRows).Scan(&ceil)
 		if errors.Is(scanErr, sql.ErrNoRows) {
 			return 0, false, nil
 		}
@@ -140,7 +140,7 @@ func PruneMutationsInTx(ctx context.Context, tx DBTX, before int64, retainDays, 
 	if skip {
 		return 0, nil
 	}
-	res, err := tx.ExecContext(ctx, "DELETE FROM bd_mutations_journal WHERE "+where, args...)
+	res, err := tx.ExecContext(ctx, "DELETE FROM bd_events_journal WHERE "+where, args...)
 	if err != nil {
 		return 0, fmt.Errorf("journal: prune below %d: %w", before, err)
 	}

@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func TestBuildMutationsPruneWhere(t *testing.T) {
+func TestBuildEventsPruneWhere(t *testing.T) {
 	now := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
 	before := int64(500)
 
@@ -48,7 +48,7 @@ func TestBuildMutationsPruneWhere(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			where, args := BuildMutationsPruneWhere(before, tc.retainDays, now, tc.rowsCeil, tc.rowsCeilOK)
+			where, args := BuildEventsPruneWhere(before, tc.retainDays, now, tc.rowsCeil, tc.rowsCeilOK)
 			if where != tc.wantWhere {
 				t.Errorf("where = %q, want %q", where, tc.wantWhere)
 			}
@@ -64,16 +64,16 @@ func TestBuildMutationsPruneWhere(t *testing.T) {
 	}
 }
 
-// TestComputeMutationsPruneWhere pins the shared retain-floor orchestration both
+// TestComputeEventsPruneWhere pins the shared retain-floor orchestration both
 // prune plumbings (the DBTX path and the proxied raw-SQL path) run through, so
 // they can never drift on the retain-rows short-circuit or which rows a floor
 // protects.
-func TestComputeMutationsPruneWhere(t *testing.T) {
+func TestComputeEventsPruneWhere(t *testing.T) {
 	now := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
 
 	t.Run("no retain-rows skips ceil read", func(t *testing.T) {
 		called := false
-		where, args, skip, err := ComputeMutationsPruneWhere(500, 7, 0, now, func() (int64, bool, error) {
+		where, args, skip, err := ComputeEventsPruneWhere(500, 7, 0, now, func() (int64, bool, error) {
 			called = true
 			return 0, false, nil
 		})
@@ -89,7 +89,7 @@ func TestComputeMutationsPruneWhere(t *testing.T) {
 	})
 
 	t.Run("retain-rows not found skips prune", func(t *testing.T) {
-		_, _, skip, err := ComputeMutationsPruneWhere(500, 0, 10, now, func() (int64, bool, error) {
+		_, _, skip, err := ComputeEventsPruneWhere(500, 0, 10, now, func() (int64, bool, error) {
 			return 0, false, nil
 		})
 		if err != nil {
@@ -101,7 +101,7 @@ func TestComputeMutationsPruneWhere(t *testing.T) {
 	})
 
 	t.Run("retain-rows floor applied", func(t *testing.T) {
-		where, args, skip, err := ComputeMutationsPruneWhere(500, 0, 10, now, func() (int64, bool, error) {
+		where, args, skip, err := ComputeEventsPruneWhere(500, 0, 10, now, func() (int64, bool, error) {
 			return 480, true, nil
 		})
 		if err != nil || skip {
@@ -114,7 +114,7 @@ func TestComputeMutationsPruneWhere(t *testing.T) {
 
 	t.Run("ceil read error propagates", func(t *testing.T) {
 		sentinel := errors.New("boom")
-		_, _, _, err := ComputeMutationsPruneWhere(500, 0, 10, now, func() (int64, bool, error) {
+		_, _, _, err := ComputeEventsPruneWhere(500, 0, 10, now, func() (int64, bool, error) {
 			return 0, false, sentinel
 		})
 		if !errors.Is(err, sentinel) {

@@ -110,7 +110,7 @@ func PromoteFromEphemeralInTx(ctx context.Context, tx *sql.Tx, id string, actor 
 	}
 	// Journal the promotion as an update: the id survives, now a regular issue
 	// (the post-mutation snapshot reflects Ephemeral=false).
-	if err := RecordMutationInTx(ctx, tx, MutationUpdate, id); err != nil {
+	if err := RecordEventInTx(ctx, tx, EventUpdate, id); err != nil {
 		return err
 	}
 	return nil

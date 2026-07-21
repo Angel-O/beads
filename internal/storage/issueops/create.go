@@ -170,7 +170,7 @@ func CreateIssueInTxWithResult(ctx context.Context, tx *sql.Tx, bc *BatchContext
 	// was persisted (stale-reject and skip paths return earlier). Bulk create
 	// funnels through this leaf, so instrumenting it covers CreateIssueInTx,
 	// CreateIssuesInTx, and CreateIssuesInTxWithResult too.
-	if err := RecordMutationInTx(ctx, tx, MutationCreate, issue.ID); err != nil {
+	if err := RecordEventInTx(ctx, tx, EventCreate, issue.ID); err != nil {
 		return result, err
 	}
 	return result, nil
@@ -834,7 +834,7 @@ func PersistDependenciesWithOptionsResult(ctx context.Context, tx *sql.Tx, issue
 				result.markChanged(item.depTable)
 				// Journal creation-time dependencies as dep_add edges so a
 				// replayer sees the graph the issue was created with.
-				if err := RecordDepMutationInTx(ctx, tx, MutationDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID); err != nil {
+				if err := RecordDepEventInTx(ctx, tx, EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID); err != nil {
 					return result, err
 				}
 			}

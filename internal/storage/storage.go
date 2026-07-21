@@ -240,11 +240,11 @@ type RawDBAccessor interface {
 	UnderlyingDB() *sql.DB
 }
 
-// MutationsJournalRow is one raw bd_mutations_journal row surfaced to the
-// `bd mutations` CLI. IssueJSON is empty when the op is a delete (no surviving
+// EventsJournalRow is one raw bd_events_journal row surfaced to the
+// `bd events` CLI. IssueJSON is empty when the op is a delete (no surviving
 // row); DepJSON is empty for non-dependency ops. TS is the insert-time timestamp
 // (stamped inside the committing transaction) normalized to a string.
-type MutationsJournalRow struct {
+type EventsJournalRow struct {
 	Seq       int64
 	TS        string
 	Op        string
@@ -253,19 +253,19 @@ type MutationsJournalRow struct {
 	DepJSON   string
 }
 
-// MutationsJournalAccessor reads and prunes the durable mutations journal
-// (bd_mutations_journal) through the store's own transaction machinery. Unlike
+// EventsJournalAccessor reads and prunes the durable events journal
+// (bd_events_journal) through the store's own transaction machinery. Unlike
 // RawDBAccessor — which only the server-mode store provides — this works on the
 // embedded store too, which owns its connections and exposes no stable *sql.DB.
 // Callers that need the journal should type-assert to this interface.
-type MutationsJournalAccessor interface {
-	// ReadMutationsJournal returns rows with seq greater than since, ordered by
+type EventsJournalAccessor interface {
+	// ReadEventsJournal returns rows with seq greater than since, ordered by
 	// seq ascending, optionally capped by limit (0 = no cap).
-	ReadMutationsJournal(ctx context.Context, since int64, limit int) ([]MutationsJournalRow, error)
-	// PruneMutationsJournal deletes rows with seq below before, honoring the
+	ReadEventsJournal(ctx context.Context, since int64, limit int) ([]EventsJournalRow, error)
+	// PruneEventsJournal deletes rows with seq below before, honoring the
 	// retain-days / retain-rows floors (0 = floor disabled), and returns the
 	// number of rows deleted.
-	PruneMutationsJournal(ctx context.Context, before int64, retainDays, retainRows int) (int64, error)
+	PruneEventsJournal(ctx context.Context, before int64, retainDays, retainRows int) (int64, error)
 }
 
 // StoreLocator provides filesystem path information for the store.

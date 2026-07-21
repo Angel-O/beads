@@ -40,9 +40,9 @@ func TestEveryRepositoryMutatorJournals(t *testing.T) {
 
 	// Direct emit helpers and the issueops functions that journal internally.
 	emitCalls := map[string]bool{
-		"RecordMutationInTx":       true,
+		"RecordEventInTx":          true,
 		"RecordDeleteInTx":         true,
-		"RecordDepMutationInTx":    true,
+		"RecordDepEventInTx":       true,
 		"CloseIssueInTx":           true,
 		"ReopenIssueInTx":          true,
 		"ClaimReadyIssueInTx":      true,

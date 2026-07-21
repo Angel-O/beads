@@ -78,7 +78,7 @@ func (r *issueSQLRepositoryImpl) Insert(ctx context.Context, issue *types.Issue,
 	// Journal the create in the same transaction. The UOW plumbing reimplements
 	// the insert here rather than routing through issueops.CreateIssueInTx, so
 	// emission lives here for this plumbing.
-	return issueops.RecordMutationInTx(ctx, r.runner, issueops.MutationCreate, issue.ID)
+	return issueops.RecordEventInTx(ctx, r.runner, issueops.EventCreate, issue.ID)
 }
 
 func (r *issueSQLRepositoryImpl) InsertBatch(ctx context.Context, issues []*types.Issue, actor string, opts domain.InsertIssueOpts) error {
@@ -183,7 +183,7 @@ func (r *issueSQLRepositoryImpl) Update(ctx context.Context, id string, updates 
 
 	// Journal the update in the same transaction. The UOW plumbing reimplements
 	// the row UPDATE here rather than routing through issueops.UpdateIssueInTx.
-	if err := issueops.RecordMutationInTx(ctx, r.runner, issueops.MutationUpdate, id); err != nil {
+	if err := issueops.RecordEventInTx(ctx, r.runner, issueops.EventUpdate, id); err != nil {
 		return err
 	}
 
@@ -346,7 +346,7 @@ func (r *issueSQLRepositoryImpl) Claim(ctx context.Context, id, actor string, op
 	// Journal the claim as an update in the same transaction. Reached only when
 	// the CAS won (rows != 0). The UOW plumbing reimplements the claim rather
 	// than routing through issueops.ClaimIssueInTx.
-	if err := issueops.RecordMutationInTx(ctx, r.runner, issueops.MutationUpdate, id); err != nil {
+	if err := issueops.RecordEventInTx(ctx, r.runner, issueops.EventUpdate, id); err != nil {
 		return domain.ClaimRowResult{}, err
 	}
 

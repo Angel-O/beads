@@ -8,13 +8,13 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// journalRow is one decoded bd_mutations_journal row.
+// journalRow is one decoded bd_events_journal row.
 type journalRow struct {
 	Seq      int64
 	Op       string
 	IssueID  string
 	Issue    *types.Issue
-	Dep      *issueops.MutationDep
+	Dep      *issueops.EventDep
 	HasIssue bool
 }
 
@@ -23,14 +23,14 @@ type journalRow struct {
 // it back off on cleanup.
 func (s *testSuite) enableJournalForTest() {
 	issueops.SetJournalEnabled(true)
-	_, err := s.Runner().ExecContext(s.Ctx(), "DELETE FROM bd_mutations_journal")
+	_, err := s.Runner().ExecContext(s.Ctx(), "DELETE FROM bd_events_journal")
 	s.Require().NoError(err)
 	s.T().Cleanup(func() { issueops.SetJournalEnabled(false) })
 }
 
 func (s *testSuite) readJournal() []journalRow {
 	rows, err := s.Runner().QueryContext(s.Ctx(),
-		`SELECT seq, op, issue_id, issue_json, dep_json FROM bd_mutations_journal ORDER BY seq ASC`)
+		`SELECT seq, op, issue_id, issue_json, dep_json FROM bd_events_journal ORDER BY seq ASC`)
 	s.Require().NoError(err)
 	defer rows.Close()
 
@@ -49,7 +49,7 @@ func (s *testSuite) readJournal() []journalRow {
 			jr.Issue = &iss
 		}
 		if len(depJS) > 0 {
-			var d issueops.MutationDep
+			var d issueops.EventDep
 			s.Require().NoError(json.Unmarshal(depJS, &d))
 			jr.Dep = &d
 		}
@@ -59,11 +59,11 @@ func (s *testSuite) readJournal() []journalRow {
 	return out
 }
 
-// TestMutationsJournal_UOWPlumbing drives every op kind through the unit-of-work
+// TestEventsJournal_UOWPlumbing drives every op kind through the unit-of-work
 // repository write path (which reimplements create/update/claim/delete/dep/label
 // and delegates close/reopen to issueops) against real Dolt, and asserts the
 // journal records each op with an engine-assigned monotonic seq.
-func (s *testSuite) TestMutationsJournal_UOWPlumbing() {
+func (s *testSuite) TestEventsJournal_UOWPlumbing() {
 	s.enableJournalForTest()
 	ctx := s.Ctx()
 	ir := s.issueRepo()
@@ -108,9 +108,9 @@ func (s *testSuite) TestMutationsJournal_UOWPlumbing() {
 	s.False(got[8].HasIssue, "delete row must have null issue")
 }
 
-// TestMutationsJournal_CascadeDelete asserts a cascade delete journals every
+// TestEventsJournal_CascadeDelete asserts a cascade delete journals every
 // affected bead — the finding the decorator design could not cover.
-func (s *testSuite) TestMutationsJournal_CascadeDelete() {
+func (s *testSuite) TestEventsJournal_CascadeDelete() {
 	s.enableJournalForTest()
 	ctx := s.Ctx()
 	ir := s.issueRepo()
@@ -122,7 +122,7 @@ func (s *testSuite) TestMutationsJournal_CascadeDelete() {
 	s.Require().NoError(dr.Insert(ctx, &types.Dependency{IssueID: "bd-cd-child", DependsOnID: "bd-cd-parent", Type: types.DepParentChild}, "actor", domain.DepInsertOpts{}))
 
 	// clear the setup rows so we assert only on the cascade delete.
-	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_mutations_journal")
+	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_events_journal")
 	s.Require().NoError(err)
 
 	uc := s.issueUseCase()
@@ -140,10 +140,10 @@ func (s *testSuite) TestMutationsJournal_CascadeDelete() {
 	s.True(deleted["bd-cd-child"], "cascade-deleted child must be journaled, got %v", deleted)
 }
 
-// TestMutationsJournal_NoPhantomDeletes asserts DeleteByIDs journals a delete
+// TestEventsJournal_NoPhantomDeletes asserts DeleteByIDs journals a delete
 // only for ids that actually removed a row — never a phantom delete for an id
 // that matched nothing (the batched DELETE reports only a per-batch total).
-func (s *testSuite) TestMutationsJournal_NoPhantomDeletes() {
+func (s *testSuite) TestEventsJournal_NoPhantomDeletes() {
 	s.enableJournalForTest()
 	ctx := s.Ctx()
 	ir := s.issueRepo()
@@ -151,7 +151,7 @@ func (s *testSuite) TestMutationsJournal_NoPhantomDeletes() {
 	s.Require().NoError(ir.Insert(ctx, newTestIssue("bd-pd-1", "t"), "actor", domain.InsertIssueOpts{}))
 	s.Require().NoError(ir.Insert(ctx, newTestIssue("bd-pd-2", "t"), "actor", domain.InsertIssueOpts{}))
 	// clear setup rows so we assert only on the delete.
-	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_mutations_journal")
+	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_events_journal")
 	s.Require().NoError(err)
 
 	// Delete a mix: two real ids and two that do not exist.
@@ -168,17 +168,17 @@ func (s *testSuite) TestMutationsJournal_NoPhantomDeletes() {
 		"journal must record a delete only for ids that removed a row, no phantoms")
 }
 
-// TestMutationsJournal_DisabledWritesNothing asserts the default-off knob writes
+// TestEventsJournal_DisabledWritesNothing asserts the default-off knob writes
 // no rows.
-func (s *testSuite) TestMutationsJournal_DisabledWritesNothing() {
+func (s *testSuite) TestEventsJournal_DisabledWritesNothing() {
 	issueops.SetJournalEnabled(false)
 	ctx := s.Ctx()
-	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_mutations_journal")
+	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_events_journal")
 	s.Require().NoError(err)
 
 	s.Require().NoError(s.issueRepo().Insert(ctx, newTestIssue("bd-off-1", "t"), "actor", domain.InsertIssueOpts{}))
 
 	var n int
-	s.Require().NoError(s.Runner().QueryRowContext(ctx, "SELECT COUNT(*) FROM bd_mutations_journal").Scan(&n))
+	s.Require().NoError(s.Runner().QueryRowContext(ctx, "SELECT COUNT(*) FROM bd_events_journal").Scan(&n))
 	s.Equal(0, n, "disabled journal must write nothing")
 }

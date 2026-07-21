@@ -13,18 +13,18 @@ import (
 )
 
 // goldenPath is the committed consumer contract: one journal line per record, in
-// the exact shape `bd mutations tail`/`export` emit. Regenerate with
-// BD_UPDATE_GOLDEN=1 go test ./cmd/bd/ -run TestMutationsJournalGolden.
-const goldenPath = "testdata/mutations_journal_records.jsonl"
+// the exact shape `bd events tail`/`export` emit. Regenerate with
+// BD_UPDATE_GOLDEN=1 go test ./cmd/bd/ -run TestEventsJournalGolden.
+const goldenPath = "testdata/events_journal_records.jsonl"
 
-// TestMutationsJournalGolden pins the external record contract for the durable
-// mutations journal. It marshals REAL beads types.Issue and MutationDep values
-// through the same buildRecord path `bd mutations tail` uses, so the golden
+// TestEventsJournalGolden pins the external record contract for the durable
+// events journal. It marshals REAL beads types.Issue and EventDep values
+// through the same buildRecord path `bd events tail` uses, so the golden
 // captures bd's actual field marshaling — issue_type, omitempty elision, and the
 // real dependency fields — that external consumers parse. A change to the wire
 // shape (a renamed/added/removed field, a lost omitempty) fails this test until
 // the golden is regenerated deliberately.
-func TestMutationsJournalGolden(t *testing.T) {
+func TestEventsJournalGolden(t *testing.T) {
 	got := renderGoldenLines(t)
 
 	if os.Getenv("BD_UPDATE_GOLDEN") == "1" {
@@ -90,16 +90,16 @@ func renderGoldenLines(t *testing.T) []byte {
 		Ephemeral: true, WispType: types.WispType("convoy"),
 	}
 
-	records := []mutationRecord{
-		buildRecord(1, ts, string(issueops.MutationCreate), minimal.ID, mustJSON(t, minimal), ""),
-		buildRecord(2, ts, string(issueops.MutationCreate), full.ID, mustJSON(t, full), ""),
-		buildRecord(3, ts, string(issueops.MutationDepAdd), "bd-101", mustJSON(t, full),
-			mustJSON(t, &issueops.MutationDep{Kind: string(types.DepBlocks), Target: "bd-100"})),
-		buildRecord(4, ts, string(issueops.MutationDepRemove), "bd-101", mustJSON(t, full),
-			mustJSON(t, &issueops.MutationDep{Kind: string(types.DepBlocks), Target: "bd-100"})),
-		buildRecord(5, ts, string(issueops.MutationClose), closedIssue.ID, mustJSON(t, closedIssue), ""),
-		buildRecord(6, ts, string(issueops.MutationCreate), wisp.ID, mustJSON(t, wisp), ""),
-		buildRecord(7, ts, string(issueops.MutationDelete), "bd-100", "", ""), // null issue on delete
+	records := []eventRecord{
+		buildRecord(1, ts, string(issueops.EventCreate), minimal.ID, mustJSON(t, minimal), ""),
+		buildRecord(2, ts, string(issueops.EventCreate), full.ID, mustJSON(t, full), ""),
+		buildRecord(3, ts, string(issueops.EventDepAdd), "bd-101", mustJSON(t, full),
+			mustJSON(t, &issueops.EventDep{Kind: string(types.DepBlocks), Target: "bd-100"})),
+		buildRecord(4, ts, string(issueops.EventDepRemove), "bd-101", mustJSON(t, full),
+			mustJSON(t, &issueops.EventDep{Kind: string(types.DepBlocks), Target: "bd-100"})),
+		buildRecord(5, ts, string(issueops.EventClose), closedIssue.ID, mustJSON(t, closedIssue), ""),
+		buildRecord(6, ts, string(issueops.EventCreate), wisp.ID, mustJSON(t, wisp), ""),
+		buildRecord(7, ts, string(issueops.EventDelete), "bd-100", "", ""), // null issue on delete
 	}
 
 	var buf bytes.Buffer

@@ -146,7 +146,7 @@ func ImportIssueCommentInTx(ctx context.Context, tx *sql.Tx, issueID, author, te
 
 	// Journal the comment as an update to the issue in the same transaction — a
 	// comment mutates the issue's bead state, recorded like a label change.
-	if err := RecordMutationInTx(ctx, tx, MutationUpdate, issueID); err != nil {
+	if err := RecordEventInTx(ctx, tx, EventUpdate, issueID); err != nil {
 		return nil, err
 	}
 

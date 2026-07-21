@@ -240,7 +240,7 @@ func UpdateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, iss
 	}
 	// Journal the rename as an update keyed on the new id (the post-rename
 	// snapshot). The 'renamed' history event carries the old->new link.
-	return RecordMutationInTx(ctx, tx, MutationUpdate, newID)
+	return RecordEventInTx(ctx, tx, EventUpdate, newID)
 }
 
 func updateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, issue *types.Issue, actor string) error {

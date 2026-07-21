@@ -16,7 +16,7 @@ var (
 	journalRefs  int
 )
 
-// enableJournalForTest turns the process-global mutations journal on for a test
+// enableJournalForTest turns the process-global events journal on for a test
 // and keeps it on until the last concurrent journal test finishes. The dolt
 // suite runs tests in parallel (setupTestStore calls t.Parallel), so a plain
 // enable/disable pair would let one journal test's cleanup flip the flag off
@@ -49,7 +49,7 @@ type jrow struct {
 func readJournalRows(t *testing.T, store *DoltStore) []jrow {
 	t.Helper()
 	rows, err := store.db.QueryContext(context.Background(),
-		`SELECT seq, op, issue_id FROM bd_mutations_journal ORDER BY seq ASC`)
+		`SELECT seq, op, issue_id FROM bd_events_journal ORDER BY seq ASC`)
 	if err != nil {
 		t.Fatalf("query journal: %v", err)
 	}
@@ -70,7 +70,7 @@ func readJournalRows(t *testing.T, store *DoltStore) []jrow {
 
 func clearJournal(t *testing.T, store *DoltStore) {
 	t.Helper()
-	if _, err := store.db.ExecContext(context.Background(), "DELETE FROM bd_mutations_journal"); err != nil {
+	if _, err := store.db.ExecContext(context.Background(), "DELETE FROM bd_events_journal"); err != nil {
 		t.Fatalf("clear journal: %v", err)
 	}
 }
@@ -85,11 +85,11 @@ func hasOpFor(rows []jrow, op, id string) bool {
 	return false
 }
 
-// TestMutationsJournal_SeamEntryPoints drives the mutation entry points the
+// TestEventsJournal_SeamEntryPoints drives the mutation entry points the
 // earlier op-by-op tests do not — rename, wisps, reopen, ready-claim, lease
 // reclaim, by-source-repo bulk delete, and creation-time dependencies — through
 // the real DoltStore and asserts each lands in the journal at the issueops seam.
-func TestMutationsJournal_SeamEntryPoints(t *testing.T) {
+func TestEventsJournal_SeamEntryPoints(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -240,10 +240,10 @@ func TestMutationsJournal_SeamEntryPoints(t *testing.T) {
 	})
 }
 
-// TestMutationsJournalAccessorServerStore guards the server-mode DoltStore's
-// MutationsJournalAccessor (the read/prune capability the `bd mutations` CLI uses
+// TestEventsJournalAccessorServerStore guards the server-mode DoltStore's
+// EventsJournalAccessor (the read/prune capability the `bd events` CLI uses
 // against a Dolt SQL server), mirroring the embedded-store guard in embeddeddolt.
-func TestMutationsJournalAccessorServerStore(t *testing.T) {
+func TestEventsJournalAccessorServerStore(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -265,7 +265,7 @@ func TestMutationsJournalAccessorServerStore(t *testing.T) {
 	must(store.CloseIssue(ctx, "jrn-a1", "done", "actor", ""), "close")
 	must(store.DeleteIssue(ctx, "jrn-a2"), "delete")
 
-	rows, err := store.ReadMutationsJournal(ctx, 0, 0)
+	rows, err := store.ReadEventsJournal(ctx, 0, 0)
 	must(err, "read all")
 	wantOps := []string{"create", "create", "update", "close", "delete"}
 	if len(rows) != len(wantOps) {
@@ -277,23 +277,23 @@ func TestMutationsJournalAccessorServerStore(t *testing.T) {
 		}
 	}
 	// retain-rows floor keeps the newest two rows despite a wide --before.
-	n, err := store.PruneMutationsJournal(ctx, 1_000_000, 0, 2)
+	n, err := store.PruneEventsJournal(ctx, 1_000_000, 0, 2)
 	must(err, "prune retain-rows")
 	if n != 3 {
 		t.Fatalf("prune retain-rows=2 deleted %d, want 3", n)
 	}
-	after, err := store.ReadMutationsJournal(ctx, 0, 0)
+	after, err := store.ReadEventsJournal(ctx, 0, 0)
 	must(err, "read after")
 	if len(after) != 2 {
 		t.Fatalf("after prune %d rows, want 2", len(after))
 	}
 }
 
-// TestMutationsJournal_ReplayFromZero proves the journal is a complete, ordered,
+// TestEventsJournal_ReplayFromZero proves the journal is a complete, ordered,
 // replayable record: applying every row in seq order (set snapshot on
 // create/update/close, drop on delete) reconstructs exactly the store's final
 // live set.
-func TestMutationsJournal_ReplayFromZero(t *testing.T) {
+func TestEventsJournal_ReplayFromZero(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -318,7 +318,7 @@ func TestMutationsJournal_ReplayFromZero(t *testing.T) {
 
 	// Replay: reconstruct the live id set from the journal snapshots.
 	rows, err := store.db.QueryContext(ctx,
-		`SELECT op, issue_id FROM bd_mutations_journal ORDER BY seq ASC`)
+		`SELECT op, issue_id FROM bd_events_journal ORDER BY seq ASC`)
 	must(err, "read journal")
 	defer rows.Close()
 	live := map[string]bool{}

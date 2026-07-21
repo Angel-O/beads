@@ -10,13 +10,13 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// TestMutationsJournalAccessor guards the embedded store's mutations-journal
-// read/prune capability end to end. This is the path `bd mutations tail/export/
+// TestEventsJournalAccessor guards the embedded store's events-journal
+// read/prune capability end to end. This is the path `bd events tail/export/
 // prune` take in the default (embedded) workspace, where there is no stable
 // *sql.DB to reach via RawDBAccessor — so it must go through the store's own
 // per-operation connection. A regression here silently breaks every
-// `bd mutations` command locally.
-func TestMutationsJournalAccessor(t *testing.T) {
+// `bd events` command locally.
+func TestEventsJournalAccessor(t *testing.T) {
 	env := newTestEnv(t, "jrn")
 	ctx := context.Background()
 	issueops.SetJournalEnabled(true)
@@ -39,7 +39,7 @@ func TestMutationsJournalAccessor(t *testing.T) {
 	must(store.CloseIssue(ctx, "jrn-1", "done", "actor", ""), "close")
 	must(store.DeleteIssue(ctx, "jrn-2"), "delete")
 
-	rows, err := store.ReadMutationsJournal(ctx, 0, 0)
+	rows, err := store.ReadEventsJournal(ctx, 0, 0)
 	must(err, "read all")
 	wantOps := []string{"create", "create", "update", "close", "delete"}
 	if len(rows) != len(wantOps) {
@@ -63,26 +63,26 @@ func TestMutationsJournalAccessor(t *testing.T) {
 	}
 
 	// since filter: only rows past the 3rd seq (the close and the delete).
-	sinceRows, err := store.ReadMutationsJournal(ctx, rows[2].Seq, 0)
+	sinceRows, err := store.ReadEventsJournal(ctx, rows[2].Seq, 0)
 	must(err, "read since")
 	if len(sinceRows) != 2 {
 		t.Fatalf("since read = %d rows, want 2: %+v", len(sinceRows), sinceRows)
 	}
 
 	// limit caps the result.
-	limited, err := store.ReadMutationsJournal(ctx, 0, 2)
+	limited, err := store.ReadEventsJournal(ctx, 0, 2)
 	must(err, "read limit")
 	if len(limited) != 2 {
 		t.Fatalf("limit read = %d rows, want 2", len(limited))
 	}
 
 	// retain-rows floor keeps the newest two rows even with a wide --before.
-	n, err := store.PruneMutationsJournal(ctx, 1_000_000, 0, 2)
+	n, err := store.PruneEventsJournal(ctx, 1_000_000, 0, 2)
 	must(err, "prune retain-rows")
 	if n != 3 {
 		t.Fatalf("prune with retain-rows=2 deleted %d, want 3 (keep newest 2)", n)
 	}
-	after, err := store.ReadMutationsJournal(ctx, 0, 0)
+	after, err := store.ReadEventsJournal(ctx, 0, 0)
 	must(err, "read after prune")
 	if len(after) != 2 {
 		t.Fatalf("after prune %d rows, want 2", len(after))
@@ -90,7 +90,7 @@ func TestMutationsJournalAccessor(t *testing.T) {
 
 	// seq continuity: a fresh mutation lands above everything after a prune.
 	must(store.CreateIssue(ctx, mk("jrn-3"), "actor"), "create 3")
-	post, err := store.ReadMutationsJournal(ctx, after[len(after)-1].Seq, 0)
+	post, err := store.ReadEventsJournal(ctx, after[len(after)-1].Seq, 0)
 	must(err, "read post")
 	if len(post) != 1 || post[0].Op != "create" {
 		t.Fatalf("post-prune create not journaled above prior max seq: %+v", post)

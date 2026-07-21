@@ -25,12 +25,12 @@ func isSerializationFailure(err error) bool {
 	return false
 }
 
-// TestMutationsJournal_CommitOrderedGaplessSeq is the FINDING 1 proof: under two
+// TestEventsJournal_CommitOrderedGaplessSeq is the FINDING 1 proof: under two
 // OVERLAPPING transactions, the journal seq order equals commit-visibility order
 // with no gaps, on bd's actual (deferred-commit, optimistic-merge) Dolt server
 // model.
 //
-// The seq is drawn from the single-row bd_mutations_seq counter inside each
+// The seq is drawn from the single-row bd_events_seq counter inside each
 // mutation's own transaction. The two inserts touch DIFFERENT issue rows and
 // DIFFERENT event rows — the ONLY cell they share is the counter row — so any
 // serialization here is caused solely by the counter. That is exactly the point:
@@ -38,11 +38,11 @@ func isSerializationFailure(err error) bool {
 // PKs assigned at insert), so commit order could invert seq order and a tailing
 // consumer would skip the lower seq. The counter converts that silent skip into
 // a detected conflict + retry that preserves commit order.
-func (s *testSuite) TestMutationsJournal_CommitOrderedGaplessSeq() {
+func (s *testSuite) TestEventsJournal_CommitOrderedGaplessSeq() {
 	ctx := s.Ctx()
 	issueops.SetJournalEnabled(true)
 	s.T().Cleanup(func() { issueops.SetJournalEnabled(false) })
-	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_mutations_journal")
+	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_events_journal")
 	s.Require().NoError(err)
 
 	port := testutil.DoltContainerPortInt()
@@ -95,17 +95,17 @@ func (s *testSuite) TestMutationsJournal_CommitOrderedGaplessSeq() {
 	s.Equalf(got[0].Seq+1, got[1].Seq, "seqs must be gapless: %d then %d", got[0].Seq, got[1].Seq)
 }
 
-// TestMutationsJournal_ConcurrentWritersGaplessNoDup drives many real journaled
+// TestEventsJournal_ConcurrentWritersGaplessNoDup drives many real journaled
 // mutations through independent connections at once and asserts the journal ends
 // up with exactly one gapless, duplicate-free seq per committed mutation. It
 // exercises the end-to-end safety property (a committed seq=N implies every
 // seq<N is already committed) through concurrent writers, each retrying its own
 // serialization losses — mirroring what withRetryTx / uow.RunTx do in production.
-func (s *testSuite) TestMutationsJournal_ConcurrentWritersGaplessNoDup() {
+func (s *testSuite) TestEventsJournal_ConcurrentWritersGaplessNoDup() {
 	ctx := s.Ctx()
 	issueops.SetJournalEnabled(true)
 	s.T().Cleanup(func() { issueops.SetJournalEnabled(false) })
-	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_mutations_journal")
+	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_events_journal")
 	s.Require().NoError(err)
 
 	port := testutil.DoltContainerPortInt()

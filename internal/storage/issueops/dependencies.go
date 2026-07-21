@@ -239,7 +239,7 @@ func AddDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 
 	// Journal the dependency add in the same transaction (both is_blocked
 	// branches below return from here, so emitting once here covers them).
-	if err := RecordDepMutationInTx(ctx, tx, MutationDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID); err != nil {
+	if err := RecordDepEventInTx(ctx, tx, EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID); err != nil {
 		return err
 	}
 
@@ -858,7 +858,7 @@ func RemoveDependencyInTx(ctx context.Context, tx *sql.Tx, issueID, dependsOnID 
 
 	// Journal the dependency remove in the same transaction (the no-match path
 	// returned earlier, so reaching here means an edge was deleted).
-	if err := RecordDepMutationInTx(ctx, tx, MutationDepRemove, issueID, depType, dependsOnID); err != nil {
+	if err := RecordDepEventInTx(ctx, tx, EventDepRemove, issueID, depType, dependsOnID); err != nil {
 		return err
 	}
 

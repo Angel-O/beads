@@ -345,7 +345,7 @@ func updateIssueInTx(ctx context.Context, tx DBTX, id string, updates map[string
 
 	// Journal the update in the same transaction. Both UpdateIssueInTx and
 	// UpdateIssueWithoutEventInTx delegate here, so this single site covers both.
-	if err := RecordMutationInTx(ctx, tx, MutationUpdate, id); err != nil {
+	if err := RecordEventInTx(ctx, tx, EventUpdate, id); err != nil {
 		return nil, err
 	}
 

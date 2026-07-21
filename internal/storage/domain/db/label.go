@@ -56,7 +56,7 @@ func (r *labelSQLRepositoryImpl) Insert(ctx context.Context, issueID, label, act
 		return err
 	}
 	// Journal the label change as an update in the same transaction.
-	return issueops.RecordMutationInTx(ctx, r.runner, issueops.MutationUpdate, issueID)
+	return issueops.RecordEventInTx(ctx, r.runner, issueops.EventUpdate, issueID)
 }
 
 func (r *labelSQLRepositoryImpl) Delete(ctx context.Context, issueID, label, actor string, opts domain.LabelOpts) error {
@@ -83,7 +83,7 @@ func (r *labelSQLRepositoryImpl) Delete(ctx context.Context, issueID, label, act
 		return err
 	}
 	// Journal the label change as an update in the same transaction.
-	return issueops.RecordMutationInTx(ctx, r.runner, issueops.MutationUpdate, issueID)
+	return issueops.RecordEventInTx(ctx, r.runner, issueops.EventUpdate, issueID)
 }
 
 func (r *labelSQLRepositoryImpl) List(ctx context.Context, issueID string, opts domain.LabelOpts) ([]string, error) {

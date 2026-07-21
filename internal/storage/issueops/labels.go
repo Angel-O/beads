@@ -153,7 +153,7 @@ func AddLabelInTx(ctx context.Context, tx DBTX, labelTable, eventTable, issueID,
 		return fmt.Errorf("add label: record event: %w", err)
 	}
 	// Journal the label change as an update (the issue's label set changed).
-	if err := RecordMutationInTx(ctx, tx, MutationUpdate, issueID); err != nil {
+	if err := RecordEventInTx(ctx, tx, EventUpdate, issueID); err != nil {
 		return err
 	}
 	return nil
@@ -184,7 +184,7 @@ func RemoveLabelInTx(ctx context.Context, tx DBTX, labelTable, eventTable, issue
 		return fmt.Errorf("remove label: record event: %w", err)
 	}
 	// Journal the label change as an update (the issue's label set changed).
-	if err := RecordMutationInTx(ctx, tx, MutationUpdate, issueID); err != nil {
+	if err := RecordEventInTx(ctx, tx, EventUpdate, issueID); err != nil {
 		return err
 	}
 	return nil

@@ -8,10 +8,10 @@ import (
 
 // The emit helpers a function calls to journal a row directly.
 var journalEmitHelpers = map[string]bool{
-	"RecordMutationInTx":    true,
-	"RecordDeleteInTx":      true,
-	"RecordDepMutationInTx": true,
-	"insertMutationRow":     true,
+	"RecordEventInTx":    true,
+	"RecordDeleteInTx":   true,
+	"RecordDepEventInTx": true,
+	"insertEventRow":     true,
 }
 
 // mutationEntryPoints are the issueops functions that must result in a journal

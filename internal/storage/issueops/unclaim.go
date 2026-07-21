@@ -125,7 +125,7 @@ func finishUnclaimInTx(ctx context.Context, tx *sql.Tx, eventTable string, id st
 	}
 	// Journal the unclaim as an update. Both UnclaimIssueInTx and
 	// UnclaimIssueIfAssigneeInTx finish through here after a successful release.
-	if err := RecordMutationInTx(ctx, tx, MutationUpdate, id); err != nil {
+	if err := RecordEventInTx(ctx, tx, EventUpdate, id); err != nil {
 		return err
 	}
 	return nil

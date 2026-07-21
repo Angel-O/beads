@@ -144,7 +144,7 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 
 	// Journal the dependency add in the same transaction (new-edge path only;
 	// the same-type metadata refresh above returns earlier without a new edge).
-	if err := issueops.RecordDepMutationInTx(ctx, r.runner, issueops.MutationDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID); err != nil {
+	if err := issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID); err != nil {
 		return err
 	}
 
@@ -261,7 +261,7 @@ func (r *dependencySQLRepositoryImpl) Delete(ctx context.Context, issueID, depen
 
 	// Journal the dependency remove in the same transaction (only reached when
 	// the edge existed — the no-match path returned earlier).
-	if err := issueops.RecordDepMutationInTx(ctx, r.runner, issueops.MutationDepRemove, issueID, depType, dependsOnID); err != nil {
+	if err := issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepRemove, issueID, depType, dependsOnID); err != nil {
 		return domain.DepDeleteResult{}, err
 	}
 

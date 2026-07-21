@@ -15,9 +15,9 @@
 // so it reflects the mutation), and the buffer is drained to the Runner only
 // after Commit succeeds. A rolled-back unit of work fires nothing.
 //
-// The durable mutations journal is a separate concern: it is written at the
+// The durable events journal is a separate concern: it is written at the
 // issueops seam inside the mutation's own transaction (see
-// issueops.RecordMutationInTx), so it covers both plumbings structurally and is
+// issueops.RecordEventInTx), so it covers both plumbings structurally and is
 // not wired here.
 package uow
 

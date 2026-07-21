@@ -13,16 +13,16 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// TestMutationsJournal_EmbeddedConcurrentGaplessNoDup is the FINDING 1 proof for
+// TestEventsJournal_EmbeddedConcurrentGaplessNoDup is the FINDING 1 proof for
 // the embedded engine (the default local workspace). Unlike the SQL server —
 // which resolves concurrent writers optimistically with a serialization abort at
 // commit — the embedded engine serializes writers on the counter row. Either way
 // the counter-drawn seq must come out gapless, commit-ordered, and duplicate-free
 // under concurrent real mutations. N goroutines each create an issue through the
 // real store path (store.CreateIssue -> issueops.CreateIssueInTx ->
-// insertMutationRow -> nextMutationSeq); the journal must end with exactly one
+// insertEventRow -> nextEventSeq); the journal must end with exactly one
 // contiguous seq per create.
-func TestMutationsJournal_EmbeddedConcurrentGaplessNoDup(t *testing.T) {
+func TestEventsJournal_EmbeddedConcurrentGaplessNoDup(t *testing.T) {
 	env := newTestEnv(t, "ecw")
 	issueops.SetJournalEnabled(true)
 	t.Cleanup(func() { issueops.SetJournalEnabled(false) })
@@ -58,7 +58,7 @@ func TestMutationsJournal_EmbeddedConcurrentGaplessNoDup(t *testing.T) {
 		}
 	}
 
-	rows, err := store.ReadMutationsJournal(context.Background(), 0, 0)
+	rows, err := store.ReadEventsJournal(context.Background(), 0, 0)
 	if err != nil {
 		t.Fatalf("read journal: %v", err)
 	}

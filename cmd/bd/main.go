@@ -1245,9 +1245,9 @@ var rootCmd = &cobra.Command{
 		// other helper paths stay in lockstep with the main command path.
 		dolt.ApplyCLIAutoStart(beadsDir, doltCfg)
 
-		// Turn the durable mutations journal on/off for this process before any
+		// Turn the durable events journal on/off for this process before any
 		// mutation runs on either plumbing (emission lives at the issueops seam).
-		applyMutationsJournalConfig()
+		applyEventsJournalConfig()
 
 		// In proxied mode the CLI short-circuits to the uowProvider path and
 		// dispatches through the *_proxied_server.go duals.
@@ -1258,9 +1258,9 @@ var rootCmd = &cobra.Command{
 			}
 			// Fire the legacy script-hook Runner after commits on the
 			// unit-of-work plumbing, which previously notified no one — this
-			// makes hooks fire on both write plumbings. The durable mutations
+			// makes hooks fire on both write plumbings. The durable events
 			// journal is written at the issueops seam inside the same
-			// transaction as the mutation (see issueops.RecordMutationInTx), so
+			// transaction as the mutation (see issueops.RecordEventInTx), so
 			// it needs no wiring here. When hooks are disabled, p is returned
 			// unwrapped (zero overhead).
 			var uowSinks uow.Sinks

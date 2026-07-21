@@ -77,7 +77,7 @@ func ReopenIssueInTx(ctx context.Context, tx DBTX, id, reason, actor string) (*R
 
 	// Journal the reopen as an update (a status transition). Only reached when a
 	// row was actually reopened (the already-open path returns earlier).
-	if err := RecordMutationInTx(ctx, tx, MutationUpdate, id); err != nil {
+	if err := RecordEventInTx(ctx, tx, EventUpdate, id); err != nil {
 		return nil, err
 	}
 
