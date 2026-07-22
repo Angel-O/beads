@@ -295,7 +295,7 @@ func queryDependentRecordsFromTable(ctx context.Context, tx DBTX, depTable, targ
 	query := fmt.Sprintf(`
 		SELECT id, issue_id, %s AS depends_on_id, type, created_at, created_by, metadata, thread_id
 		FROM %s
-		WHERE %s`, DepTargetExpr, depTable, depTargetEqualsOr(""))
+		WHERE %s`, DepTargetExpr, depTable, depTargetEqualsOr())
 	args := []any{targetID, targetID, targetID}
 	if depType != "" {
 		query += " AND type = ?"
@@ -386,8 +386,8 @@ func CountDependentRecordsInTx(ctx context.Context, tx DBTX, targetID, depType s
 //
 //nolint:gosec // G201: table names are hardcoded constants; targetID/depType are bound as parameters.
 func countWispDependentsNotInDurableInTx(ctx context.Context, tx DBTX, targetID, depType string) (int, error) {
-	wispWhere := depTargetEqualsOr("")
-	durableWhere := depTargetEqualsOr("")
+	wispWhere := depTargetEqualsOr()
+	durableWhere := depTargetEqualsOr()
 	args := []any{targetID, targetID, targetID}
 	if depType != "" {
 		wispWhere += " AND type = ?"
@@ -410,7 +410,7 @@ func countWispDependentsNotInDurableInTx(ctx context.Context, tx DBTX, targetID,
 
 //nolint:gosec // G201: depTable is a hardcoded constant; targetID/depType are bound as parameters.
 func countDependentRecordsFromTable(ctx context.Context, tx DBTX, depTable, targetID, depType string) (int, error) {
-	query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", depTable, depTargetEqualsOr(""))
+	query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", depTable, depTargetEqualsOr())
 	args := []any{targetID, targetID, targetID}
 	if depType != "" {
 		query += " AND type = ?"

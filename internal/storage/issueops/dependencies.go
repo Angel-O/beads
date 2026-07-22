@@ -64,11 +64,8 @@ func depTargetEquals(alias string) string {
 // so the un-ordered COUNT still scans, but the COALESCE form never had any index
 // path either; the type-filtered path seeks the (type, target) composite on both.
 // Use it for target-keyed reads of a single fixed target.
-func depTargetEqualsOr(alias string) string {
-	if alias == "" {
-		return "(depends_on_issue_id = ? OR depends_on_wisp_id = ? OR depends_on_external = ?)"
-	}
-	return fmt.Sprintf("(%s.depends_on_issue_id = ? OR %s.depends_on_wisp_id = ? OR %s.depends_on_external = ?)", alias, alias, alias)
+func depTargetEqualsOr() string {
+	return "(depends_on_issue_id = ? OR depends_on_wisp_id = ? OR depends_on_external = ?)"
 }
 
 func depTargetIn(alias, placeholders string) string {
