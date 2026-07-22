@@ -995,55 +995,61 @@ func IsBlockedInTx(ctx context.Context, tx DBTX, issueID string) (bool, []string
 // and skips any later (wisps) duplicate. The two reads share the is_blocked field,
 // so they must resolve a collision identically — this is a data anomaly, but the
 // single and batch reads would otherwise disagree on the same stored flag.
-//
-//nolint:gosec // G201: table is a hardcoded "issues" or "wisps".
 func IsBlockedBatchInTx(ctx context.Context, tx DBTX, ids []string) (map[string]bool, error) {
 	blocked := make(map[string]bool, len(ids))
 	if len(ids) == 0 {
 		return blocked, nil
 	}
-
-	seen := make(map[string]string, len(ids))
+	// De-dup by id across the two tables, keeping the first-seen (issues) value so
+	// a cross-table collision resolves ISSUES-win, exactly as IsBlockedInTx does
+	// (see above). The wisps table is optional, so a missing one is skipped —
+	// same two-table read shape as GetDependentRecordsForIssuesInTx.
+	seen := make(map[string]bool, len(ids))
 	for _, table := range []string{"issues", "wisps"} {
-		for start := 0; start < len(ids); start += queryBatchSize {
-			end := start + queryBatchSize
-			if end > len(ids) {
-				end = len(ids)
+		if err := readIsBlockedIntoFromTable(ctx, tx, table, ids, seen, blocked); err != nil {
+			if optionalBlockedTable(table) && isTableNotExistError(err) {
+				continue
 			}
-			placeholders, args := buildSQLInClause(ids[start:end])
-			rows, err := tx.QueryContext(ctx, fmt.Sprintf(
-				"SELECT id, is_blocked FROM %s WHERE id IN (%s)", table, placeholders), args...)
-			if err != nil {
-				if optionalBlockedTable(table) && isTableNotExistError(err) {
-					break
-				}
-				return nil, fmt.Errorf("read is_blocked from %s: %w", table, err)
-			}
-			for rows.Next() {
-				var id string
-				var b int
-				if err := rows.Scan(&id, &b); err != nil {
-					_ = rows.Close()
-					return nil, fmt.Errorf("scan is_blocked from %s: %w", table, err)
-				}
-				// Tables iterate issues→wisps and IsBlockedInTx breaks on the
-				// first table that has the id (issues first) — so ISSUES wins on
-				// a cross-table id collision. Keep the first-seen value and skip
-				// any later (wisps) duplicate, so the batch is_blocked matches
-				// per-row IsBlocked exactly on the shared field.
-				if _, dup := seen[id]; dup {
-					continue
-				}
-				seen[id] = table
-				blocked[id] = b != 0
-			}
-			_ = rows.Close()
-			if err := rows.Err(); err != nil {
-				return nil, fmt.Errorf("is_blocked rows from %s: %w", table, err)
-			}
+			return nil, err
 		}
 	}
 	return blocked, nil
+}
+
+//nolint:gosec // G201: table is a hardcoded "issues" or "wisps"; placeholders are ? only.
+func readIsBlockedIntoFromTable(ctx context.Context, tx DBTX, table string, ids []string, seen, blocked map[string]bool) error {
+	for start := 0; start < len(ids); start += queryBatchSize {
+		end := start + queryBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		placeholders, args := buildSQLInClause(ids[start:end])
+		rows, err := tx.QueryContext(ctx, fmt.Sprintf(
+			"SELECT id, is_blocked FROM %s WHERE id IN (%s)", table, placeholders), args...)
+		if err != nil {
+			return fmt.Errorf("read is_blocked from %s: %w", table, err)
+		}
+		for rows.Next() {
+			var id string
+			var b int
+			if err := rows.Scan(&id, &b); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("scan is_blocked from %s: %w", table, err)
+			}
+			// Keep the first-seen (issues) value and skip any later (wisps)
+			// duplicate, so the batch is_blocked matches per-row IsBlocked.
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			blocked[id] = b != 0
+		}
+		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("is_blocked rows from %s: %w", table, err)
+		}
+	}
+	return nil
 }
 
 // scanDependencyRow scans a single dependency row from a *sql.Rows.
