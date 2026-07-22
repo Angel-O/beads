@@ -58,6 +58,25 @@ func TestParseClaimConflict(t *testing.T) {
 		}
 	})
 
+	t.Run("open pre-assigned conflict classifies, assignee best-effort", func(t *testing.T) {
+		t.Parallel()
+		// Mirrors issueops.ClaimIssueInTx's open-but-assigned branch: the
+		// sentinel is wrapped (so errors.Is classification holds) but the
+		// holder-focused message does not end in the " by <assignee>" tail, so
+		// the assignee comes back empty — best-effort — while ok stays true.
+		err := fmt.Errorf("claim cl-fa1: %w", fmt.Errorf("%w: already assigned to %q — coordinate with the holder; if their claim is abandoned (crashed agent), lease expiry will surface it for bd reclaim", storage.ErrAlreadyClaimed, "alice"))
+		got, ok := ParseClaimConflict(err)
+		if !ok {
+			t.Fatalf("ParseClaimConflict returned ok=false for a wrapped open-assigned ErrAlreadyClaimed")
+		}
+		if got.CurrentAssignee != "" {
+			t.Errorf("CurrentAssignee = %q, want empty (holder-focused message has no parseable tail)", got.CurrentAssignee)
+		}
+		if got.CurrentStatus != "" {
+			t.Errorf("CurrentStatus = %q, want empty", got.CurrentStatus)
+		}
+	})
+
 	t.Run("not claimable recovers status", func(t *testing.T) {
 		t.Parallel()
 		err := fmt.Errorf("%w: status %s", storage.ErrNotClaimable, "in_progress")

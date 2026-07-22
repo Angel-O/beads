@@ -147,6 +147,7 @@ func RunAll(t *testing.T, factory Factory) {
 	t.Run("Claim", func(t *testing.T) { testClaim(t, factory) })
 	t.Run("ClaimIdempotent", func(t *testing.T) { testClaimIdempotent(t, factory) })
 	t.Run("ClaimAlreadyClaimed", func(t *testing.T) { testClaimAlreadyClaimed(t, factory) })
+	t.Run("ClaimOpenForeignAssignee", func(t *testing.T) { testClaimOpenForeignAssignee(t, factory) })
 	t.Run("ClaimNotClaimable", func(t *testing.T) { testClaimNotClaimable(t, factory) })
 	t.Run("ClaimReadyIssue", func(t *testing.T) { testClaimReadyIssue(t, factory) })
 	t.Run("ClaimReadyIssueLabelFilters", func(t *testing.T) { testClaimReadyIssueLabelFilters(t, factory) })
@@ -940,6 +941,42 @@ func sumCounts(m map[string]int) int {
 	return total
 }
 
+// snapView bundles the composite-view reads taken at a single point inside a
+// transaction so the baseline and post-mutation snapshots can be compared as
+// plain data instead of a wall of inline reads. Both snapshots share these five
+// reads; point-specific extras (comments, the snap-1-scoped event feed, and the
+// batch blocked flags) are read separately by the caller.
+type snapView struct {
+	issues []*types.Issue
+	counts map[string]int
+	deps   []*types.Dependency
+	nDep   int
+	events []*types.Event
+}
+
+// readSnapView captures the five composite-view reads shared by the baseline and
+// post-mutation snapshots in testTransactionSnapshotReads.
+func readSnapView(c context.Context, tx storage.Transaction) (snapView, error) {
+	var v snapView
+	var err error
+	if v.issues, err = tx.SearchIssues(c, "", types.IssueFilter{}); err != nil {
+		return v, err
+	}
+	if v.counts, err = tx.CountIssuesByGroup(c, types.IssueFilter{}, "status"); err != nil {
+		return v, err
+	}
+	if v.deps, err = tx.GetDependentRecords(c, "snap-1", "", 0, ""); err != nil {
+		return v, err
+	}
+	if v.nDep, err = tx.CountDependentRecords(c, "snap-1", ""); err != nil {
+		return v, err
+	}
+	if v.events, err = tx.EventsSince(c, storage.EventCursor{}, "", 1000); err != nil {
+		return v, err
+	}
+	return v, nil
+}
+
 // testTransactionSnapshotReads proves the new reads run on the transaction's
 // live snapshot rather than a fresh (committed-only) connection: it reads a
 // composite view off the opening snapshot, mutates INSIDE the transaction, and
@@ -976,19 +1013,7 @@ func testTransactionSnapshotReads(t *testing.T, f Factory) {
 
 	err := s.RunInTransaction(c, "bd: snapshot", func(tx storage.Transaction) error {
 		// --- Baseline reads off the opening snapshot. ---
-		issues0, err := tx.SearchIssues(c, "", types.IssueFilter{})
-		if err != nil {
-			return err
-		}
-		counts0, err := tx.CountIssuesByGroup(c, types.IssueFilter{}, "status")
-		if err != nil {
-			return err
-		}
-		dep0, err := tx.GetDependentRecords(c, "snap-1", "", 0, "")
-		if err != nil {
-			return err
-		}
-		nDep0, err := tx.CountDependentRecords(c, "snap-1", "")
+		base, err := readSnapView(c, tx)
 		if err != nil {
 			return err
 		}
@@ -996,47 +1021,11 @@ func testTransactionSnapshotReads(t *testing.T, f Factory) {
 		if err != nil {
 			return err
 		}
-		events0, err := tx.EventsSince(c, storage.EventCursor{}, "", 1000)
-		if err != nil {
-			return err
-		}
 		scoped0, err := tx.EventsSince(c, storage.EventCursor{}, "snap-1", 1000)
 		if err != nil {
 			return err
 		}
-
-		// CountIssuesByGroup merges wisps on every backend, so its buckets sum to
-		// the 3 durable issues + the committed wisp. Whether SearchIssues also
-		// counts that committed wisp is backend-specific (the classic Dolt tx reads
-		// the issues table only; the embedded tx merges both), so we assert the
-		// durable issues are all present rather than a wisp-free equality — see the
-		// count-vs-search wisp-scoping asymmetry noted on storage.Transaction.
-		const durableSeeded = 3
-		if got := sumCounts(counts0); got != durableSeeded+committedWisps {
-			t.Errorf("baseline sum(CountIssuesByGroup)=%d, want %d (durable + committed wisp)", got, durableSeeded+committedWisps)
-		}
-		for _, id := range []string{"snap-1", "snap-2", "snap-3"} {
-			if !containsIssueID(issues0, id) {
-				t.Errorf("baseline SearchIssues missing durable issue %s", id)
-			}
-		}
-		if len(dep0) != 1 || dep0[0].IssueID != "snap-2" {
-			t.Errorf("baseline GetDependentRecords(snap-1)=%v, want one edge from snap-2", dep0)
-		}
-		if nDep0 != len(dep0) {
-			t.Errorf("baseline CountDependentRecords=%d != len(GetDependentRecords)=%d", nDep0, len(dep0))
-		}
-		if len(comments0) != 2 {
-			t.Errorf("baseline GetIssueCommentsPage(snap-1)=%d comments, want 2", len(comments0))
-		}
-		if len(events0) == 0 {
-			t.Errorf("baseline EventsSince(all) returned no events")
-		}
-		for _, e := range scoped0 {
-			if e.IssueID != "snap-1" {
-				t.Errorf("EventsSince(snap-1) leaked event for %s", e.IssueID)
-			}
-		}
+		assertSnapBaseline(t, base, comments0, scoped0, committedWisps)
 
 		// --- Mutate INSIDE the transaction, then re-read the same view. ---
 		if err := tx.CreateIssue(c, withDefaults(&types.Issue{ID: "snap-4", Title: "InTx", Status: types.StatusOpen, IssueType: "task", Priority: 1}), "a"); err != nil {
@@ -1046,19 +1035,7 @@ func testTransactionSnapshotReads(t *testing.T, f Factory) {
 			return err
 		}
 
-		issues1, err := tx.SearchIssues(c, "", types.IssueFilter{})
-		if err != nil {
-			return err
-		}
-		counts1, err := tx.CountIssuesByGroup(c, types.IssueFilter{}, "status")
-		if err != nil {
-			return err
-		}
-		dep1, err := tx.GetDependentRecords(c, "snap-1", "", 0, "")
-		if err != nil {
-			return err
-		}
-		nDep1, err := tx.CountDependentRecords(c, "snap-1", "")
+		after, err := readSnapView(c, tx)
 		if err != nil {
 			return err
 		}
@@ -1066,40 +1043,7 @@ func testTransactionSnapshotReads(t *testing.T, f Factory) {
 		if err != nil {
 			return err
 		}
-		events1, err := tx.EventsSince(c, storage.EventCursor{}, "", 1000)
-		if err != nil {
-			return err
-		}
-
-		// Every read must reflect the in-transaction mutation — the delta is
-		// exactly the new issue + edge, nothing torn.
-		if len(issues1) != len(issues0)+1 {
-			t.Errorf("SearchIssues after in-tx create = %d, want %d", len(issues1), len(issues0)+1)
-		}
-		if sumCounts(counts1) != sumCounts(counts0)+1 {
-			t.Errorf("CountIssuesByGroup total after in-tx create = %d, want %d", sumCounts(counts1), sumCounts(counts0)+1)
-		}
-		if len(dep1) != len(dep0)+1 {
-			t.Errorf("GetDependentRecords(snap-1) after in-tx edge = %d, want %d", len(dep1), len(dep0)+1)
-		}
-		if !containsDependentFrom(dep1, "snap-4") {
-			t.Errorf("GetDependentRecords(snap-1) missing in-tx edge from snap-4: %v", dep1)
-		}
-		if nDep1 != nDep0+1 {
-			t.Errorf("CountDependentRecords(snap-1) after in-tx edge = %d, want %d", nDep1, nDep0+1)
-		}
-		if !blocked1["snap-4"] {
-			t.Errorf("snap-4 should read blocked after its in-tx dependency")
-		}
-		if !blocked1["snap-2"] {
-			t.Errorf("snap-2 should still read blocked")
-		}
-		if blocked1["snap-1"] || blocked1["snap-3"] {
-			t.Errorf("snap-1/snap-3 should read not-blocked, got %v", blocked1)
-		}
-		if len(events1) <= len(events0) {
-			t.Errorf("EventsSince(all) did not grow after in-tx writes: %d <= %d", len(events1), len(events0))
-		}
+		assertSnapDelta(t, base, after, blocked1)
 		return nil
 	})
 	if err != nil {
@@ -1128,6 +1072,80 @@ func containsIssueID(issues []*types.Issue, id string) bool {
 	return false
 }
 
+// assertSnapBaseline checks the opening-snapshot reads: the durable+wisp count
+// sum, presence of every durable issue, the single inbound edge on snap-1 (with
+// list/count agreement), the two comments, a non-empty event feed, and that the
+// snap-1-scoped feed never leaks another issue's events.
+func assertSnapBaseline(t *testing.T, v snapView, comments []*types.Comment, scoped []*types.Event, committedWisps int) {
+	t.Helper()
+	// CountIssuesByGroup merges wisps on every backend, so its buckets sum to the
+	// 3 durable issues + the committed wisp. Whether SearchIssues also counts that
+	// committed wisp is backend-specific (the classic Dolt tx reads the issues
+	// table only; the embedded tx merges both), so we assert the durable issues
+	// are all present rather than a wisp-free equality — see the count-vs-search
+	// wisp-scoping asymmetry noted on storage.Transaction.
+	const durableSeeded = 3
+	if got := sumCounts(v.counts); got != durableSeeded+committedWisps {
+		t.Errorf("baseline sum(CountIssuesByGroup)=%d, want %d (durable + committed wisp)", got, durableSeeded+committedWisps)
+	}
+	for _, id := range []string{"snap-1", "snap-2", "snap-3"} {
+		if !containsIssueID(v.issues, id) {
+			t.Errorf("baseline SearchIssues missing durable issue %s", id)
+		}
+	}
+	if len(v.deps) != 1 || v.deps[0].IssueID != "snap-2" {
+		t.Errorf("baseline GetDependentRecords(snap-1)=%v, want one edge from snap-2", v.deps)
+	}
+	if v.nDep != len(v.deps) {
+		t.Errorf("baseline CountDependentRecords=%d != len(GetDependentRecords)=%d", v.nDep, len(v.deps))
+	}
+	if len(comments) != 2 {
+		t.Errorf("baseline GetIssueCommentsPage(snap-1)=%d comments, want 2", len(comments))
+	}
+	if len(v.events) == 0 {
+		t.Errorf("baseline EventsSince(all) returned no events")
+	}
+	for _, e := range scoped {
+		if e.IssueID != "snap-1" {
+			t.Errorf("EventsSince(snap-1) leaked event for %s", e.IssueID)
+		}
+	}
+}
+
+// assertSnapDelta checks that every composite-view read reflects exactly the
+// in-transaction create + edge (one new issue, one new inbound edge on snap-1
+// from snap-4 with snap-4 reading blocked) with no torn or missing rows.
+func assertSnapDelta(t *testing.T, base, after snapView, blocked map[string]bool) {
+	t.Helper()
+	if len(after.issues) != len(base.issues)+1 {
+		t.Errorf("SearchIssues after in-tx create = %d, want %d", len(after.issues), len(base.issues)+1)
+	}
+	if sumCounts(after.counts) != sumCounts(base.counts)+1 {
+		t.Errorf("CountIssuesByGroup total after in-tx create = %d, want %d", sumCounts(after.counts), sumCounts(base.counts)+1)
+	}
+	if len(after.deps) != len(base.deps)+1 {
+		t.Errorf("GetDependentRecords(snap-1) after in-tx edge = %d, want %d", len(after.deps), len(base.deps)+1)
+	}
+	if !containsDependentFrom(after.deps, "snap-4") {
+		t.Errorf("GetDependentRecords(snap-1) missing in-tx edge from snap-4: %v", after.deps)
+	}
+	if after.nDep != base.nDep+1 {
+		t.Errorf("CountDependentRecords(snap-1) after in-tx edge = %d, want %d", after.nDep, base.nDep+1)
+	}
+	if !blocked["snap-4"] {
+		t.Errorf("snap-4 should read blocked after its in-tx dependency")
+	}
+	if !blocked["snap-2"] {
+		t.Errorf("snap-2 should still read blocked")
+	}
+	if blocked["snap-1"] || blocked["snap-3"] {
+		t.Errorf("snap-1/snap-3 should read not-blocked, got %v", blocked)
+	}
+	if len(after.events) <= len(base.events) {
+		t.Errorf("EventsSince(all) did not grow after in-tx writes: %d <= %d", len(after.events), len(base.events))
+	}
+}
+
 // testTransactionReadYourWrites creates an issue graph inside a transaction and
 // reads it back through the new composite-view methods BEFORE commit, proving
 // the transaction sees its own uncommitted writes — including through the
@@ -1137,74 +1155,96 @@ func testTransactionReadYourWrites(t *testing.T, f Factory) {
 	c := ctx()
 
 	err := s.RunInTransaction(c, "bd: ryw", func(tx storage.Transaction) error {
-		if err := tx.CreateIssue(c, withDefaults(&types.Issue{ID: "ryw-1", Title: "Blocker", Status: types.StatusOpen}), "a"); err != nil {
+		if err := seedReadYourWritesGraph(c, tx); err != nil {
 			return err
 		}
-		if err := tx.CreateIssue(c, withDefaults(&types.Issue{ID: "ryw-2", Title: "Blocked", Status: types.StatusOpen}), "a"); err != nil {
+		if err := assertInTxDependentReads(t, c, tx); err != nil {
 			return err
 		}
-		if err := tx.AddDependency(c, &types.Dependency{IssueID: "ryw-2", DependsOnID: "ryw-1", Type: types.DepBlocks}, "a"); err != nil {
-			return err
-		}
-
-		dependents, err := tx.GetDependentRecords(c, "ryw-1", "", 0, "")
-		if err != nil {
-			return err
-		}
-		if len(dependents) != 1 || dependents[0].IssueID != "ryw-2" {
-			t.Errorf("in-tx GetDependentRecords(ryw-1) = %v, want one edge from ryw-2", dependents)
-		}
-		byTarget, err := tx.GetDependentRecordsForIssues(c, []string{"ryw-1"})
-		if err != nil {
-			return err
-		}
-		if len(byTarget["ryw-1"]) != 1 {
-			t.Errorf("in-tx GetDependentRecordsForIssues[ryw-1] = %d, want 1", len(byTarget["ryw-1"]))
-		}
-		nDep, err := tx.CountDependentRecords(c, "ryw-1", "")
-		if err != nil {
-			return err
-		}
-		if nDep != 1 {
-			t.Errorf("in-tx CountDependentRecords(ryw-1) = %d, want 1", nDep)
-		}
-		batch, err := tx.IsBlockedBatch(c, []string{"ryw-1", "ryw-2"})
-		if err != nil {
-			return err
-		}
-		if !batch["ryw-2"] || batch["ryw-1"] {
-			t.Errorf("in-tx IsBlockedBatch = %v, want ryw-2 blocked, ryw-1 not", batch)
-		}
-		isBlocked, blockers, err := tx.IsBlocked(c, "ryw-2")
-		if err != nil {
-			return err
-		}
-		if !isBlocked || len(blockers) != 1 || blockers[0] != "ryw-1" {
-			t.Errorf("in-tx IsBlocked(ryw-2) = %v, %v, want true, [ryw-1]", isBlocked, blockers)
-		}
-
-		// The two in-tx durable issues are visible through the grouped counts.
-		counts, err := tx.CountIssuesByGroup(c, types.IssueFilter{}, "status")
-		if err != nil {
-			return err
-		}
-		if sumCounts(counts) != 2 {
-			t.Errorf("in-tx CountIssuesByGroup total = %d, want 2 (both uncommitted issues)", sumCounts(counts))
-		}
-
-		// The in-tx create event is visible through the durable event feed.
-		evs, err := tx.EventsSince(c, storage.EventCursor{}, "ryw-1", 100)
-		if err != nil {
-			return err
-		}
-		if len(evs) == 0 {
-			t.Errorf("in-tx EventsSince(ryw-1) returned no events for the uncommitted create")
-		}
-		return nil
+		return assertInTxCountsAndEvents(t, c, tx)
 	})
 	if err != nil {
 		t.Fatalf("RunInTransaction: %v", err)
 	}
+}
+
+// seedReadYourWritesGraph creates the ryw-1 <- ryw-2 (blocked-by) graph inside
+// the transaction that reads it back.
+func seedReadYourWritesGraph(c context.Context, tx storage.Transaction) error {
+	if err := tx.CreateIssue(c, withDefaults(&types.Issue{ID: "ryw-1", Title: "Blocker", Status: types.StatusOpen}), "a"); err != nil {
+		return err
+	}
+	if err := tx.CreateIssue(c, withDefaults(&types.Issue{ID: "ryw-2", Title: "Blocked", Status: types.StatusOpen}), "a"); err != nil {
+		return err
+	}
+	return tx.AddDependency(c, &types.Dependency{IssueID: "ryw-2", DependsOnID: "ryw-1", Type: types.DepBlocks}, "a")
+}
+
+// assertInTxDependentReads proves the dependents/blocked family reads the graph's
+// own uncommitted writes: the single inbound edge on ryw-1 (list, by-target map,
+// and count all agree) and the blocked flags (ryw-2 blocked, ryw-1 not) through
+// both IsBlockedBatch and IsBlocked.
+func assertInTxDependentReads(t *testing.T, c context.Context, tx storage.Transaction) error {
+	t.Helper()
+	dependents, err := tx.GetDependentRecords(c, "ryw-1", "", 0, "")
+	if err != nil {
+		return err
+	}
+	if len(dependents) != 1 || dependents[0].IssueID != "ryw-2" {
+		t.Errorf("in-tx GetDependentRecords(ryw-1) = %v, want one edge from ryw-2", dependents)
+	}
+	byTarget, err := tx.GetDependentRecordsForIssues(c, []string{"ryw-1"})
+	if err != nil {
+		return err
+	}
+	if len(byTarget["ryw-1"]) != 1 {
+		t.Errorf("in-tx GetDependentRecordsForIssues[ryw-1] = %d, want 1", len(byTarget["ryw-1"]))
+	}
+	nDep, err := tx.CountDependentRecords(c, "ryw-1", "")
+	if err != nil {
+		return err
+	}
+	if nDep != 1 {
+		t.Errorf("in-tx CountDependentRecords(ryw-1) = %d, want 1", nDep)
+	}
+	batch, err := tx.IsBlockedBatch(c, []string{"ryw-1", "ryw-2"})
+	if err != nil {
+		return err
+	}
+	if !batch["ryw-2"] || batch["ryw-1"] {
+		t.Errorf("in-tx IsBlockedBatch = %v, want ryw-2 blocked, ryw-1 not", batch)
+	}
+	isBlocked, blockers, err := tx.IsBlocked(c, "ryw-2")
+	if err != nil {
+		return err
+	}
+	if !isBlocked || len(blockers) != 1 || blockers[0] != "ryw-1" {
+		t.Errorf("in-tx IsBlocked(ryw-2) = %v, %v, want true, [ryw-1]", isBlocked, blockers)
+	}
+	return nil
+}
+
+// assertInTxCountsAndEvents proves the grouped counts and durable event feed also
+// reflect the transaction's own uncommitted writes.
+func assertInTxCountsAndEvents(t *testing.T, c context.Context, tx storage.Transaction) error {
+	t.Helper()
+	// The two in-tx durable issues are visible through the grouped counts.
+	counts, err := tx.CountIssuesByGroup(c, types.IssueFilter{}, "status")
+	if err != nil {
+		return err
+	}
+	if sumCounts(counts) != 2 {
+		t.Errorf("in-tx CountIssuesByGroup total = %d, want 2 (both uncommitted issues)", sumCounts(counts))
+	}
+	// The in-tx create event is visible through the durable event feed.
+	evs, err := tx.EventsSince(c, storage.EventCursor{}, "ryw-1", 100)
+	if err != nil {
+		return err
+	}
+	if len(evs) == 0 {
+		t.Errorf("in-tx EventsSince(ryw-1) returned no events for the uncommitted create")
+	}
+	return nil
 }
 
 // --- Ready-work counts equivalence (perf/ready-counts) ---

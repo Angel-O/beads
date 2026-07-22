@@ -151,8 +151,14 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 				// pattern-matched by batch agents into an unclaim+claim
 				// steamroller of live claims (wy-yuclk). Point at the holder;
 				// bd reclaim is safe to name because it only recovers claims
-				// whose lease has already expired.
-				return nil, fmt.Errorf("issue already assigned to %q — coordinate with the holder; if their claim is abandoned (crashed agent), lease expiry will surface it for bd reclaim", assignee)
+				// whose lease has already expired. Keep the %w wrap so this
+				// open-but-assigned refusal is still a classifiable claim
+				// conflict: the public IssueClaimer contract promises wrapped
+				// ErrAlreadyClaimed, and errors.Is / ParseClaimConflict (and the
+				// proxied batch exit code) key on it. This mirrors the
+				// domain-stack twin (domain.issueUseCaseImpl.claim, bd-at6rc),
+				// which already wraps the same message.
+				return nil, fmt.Errorf("%w: already assigned to %q — coordinate with the holder; if their claim is abandoned (crashed agent), lease expiry will surface it for bd reclaim", storage.ErrAlreadyClaimed, assignee)
 			}
 			return nil, fmt.Errorf("%w%s%s", storage.ErrAlreadyClaimed, storage.ClaimedByFragment, assignee)
 		}
