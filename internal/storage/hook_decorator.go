@@ -174,7 +174,7 @@ func (h *HookFiringStore) AddDependency(ctx context.Context, dep *types.Dependen
 	if err := h.inner.AddDependency(ctx, dep, actor); err != nil {
 		return err
 	}
-	h.fireDependencyHookByID(ctx, hooks.EventUpdate, dep.IssueID)
+	h.fireDependencyHookByID(ctx, dep.IssueID)
 	return nil
 }
 
@@ -183,7 +183,7 @@ func (h *HookFiringStore) AddDependencyWithOptions(ctx context.Context, dep *typ
 	if err := h.inner.AddDependencyWithOptions(ctx, dep, actor, opts); err != nil {
 		return err
 	}
-	h.fireDependencyHookByID(ctx, hooks.EventUpdate, dep.IssueID)
+	h.fireDependencyHookByID(ctx, dep.IssueID)
 	return nil
 }
 
@@ -192,7 +192,7 @@ func (h *HookFiringStore) RemoveDependency(ctx context.Context, issueID, depends
 	if err := h.inner.RemoveDependency(ctx, issueID, dependsOnID, actor); err != nil {
 		return err
 	}
-	h.fireDependencyHookByID(ctx, hooks.EventUpdate, issueID)
+	h.fireDependencyHookByID(ctx, issueID)
 	return nil
 }
 
@@ -201,7 +201,7 @@ func (h *HookFiringStore) RemoveDependencyWithOptions(ctx context.Context, issue
 	if err := h.inner.RemoveDependencyWithOptions(ctx, issueID, dependsOnID, actor, opts); err != nil {
 		return err
 	}
-	h.fireDependencyHookByID(ctx, hooks.EventUpdate, issueID)
+	h.fireDependencyHookByID(ctx, issueID)
 	return nil
 }
 
@@ -279,7 +279,7 @@ func (h *HookFiringStore) fireHookByID(ctx context.Context, event, id string) {
 	h.runner.Run(event, issue)
 }
 
-func (h *HookFiringStore) fireDependencyHookByID(ctx context.Context, event, id string) {
+func (h *HookFiringStore) fireDependencyHookByID(ctx context.Context, id string) {
 	if h.runner == nil {
 		return
 	}
@@ -287,7 +287,7 @@ func (h *HookFiringStore) fireDependencyHookByID(ctx context.Context, event, id 
 	if err != nil {
 		return
 	}
-	h.runner.Run(event, issue)
+	h.runner.Run(hooks.EventUpdate, issue)
 }
 
 // ── Hook tracking transaction ───────────────────────────────────────
