@@ -1031,7 +1031,9 @@ func (r *issueSQLRepositoryImpl) GetEpicsEligibleForClosure(ctx context.Context)
 }
 
 func (r *issueSQLRepositoryImpl) UnclaimIssue(ctx context.Context, id, actor string, force bool) error {
-	if err := issueops.UnclaimIssueInTx(ctx, r.runner, id, actor, force); err != nil {
+	// nil fence: `bd unclaim --if-fence` is refused in proxied-server mode
+	// rather than silently dropped, so no guard ever reaches this path.
+	if err := issueops.UnclaimIssueInTx(ctx, r.runner, id, actor, force, nil); err != nil {
 		return fmt.Errorf("db: IssueSQLRepository.UnclaimIssue: %w", err)
 	}
 	return nil

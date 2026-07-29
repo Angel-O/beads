@@ -35,22 +35,25 @@ func (s *EmbeddedDoltStore) ClaimReadyIssue(ctx context.Context, filter types.Wo
 }
 
 // UnclaimIssue atomically unclaims an issue by clearing the assignee
-// and resetting status to "open". Records an "unclaimed" event.
+// and resetting status to "open". Records an "unclaimed" event. A non-nil
+// expectedFence pins the release to that ownership generation, refusing with
+// storage.ErrFenceMismatch otherwise (force does not waive it).
 // Delegates SQL work to issueops; EmbeddedDolt auto-commits the transaction.
-func (s *EmbeddedDoltStore) UnclaimIssue(ctx context.Context, id string, actor string, force bool) error {
+func (s *EmbeddedDoltStore) UnclaimIssue(ctx context.Context, id string, actor string, force bool, expectedFence *int64) error {
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		return issueops.UnclaimIssueInTx(ctx, tx, id, actor, force)
+		return issueops.UnclaimIssueInTx(ctx, tx, id, actor, force, expectedFence)
 	})
 }
 
 // UnclaimIssueIfAssignee releases a claim only while the issue is still assigned
 // to expectedAssignee (compare-and-swap, the inverse of ClaimIssue). Returns
 // storage.ErrAssigneeMismatch, leaving the issue untouched, when the current
-// assignee differs. Delegates SQL work to issueops; EmbeddedDolt auto-commits
-// the transaction.
-func (s *EmbeddedDoltStore) UnclaimIssueIfAssignee(ctx context.Context, id string, actor string, expectedAssignee string) error {
+// assignee differs, and storage.ErrFenceMismatch when a non-nil expectedFence
+// names a superseded ownership generation. Delegates SQL work to issueops;
+// EmbeddedDolt auto-commits the transaction.
+func (s *EmbeddedDoltStore) UnclaimIssueIfAssignee(ctx context.Context, id string, actor string, expectedAssignee string, expectedFence *int64) error {
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		return issueops.UnclaimIssueIfAssigneeInTx(ctx, tx, id, actor, expectedAssignee)
+		return issueops.UnclaimIssueIfAssigneeInTx(ctx, tx, id, actor, expectedAssignee, expectedFence)
 	})
 }
 
@@ -104,7 +107,7 @@ func (s *EmbeddedDoltStore) UpdateIssueChecked(ctx context.Context, id string, u
 				return err
 			}
 		}
-		if err := issueops.CheckExpectedFieldsInTx(ctx, tx, id, opts.ExpectedAssignee, opts.ExpectedStatus); err != nil {
+		if err := issueops.CheckExpectedFieldsInTx(ctx, tx, id, opts.ExpectedAssignee, opts.ExpectedStatus, opts.ExpectedFence); err != nil {
 			return err
 		}
 		_, err := issueops.UpdateIssueInTx(ctx, tx, id, updates, actor)
@@ -181,7 +184,7 @@ func (s *EmbeddedDoltStore) CloseIssue(ctx context.Context, id string, reason st
 func (s *EmbeddedDoltStore) CloseIssueChecked(ctx context.Context, id string, actor string, opts storage.CloseIssueOptions) (storage.CloseIssueResult, error) {
 	var result storage.CloseIssueResult
 	err := s.withConn(ctx, true, func(tx *sql.Tx) error {
-		res, err := issueops.CloseIssueCheckedInTx(ctx, tx, id, opts.Reason, actor, opts.Session, opts.Force, opts.ExpectedVersion)
+		res, err := issueops.CloseIssueCheckedInTx(ctx, tx, id, opts.Reason, actor, opts.Session, opts.Force, opts.ExpectedVersion, opts.ExpectedFence)
 		if err != nil {
 			return err
 		}

@@ -159,6 +159,8 @@ func RunAll(t *testing.T, factory Factory) {
 	t.Run("ReclaimScoped", func(t *testing.T) { testReclaimScoped(t, factory) })
 	t.Run("UnclaimIfAssigneeMatch", func(t *testing.T) { testUnclaimIfAssigneeMatch(t, factory) })
 	t.Run("UnclaimIfAssigneeStale", func(t *testing.T) { testUnclaimIfAssigneeStale(t, factory) })
+	t.Run("GuardedReleaseFenceConflict", func(t *testing.T) { testGuardedReleaseFenceConflict(t, factory) })
+	t.Run("GuardedCloseFenceConflict", func(t *testing.T) { testGuardedCloseFenceConflict(t, factory) })
 
 	// Labels
 	t.Run("Labels", func(t *testing.T) { testLabels(t, factory) })

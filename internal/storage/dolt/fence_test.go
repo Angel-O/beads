@@ -132,7 +132,7 @@ func TestUnclaimBumpsFence(t *testing.T) {
 	seedClaimedIssue(t, ctx, store, "fence-unclaim", "alice", time.Hour)
 	before := readFenceState(t, ctx, store, "fence-unclaim")
 
-	if err := store.UnclaimIssue(ctx, "fence-unclaim", "alice", false); err != nil {
+	if err := store.UnclaimIssue(ctx, "fence-unclaim", "alice", false, nil); err != nil {
 		t.Fatalf("unclaim: %v", err)
 	}
 	assertFenceBumped(t, before, readFenceState(t, ctx, store, "fence-unclaim"), "unclaim")
@@ -149,7 +149,7 @@ func TestUnclaimIfAssigneeBumpsFence(t *testing.T) {
 	seedClaimedIssue(t, ctx, store, "fence-unclaim-cas", "alice", time.Hour)
 	before := readFenceState(t, ctx, store, "fence-unclaim-cas")
 
-	if err := store.UnclaimIssueIfAssignee(ctx, "fence-unclaim-cas", "admin", "alice"); err != nil {
+	if err := store.UnclaimIssueIfAssignee(ctx, "fence-unclaim-cas", "admin", "alice", nil); err != nil {
 		t.Fatalf("conditional unclaim: %v", err)
 	}
 	assertFenceBumped(t, before, readFenceState(t, ctx, store, "fence-unclaim-cas"), "unclaim --if-assignee")
@@ -394,7 +394,7 @@ func TestWispClaimBumpsFence(t *testing.T) {
 		t.Errorf("wisp claim_fence = %d, want %d", after, before+1)
 	}
 
-	if err := store.UnclaimIssue(ctx, "fence-wisp", "alice", false); err != nil {
+	if err := store.UnclaimIssue(ctx, "fence-wisp", "alice", false, nil); err != nil {
 		t.Fatalf("unclaim wisp: %v", err)
 	}
 	if released := wispFence(); released != after+1 {
@@ -469,7 +469,7 @@ func TestUpsertFenceDiscipline(t *testing.T) {
 	// ""/NULL normalization: release (stored assignee becomes ""), then
 	// re-import the unassigned row (binds NULL). Both mean unassigned — a
 	// content-only sync must not bump.
-	if err := store.UnclaimIssue(ctx, "fence-upsert", "carol", false); err != nil {
+	if err := store.UnclaimIssue(ctx, "fence-upsert", "carol", false, nil); err != nil {
 		t.Fatalf("unclaim: %v", err)
 	}
 	released := readFenceState(t, ctx, store, "fence-upsert")
