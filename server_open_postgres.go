@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/postgres"
 )
 
@@ -24,6 +25,11 @@ type PostgresServerConfig struct {
 	// search_path on every connection. In hosted deployments routing decides
 	// this value; clients never do.
 	Schema string
+
+	// EventsJournal enables the durable bd events journal for this project
+	// instance only. It is intentionally an embedding-server setting rather
+	// than a process-global or CLI config switch.
+	EventsJournal bool
 }
 
 // OpenServerPostgres opens the beads engine against an external Postgres
@@ -40,5 +46,15 @@ func OpenServerPostgres(ctx context.Context, cfg PostgresServerConfig) (Storage,
 	if cfg.Schema == "" {
 		return nil, fmt.Errorf("beads: OpenServerPostgres requires a Schema")
 	}
-	return postgres.Provision(ctx, cfg.DSN, cfg.Schema)
+	st, err := postgres.Provision(ctx, cfg.DSN, cfg.Schema)
+	if err != nil {
+		return nil, err
+	}
+	journalConfig, ok := st.(storage.EventsJournalConfigurer)
+	if !ok {
+		_ = st.Close()
+		return nil, fmt.Errorf("beads: PostgreSQL store does not support events-journal configuration")
+	}
+	journalConfig.SetEventsJournalEnabled(cfg.EventsJournal)
+	return st, nil
 }

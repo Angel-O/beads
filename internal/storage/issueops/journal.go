@@ -6,7 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync/atomic"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
@@ -49,31 +50,168 @@ type EventOp string
 
 // The closed set of journalled mutation kinds.
 const (
-	EventCreate    EventOp = "create"
-	EventUpdate    EventOp = "update"
-	EventClose     EventOp = "close"
-	EventDelete    EventOp = "delete"
-	EventDepAdd    EventOp = "dep_add"
-	EventDepRemove EventOp = "dep_remove"
+	EventCreate       EventOp = "create"
+	EventUpdate       EventOp = "update"
+	EventClose        EventOp = "close"
+	EventDelete       EventOp = "delete"
+	EventDepAdd       EventOp = "dep_add"
+	EventDepRemove    EventOp = "dep_remove"
+	EventCommentWrite EventOp = "comment"
 )
 
 // EventDep is the edge payload recorded for dependency operations.
 type EventDep struct {
-	Kind   string `json:"kind"`
-	Target string `json:"target"`
+	Kind     string `json:"kind"`
+	Target   string `json:"target"`
+	Metadata string `json:"metadata"`
 }
 
-// journalOn gates every emission. It is process-global because a bd process
-// serves a single workspace; cmd/bd sets it from the events-journal config
-// knob, and tests set it directly. Default OFF: when off, the *InTx emit helpers
-// are a cheap no-op and no rows are written.
-var journalOn atomic.Bool
+// EventComment is the stable, replayable payload for a comment write. Source
+// distinguishes a structured comment row from an audit-trail comment event.
+type EventComment struct {
+	ID        string    `json:"id"`
+	Author    string    `json:"author"`
+	Text      string    `json:"text"`
+	CreatedAt time.Time `json:"created_at"`
+	Source    string    `json:"source"`
+}
 
-// SetJournalEnabled turns events journaling on or off for this process.
-func SetJournalEnabled(on bool) { journalOn.Store(on) }
+// Journal activation is carried by the operation context. Store instances add
+// this value when opening an explicitly enabled project, so opening one Hosted
+// project cannot turn journaling on for any other project in the same process.
+// A missing value is deliberately safe-off.
+type journalContextKey struct{}
 
-// JournalEnabled reports whether events journaling is currently on.
-func JournalEnabled() bool { return journalOn.Load() }
+var journalTransactions sync.Map // map[DBTX]bool; entries live for one transaction
+
+// WithEventsJournal returns ctx scoped to one storage operation with the
+// durable events journal enabled or disabled.
+func WithEventsJournal(ctx context.Context, enabled bool) context.Context {
+	return context.WithValue(ctx, journalContextKey{}, enabled)
+}
+
+// ScopeEventsJournalTransaction associates activation with one concrete
+// transaction and returns a cleanup function. Store implementations call it
+// immediately after BeginTx. This is instance/project scoped even when many
+// stores share a process; there is no process-wide activation switch.
+func ScopeEventsJournalTransaction(tx DBTX, enabled bool) func() {
+	if tx == nil {
+		return func() {}
+	}
+	journalTransactions.Store(tx, enabled)
+	return func() { journalTransactions.Delete(tx) }
+}
+
+func journalEnabled(ctx context.Context, tx DBTX) bool {
+	if enabled, ok := ctx.Value(journalContextKey{}).(bool); ok {
+		return enabled
+	}
+	enabled, _ := journalTransactions.Load(tx)
+	on, _ := enabled.(bool)
+	return on
+}
+
+type blockedJournalKey struct {
+	table string
+	id    string
+}
+
+type blockedJournalSnapshot map[blockedJournalKey]bool
+
+// captureBlockedJournalSnapshot records the pre-maintenance readiness state
+// for the exact affected set. It is a no-op unless this transaction's durable
+// journal is enabled, so ordinary local operations pay no extra reads.
+func captureBlockedJournalSnapshot(
+	ctx context.Context,
+	tx DBTX,
+	issueIDs, wispIDs []string,
+) (blockedJournalSnapshot, error) {
+	if !journalEnabled(ctx, tx) {
+		return nil, nil
+	}
+
+	snapshot := make(blockedJournalSnapshot, len(issueIDs)+len(wispIDs))
+	for _, target := range []struct {
+		table string
+		ids   []string
+	}{
+		{table: "issues", ids: issueIDs},
+		{table: "wisps", ids: wispIDs},
+	} {
+		for start := 0; start < len(target.ids); start += queryBatchSize {
+			end := start + queryBatchSize
+			if end > len(target.ids) {
+				end = len(target.ids)
+			}
+			inClause, args := buildSQLInClause(target.ids[start:end])
+			//nolint:gosec // table is one of the two hardcoded values above.
+			rows, err := tx.QueryContext(ctx,
+				fmt.Sprintf("SELECT id, is_blocked FROM %s WHERE id IN (%s)", target.table, inClause),
+				args...)
+			if err != nil {
+				if optionalBlockedTable(target.table) && isTableNotExistError(err) {
+					break
+				}
+				return nil, fmt.Errorf("journal: snapshot derived is_blocked from %s: %w", target.table, err)
+			}
+			for rows.Next() {
+				var id string
+				var blocked int
+				if err := rows.Scan(&id, &blocked); err != nil {
+					_ = rows.Close()
+					return nil, fmt.Errorf("journal: scan derived is_blocked from %s: %w", target.table, err)
+				}
+				snapshot[blockedJournalKey{table: target.table, id: id}] = blocked != 0
+			}
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("journal: iterate derived is_blocked from %s: %w", target.table, err)
+			}
+			if err := rows.Close(); err != nil {
+				return nil, fmt.Errorf("journal: close derived is_blocked from %s: %w", target.table, err)
+			}
+		}
+	}
+	return snapshot, nil
+}
+
+// recordBlockedJournalChanges compares the stable post-maintenance state with
+// the captured state and journals only beads whose derived is_blocked value
+// actually changed. The emitted update carries the complete post-mutation
+// snapshot, allowing a cursor consumer to stay correct without graph queries.
+func recordBlockedJournalChanges(
+	ctx context.Context,
+	tx DBTX,
+	before blockedJournalSnapshot,
+	issueIDs, wispIDs []string,
+) error {
+	if before == nil {
+		return nil
+	}
+	after, err := captureBlockedJournalSnapshot(ctx, tx, issueIDs, wispIDs)
+	if err != nil {
+		return err
+	}
+
+	var changed []blockedJournalKey
+	for key, afterBlocked := range after {
+		if beforeBlocked, existed := before[key]; existed && beforeBlocked != afterBlocked {
+			changed = append(changed, key)
+		}
+	}
+	sort.Slice(changed, func(i, j int) bool {
+		if changed[i].table != changed[j].table {
+			return changed[i].table < changed[j].table
+		}
+		return changed[i].id < changed[j].id
+	})
+	for _, key := range changed {
+		if err := RecordEventInTx(ctx, tx, EventUpdate, key.id); err != nil {
+			return fmt.Errorf("journal: record derived is_blocked update for %s: %w", key.id, err)
+		}
+	}
+	return nil
+}
 
 // RecordEventInTx records op for issueID, snapshotting the issue's
 // post-mutation state as of tx (read-your-writes within the same transaction).
@@ -81,45 +219,86 @@ func JournalEnabled() bool { return journalOn.Load() }
 // RecordDeleteInTx) and dependency ops (use RecordDepEventInTx). A no-op when
 // journaling is disabled.
 func RecordEventInTx(ctx context.Context, tx DBTX, op EventOp, issueID string) error {
-	if !journalOn.Load() {
+	if !journalEnabled(ctx, tx) {
 		return nil
 	}
-	issue, err := GetIssueInTx(ctx, tx, issueID)
+	issue, err := getJournalIssueInTx(ctx, tx, issueID)
 	if err != nil {
 		// The row should exist for a non-delete op; a missing row means the
 		// mutation and the journal disagree, so fail the transaction rather than
 		// record a hole.
 		return fmt.Errorf("journal: snapshot %s for %s: %w", op, issueID, err)
 	}
-	return insertEventRow(ctx, tx, op, issueID, issue, nil)
+	return insertEventRow(ctx, tx, op, issueID, issue, nil, nil)
 }
 
 // RecordDeleteInTx records a delete for issueID with a null issue payload (the
 // row no longer exists). A no-op when journaling is disabled.
 func RecordDeleteInTx(ctx context.Context, tx DBTX, issueID string) error {
-	if !journalOn.Load() {
+	if !journalEnabled(ctx, tx) {
 		return nil
 	}
-	return insertEventRow(ctx, tx, EventDelete, issueID, nil, nil)
+	return insertEventRow(ctx, tx, EventDelete, issueID, nil, nil, nil)
 }
 
 // RecordDepEventInTx records a dependency add or remove for issueID, carrying
 // the edge kind and target. The issue snapshot is the post-mutation state as of
 // tx. A no-op when journaling is disabled.
-func RecordDepEventInTx(ctx context.Context, tx DBTX, op EventOp, issueID, kind, target string) error {
-	if !journalOn.Load() {
+func RecordDepEventInTx(ctx context.Context, tx DBTX, op EventOp, issueID, kind, target, metadata string) error {
+	if !journalEnabled(ctx, tx) {
 		return nil
 	}
-	issue, err := GetIssueInTx(ctx, tx, issueID)
+	issue, err := getJournalIssueInTx(ctx, tx, issueID)
 	if err != nil {
 		// The dependency source may itself have been deleted (cascade); record
 		// the edge change with a null snapshot rather than failing.
 		if errors.Is(err, storage.ErrNotFound) {
-			return insertEventRow(ctx, tx, op, issueID, nil, &EventDep{Kind: kind, Target: target})
+			return insertEventRow(ctx, tx, op, issueID, nil, &EventDep{Kind: kind, Target: target, Metadata: metadata}, nil)
 		}
 		return fmt.Errorf("journal: snapshot %s for %s: %w", op, issueID, err)
 	}
-	return insertEventRow(ctx, tx, op, issueID, issue, &EventDep{Kind: kind, Target: target})
+	return insertEventRow(ctx, tx, op, issueID, issue, &EventDep{Kind: kind, Target: target, Metadata: metadata}, nil)
+}
+
+// RecordCommentEventInTx records a replayable structured or audit comment.
+func RecordCommentEventInTx(ctx context.Context, tx DBTX, issueID string, comment *EventComment) error {
+	if !journalEnabled(ctx, tx) {
+		return nil
+	}
+	issue, err := getJournalIssueInTx(ctx, tx, issueID)
+	if err != nil {
+		return fmt.Errorf("journal: snapshot comment for %s: %w", issueID, err)
+	}
+	return insertEventRow(ctx, tx, EventCommentWrite, issueID, issue, nil, comment)
+}
+
+// getJournalIssueInTx augments the normal issue snapshot with the persisted
+// readiness projection. is_blocked is deliberately not part of ordinary issue
+// hydration, but it is required in a journal snapshot because a dependency
+// delta must be replayable without re-running graph maintenance.
+func getJournalIssueInTx(ctx context.Context, tx DBTX, issueID string) (*types.Issue, error) {
+	for _, candidate := range []struct {
+		issueTable string
+		labelTable string
+	}{
+		{"issues", "labels"},
+		{"wisps", "wisp_labels"},
+	} {
+		issue, err := getIssueFromTableInTx(ctx, tx, candidate.issueTable, candidate.labelTable, issueID)
+		if errors.Is(err, storage.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		var blocked int
+		if err := tx.QueryRowContext(ctx, fmt.Sprintf("SELECT is_blocked FROM %s WHERE id = ?", candidate.issueTable), issueID).Scan(&blocked); err != nil {
+			return nil, fmt.Errorf("journal: read is_blocked for %s: %w", issueID, err)
+		}
+		issue.IsBlocked = blocked != 0
+		return issue, nil
+	}
+	return nil, fmt.Errorf("%w: issue %s", storage.ErrNotFound, issueID)
 }
 
 // insertEventRow performs the actual INSERT. It is the ONE seam both write
@@ -127,7 +306,7 @@ func RecordDepEventInTx(ctx context.Context, tx DBTX, op EventOp, issueID, kind,
 // nil issue is stored as SQL NULL (deletes); a nil dep is stored as SQL NULL
 // (non-dependency ops). ts is the insert time, stamped inside the committing
 // transaction.
-func insertEventRow(ctx context.Context, tx DBTX, op EventOp, issueID string, issue *types.Issue, dep *EventDep) error {
+func insertEventRow(ctx context.Context, tx DBTX, op EventOp, issueID string, issue *types.Issue, dep *EventDep, comment *EventComment) error {
 	var issueJSON any
 	if issue != nil {
 		b, err := json.Marshal(issue)
@@ -144,14 +323,22 @@ func insertEventRow(ctx context.Context, tx DBTX, op EventOp, issueID string, is
 		}
 		depJSON = string(b)
 	}
+	var commentJSON any
+	if comment != nil {
+		b, err := json.Marshal(comment)
+		if err != nil {
+			return fmt.Errorf("journal: marshal comment for %s: %w", issueID, err)
+		}
+		commentJSON = string(b)
+	}
 	seq, err := nextEventSeq(ctx, tx)
 	if err != nil {
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO bd_events_journal (seq, ts, op, issue_id, issue_json, dep_json)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, seq, time.Now().UTC(), string(op), issueID, issueJSON, depJSON)
+		INSERT INTO bd_events_journal (seq, ts, op, issue_id, issue_json, dep_json, comment_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, seq, time.Now().UTC(), string(op), issueID, issueJSON, depJSON, commentJSON)
 	if err != nil {
 		return fmt.Errorf("journal: record %s for %s: %w", op, issueID, err)
 	}

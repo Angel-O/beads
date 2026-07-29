@@ -1105,6 +1105,15 @@ var rootCmd = &cobra.Command{
 		}
 		doltCfg.SyncRemote = resolveSyncRemote()
 
+		journalEnabled := eventsJournalEnabled()
+		backend := configfile.BackendDolt
+		if cfg != nil {
+			backend = cfg.GetBackend()
+		}
+		if err := validateEventsJournalBackend(backend, journalEnabled); err != nil {
+			return HandleError("%v", err)
+		}
+
 		// --global flag: switch to the global shared-server database.
 		// Must be in shared-server mode; errors otherwise.
 		if globalFlag {
@@ -1118,11 +1127,6 @@ var rootCmd = &cobra.Command{
 		// other helper paths stay in lockstep with the main command path.
 		dolt.ApplyCLIAutoStart(beadsDir, doltCfg)
 
-		// Enable the shared transaction-seam journal before either the Dolt or
-		// SQL-family store can serve a mutation. The setting is process-local by
-		// design; BD_EVENTS_JOURNAL is the Hosted writer activation switch.
-		applyEventsJournalConfig()
-
 		// BD_SPIKE_UOWSTORE (issue #4547 Route A derisk): in proxied mode the CLI
 		// normally short-circuits to the uowProvider path and dispatches through
 		// the *_proxied_server.go duals. With the spike flag set we instead fall
@@ -1130,6 +1134,7 @@ var rootCmd = &cobra.Command{
 		// travel the ordinary store path — exercising exactly the adapter this
 		// spike is proving. Default (unset) keeps the original short-circuit.
 		if proxiedServerMode && !spikeUOWStore() {
+			rootCtx = withConfiguredEventsJournal(rootCtx, journalEnabled)
 			p, err := newProxiedServerUOWProvider(rootCtx, beadsDir)
 			if err != nil {
 				return HandleError("failed to open uow provider: %v", err)
@@ -1208,6 +1213,11 @@ var rootCmd = &cobra.Command{
 				os.Exit(1)
 			}
 			return HandleError("failed to open database: %v", err)
+		}
+		if err := configureEventsJournalStore(store, journalEnabled); err != nil {
+			_ = store.Close()
+			store = nil
+			return HandleError("configuring events journal: %v", err)
 		}
 
 		// Mark store as active for flush goroutine safety

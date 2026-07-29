@@ -49,22 +49,18 @@ var mutationEntryPoints = []string{
 
 // beadDMLExemptions are exported functions the DML detector flags as writing a
 // work-bead table but which legitimately do NOT journal, each with a reason.
-// They fall into four buckets: (1) derived is_blocked maintenance; (2) aux-table
-// writers the templated-%s heuristic can't distinguish from a bead table (events,
-// child counters); (3) constituent sub-helpers of a create/rename/promote/delete
-// whose top-level entry point journals the whole mutation once; (4) compaction
+// They fall into four buckets: (1) derived child-counter maintenance; (2)
+// aux-table writers the templated-%s heuristic can't distinguish from a bead
+// table (events, child counters); (3) constituent sub-helpers of a
+// create/rename/promote/delete whose top-level entry point journals the whole
+// mutation once; (4) compaction
 // maintenance outside the create/update/close/delete/dep/label op vocabulary. The
 // staleness check fails if any stops being flagged, so an exemption cannot rot.
 var beadDMLExemptions = map[string]string{
-	// (1) is_blocked is a denormalized/derived column recomputed as a side effect
-	// of the graph mutation that changed it (which journals).
-	"MarkIsBlockedInTx":                "maintains the derived is_blocked column, not a bead mutation",
-	"RecomputeIsBlockedInTx":           "recomputes the derived is_blocked column, not a bead mutation",
-	"RecomputeAllIsBlockedInTx":        "recomputes the derived is_blocked column, not a bead mutation",
-	"RecomputeIsBlockedForIDsInTx":     "recomputes the derived is_blocked column, not a bead mutation",
-	"RecomputeIsBlockedForWispIDsInTx": "recomputes the derived is_blocked column, not a bead mutation",
-	"RecomputeIsBlockedAfterMergeInTx": "recomputes the derived is_blocked column, not a bead mutation",
-	"ReconcileChildCounters":           "recomputes denormalized child-counter state, not a bead mutation",
+	// (1) Child counters are derived CLI acceleration state. In contrast,
+	// is_blocked is part of the exported bead snapshot and its recompute helpers
+	// structurally journal every value that actually changes.
+	"ReconcileChildCounters": "recomputes denormalized child-counter state, not a bead mutation",
 
 	// (2) aux tables matched via templated %s, not work-bead state.
 	"RecordEventInTable":     "writes the events audit table (templated %s), not work-bead state",

@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/pgdialect"
 	"github.com/steveyegge/beads/internal/types"
@@ -49,8 +51,7 @@ func TestPostgresEventsJournalContract(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	issueops.SetJournalEnabled(true)
-	t.Cleanup(func() { issueops.SetJournalEnabled(false) })
+	st.SetEventsJournalEnabled(true)
 	newIssue := func(id string) *types.Issue {
 		return &types.Issue{ID: id, Title: id, IssueType: "task", Status: types.StatusOpen, Priority: 2}
 	}
@@ -58,6 +59,14 @@ func TestPostgresEventsJournalContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.CreateIssue(ctx, newIssue("pgj-2"), "tester"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunInTransaction(ctx, "journal transaction labels", func(tx storage.Transaction) error {
+		if err := tx.AddLabel(ctx, "pgj-1", "demo", "tester"); err != nil {
+			return err
+		}
+		return tx.RemoveLabel(ctx, "pgj-1", "demo", "tester")
+	}); err != nil {
 		t.Fatal(err)
 	}
 	dep := &types.Dependency{IssueID: "pgj-2", DependsOnID: "pgj-1", Type: types.DepBlocks}
@@ -81,7 +90,14 @@ func TestPostgresEventsJournalContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantOps := []string{"create", "create", "dep_add", "dep_remove", "update", "close", "delete"}
+	wantOps := []string{
+		"create", "create",
+		"update", "update", // transaction label add/remove
+		"dep_add",
+		"update", // derived is_blocked flip after dependency removal
+		"dep_remove",
+		"update", "close", "delete",
+	}
 	if len(rows) != len(wantOps) {
 		t.Fatalf("journal rows=%d, want %d", len(rows), len(wantOps))
 	}
@@ -95,10 +111,20 @@ func TestPostgresEventsJournalContract(t *testing.T) {
 			}
 			continue
 		}
+		if _, err := time.Parse(time.RFC3339Nano, row.TS); err != nil || !strings.HasSuffix(row.TS, "Z") {
+			t.Fatalf("row %d timestamp = %q, want RFC3339Nano UTC (parse err=%v)", i, row.TS, err)
+		}
 		var issue types.Issue
 		if err := json.Unmarshal([]byte(row.IssueJSON), &issue); err != nil {
 			t.Fatalf("row %d issue payload is not canonical issue JSON: %v", i, err)
 		}
+	}
+	var derived types.Issue
+	if err := json.Unmarshal([]byte(rows[5].IssueJSON), &derived); err != nil {
+		t.Fatalf("derived readiness payload: %v", err)
+	}
+	if derived.ID != "pgj-2" || derived.IsBlocked {
+		t.Fatalf("derived readiness update = id %q blocked=%v, want pgj-2 unblocked", derived.ID, derived.IsBlocked)
 	}
 
 	// Mutation and journal insert share one SQL transaction: rolling back both
@@ -111,7 +137,7 @@ func TestPostgresEventsJournalContract(t *testing.T) {
 		_ = tx.Rollback()
 		t.Fatal(err)
 	}
-	if err := issueops.RecordEventInTx(ctx, tx, issueops.EventUpdate, "pgj-1"); err != nil {
+	if err := issueops.RecordEventInTx(issueops.WithEventsJournal(ctx, true), tx, issueops.EventUpdate, "pgj-1"); err != nil {
 		_ = tx.Rollback()
 		t.Fatal(err)
 	}
@@ -124,6 +150,23 @@ func TestPostgresEventsJournalContract(t *testing.T) {
 	}
 	if len(rowsAfterRollback) != len(rows) {
 		t.Fatalf("rollback added journal rows: got %d, want %d", len(rowsAfterRollback), len(rows))
+	}
+
+	// Recovery must seed the counter from the journal high-water mark rather
+	// than restart at one. This is the PostgreSQL crash/operator-repair path;
+	// a stale/missing counter must never collide with an existing source cursor.
+	if _, err := st.DB().ExecContext(ctx, "DELETE FROM bd_events_seq"); err != nil {
+		t.Fatalf("remove counter for recovery proof: %v", err)
+	}
+	if err := st.CreateIssue(ctx, newIssue("pgj-recovered-counter"), "tester"); err != nil {
+		t.Fatalf("create after counter recovery: %v", err)
+	}
+	recoveredRows, err := st.ReadEventsJournal(ctx, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := recoveredRows[len(recoveredRows)-1].Seq, int64(len(rows)+1); got != want {
+		t.Fatalf("recovered counter seq = %d, want journal high-water + 1 = %d", got, want)
 	}
 
 	const writers = 8

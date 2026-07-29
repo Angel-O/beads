@@ -9,7 +9,6 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/storage/domain"
-	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/testutil"
 )
 
@@ -39,9 +38,9 @@ func isSerializationFailure(err error) bool {
 // consumer would skip the lower seq. The counter converts that silent skip into
 // a detected conflict + retry that preserves commit order.
 func (s *testSuite) TestEventsJournal_CommitOrderedGaplessSeq() {
+	s.journalEnabled = true
+	s.T().Cleanup(func() { s.journalEnabled = false })
 	ctx := s.Ctx()
-	issueops.SetJournalEnabled(true)
-	s.T().Cleanup(func() { issueops.SetJournalEnabled(false) })
 	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_events_journal")
 	s.Require().NoError(err)
 
@@ -102,9 +101,9 @@ func (s *testSuite) TestEventsJournal_CommitOrderedGaplessSeq() {
 // seq<N is already committed) through concurrent writers, each retrying its own
 // serialization losses — mirroring what withRetryTx / uow.RunTx do in production.
 func (s *testSuite) TestEventsJournal_ConcurrentWritersGaplessNoDup() {
+	s.journalEnabled = true
+	s.T().Cleanup(func() { s.journalEnabled = false })
 	ctx := s.Ctx()
-	issueops.SetJournalEnabled(true)
-	s.T().Cleanup(func() { issueops.SetJournalEnabled(false) })
 	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_events_journal")
 	s.Require().NoError(err)
 

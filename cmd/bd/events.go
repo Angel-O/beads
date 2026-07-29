@@ -12,6 +12,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/uow"
 )
 
 // eventFollowPollInterval is how often `bd events tail --follow` polls the
@@ -54,17 +55,18 @@ var eventsTailCmd = &cobra.Command{
 	Long: `Print events journal records with seq greater than --since, in order.
 
 Each line is a JSON record:
-  {"seq":N,"ts":"...","op":"create|update|close|delete|dep_add|dep_remove",
-   "issue_id":"...","issue":{...|null},"dep":{"kind":..,"target":..}}
+  {"seq":N,"ts":"...","op":"create|update|close|delete|dep_add|dep_remove|comment",
+   "issue_id":"...","issue":{...|null},"dep":{"kind":..,"target":..,"metadata":..},"comment":{...}}
 
 Record contract (stable for external consumers):
   seq       int64   counter-assigned inside the mutation's transaction; gapless,
                     strictly increasing in commit order, never reused or reset
   ts        string  UTC insert time, stamped inside the committing transaction
-  op        string  one of the six ops above
+  op        string  one of the seven ops above
   issue_id  string  the mutated issue's id
   issue     object  full issue state AFTER the mutation; null on delete
-  dep       object  {"kind","target"} for dep_add / dep_remove; omitted otherwise
+  dep       object  {"kind","target","metadata"} for dep_add / dep_remove; omitted otherwise
+  comment   object  {"id","author","text","created_at","source"} for comment; omitted otherwise
 
 Poll with the highest seq seen to consume new mutations incrementally, or pass
 --follow to keep printing new records as they are committed (Ctrl-C to stop).`,
@@ -147,12 +149,13 @@ type eventRecord struct {
 	IssueID string          `json:"issue_id"`
 	Issue   json.RawMessage `json:"issue"`
 	Dep     json.RawMessage `json:"dep,omitempty"`
+	Comment json.RawMessage `json:"comment,omitempty"`
 }
 
 // tailSelect builds the read query. CAST(ts AS CHAR) normalizes the DATETIME to
 // a string across drivers.
 func tailSelect(limit int) string {
-	q := `SELECT seq, CAST(ts AS CHAR), op, issue_id, issue_json, dep_json
+	q := `SELECT seq, CAST(ts AS CHAR), op, issue_id, issue_json, dep_json, comment_json
 	      FROM bd_events_journal WHERE seq > ? ORDER BY seq ASC`
 	if limit > 0 {
 		q += " LIMIT " + strconv.Itoa(limit)
@@ -234,25 +237,37 @@ func journalAccessor() (storage.EventsJournalAccessor, error) {
 	return acc, nil
 }
 
-// readJournal reads records with seq greater than since from the active store's
-// journal capability. The older proxied UOW surface intentionally has no raw
-// journal capability; its mutation paths remain supported, but journal tailing
-// requires the direct store path until that public seam is widened.
+// readJournal reads records with seq greater than since from the active
+// storage seam. Proxied-server mode uses its transaction-bound UOW journal
+// capability; direct stores use EventsJournalAccessor.
 func readJournal(ctx context.Context, since int64, limit int) ([]eventRecord, error) {
+	var rows []storage.EventsJournalRow
 	if usesProxiedServer() {
-		return nil, fmt.Errorf("events journal is unavailable through the proxied-server UOW backend")
-	}
-	acc, err := journalAccessor()
-	if err != nil {
-		return nil, err
-	}
-	rows, err := acc.ReadEventsJournal(ctx, since, limit)
-	if err != nil {
-		return nil, err
+		if uowProvider == nil {
+			return nil, fmt.Errorf("no proxied-server unit-of-work provider available")
+		}
+		uw, err := uowProvider.NewUOW(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer uw.Close(ctx)
+		rows, err = uw.EventsJournalUseCase().Read(ctx, since, limit)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		acc, err := journalAccessor()
+		if err != nil {
+			return nil, err
+		}
+		rows, err = acc.ReadEventsJournal(ctx, since, limit)
+		if err != nil {
+			return nil, err
+		}
 	}
 	out := make([]eventRecord, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, buildRecord(r.Seq, r.TS, r.Op, r.IssueID, r.IssueJSON, r.DepJSON))
+		out = append(out, buildRecord(r.Seq, r.TS, r.Op, r.IssueID, r.IssueJSON, r.DepJSON, r.CommentJSON))
 	}
 	return out, nil
 }
@@ -260,7 +275,16 @@ func readJournal(ctx context.Context, since int64, limit int) ([]eventRecord, er
 // pruneJournal deletes records below before honoring the retain floors.
 func pruneJournal(ctx context.Context, before int64, retainDays, retainRows int) (int64, error) {
 	if usesProxiedServer() {
-		return 0, fmt.Errorf("events journal is unavailable through the proxied-server UOW backend")
+		if uowProvider == nil {
+			return 0, fmt.Errorf("no proxied-server unit-of-work provider available")
+		}
+		var n int64
+		err := uow.RunInTx(ctx, uowProvider, fmt.Sprintf("bd: prune events journal below %d", before), func(uw uow.UnitOfWork) error {
+			var pruneErr error
+			n, pruneErr = uw.EventsJournalUseCase().Prune(ctx, before, retainDays, retainRows)
+			return pruneErr
+		})
+		return n, err
 	}
 	acc, err := journalAccessor()
 	if err != nil {
@@ -269,13 +293,16 @@ func pruneJournal(ctx context.Context, before int64, retainDays, retainRows int)
 	return acc.PruneEventsJournal(ctx, before, retainDays, retainRows)
 }
 
-func buildRecord(seq int64, ts, op, issueID, issueJS, depJS string) eventRecord {
+func buildRecord(seq int64, ts, op, issueID, issueJS, depJS, commentJS string) eventRecord {
 	rec := eventRecord{Seq: seq, TS: ts, Op: op, IssueID: issueID, Issue: json.RawMessage("null")}
 	if issueJS != "" {
 		rec.Issue = json.RawMessage(issueJS)
 	}
 	if depJS != "" {
 		rec.Dep = json.RawMessage(depJS)
+	}
+	if commentJS != "" {
+		rec.Comment = json.RawMessage(commentJS)
 	}
 	return rec
 }

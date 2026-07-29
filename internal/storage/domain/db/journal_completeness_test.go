@@ -34,19 +34,20 @@ func TestEveryRepositoryMutatorJournals(t *testing.T) {
 	// The staleness check below fails if any of these stops being a bead mutator,
 	// so a rename or refactor cannot silently strand an exemption.
 	exempt := map[string]string{
-		"DeleteAllForIDs":         "bulk edge/label cleanup runs under a parent issue delete that already journals each removed bead",
-		"markDirectBlockedSource": "maintains the derived is_blocked column as a side effect of a journaled dependency insert",
+		"labelSQLRepositoryImpl.DeleteAllForIDs":              "bulk label cleanup runs under a parent issue delete; the surviving journal record is the node delete",
+		"dependencySQLRepositoryImpl.markDirectBlockedSource": "maintains the derived is_blocked column as a side effect of a journaled dependency insert",
 	}
 
 	// Direct emit helpers and the issueops functions that journal internally.
 	emitCalls := map[string]bool{
-		"RecordEventInTx":          true,
-		"RecordDeleteInTx":         true,
-		"RecordDepEventInTx":       true,
-		"CloseIssueInTx":           true,
-		"ReopenIssueInTx":          true,
-		"ClaimReadyIssueInTx":      true,
-		"ReclaimExpiredLeasesInTx": true,
+		"RecordEventInTx":                      true,
+		"RecordDeleteInTx":                     true,
+		"RecordDepEventInTx":                   true,
+		"RecordDependencyRemovalsForTableInTx": true,
+		"CloseIssueInTx":                       true,
+		"ReopenIssueInTx":                      true,
+		"ClaimReadyIssueInTx":                  true,
+		"ReclaimExpiredLeasesInTx":             true,
 	}
 
 	fns, err := journalscan.ParsePackage(".")
@@ -74,11 +75,12 @@ func TestEveryRepositoryMutatorJournals(t *testing.T) {
 		if !beadReceivers[f.Recv] || !beadDML[name] {
 			continue
 		}
-		if reason, ok := exempt[f.Name]; ok {
+		exemptKey := f.Recv + "." + f.Name
+		if reason, ok := exempt[exemptKey]; ok {
 			if reason == "" {
-				t.Errorf("%s has an empty exemption reason", f.Name)
+				t.Errorf("%s has an empty exemption reason", exemptKey)
 			}
-			seenExempt[f.Name] = true
+			seenExempt[exemptKey] = true
 			continue
 		}
 		checked++

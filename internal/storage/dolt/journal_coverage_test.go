@@ -2,41 +2,22 @@ package dolt
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
-	"sync"
 	"testing"
 	"time"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
-var (
-	journalRefMu sync.Mutex
-	journalRefs  int
-)
-
-// enableJournalForTest turns the process-global events journal on for a test
-// and keeps it on until the last concurrent journal test finishes. The dolt
-// suite runs tests in parallel (setupTestStore calls t.Parallel), so a plain
-// enable/disable pair would let one journal test's cleanup flip the flag off
-// underneath a still-running sibling. Reference counting keeps the flag stable
-// across the overlapping journal tests; non-journal tests are unaffected because
-// the journal table is dolt_ignored and separate from versioned data.
-func enableJournalForTest(t *testing.T) {
+// enableJournalForTest activates only this store. Journal tests run in
+// parallel, so a process-global switch would leak across unrelated projects.
+func enableJournalForTest(t *testing.T, store *DoltStore) {
 	t.Helper()
-	journalRefMu.Lock()
-	journalRefs++
-	issueops.SetJournalEnabled(true)
-	journalRefMu.Unlock()
-	t.Cleanup(func() {
-		journalRefMu.Lock()
-		journalRefs--
-		if journalRefs == 0 {
-			issueops.SetJournalEnabled(false)
-		}
-		journalRefMu.Unlock()
-	})
+	store.SetEventsJournalEnabled(true)
+	t.Cleanup(func() { store.SetEventsJournalEnabled(false) })
 }
 
 // jrow is one journal row read back in seq order.
@@ -93,7 +74,7 @@ func TestEventsJournal_SeamEntryPoints(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 	ctx := context.Background()
-	enableJournalForTest(t)
+	enableJournalForTest(t, store)
 
 	mk := func(id string) *types.Issue {
 		return &types.Issue{ID: id, Title: "t-" + id, IssueType: types.TypeTask, Status: types.StatusOpen}
@@ -111,8 +92,9 @@ func TestEventsJournal_SeamEntryPoints(t *testing.T) {
 		if err := store.UpdateIssueID(ctx, "bd-rn-1", "bd-rn-2", iss, "actor"); err != nil {
 			t.Fatalf("rename: %v", err)
 		}
-		if rows := readJournalRows(t, store); !hasOpFor(rows, "update", "bd-rn-2") {
-			t.Fatalf("rename must journal an update for the new id; got %+v", rows)
+		rows := readJournalRows(t, store)
+		if !hasOpFor(rows, "delete", "bd-rn-1") || !hasOpFor(rows, "create", "bd-rn-2") {
+			t.Fatalf("rename must journal an old-node delete and new-node create; got %+v", rows)
 		}
 	})
 
@@ -133,6 +115,25 @@ func TestEventsJournal_SeamEntryPoints(t *testing.T) {
 			if !hasOpFor(rows, op, w.ID) {
 				t.Fatalf("wisp must journal %q for %s; got %+v", op, w.ID, rows)
 			}
+		}
+	})
+
+	t.Run("transaction label writes", func(t *testing.T) {
+		if err := store.CreateIssue(ctx, mk("bd-tx-label-1"), "actor"); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		clearJournal(t, store)
+		if err := store.RunInTransaction(ctx, "journal transaction labels", func(tx storage.Transaction) error {
+			if err := tx.AddLabel(ctx, "bd-tx-label-1", "demo", "actor"); err != nil {
+				return err
+			}
+			return tx.RemoveLabel(ctx, "bd-tx-label-1", "demo", "actor")
+		}); err != nil {
+			t.Fatalf("transaction labels: %v", err)
+		}
+		rows := readJournalRows(t, store)
+		if len(rows) != 2 || !hasOpFor(rows, "update", "bd-tx-label-1") {
+			t.Fatalf("transaction add/remove label must each journal an update; got %+v", rows)
 		}
 	})
 
@@ -240,6 +241,149 @@ func TestEventsJournal_SeamEntryPoints(t *testing.T) {
 	})
 }
 
+// TestEventsJournal_RenameRelationshipDeltas proves a cursor consumer can
+// replay a rename without querying current graph state. Both source and target
+// endpoints are explicit in old-edge removals and new-edge additions.
+func TestEventsJournal_RenameRelationshipDeltas(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	enableJournalForTest(t, store)
+
+	mk := func(id string) *types.Issue {
+		return &types.Issue{ID: id, Title: id, IssueType: types.TypeTask, Status: types.StatusOpen}
+	}
+	for _, id := range []string{"bd-rn-old", "bd-rn-out", "bd-rn-in"} {
+		if err := store.CreateIssue(ctx, mk(id), "actor"); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	for _, dep := range []*types.Dependency{
+		{IssueID: "bd-rn-old", DependsOnID: "bd-rn-out", Type: types.DepBlocks},
+		{IssueID: "bd-rn-in", DependsOnID: "bd-rn-old", Type: types.DepRelated},
+	} {
+		if err := store.AddDependency(ctx, dep, "actor"); err != nil {
+			t.Fatalf("add dependency %+v: %v", dep, err)
+		}
+	}
+	clearJournal(t, store)
+	issue, err := store.GetIssue(ctx, "bd-rn-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateIssueID(ctx, "bd-rn-old", "bd-rn-new", issue, "actor"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+
+	rows, err := store.db.QueryContext(ctx,
+		`SELECT op, issue_id, dep_json FROM bd_events_journal ORDER BY seq ASC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var op, id string
+		var depJSON []byte
+		if err := rows.Scan(&op, &id, &depJSON); err != nil {
+			t.Fatal(err)
+		}
+		if len(depJSON) == 0 {
+			got = append(got, op+":"+id)
+			continue
+		}
+		var dep issueops.EventDep
+		if err := json.Unmarshal(depJSON, &dep); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, op+":"+id+"->"+dep.Target+":"+dep.Kind)
+	}
+	want := []string{
+		"dep_remove:bd-rn-in->bd-rn-old:related",
+		"dep_remove:bd-rn-old->bd-rn-out:blocks",
+		"delete:bd-rn-old",
+		"create:bd-rn-new",
+		"dep_add:bd-rn-in->bd-rn-new:related",
+		"dep_add:bd-rn-new->bd-rn-out:blocks",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("rename journal = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("rename journal[%d] = %q, want %q (all=%v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// TestEventsJournal_DeleteRelationshipDeltas guards the direct-store path:
+// both incoming and outgoing edges are explicit dep_remove rows before the
+// deleted node, so replay never relies on implicit database cascades.
+func TestEventsJournal_DeleteRelationshipDeltas(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	enableJournalForTest(t, store)
+
+	mk := func(id string) *types.Issue {
+		return &types.Issue{ID: id, Title: id, IssueType: types.TypeTask, Status: types.StatusOpen}
+	}
+	for _, id := range []string{"bd-del-center", "bd-del-in", "bd-del-out"} {
+		if err := store.CreateIssue(ctx, mk(id), "actor"); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	for _, dep := range []*types.Dependency{
+		{IssueID: "bd-del-center", DependsOnID: "bd-del-out", Type: types.DepBlocks},
+		{IssueID: "bd-del-in", DependsOnID: "bd-del-center", Type: types.DepRelated},
+	} {
+		if err := store.AddDependency(ctx, dep, "actor"); err != nil {
+			t.Fatalf("add dependency %+v: %v", dep, err)
+		}
+	}
+	clearJournal(t, store)
+	if err := store.DeleteIssue(ctx, "bd-del-center"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	rows, err := store.db.QueryContext(ctx,
+		`SELECT op, issue_id, dep_json FROM bd_events_journal ORDER BY seq ASC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var op, id string
+		var depJSON []byte
+		if err := rows.Scan(&op, &id, &depJSON); err != nil {
+			t.Fatal(err)
+		}
+		if len(depJSON) == 0 {
+			got = append(got, op+":"+id)
+			continue
+		}
+		var dep issueops.EventDep
+		if err := json.Unmarshal(depJSON, &dep); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, op+":"+id+"->"+dep.Target+":"+dep.Kind)
+	}
+	want := []string{
+		"dep_remove:bd-del-center->bd-del-out:blocks",
+		"dep_remove:bd-del-in->bd-del-center:related",
+		"delete:bd-del-center",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("delete journal = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("delete journal[%d] = %q, want %q (all=%v)", i, got[i], want[i], got)
+		}
+	}
+}
+
 // TestEventsJournalAccessorServerStore guards the server-mode DoltStore's
 // EventsJournalAccessor (the read/prune capability the `bd events` CLI uses
 // against a Dolt SQL server), mirroring the embedded-store guard in embeddeddolt.
@@ -247,7 +391,7 @@ func TestEventsJournalAccessorServerStore(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 	ctx := context.Background()
-	enableJournalForTest(t)
+	enableJournalForTest(t, store)
 	clearJournal(t, store)
 
 	mk := func(id string) *types.Issue {
@@ -297,7 +441,7 @@ func TestEventsJournal_ReplayFromZero(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 	ctx := context.Background()
-	enableJournalForTest(t)
+	enableJournalForTest(t, store)
 	clearJournal(t, store)
 
 	mk := func(id string) *types.Issue {
@@ -352,5 +496,241 @@ func TestEventsJournal_ReplayFromZero(t *testing.T) {
 	}
 	if _, err := store.GetIssue(ctx, "bd-rp-3"); err == nil {
 		t.Fatalf("bd-rp-3 was deleted; replay must not resurrect it")
+	}
+}
+
+// TestEventsJournal_DependencySnapshotsFollowBlockedState proves that a
+// consumer never observes a dependency delta whose issue snapshot predates the
+// derived is_blocked state committed with that graph change. It also pins the
+// exact metadata replacement payload used to replay same-type refreshes.
+func TestEventsJournal_DependencySnapshotsFollowBlockedState(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	enableJournalForTest(t, store)
+
+	mk := func(id string) *types.Issue {
+		return &types.Issue{ID: id, Title: id, IssueType: types.TypeTask, Status: types.StatusOpen}
+	}
+	for _, id := range []string{"bd-js-source", "bd-js-target"} {
+		if err := store.CreateIssue(ctx, mk(id), "actor"); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	clearJournal(t, store)
+
+	add := func(metadata string) {
+		t.Helper()
+		if err := store.AddDependency(ctx, &types.Dependency{IssueID: "bd-js-source", DependsOnID: "bd-js-target", Type: types.DepBlocks, Metadata: metadata}, "actor"); err != nil {
+			t.Fatalf("add dependency: %v", err)
+		}
+	}
+	readLast := func() (types.Issue, issueops.EventDep) {
+		t.Helper()
+		var issueJSON, depJSON []byte
+		if err := store.db.QueryRowContext(ctx, `SELECT issue_json, dep_json FROM bd_events_journal ORDER BY seq DESC LIMIT 1`).Scan(&issueJSON, &depJSON); err != nil {
+			t.Fatalf("read journal: %v", err)
+		}
+		var issue types.Issue
+		var dep issueops.EventDep
+		if err := json.Unmarshal(issueJSON, &issue); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(depJSON, &dep); err != nil {
+			t.Fatal(err)
+		}
+		return issue, dep
+	}
+
+	add(`{"revision":"A"}`)
+	issue, dep := readLast()
+	if !issue.IsBlocked || dep.Metadata != `{"revision":"A"}` {
+		t.Fatalf("initial dep_add = issue(blocked=%v), dep=%+v; want blocked snapshot and metadata A", issue.IsBlocked, dep)
+	}
+	add(`{"revision":"B"}`)
+	issue, dep = readLast()
+	if !issue.IsBlocked || dep.Metadata != `{"revision":"B"}` {
+		t.Fatalf("metadata refresh = issue(blocked=%v), dep=%+v; want blocked snapshot and metadata B", issue.IsBlocked, dep)
+	}
+	if err := store.RemoveDependency(ctx, "bd-js-source", "bd-js-target", "actor"); err != nil {
+		t.Fatalf("remove dependency: %v", err)
+	}
+	issue, dep = readLast()
+	if issue.IsBlocked || dep.Metadata != `{"revision":"B"}` {
+		t.Fatalf("dep_remove = issue(blocked=%v), dep=%+v; want unblocked snapshot and metadata B", issue.IsBlocked, dep)
+	}
+}
+
+// TestEventsJournal_DerivedBlockedStateChanges proves that mutations affecting
+// another bead's persisted readiness emit a post-recompute update for that
+// bead. Without these rows, cursor consumers retain stale is_blocked values
+// until a later full reconciliation.
+func TestEventsJournal_DerivedBlockedStateChanges(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	enableJournalForTest(t, store)
+
+	mk := func(id string) *types.Issue {
+		return &types.Issue{ID: id, Title: id, IssueType: types.TypeTask, Status: types.StatusOpen}
+	}
+	mustCreate := func(tb testing.TB, ids ...string) {
+		tb.Helper()
+		for _, id := range ids {
+			if err := store.CreateIssue(ctx, mk(id), "actor"); err != nil {
+				tb.Fatalf("create %s: %v", id, err)
+			}
+		}
+	}
+	mustAdd := func(tb testing.TB, source, target string, kind types.DependencyType) {
+		tb.Helper()
+		if err := store.AddDependency(ctx, &types.Dependency{
+			IssueID: source, DependsOnID: target, Type: kind,
+		}, "actor"); err != nil {
+			tb.Fatalf("add dependency %s -> %s (%s): %v", source, target, kind, err)
+		}
+	}
+	assertBlocked := func(tb testing.TB, id string, want bool) {
+		tb.Helper()
+		var got int
+		if err := store.db.QueryRowContext(ctx, "SELECT is_blocked FROM issues WHERE id = ?", id).Scan(&got); err != nil {
+			tb.Fatalf("read is_blocked for %s: %v", id, err)
+		}
+		if (got != 0) != want {
+			tb.Fatalf("%s is_blocked = %d, want %v", id, got, want)
+		}
+	}
+	assertJournalUpdate := func(tb testing.TB, id string, wantBlocked bool) {
+		tb.Helper()
+		rows, err := store.db.QueryContext(ctx,
+			`SELECT issue_json FROM bd_events_journal WHERE op = 'update' AND issue_id = ? ORDER BY seq`, id)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		defer rows.Close()
+		var snapshots []types.Issue
+		for rows.Next() {
+			var raw []byte
+			if err := rows.Scan(&raw); err != nil {
+				tb.Fatal(err)
+			}
+			var issue types.Issue
+			if err := json.Unmarshal(raw, &issue); err != nil {
+				tb.Fatal(err)
+			}
+			snapshots = append(snapshots, issue)
+		}
+		if err := rows.Err(); err != nil {
+			tb.Fatal(err)
+		}
+		if len(snapshots) != 1 || snapshots[0].IsBlocked != wantBlocked {
+			tb.Fatalf("journal updates for %s = %+v, want one snapshot with is_blocked=%v", id, snapshots, wantBlocked)
+		}
+	}
+
+	t.Run("closing blocker updates depender", func(t *testing.T) {
+		mustCreate(t, "bd-derived-close-source", "bd-derived-close-target")
+		mustAdd(t, "bd-derived-close-source", "bd-derived-close-target", types.DepBlocks)
+		assertBlocked(t, "bd-derived-close-source", true)
+		clearJournal(t, store)
+
+		if err := store.CloseIssue(ctx, "bd-derived-close-target", "done", "actor", ""); err != nil {
+			t.Fatal(err)
+		}
+		assertBlocked(t, "bd-derived-close-source", false)
+		assertJournalUpdate(t, "bd-derived-close-source", false)
+	})
+
+	t.Run("deleting blocker updates depender", func(t *testing.T) {
+		mustCreate(t, "bd-derived-delete-source", "bd-derived-delete-target")
+		mustAdd(t, "bd-derived-delete-source", "bd-derived-delete-target", types.DepBlocks)
+		assertBlocked(t, "bd-derived-delete-source", true)
+		clearJournal(t, store)
+
+		if err := store.DeleteIssue(ctx, "bd-derived-delete-target"); err != nil {
+			t.Fatal(err)
+		}
+		assertBlocked(t, "bd-derived-delete-source", false)
+		assertJournalUpdate(t, "bd-derived-delete-source", false)
+	})
+
+	t.Run("removing parent blocker updates descendant", func(t *testing.T) {
+		mustCreate(t, "bd-derived-parent", "bd-derived-child", "bd-derived-parent-target")
+		mustAdd(t, "bd-derived-child", "bd-derived-parent", types.DepParentChild)
+		mustAdd(t, "bd-derived-parent", "bd-derived-parent-target", types.DepBlocks)
+		assertBlocked(t, "bd-derived-parent", true)
+		assertBlocked(t, "bd-derived-child", true)
+		clearJournal(t, store)
+
+		if err := store.RemoveDependency(ctx, "bd-derived-parent", "bd-derived-parent-target", "actor"); err != nil {
+			t.Fatal(err)
+		}
+		assertBlocked(t, "bd-derived-parent", false)
+		assertBlocked(t, "bd-derived-child", false)
+		assertJournalUpdate(t, "bd-derived-child", false)
+	})
+}
+
+// TestEventsJournal_CommentPayloads pins the exact comment record returned by
+// structured, imported, and audit-comment write paths.
+func TestEventsJournal_CommentPayloads(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	enableJournalForTest(t, store)
+	issue := &types.Issue{ID: "bd-jc", Title: "comments", IssueType: types.TypeTask, Status: types.StatusOpen}
+	if err := store.CreateIssue(ctx, issue, "actor"); err != nil {
+		t.Fatal(err)
+	}
+	clearJournal(t, store)
+
+	first, err := store.AddIssueComment(ctx, issue.ID, "alice", "structured")
+	if err != nil {
+		t.Fatal(err)
+	}
+	importedAt := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
+	second, err := store.ImportIssueComment(ctx, issue.ID, "bob", "imported", importedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddComment(ctx, issue.ID, "carol", "audit"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := store.db.QueryContext(ctx, `SELECT op, comment_json FROM bd_events_journal ORDER BY seq ASC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []issueops.EventComment
+	for rows.Next() {
+		var op string
+		var raw []byte
+		if err := rows.Scan(&op, &raw); err != nil {
+			t.Fatal(err)
+		}
+		if op != string(issueops.EventCommentWrite) {
+			t.Fatalf("op = %q, want comment", op)
+		}
+		var comment issueops.EventComment
+		if err := json.Unmarshal(raw, &comment); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, comment)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("comment rows = %+v, want three", got)
+	}
+	if got[0].ID != first.ID || got[0].Author != "alice" || got[0].Text != "structured" || got[0].Source != "structured" {
+		t.Fatalf("structured comment = %+v", got[0])
+	}
+	if got[1].ID != second.ID || !got[1].CreatedAt.Equal(importedAt) || got[1].Source != "structured" {
+		t.Fatalf("imported comment = %+v, want id %s timestamp %s", got[1], second.ID, importedAt)
+	}
+	if got[2].ID == "" || got[2].Author != "carol" || got[2].Text != "audit" || got[2].Source != "audit" || got[2].CreatedAt.IsZero() {
+		t.Fatalf("audit comment = %+v", got[2])
 	}
 }

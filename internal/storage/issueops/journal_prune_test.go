@@ -122,3 +122,18 @@ func TestComputeEventsPruneWhere(t *testing.T) {
 		}
 	})
 }
+
+func TestNormalizeEventsTimestampRFC3339UTC(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{"2026-07-29 10:11:12", "2026-07-29T10:11:12Z"},
+		{"2026-07-29 10:11:12.123456", "2026-07-29T10:11:12.123456Z"},
+		{"2026-07-29T10:11:12.123456+02:00", "2026-07-29T08:11:12.123456Z"},
+	} {
+		if got := normalizeEventsTimestamp(tc.in); got != tc.want {
+			t.Errorf("normalizeEventsTimestamp(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

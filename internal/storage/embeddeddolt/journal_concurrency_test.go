@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -24,9 +23,8 @@ import (
 // contiguous seq per create.
 func TestEventsJournal_EmbeddedConcurrentGaplessNoDup(t *testing.T) {
 	env := newTestEnv(t, "ecw")
-	issueops.SetJournalEnabled(true)
-	t.Cleanup(func() { issueops.SetJournalEnabled(false) })
 	store := env.store
+	store.SetEventsJournalEnabled(true)
 
 	const writers = 12
 	var wg sync.WaitGroup

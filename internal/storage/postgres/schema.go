@@ -446,13 +446,17 @@ CREATE INDEX IF NOT EXISTS idx_repo_mtimes_checked ON repo_mtimes (last_checked)
 -- its counter increment as well and sequence numbers stay commit-visible and
 -- gapless.
 CREATE TABLE IF NOT EXISTS bd_events_journal (
-    seq        bigint NOT NULL PRIMARY KEY,
-    ts         timestamp(6) NOT NULL,
-    op         text NOT NULL,
-    issue_id   text NOT NULL,
-    issue_json text,
-    dep_json   text
+    seq          bigint NOT NULL PRIMARY KEY,
+    ts           timestamp(6) NOT NULL,
+    op           text NOT NULL,
+    issue_id     text NOT NULL,
+    issue_json   text,
+    dep_json     text,
+    comment_json text
 );
+
+ALTER TABLE bd_events_journal
+    ADD COLUMN IF NOT EXISTS comment_json text;
 
 CREATE INDEX IF NOT EXISTS idx_bd_events_journal_issue ON bd_events_journal (issue_id);
 

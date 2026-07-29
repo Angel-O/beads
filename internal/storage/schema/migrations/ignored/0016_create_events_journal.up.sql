@@ -21,6 +21,7 @@ CREATE TABLE __temp__bd_events_journal (
     issue_id VARCHAR(255) NOT NULL,
     issue_json LONGTEXT,
     dep_json TEXT,
+    comment_json TEXT,
     INDEX idx_bd_events_journal_issue (issue_id)
 );
 SET @exists = (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bd_events_journal');

@@ -22,10 +22,10 @@ type journalRow struct {
 // tests (the table is dolt-ignored, so DOLT_RESET does not clear it), and turns
 // it back off on cleanup.
 func (s *testSuite) enableJournalForTest() {
-	issueops.SetJournalEnabled(true)
+	s.journalEnabled = true
 	_, err := s.Runner().ExecContext(s.Ctx(), "DELETE FROM bd_events_journal")
 	s.Require().NoError(err)
-	s.T().Cleanup(func() { issueops.SetJournalEnabled(false) })
+	s.T().Cleanup(func() { s.journalEnabled = false })
 }
 
 func (s *testSuite) readJournal() []journalRow {
@@ -84,7 +84,11 @@ func (s *testSuite) TestEventsJournal_UOWPlumbing() {
 	s.Require().NoError(ir.Delete(ctx, "bd-mj-2", domain.IssueTableOpts{}))
 
 	got := s.readJournal()
-	wantOps := []string{"create", "create", "update", "update", "update", "dep_add", "dep_remove", "close", "delete"}
+	wantOps := []string{
+		"create", "create", "update", "update", "update", "dep_add",
+		"update", // derived is_blocked flip after dependency removal
+		"dep_remove", "close", "delete",
+	}
 	s.Require().Len(got, len(wantOps), "journal rows: %+v", got)
 
 	var prev int64
@@ -100,12 +104,16 @@ func (s *testSuite) TestEventsJournal_UOWPlumbing() {
 	s.Require().NotNil(got[5].Dep)
 	s.Equal(string(types.DepBlocks), got[5].Dep.Kind)
 	s.Equal("bd-mj-2", got[5].Dep.Target)
+	// Dependency removal changes the persisted readiness projection before its
+	// edge delta, so cursor consumers receive the derived source update too.
+	s.Require().True(got[6].HasIssue)
+	s.False(got[6].Issue.IsBlocked)
 	// dep_remove carries the edge details.
-	s.Require().NotNil(got[6].Dep)
-	s.Equal("bd-mj-2", got[6].Dep.Target)
+	s.Require().NotNil(got[7].Dep)
+	s.Equal("bd-mj-2", got[7].Dep.Target)
 	// delete carries a null issue payload.
-	s.Equal("delete", got[8].Op)
-	s.False(got[8].HasIssue, "delete row must have null issue")
+	s.Equal("delete", got[9].Op)
+	s.False(got[9].HasIssue, "delete row must have null issue")
 }
 
 // TestEventsJournal_CascadeDelete asserts a cascade delete journals every
@@ -140,6 +148,49 @@ func (s *testSuite) TestEventsJournal_CascadeDelete() {
 	s.True(deleted["bd-cd-child"], "cascade-deleted child must be journaled, got %v", deleted)
 }
 
+// TestEventsJournal_DeleteRelationshipDeltas proves a cursor consumer sees
+// every edge removal before the nodes disappear, including both incoming and
+// outgoing relationships in a multi-node UOW delete.
+func (s *testSuite) TestEventsJournal_DeleteRelationshipDeltas() {
+	s.enableJournalForTest()
+	ctx := s.Ctx()
+	ir := s.issueRepo()
+	dr := s.depRepo()
+
+	for _, id := range []string{"bd-del-center", "bd-del-in", "bd-del-out"} {
+		s.Require().NoError(ir.Insert(ctx, newTestIssue(id, "t"), "actor", domain.InsertIssueOpts{}))
+	}
+	s.Require().NoError(dr.Insert(ctx, &types.Dependency{
+		IssueID: "bd-del-center", DependsOnID: "bd-del-out", Type: types.DepBlocks,
+	}, "actor", domain.DepInsertOpts{}))
+	s.Require().NoError(dr.Insert(ctx, &types.Dependency{
+		IssueID: "bd-del-in", DependsOnID: "bd-del-center", Type: types.DepRelated,
+	}, "actor", domain.DepInsertOpts{}))
+
+	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_events_journal")
+	s.Require().NoError(err)
+
+	_, err = s.issueUseCase().DeleteIssues(ctx, domain.DeleteIssuesParams{
+		IDs: []string{"bd-del-center", "bd-del-in", "bd-del-out"},
+	}, "actor")
+	s.Require().NoError(err)
+
+	got := s.readJournal()
+	s.Require().Len(got, 5, "two edge removals followed by three node deletes: %+v", got)
+	for i := 0; i < 2; i++ {
+		s.Equal("dep_remove", got[i].Op, "edge delta %d must precede node deletes", i)
+	}
+	for i := 2; i < len(got); i++ {
+		s.Equal("delete", got[i].Op, "row %d", i)
+	}
+	s.Require().NotNil(got[0].Dep)
+	s.Require().NotNil(got[1].Dep)
+	s.Equal("bd-del-center", got[0].IssueID)
+	s.Equal("bd-del-out", got[0].Dep.Target)
+	s.Equal("bd-del-in", got[1].IssueID)
+	s.Equal("bd-del-center", got[1].Dep.Target)
+}
+
 // TestEventsJournal_NoPhantomDeletes asserts DeleteByIDs journals a delete
 // only for ids that actually removed a row — never a phantom delete for an id
 // that matched nothing (the batched DELETE reports only a per-batch total).
@@ -171,7 +222,7 @@ func (s *testSuite) TestEventsJournal_NoPhantomDeletes() {
 // TestEventsJournal_DisabledWritesNothing asserts the default-off knob writes
 // no rows.
 func (s *testSuite) TestEventsJournal_DisabledWritesNothing() {
-	issueops.SetJournalEnabled(false)
+	s.journalEnabled = false
 	ctx := s.Ctx()
 	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_events_journal")
 	s.Require().NoError(err)
@@ -181,4 +232,51 @@ func (s *testSuite) TestEventsJournal_DisabledWritesNothing() {
 	var n int
 	s.Require().NoError(s.Runner().QueryRowContext(ctx, "SELECT COUNT(*) FROM bd_events_journal").Scan(&n))
 	s.Equal(0, n, "disabled journal must write nothing")
+}
+
+// TestEventsJournal_UOWDependencySnapshotsFollowBlockedState mirrors the
+// direct-store guard at the UOW repository seam. The event snapshot must be
+// taken after is_blocked maintenance, including same-type metadata refreshes.
+func (s *testSuite) TestEventsJournal_UOWDependencySnapshotsFollowBlockedState() {
+	s.enableJournalForTest()
+	ctx := s.Ctx()
+	ir := s.issueRepo()
+	dr := s.depRepo()
+	for _, id := range []string{"bd-uj-source", "bd-uj-target"} {
+		s.Require().NoError(ir.Insert(ctx, newTestIssue(id, id), "actor", domain.InsertIssueOpts{}))
+	}
+	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_events_journal")
+	s.Require().NoError(err)
+
+	add := func(metadata string) {
+		s.T().Helper()
+		s.Require().NoError(dr.Insert(ctx, &types.Dependency{
+			IssueID: "bd-uj-source", DependsOnID: "bd-uj-target", Type: types.DepBlocks, Metadata: metadata,
+		}, "actor", domain.DepInsertOpts{}))
+	}
+	last := func() journalRow {
+		s.T().Helper()
+		rows := s.readJournal()
+		s.Require().NotEmpty(rows)
+		return rows[len(rows)-1]
+	}
+
+	add(`{"revision":"A"}`)
+	row := last()
+	s.Require().True(row.Issue.IsBlocked)
+	s.Require().NotNil(row.Dep)
+	s.Equal(`{"revision":"A"}`, row.Dep.Metadata)
+
+	add(`{"revision":"B"}`)
+	row = last()
+	s.Require().True(row.Issue.IsBlocked)
+	s.Require().NotNil(row.Dep)
+	s.Equal(`{"revision":"B"}`, row.Dep.Metadata)
+
+	_, err = dr.Delete(ctx, "bd-uj-source", "bd-uj-target", "actor", domain.DepInsertOpts{})
+	s.Require().NoError(err)
+	row = last()
+	s.Require().False(row.Issue.IsBlocked)
+	s.Require().NotNil(row.Dep)
+	s.Equal(`{"revision":"B"}`, row.Dep.Metadata)
 }

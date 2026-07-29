@@ -93,7 +93,7 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 			); err != nil {
 				return fmt.Errorf("db: DependencySQLRepository.Insert: refresh metadata: %w", err)
 			}
-			return nil
+			return issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID, metadata)
 		}
 		return &domain.DependencyTypeConflictError{
 			IssueID:       dep.IssueID,
@@ -125,12 +125,6 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 		return fmt.Errorf("db: DependencySQLRepository.Insert: %w", err)
 	}
 
-	// Journal the dependency add in the same transaction (new-edge path only;
-	// the same-type metadata refresh above returns earlier without a new edge).
-	if err := issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID); err != nil {
-		return err
-	}
-
 	// is_blocked maintenance mirrors the classic AddDependencyInTx flow
 	// (issueops/dependencies.go): the affected set expands the source by its
 	// parent-child descendants (plus, for parent-child edges, waiters on the
@@ -160,12 +154,12 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 		if err := issueops.RecomputeIsBlockedInTx(ctx, r.runner, affectedIssues, affectedWisps); err != nil {
 			return fmt.Errorf("db: DependencySQLRepository.Insert: recompute is_blocked: %w", err)
 		}
-		return nil
+		return issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID, metadata)
 	}
 	if err := issueops.MarkIsBlockedInTx(ctx, r.runner, affectedIssues, affectedWisps); err != nil {
 		return fmt.Errorf("db: DependencySQLRepository.Insert: mark is_blocked (affected): %w", err)
 	}
-	return nil
+	return issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID, metadata)
 }
 
 // markDirectBlockedSource mirrors issueops.markDirectBlockingDependencySourceInTx:
@@ -210,12 +204,12 @@ func (r *dependencySQLRepositoryImpl) Delete(ctx context.Context, issueID, depen
 	}
 	table := pickDepTable(opts.UseWispsTable)
 
-	var depType string
+	var depType, metadata string
 	//nolint:gosec // G201: table and depTargetExpr are hardcoded constants
 	err := r.runner.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT type FROM %s WHERE issue_id = ? AND %s = ?", table, depTargetExpr),
+		fmt.Sprintf("SELECT type, metadata FROM %s WHERE issue_id = ? AND %s = ?", table, depTargetExpr),
 		issueID, dependsOnID,
-	).Scan(&depType)
+	).Scan(&depType, &metadata)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return domain.DepDeleteResult{Found: false}, nil
@@ -229,12 +223,6 @@ func (r *dependencySQLRepositoryImpl) Delete(ctx context.Context, issueID, depen
 		issueID, dependsOnID,
 	); err != nil {
 		return domain.DepDeleteResult{}, fmt.Errorf("db: DependencySQLRepository.Delete: %s -> %s: %w", issueID, dependsOnID, err)
-	}
-
-	// Journal the dependency remove in the same transaction (only reached when
-	// the edge existed — the no-match path returned earlier).
-	if err := issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepRemove, issueID, depType, dependsOnID); err != nil {
-		return domain.DepDeleteResult{}, err
 	}
 
 	dt := types.DependencyType(depType)
@@ -252,6 +240,9 @@ func (r *dependencySQLRepositoryImpl) Delete(ctx context.Context, issueID, depen
 		return domain.DepDeleteResult{}, fmt.Errorf("db: DependencySQLRepository.Delete: recompute is_blocked: %w", err)
 	}
 
+	if err := issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepRemove, issueID, depType, dependsOnID, metadata); err != nil {
+		return domain.DepDeleteResult{}, err
+	}
 	return domain.DepDeleteResult{Found: true, Type: dt, DependsOnID: dependsOnID}, nil
 }
 
@@ -659,6 +650,9 @@ func (r *dependencySQLRepositoryImpl) DeleteAllForIDs(ctx context.Context, ids [
 			args = append(args, id)
 		}
 		ph := strings.Join(placeholders, ",")
+		if err := issueops.RecordDependencyRemovalsForTableInTx(ctx, r.runner, table, batch); err != nil {
+			return total, fmt.Errorf("db: DependencySQLRepository.DeleteAllForIDs journal from %s: %w", table, err)
+		}
 		//nolint:gosec // G201: table is one of two hardcoded constants; ? placeholders only.
 		res, err := r.runner.ExecContext(ctx,
 			fmt.Sprintf("DELETE FROM %s WHERE issue_id IN (%s) OR %s IN (%s)", table, ph, issueops.DepTargetExpr, ph),

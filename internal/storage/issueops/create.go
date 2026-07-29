@@ -740,7 +740,7 @@ func PersistDependenciesWithOptionsResult(ctx context.Context, tx *sql.Tx, issue
 				result.markChanged(depTable)
 				// Creation-time edges are independently replayable operations; do
 				// not rely on the issue create payload's inline dependencies.
-				if err := RecordDepEventInTx(ctx, tx, EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID); err != nil {
+				if err := RecordDepEventInTx(ctx, tx, EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID, dep.Metadata); err != nil {
 					return result, err
 				}
 			}

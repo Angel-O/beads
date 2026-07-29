@@ -225,15 +225,17 @@ type RawDBAccessor interface {
 
 // EventsJournalRow is one raw bd_events_journal row surfaced to the
 // `bd events` CLI. IssueJSON is empty when the op is a delete (no surviving
-// row); DepJSON is empty for non-dependency ops. TS is the insert-time timestamp
+// row); DepJSON is empty for non-dependency ops; CommentJSON is empty for
+// non-comment ops. TS is the insert-time timestamp
 // (stamped inside the committing transaction) normalized to a string.
 type EventsJournalRow struct {
-	Seq       int64
-	TS        string
-	Op        string
-	IssueID   string
-	IssueJSON string
-	DepJSON   string
+	Seq         int64
+	TS          string
+	Op          string
+	IssueID     string
+	IssueJSON   string
+	DepJSON     string
+	CommentJSON string
 }
 
 // EventsJournalAccessor reads and prunes the durable events journal
@@ -249,6 +251,13 @@ type EventsJournalAccessor interface {
 	// retain-days / retain-rows floors (0 = floor disabled), and returns the
 	// number of rows deleted.
 	PruneEventsJournal(ctx context.Context, before int64, retainDays, retainRows int) (int64, error)
+}
+
+// EventsJournalConfigurer controls journal activation on one storage instance.
+// Implementations must never use process-global state: Hosted serves multiple
+// project stores concurrently in one process.
+type EventsJournalConfigurer interface {
+	SetEventsJournalEnabled(enabled bool)
 }
 
 // StoreLocator provides filesystem path information for the store.

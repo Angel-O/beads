@@ -98,15 +98,16 @@ func renderGoldenLines(t *testing.T) []byte {
 	}
 
 	records := []eventRecord{
-		buildRecord(1, ts, string(issueops.EventCreate), minimal.ID, mustJSON(t, minimal), ""),
-		buildRecord(2, ts, string(issueops.EventCreate), full.ID, mustJSON(t, full), ""),
+		buildRecord(1, ts, string(issueops.EventCreate), minimal.ID, mustJSON(t, minimal), "", ""),
+		buildRecord(2, ts, string(issueops.EventCreate), full.ID, mustJSON(t, full), "", ""),
 		buildRecord(3, ts, string(issueops.EventDepAdd), "bd-101", mustJSON(t, full),
-			mustJSON(t, &issueops.EventDep{Kind: string(types.DepBlocks), Target: "bd-100"})),
+			mustJSON(t, &issueops.EventDep{Kind: string(types.DepBlocks), Target: "bd-100", Metadata: `{}`}), ""),
 		buildRecord(4, ts, string(issueops.EventDepRemove), "bd-101", mustJSON(t, full),
-			mustJSON(t, &issueops.EventDep{Kind: string(types.DepBlocks), Target: "bd-100"})),
-		buildRecord(5, ts, string(issueops.EventClose), closedIssue.ID, mustJSON(t, closedIssue), ""),
-		buildRecord(6, ts, string(issueops.EventCreate), wisp.ID, mustJSON(t, wisp), ""),
-		buildRecord(7, ts, string(issueops.EventDelete), "bd-100", "", ""), // null issue on delete
+			mustJSON(t, &issueops.EventDep{Kind: string(types.DepBlocks), Target: "bd-100", Metadata: `{}`}), ""),
+		buildRecord(5, ts, string(issueops.EventCommentWrite), full.ID, mustJSON(t, full), "", mustJSON(t, &issueops.EventComment{ID: "019c0000-0000-7000-8000-000000000000", Author: "worker-1", Text: "journal me", CreatedAt: updated, Source: "structured"})),
+		buildRecord(6, ts, string(issueops.EventClose), closedIssue.ID, mustJSON(t, closedIssue), "", ""),
+		buildRecord(7, ts, string(issueops.EventCreate), wisp.ID, mustJSON(t, wisp), "", ""),
+		buildRecord(8, ts, string(issueops.EventDelete), "bd-100", "", "", ""), // null issue on delete
 	}
 
 	var buf bytes.Buffer

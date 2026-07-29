@@ -10,6 +10,8 @@ import (
 // up in dolt_status — the signal bd's auto-commit path uses to decide what to
 // stage/commit.
 func (s *testSuite) TestEventsJournal_IsDoltIgnored() {
+	s.journalEnabled = true
+	defer func() { s.journalEnabled = false }()
 	ctx := s.Ctx()
 
 	var ignored bool
@@ -20,8 +22,6 @@ func (s *testSuite) TestEventsJournal_IsDoltIgnored() {
 
 	// Write a journal row, then confirm the ignored table never surfaces in
 	// dolt_status (which is what the auto-commit/add path consults).
-	issueops.SetJournalEnabled(true)
-	defer issueops.SetJournalEnabled(false)
 	s.Require().NoError(s.issueRepo().Insert(ctx, newTestIssue("bd-di-1", "t"), "actor", domain.InsertIssueOpts{}))
 
 	var statusCount int
@@ -35,9 +35,9 @@ func (s *testSuite) TestEventsJournal_IsDoltIgnored() {
 // git-untracked state), because the table is dolt-ignored. If reset destroyed
 // them, the outbox design would be unsound — this is the guard for that.
 func (s *testSuite) TestEventsJournal_SurvivesCommitAndReset() {
+	s.journalEnabled = true
+	defer func() { s.journalEnabled = false }()
 	ctx := s.Ctx()
-	issueops.SetJournalEnabled(true)
-	defer issueops.SetJournalEnabled(false)
 
 	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_events_journal")
 	s.Require().NoError(err)
@@ -69,9 +69,9 @@ func (s *testSuite) TestEventsJournal_SurvivesCommitAndReset() {
 // mutation share the transaction even though the journal table is ignored: a
 // rollback drops both, a commit keeps both.
 func (s *testSuite) TestEventsJournal_TxAtomicity() {
+	s.journalEnabled = true
+	defer func() { s.journalEnabled = false }()
 	ctx := s.Ctx()
-	issueops.SetJournalEnabled(true)
-	defer issueops.SetJournalEnabled(false)
 
 	_, err := s.Runner().ExecContext(ctx, "DELETE FROM bd_events_journal")
 	s.Require().NoError(err)

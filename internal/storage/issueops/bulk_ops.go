@@ -197,6 +197,9 @@ func DeleteIssuesBySourceRepoInTx(ctx context.Context, tx *sql.Tx, sourceRepo st
 		return 0, fmt.Errorf("affected by source-repo delete: %w", aerr)
 	}
 
+	if err := RecordDependencyRemovalsForIssuesInTx(ctx, tx, issueIDs); err != nil {
+		return 0, fmt.Errorf("journal dependency removals for source-repo delete: %w", err)
+	}
 	result, err := tx.ExecContext(ctx, `DELETE FROM issues WHERE source_repo = ?`, sourceRepo)
 	if err != nil {
 		return 0, fmt.Errorf("delete issues: %w", err)
@@ -224,6 +227,14 @@ func DeleteIssuesBySourceRepoInTx(ctx context.Context, tx *sql.Tx, sourceRepo st
 
 //nolint:gosec // G201: table names are hardcoded
 func UpdateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, issue *types.Issue, actor string) error {
+	var renameEdges []journalDependencyEdge
+	if journalEnabled(ctx, tx) {
+		var err error
+		renameEdges, err = dependencyEdgesForIssueIDsInTx(ctx, tx, []string{oldID})
+		if err != nil {
+			return fmt.Errorf("capture dependency edges for rename %s -> %s: %w", oldID, newID, err)
+		}
+	}
 	if IsActiveWispInTx(ctx, tx, oldID) {
 		if err := updateWispIDInTx(ctx, tx, oldID, newID, issue, actor); err != nil {
 			return err
@@ -231,9 +242,34 @@ func UpdateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, iss
 	} else if err := updateIssueIDInTx(ctx, tx, oldID, newID, issue, actor); err != nil {
 		return err
 	}
-	// Journal the rename as an update keyed on the new id (the post-rename
-	// snapshot). The 'renamed' history event carries the old->new link.
-	return RecordEventInTx(ctx, tx, EventUpdate, newID)
+	return recordRenameInJournal(ctx, tx, oldID, newID, renameEdges)
+}
+
+func recordRenameInJournal(ctx context.Context, tx DBTX, oldID, newID string, edges []journalDependencyEdge) error {
+	for _, edge := range edges {
+		if err := RecordDepEventInTx(ctx, tx, EventDepRemove, edge.source, edge.kind, edge.target, edge.metadata); err != nil {
+			return err
+		}
+	}
+	if err := RecordDeleteInTx(ctx, tx, oldID); err != nil {
+		return err
+	}
+	if err := RecordEventInTx(ctx, tx, EventCreate, newID); err != nil {
+		return err
+	}
+	for _, edge := range edges {
+		source, target := edge.source, edge.target
+		if source == oldID {
+			source = newID
+		}
+		if target == oldID {
+			target = newID
+		}
+		if err := RecordDepEventInTx(ctx, tx, EventDepAdd, source, edge.kind, target, edge.metadata); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func updateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, issue *types.Issue, actor string) error {

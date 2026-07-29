@@ -61,7 +61,7 @@ func BuildEventsPruneWhere(before int64, retainDays int, now time.Time, rowsCeil
 // transaction so it works on every store plumbing (embedded, server, proxied).
 func ReadEventsInTx(ctx context.Context, tx DBTX, since int64, limit int) ([]storage.EventsJournalRow, error) {
 	// CAST(ts AS CHAR) normalizes the DATETIME to a stable string across drivers.
-	q := `SELECT seq, CAST(ts AS CHAR), op, issue_id, issue_json, dep_json
+	q := `SELECT seq, CAST(ts AS CHAR), op, issue_id, issue_json, dep_json, comment_json
 	      FROM bd_events_journal WHERE seq > ? ORDER BY seq ASC`
 	if limit > 0 {
 		q += " LIMIT " + strconv.Itoa(limit)
@@ -75,18 +75,41 @@ func ReadEventsInTx(ctx context.Context, tx DBTX, since int64, limit int) ([]sto
 	var out []storage.EventsJournalRow
 	for rows.Next() {
 		var (
-			r       storage.EventsJournalRow
-			issueJS sql.NullString
-			depJS   sql.NullString
+			r         storage.EventsJournalRow
+			issueJS   sql.NullString
+			depJS     sql.NullString
+			commentJS sql.NullString
 		)
-		if err := rows.Scan(&r.Seq, &r.TS, &r.Op, &r.IssueID, &issueJS, &depJS); err != nil {
+		if err := rows.Scan(&r.Seq, &r.TS, &r.Op, &r.IssueID, &issueJS, &depJS, &commentJS); err != nil {
 			return nil, fmt.Errorf("journal: scan row: %w", err)
 		}
+		r.TS = normalizeEventsTimestamp(r.TS)
 		r.IssueJSON = issueJS.String
 		r.DepJSON = depJS.String
+		r.CommentJSON = commentJS.String
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// normalizeEventsTimestamp emits the journal boundary's stable RFC3339Nano UTC
+// contract. Dolt/MySQL stringify DATETIME with a space while PostgreSQL may
+// include a numeric offset; consumers (including Gasworks) require a parsable
+// UTC timestamp regardless of the backing driver.
+func normalizeEventsTimestamp(raw string) string {
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		"2006-01-02 15:04:05.999999999Z07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+	} {
+		if ts, err := time.Parse(layout, raw); err == nil {
+			return ts.UTC().Format(time.RFC3339Nano)
+		}
+	}
+	// Preserve an unexpected driver rendering rather than silently changing the
+	// event payload. Normal supported backends are covered by the layouts above.
+	return raw
 }
 
 // ComputeEventsPruneWhere resolves the retain-rows floor via readCeil and

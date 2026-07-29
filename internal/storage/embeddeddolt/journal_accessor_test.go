@@ -6,7 +6,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -19,10 +18,8 @@ import (
 func TestEventsJournalAccessor(t *testing.T) {
 	env := newTestEnv(t, "jrn")
 	ctx := context.Background()
-	issueops.SetJournalEnabled(true)
-	t.Cleanup(func() { issueops.SetJournalEnabled(false) })
-
 	store := env.store
+	store.SetEventsJournalEnabled(true)
 	mk := func(id string) *types.Issue {
 		return &types.Issue{ID: id, Title: "t-" + id, IssueType: types.TypeTask, Status: types.StatusOpen}
 	}

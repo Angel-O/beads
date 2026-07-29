@@ -156,15 +156,16 @@ var _ storage.SchemaMigrator = (*DoltStore)(nil)
 
 // DoltStore implements the Storage interface using Dolt
 type DoltStore struct {
-	db            *sql.DB
-	dbPath        string       // Path to Dolt data directory (server root, e.g. .beads/dolt/)
-	beadsDir      string       // Path to .beads directory (parent of dbPath)
-	database      string       // Database name (subdirectory under dbPath)
-	closed        atomic.Bool  // Tracks whether Close() has been called
-	connStr       string       // Connection string for reconnection
-	mu            sync.RWMutex // Protects concurrent access
-	readOnly      bool         // True if opened in read-only mode
-	credentialKey []byte       // Random encryption key for federation credentials
+	db                   *sql.DB
+	dbPath               string      // Path to Dolt data directory (server root, e.g. .beads/dolt/)
+	beadsDir             string      // Path to .beads directory (parent of dbPath)
+	database             string      // Database name (subdirectory under dbPath)
+	closed               atomic.Bool // Tracks whether Close() has been called
+	eventsJournalEnabled atomic.Bool
+	connStr              string       // Connection string for reconnection
+	mu                   sync.RWMutex // Protects concurrent access
+	readOnly             bool         // True if opened in read-only mode
+	credentialKey        []byte       // Random encryption key for federation credentials
 
 	customStatusDetailedCache []types.CustomStatus
 	customStatusCache         []string
@@ -706,6 +707,8 @@ func (s *DoltStore) withWriteTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 	if err != nil {
 		return fmt.Errorf("begin write tx: %w", err)
 	}
+	clearJournalScope := s.scopeEventsJournalTransaction(tx)
+	defer clearJournalScope()
 	if err := fn(tx); err != nil {
 		return errors.Join(err, tx.Rollback())
 	}
@@ -715,6 +718,15 @@ func (s *DoltStore) withWriteTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 		return fmt.Errorf("commit write tx: %w (%w)", err, errCommitPhase)
 	}
 	return nil
+}
+
+// SetEventsJournalEnabled activates the journal for this store instance only.
+func (s *DoltStore) SetEventsJournalEnabled(enabled bool) {
+	s.eventsJournalEnabled.Store(enabled)
+}
+
+func (s *DoltStore) scopeEventsJournalTransaction(tx *sql.Tx) func() {
+	return issueops.ScopeEventsJournalTransaction(tx, s.eventsJournalEnabled.Load())
 }
 
 // uncommitted implicit transaction that Dolt rolls back on connection close,
