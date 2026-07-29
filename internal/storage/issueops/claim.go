@@ -55,6 +55,10 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 	// cell-merge. The lease itself is granted separately below, in the
 	// ephemeral leases table — claims commit (status/assignee are
 	// history-worthy) but lease grants and heartbeats do not (bd-lrgn1).
+	//
+	// Every CAS that lands is an ownership transition, so it also bumps
+	// claim_fence in the same statement (see fence.go for why the bump is
+	// unconditional and why the row_lock pairing is mandatory).
 	rowLockClause, rowLockArgs := RowLockClause()
 
 	// An issue is claimable from "open" plus any configured custom status whose
@@ -96,9 +100,9 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 		args = append(args, assigneeArgs...)
 		result, err = tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE %s
-			SET assignee = ?, status = 'in_progress', updated_at = ?, started_at = ?, %s
+			SET assignee = ?, status = 'in_progress', updated_at = ?, started_at = ?, %s, %s
 			WHERE id = ? AND status IN (%s) AND (%s)
-		`, issueTable, rowLockClause, statusPlaceholders, assigneePredicate), args...)
+		`, issueTable, fenceBumpExpr, rowLockClause, statusPlaceholders, assigneePredicate), args...)
 	} else {
 		args := append([]interface{}{actor, now}, rowLockArgs...)
 		args = append(args, id)
@@ -106,9 +110,9 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 		args = append(args, assigneeArgs...)
 		result, err = tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE %s
-			SET assignee = ?, status = 'in_progress', updated_at = ?, %s
+			SET assignee = ?, status = 'in_progress', updated_at = ?, %s, %s
 			WHERE id = ? AND status IN (%s) AND (%s)
-		`, issueTable, rowLockClause, statusPlaceholders, assigneePredicate), args...)
+		`, issueTable, fenceBumpExpr, rowLockClause, statusPlaceholders, assigneePredicate), args...)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to claim issue: %w", err)

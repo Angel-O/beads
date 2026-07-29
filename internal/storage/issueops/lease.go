@@ -60,13 +60,15 @@ func leaseTTL(ctx context.Context) time.Duration {
 // in_progress issue MUST rewrite row_lock — that is the set the reclaim/close
 // races care about (claim, close, updateIssueInTx, reclaim, unclaim all do).
 // Paths that touch only orthogonal cells (is_blocked, compaction_level,
-// dependency metadata, rename, or reopen — which acts on closed rows) are safe
-// to merge with a reclaim and intentionally do NOT rewrite it. Heartbeats no
-// longer touch the issues row at all (bd-lrgn1): the lease lives in the
-// ephemeral leases table, where a racing heartbeat and reclaim contend on the
-// SAME lease row and conflict without any help. Adding a new path that sets
-// status/assignee outside updateIssueInTx without rewriting row_lock would
-// silently reintroduce the zombie-merge bug.
+// dependency metadata, rename) are safe to merge with a reclaim and
+// intentionally do NOT rewrite it. Reopen does rewrite it — not for the
+// reclaim race (it acts on closed rows) but because it bumps claim_fence, and
+// every fence bump must pair with a row_lock rewrite (see fence.go).
+// Heartbeats no longer touch the issues row at all (bd-lrgn1): the lease
+// lives in the ephemeral leases table, where a racing heartbeat and reclaim
+// contend on the SAME lease row and conflict without any help. Adding a new
+// path that sets status/assignee outside updateIssueInTx without rewriting
+// row_lock would silently reintroduce the zombie-merge bug.
 func freshRowLock() int64 {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -387,9 +389,10 @@ func reclaimReplicaSQL(filter types.ReclaimFilter, localNode string) (string, []
 
 // ReclaimExpiredLeasesInTx reverts in_progress issues whose lease has gone stale
 // back to ready: the lease row is deleted, then status → open, assignee cleared,
-// started_at cleared, and a fresh row_lock so the reclaim conflicts with a
-// racing close/update on the same issues row (see freshRowLock). An issue is
-// stale when its lease row's lease_expires_at is strictly before cutoff.
+// started_at cleared, claim_fence bumped (the previous holder is fenced out),
+// and a fresh row_lock so the reclaim conflicts with a racing close/update on
+// the same issues row (see freshRowLock). An issue is stale when its lease
+// row's lease_expires_at is strictly before cutoff.
 // Callers pass cutoff = now - graceWindow (the supervisor uses graceWindow =
 // 2×TTL) so only leases that expired a safe margin ago — i.e. workers that are
 // almost certainly dead — are reclaimed.
@@ -427,9 +430,9 @@ func reclaimReplicaSQL(filter types.ReclaimFilter, localNode string) (string, []
 // round.
 //
 // Reclaim only ever touches the permanent issues table: wisps are ephemeral and
-// are never leased work. Returns the issues it reverted (id + the owner it took
-// the lease from) so the caller can log/emit recovery events. The caller owns
-// Dolt versioning.
+// are never leased work. Returns the issues it reverted (id, the owner it took
+// the lease from, and the post-bump claim_fence that fences that owner out) so
+// the caller can log/emit recovery events. The caller owns Dolt versioning.
 //
 // filter narrows which stale leases are eligible (see types.ReclaimFilter); the
 // zero filter keeps the historical global behavior. Scoping is applied to the
@@ -449,7 +452,7 @@ func ReclaimExpiredLeasesInTx(ctx context.Context, tx DBTX, cutoff time.Time, fi
 	args := append([]any{cutoff}, replicaArgs...)
 	args = append(args, scopeArgs...)
 	rows, err := tx.QueryContext(ctx, `
-		SELECT l.issue_id, COALESCE(i.assignee, ''), COALESCE(l.granted_node, '') FROM leases l
+		SELECT l.issue_id, COALESCE(i.assignee, ''), COALESCE(l.granted_node, ''), i.claim_fence FROM leases l
 		JOIN issues i ON i.id = l.issue_id
 		WHERE i.status = 'in_progress'
 		  AND l.lease_expires_at < ?
@@ -464,9 +467,11 @@ func ReclaimExpiredLeasesInTx(ctx context.Context, tx DBTX, cutoff time.Time, fi
 	// recovery record every backend returns to callers.
 	staleNodes := map[string]string{}
 	for rows.Next() {
+		// r.ClaimFence holds the PRE-bump fence until the revert below lands;
+		// see the derivation comment there.
 		var r types.ReclaimedLease
 		var grantedNode string
-		if err := rows.Scan(&r.ID, &r.PreviousOwner, &grantedNode); err != nil {
+		if err := rows.Scan(&r.ID, &r.PreviousOwner, &grantedNode, &r.ClaimFence); err != nil {
 			_ = rows.Close()
 			return nil, fmt.Errorf("scan stale lease row: %w", err)
 		}
@@ -517,10 +522,13 @@ func ReclaimExpiredLeasesInTx(ctx context.Context, tx DBTX, cutoff time.Time, fi
 		// Revert the issue itself. status is re-checked so a row that stopped
 		// being in_progress under us (closed) is left alone; row_lock makes a
 		// concurrent close/update conflict at commit time rather than
-		// cell-merge with this write.
+		// cell-merge with this write. Taking a claim away is an ownership
+		// transition, so claim_fence advances in the same statement (see
+		// fence.go).
 		res, err = tx.ExecContext(ctx, `
 			UPDATE issues
 			SET status = 'open', assignee = NULL, started_at = NULL,
+			    claim_fence = claim_fence + 1,
 			    updated_at = ?, row_lock = ?
 			WHERE id = ? AND status = 'in_progress'
 		`, time.Now().UTC(), freshRowLock(), r.ID)
@@ -534,6 +542,28 @@ func ReclaimExpiredLeasesInTx(ctx context.Context, tx DBTX, cutoff time.Time, fi
 		if n == 0 {
 			continue // no longer in_progress — its lease row was stale anyway
 		}
+		// Report the post-bump fence so the caller holds the value that fences
+		// out the previous holder — DERIVED, not re-read.
+		//
+		// The derivation is exact, and a read-back could not be more accurate.
+		// The snapshot SELECT above and this UPDATE run in the SAME sql.Tx,
+		// i.e. on one pinned connection, and each Dolt connection has its own
+		// independent working set (see dolt.runDoltTransaction): reads and
+		// writes inside the transaction both resolve against that working set,
+		// so `claim_fence + 1` increments precisely the value the snapshot
+		// read. Nothing between them touches this row's fence — the DELETE
+		// hits leases, and leases.issue_id is a PRIMARY KEY, so each id
+		// appears in the snapshot at most once. A read-back here would return
+		// the transaction's own uncommitted write, which is this same number.
+		//
+		// A concurrent bump from another session cannot make the report lie
+		// either: it lands in a different working set, and the paired row_lock
+		// rewrite (see fence.go) turns the overlap into a commit-time conflict
+		// (1213/1205) that withRetryTx replays from the top with a fresh
+		// snapshot, or that surfaces as an error and discards the report
+		// entirely. The number is only ever observed on the commit that
+		// actually wrote it.
+		r.ClaimFence++
 		if err := RecordFullEventInTable(ctx, tx, "events", r.ID, types.EventLeaseReclaimed, actor,
 			r.PreviousOwner, ""); err != nil {
 			return nil, fmt.Errorf("record reclaim event for %s: %w", r.ID, err)

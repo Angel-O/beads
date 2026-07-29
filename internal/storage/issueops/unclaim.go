@@ -74,7 +74,7 @@ func UnclaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string, for
 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE %s
 		SET assignee = '', status = 'open', updated_at = ?,
-		    started_at = NULL, row_lock = ?
+		    started_at = NULL, claim_fence = claim_fence + 1, row_lock = ?
 		WHERE id = ? AND status IN ('open', 'in_progress') %s
 	`, issueTable, ownerPredicate), args...)
 	if err != nil {
@@ -175,7 +175,7 @@ func UnclaimIssueIfAssigneeInTx(ctx context.Context, tx DBTX, id string, actor s
 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE %s
 		SET assignee = '', status = 'open', updated_at = ?,
-		    started_at = NULL, row_lock = ?
+		    started_at = NULL, claim_fence = claim_fence + 1, row_lock = ?
 		WHERE id = ? AND status IN ('open', 'in_progress') AND assignee = ?
 	`, issueTable), now, freshRowLock(), id, expectedAssignee)
 	if err != nil {

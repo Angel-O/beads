@@ -43,6 +43,25 @@ func testClaim(t *testing.T, f Factory) {
 	}
 }
 
+// testClaimBumpsFence: a claim is an ownership transition, so it advances the
+// row's claim_fence off the never-claimed 0 and the value is readable back
+// through the normal hydration path (migration 0062 + ignored/0019). The
+// idempotent re-claim below is the case that does NOT bump.
+func testClaimBumpsFence(t *testing.T, f Factory) {
+	s := f(t)
+	c := ctx()
+	must(t, s.CreateIssue(c, withDefaults(&types.Issue{ID: "cl-fence-1", Title: "T", Status: types.StatusOpen}), "a"))
+	must(t, s.ClaimIssue(c, "cl-fence-1", "alice"))
+	got, err := s.GetIssue(c, "cl-fence-1")
+	must(t, err)
+	if got.ClaimFence == 0 {
+		t.Error("claim did not bump claim_fence off zero")
+	}
+	if got.Assignee != "alice" || got.Status != types.StatusInProgress {
+		t.Errorf("after claim: assignee=%q status=%q", got.Assignee, got.Status)
+	}
+}
+
 // testClaimIdempotent: re-claiming an in_progress issue by the SAME actor is a no-op
 // success (supports agent retry workflows).
 func testClaimIdempotent(t *testing.T, f Factory) {

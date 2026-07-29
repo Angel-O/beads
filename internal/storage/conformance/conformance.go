@@ -145,6 +145,7 @@ func RunAll(t *testing.T, factory Factory) {
 
 	// Claim / lease (dead-worker recovery)
 	t.Run("Claim", func(t *testing.T) { testClaim(t, factory) })
+	t.Run("ClaimBumpsFence", func(t *testing.T) { testClaimBumpsFence(t, factory) })
 	t.Run("ClaimIdempotent", func(t *testing.T) { testClaimIdempotent(t, factory) })
 	t.Run("ClaimAlreadyClaimed", func(t *testing.T) { testClaimAlreadyClaimed(t, factory) })
 	t.Run("ClaimOpenForeignAssignee", func(t *testing.T) { testClaimOpenForeignAssignee(t, factory) })
