@@ -172,9 +172,11 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 	// Grant the lease: what makes the claim recoverable — a worker that dies
 	// stops heartbeating and bd reclaim later reverts the issue. Lease rows
 	// live in the ephemeral leases table (no Dolt commit, node-local). Wisps
-	// are never leased (they are ephemeral, not reclaimable work).
+	// are never leased (they are ephemeral, not reclaimable work), and a store
+	// that disarmed lease.auto gets no lease either (ClaimLeaseUpsert) — the
+	// claim itself is unaffected, fence bump included.
 	if !isWisp {
-		if err := UpsertLeaseInTx(ctx, tx, id, actor, now, leaseTTL(ctx)); err != nil {
+		if err := ClaimLeaseUpsert(ctx, tx, id, actor, now); err != nil {
 			return nil, err
 		}
 	}

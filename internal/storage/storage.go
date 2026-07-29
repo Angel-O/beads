@@ -35,6 +35,14 @@ var ErrNotOwner = errors.New("issue claimed by a different actor")
 // stale; the issue is left untouched.
 var ErrAssigneeMismatch = errors.New("assignee mismatch")
 
+// ErrUnleased is returned by HeartbeatIssue when the actor holds the claim it
+// is heartbeating but that claim carries no lease, on a store that disarmed
+// automatic stamping (lease.auto off — see bd lease disarm). Heartbeat is
+// strictly a renewal there: arming a lease on a deliberately unleased claim
+// would silently re-create the reclaim exposure disarming exists to remove.
+// The claim is untouched; the caller should stop heartbeating, not retry.
+var ErrUnleased = errors.New("issue has no lease")
+
 // ClaimedByFragment and NotClaimableStatusFragment are the exact message
 // fragments the claim path (issueops/claim.go) appends after the sentinel to
 // carry the conflicting assignee/status: ErrAlreadyClaimed is wrapped as

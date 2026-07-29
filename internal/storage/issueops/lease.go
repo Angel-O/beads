@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/beads/internal/config"
@@ -39,6 +41,37 @@ func leaseTTL(ctx context.Context) time.Duration {
 		return ttl
 	}
 	return DefaultLeaseTTL
+}
+
+// LeaseAutoConfigKey is the store config key governing automatic lease
+// stamping on claim. Default (unset, or anything not falsy) is ON, which is
+// the shipped behavior: every claim stamps a DefaultLeaseTTL lease and a
+// supervisor's bd reclaim recovers dead workers. Off disarms stamping for
+// deployments whose recovery authority lives elsewhere — an orchestrator with
+// its own liveness evidence — so an un-renewed fleet is never one stray
+// reclaim away from mass-reverting live work: claims carry no lease row and
+// are therefore invisible to the reaper. See `bd lease disarm`.
+const LeaseAutoConfigKey = "lease.auto"
+
+// autoLeaseEnabled reads the lease.auto store config inside the caller's
+// transaction. Only an explicitly falsy value disarms; unset, unrecognized,
+// and unreadable all leave stamping ARMED, because armed is what every store
+// shipped with and a knob that silently changes claim semantics on a failed
+// read is worse than one that ignores a typo. Disarming is an explicit
+// operator action (bd lease disarm), never an inference.
+func autoLeaseEnabled(ctx context.Context, tx DBTX) bool {
+	v, err := GetConfigInTx(ctx, tx, LeaseAutoConfigKey)
+	if err != nil {
+		return true
+	}
+	// The repo's opt-out convention (see doltserver.IsAutoStartDisabled):
+	// anything strconv.ParseBool reads as false, plus "off".
+	v = strings.TrimSpace(v)
+	if strings.EqualFold(v, "off") {
+		return false
+	}
+	b, perr := strconv.ParseBool(v)
+	return perr != nil || b
 }
 
 // freshRowLock returns a random non-zero int64 for the row_lock cell.
@@ -102,13 +135,6 @@ func FreshRowLock() int64 {
 	return freshRowLock()
 }
 
-// LeaseTTL is the exported form of leaseTTL: it resolves the lease TTL for the
-// current claim from the context (WithLeaseTTL) or falls back to
-// DefaultLeaseTTL.
-func LeaseTTL(ctx context.Context) time.Duration {
-	return leaseTTL(ctx)
-}
-
 // nodeIDContextKey overrides config.NodeID() for a single call. Used by tests
 // that have to be two replicas at once (one process, one database, two
 // granting nodes); unset in normal use, where every call resolves the real
@@ -166,6 +192,20 @@ func UpsertLeaseInTx(ctx context.Context, tx DBTX, id, holder string, now time.T
 		return fmt.Errorf("upsert lease for %s: %w", id, err)
 	}
 	return nil
+}
+
+// ClaimLeaseUpsert grants the lease for a claim that just won its CAS,
+// honoring lease.auto (see LeaseAutoConfigKey). On a disarmed store the claim
+// gets no lease, and any lease row left over from an earlier regime is
+// scrubbed so a later reclaim cannot key on it. Both claim dispatch layers —
+// ClaimIssueInTx and the proxied-server dual in internal/storage/domain/db —
+// call this one helper, so the grant policy cannot drift between them.
+// Callers route wisps away first: wisps are never leased.
+func ClaimLeaseUpsert(ctx context.Context, tx DBTX, id, holder string, now time.Time) error {
+	if !autoLeaseEnabled(ctx, tx) {
+		return DeleteLeaseInTx(ctx, tx, id)
+	}
+	return UpsertLeaseInTx(ctx, tx, id, holder, now, leaseTTL(ctx))
 }
 
 // DeleteLeaseInTx removes the lease row for an issue, if any. Call from every
@@ -272,6 +312,13 @@ func RestoreLeaseOnImportInTx(ctx context.Context, tx DBTX, issue *types.Issue, 
 // stamp issues.updated_at — updated_at keeps its merge/LWW meaning and bd
 // stale consults leases.heartbeat_at for in_progress rows instead (bd-lrgn1).
 //
+// On a disarmed store (lease.auto off) heartbeat is strictly a RENEWAL: an
+// owned in_progress row that carries no lease row is rejected with
+// storage.ErrUnleased rather than armed, because arming one as a heartbeat
+// side effect would silently re-create the unrequested reclaim exposure
+// `bd lease disarm` exists to remove. A claim that still holds a lease row
+// keeps renewing normally.
+//
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
 func HeartbeatIssueInTx(ctx context.Context, tx DBTX, id, actor string) error {
 	now := time.Now().UTC()
@@ -312,15 +359,108 @@ func HeartbeatIssueInTx(ctx context.Context, tx DBTX, id, actor string) error {
 			return fmt.Errorf("%w by %s", storage.ErrAlreadyClaimed, assignee)
 		}
 		if !isWisp && assignee == actor && status == string(types.StatusInProgress) {
-			// The caller genuinely holds the claim but has no lease row — e.g.
+			// The caller genuinely holds the claim. Either its lease row exists
+			// and the UPDATE above simply changed nothing (a same-second renewal
+			// writing identical values), or there is no lease row at all — e.g.
 			// the claim was hand-doled through a generic update (which never
 			// arms a lease, bd-9hpgf) and the worker is now opting into lease
-			// semantics. A real worker's heartbeat re-arms recovery.
+			// semantics. A real worker's heartbeat re-arms recovery, except on a
+			// disarmed store, where an unleased claim is deliberate.
+			var leased int
+			if err := tx.QueryRowContext(ctx,
+				"SELECT COUNT(*) FROM leases WHERE issue_id = ? AND holder = ?", id, actor,
+			).Scan(&leased); err != nil {
+				return fmt.Errorf("read lease row for %s: %w", id, err)
+			}
+			if leased == 0 && !autoLeaseEnabled(ctx, tx) {
+				return fmt.Errorf("%w: %s", storage.ErrUnleased, id)
+			}
 			return UpsertLeaseInTx(ctx, tx, id, actor, now, leaseTTL(ctx))
 		}
 		return fmt.Errorf("%w: %s status %s", storage.ErrNotClaimable, id, status)
 	}
 	return nil
+}
+
+// DisarmLeaseConfigInTx flips the store's lease.auto config to off. Pair it
+// with ClearArmedLeasesInTx inside the SAME transaction so turning stamping
+// off and removing the existing reclaim exposure land together, then run
+// ClearArmedLeasesInTx again in follow-up transactions until it clears zero
+// rows: a claim transaction that read lease.auto before the flip committed can
+// stamp a lease the first sweep's snapshot never saw, and because the two
+// touch disjoint rows nothing forces them to conflict. The bounded re-sweep is
+// what closes that window (see DoltStore.DisarmAutoLeases).
+func DisarmLeaseConfigInTx(ctx context.Context, tx DBTX) error {
+	if err := SetConfigInTx(ctx, tx, LeaseAutoConfigKey, "off"); err != nil {
+		return fmt.Errorf("set %s=off: %w", LeaseAutoConfigKey, err)
+	}
+	return nil
+}
+
+// ClearArmedLeasesInTx deletes the lease row of every live claim without
+// releasing anything: status, assignee and started_at are untouched and
+// claim_fence does not move, because disarming is lease bookkeeping, not an
+// ownership transition. Wisps are never leased, so there is a single tier to
+// sweep. A racing heartbeat or reclaim contends on the same lease row being
+// deleted and conflicts rather than cell-merging. Returns the number of lease
+// rows cleared.
+func ClearArmedLeasesInTx(ctx context.Context, tx DBTX) (int64, error) {
+	res, err := tx.ExecContext(ctx, `
+		DELETE FROM leases
+		WHERE issue_id IN (SELECT id FROM issues WHERE status = 'in_progress')
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("disarm armed leases: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("disarm rows affected: %w", err)
+	}
+	return n, nil
+}
+
+// maxDisarmResweeps bounds the follow-up sweeps in DisarmAutoLeasesWith.
+const maxDisarmResweeps = 3
+
+// DisarmAutoLeasesWith drives the flip-then-resweep protocol that
+// DisarmLeaseConfigInTx and ClearArmedLeasesInTx are two halves of, so the loop
+// and its bound live beside them instead of being copied into every backend.
+//
+// run performs exactly ONE transaction and returns the lease rows it cleared.
+// flip=true means "set lease.auto=off AND sweep" — the pair MUST share a
+// transaction, or a claim landing between them arms a lease nothing removes;
+// flip=false means "sweep only". Each store passes its own closure so its
+// transaction plumbing and Dolt versioning stay its own business (the server
+// store commits the config flip inside the closure; the embedded store leaves
+// versioning to its caller).
+//
+// After the flip, up to maxDisarmResweeps follow-up sweeps catch claims whose
+// transactions read lease.auto BEFORE the flip committed and stamped a lease
+// the first sweep's snapshot never saw — disjoint rows, so nothing forces them
+// to conflict. Every transaction begun after the flip reads off, so the sweeps
+// converge in a pass or two rather than chasing a moving target; the bound is
+// what stops a pathological arrival rate from spinning here, and a store that
+// somehow has not converged is simply swept again by the next disarm.
+//
+// Returns the total rows cleared. A failure in the flip transaction returns 0
+// (nothing is known to have been swept); a failure in a later sweep returns the
+// partial total alongside the error, because those rows really were cleared.
+func DisarmAutoLeasesWith(run func(flip bool) (int64, error)) (int64, error) {
+	total, err := run(true)
+	if err != nil {
+		return 0, err
+	}
+	for i := 0; i < maxDisarmResweeps; i++ {
+		n, err := run(false)
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n == 0 {
+			break
+		}
+	}
+	return total, nil
 }
 
 // warnReplica writes a replica-guard audit line to STDERR (never stdout —

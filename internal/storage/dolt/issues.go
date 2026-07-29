@@ -507,6 +507,50 @@ func (s *DoltStore) ReclaimExpiredLeases(ctx context.Context, olderThan time.Dur
 	return reclaimed, nil
 }
 
+// DisarmAutoLeases sets lease.auto=off and deletes the lease rows of the
+// claims already holding one, without releasing them. The flip and the first
+// sweep share one transaction, and bounded follow-up sweeps close the window
+// where a claim in flight across the flip arms a lease the first sweep never
+// saw — issueops.DisarmAutoLeasesWith owns that sequencing; this is only the
+// one-transaction closure it drives. Only the config flip is Dolt-versioned:
+// lease rows live in the ephemeral (dolt_ignored) leases table, so clearing
+// them mints no commit.
+func (s *DoltStore) DisarmAutoLeases(ctx context.Context) (int64, error) {
+	return issueops.DisarmAutoLeasesWith(func(flip bool) (int64, error) {
+		var swept int64
+		err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+			swept = 0 // withRetryTx replays this closure; don't accumulate
+			if flip {
+				if err := issueops.DisarmLeaseConfigInTx(ctx, tx); err != nil {
+					return err
+				}
+			}
+			n, err := issueops.ClearArmedLeasesInTx(ctx, tx)
+			if err != nil {
+				return err
+			}
+			swept = n
+			if !flip {
+				return nil // lease-row deletes are ephemeral: nothing to version
+			}
+			// config is the one table here that is NOT dolt_ignore'd, so the
+			// best-effort ignore idiom the issue-table stagers use does not
+			// apply: a silently skipped failed ADD leaves config dirty and the
+			// flip uncommitted (see commitWorkingSet in store.go).
+			if _, err := tx.ExecContext(ctx, "CALL DOLT_ADD(?)", "config"); err != nil {
+				return fmt.Errorf("failed to stage config before commit: %w", err)
+			}
+			commitMsg := fmt.Sprintf("bd: disarm auto-leases (%d lease(s) cleared)", swept)
+			if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
+				commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+				return fmt.Errorf("dolt commit: %w", err)
+			}
+			return nil
+		})
+		return swept, err
+	})
+}
+
 // UnclaimIssue atomically unclaims an issue by clearing the assignee, resetting
 // status to "open", deleting its lease row and rewriting row_lock. Records
 // an "unclaimed" event. Only the current assignee may release its own claim

@@ -377,10 +377,11 @@ func (r *issueSQLRepositoryImpl) Claim(ctx context.Context, id, actor string, op
 	}
 
 	// Grant the lease in the ephemeral leases table, mirroring
-	// issueops.ClaimIssueInTx. Wisps are never leased. This dual must stay in
-	// lockstep with the primary path (see the row_lock comment above).
+	// issueops.ClaimIssueInTx. Wisps are never leased. Both paths go through
+	// ClaimLeaseUpsert so the lease.auto grant policy cannot drift between
+	// them (see the row_lock comment above for the same lockstep rule).
 	if !opts.UseWispsTable {
-		if err := issueops.UpsertLeaseInTx(ctx, r.runner, id, actor, now, issueops.LeaseTTL(ctx)); err != nil {
+		if err := issueops.ClaimLeaseUpsert(ctx, r.runner, id, actor, now); err != nil {
 			return domain.ClaimRowResult{}, fmt.Errorf("db: Claim %s: %w", id, err)
 		}
 	}

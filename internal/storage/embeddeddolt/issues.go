@@ -140,6 +140,32 @@ func (s *EmbeddedDoltStore) ReclaimExpiredLeases(ctx context.Context, olderThan 
 	return reclaimed, err
 }
 
+// DisarmAutoLeases sets lease.auto=off and clears the lease rows of the claims
+// already holding one, without releasing them. The flip-then-resweep
+// sequencing (and the race it closes) belongs to
+// issueops.DisarmAutoLeasesWith; this supplies the one-transaction closure it
+// drives. Dolt versioning is the caller's job here, as everywhere in the
+// embedded store.
+func (s *EmbeddedDoltStore) DisarmAutoLeases(ctx context.Context) (int64, error) {
+	return issueops.DisarmAutoLeasesWith(func(flip bool) (int64, error) {
+		var swept int64
+		err := s.withConn(ctx, true, func(tx *sql.Tx) error {
+			if flip {
+				if err := issueops.DisarmLeaseConfigInTx(ctx, tx); err != nil {
+					return err
+				}
+			}
+			n, err := issueops.ClearArmedLeasesInTx(ctx, tx)
+			if err != nil {
+				return err
+			}
+			swept = n
+			return nil
+		})
+		return swept, err
+	})
+}
+
 // ReopenIssue reopens a closed issue, setting status to open and clearing
 // closed_at and defer_until. If reason is non-empty, it is recorded as a comment.
 // Wraps UpdateIssue; EmbeddedDolt auto-commits the transaction.
