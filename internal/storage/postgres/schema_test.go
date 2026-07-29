@@ -48,7 +48,7 @@ func TestInitSchema(t *testing.T) {
 		}
 	})
 
-	for _, table := range []string{"issues", "dependencies"} {
+	for _, table := range []string{"issues", "dependencies", "bd_events_journal", "bd_events_seq"} {
 		if !tableExists(ctx, t, db, schema, table) {
 			t.Errorf("expected table %q to exist in schema %q", table, schema)
 		}

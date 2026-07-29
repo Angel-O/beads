@@ -152,6 +152,10 @@ func AddLabelInTx(ctx context.Context, tx DBTX, labelTable, eventTable, issueID,
 		NewEventID(), issueID, types.EventLabelAdded, actor, comment); err != nil {
 		return fmt.Errorf("add label: record event: %w", err)
 	}
+	// Journal the label change as an update (the issue's label set changed).
+	if err := RecordEventInTx(ctx, tx, EventUpdate, issueID); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -178,6 +182,10 @@ func RemoveLabelInTx(ctx context.Context, tx DBTX, labelTable, eventTable, issue
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (id, issue_id, event_type, actor, comment) VALUES (?, ?, ?, ?, ?)`, eventTable),
 		NewEventID(), issueID, types.EventLabelRemoved, actor, comment); err != nil {
 		return fmt.Errorf("remove label: record event: %w", err)
+	}
+	// Journal the label change as an update (the issue's label set changed).
+	if err := RecordEventInTx(ctx, tx, EventUpdate, issueID); err != nil {
+		return err
 	}
 	return nil
 }
