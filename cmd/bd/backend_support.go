@@ -30,8 +30,7 @@ func registeredBackendWorkspaceIsBeadsDir(cfg *configfile.Config) bool {
 	if cfg == nil {
 		return false
 	}
-	backend, ok := backends.Lookup(cfg.GetBackend())
-	return ok && backend.WorkspaceIsBeadsDir
+	return backends.WorkspaceIsBeadsDir(cfg.GetBackend())
 }
 
 func requireDoltBackend(cfg *configfile.Config) error {

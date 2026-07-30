@@ -6,6 +6,19 @@
 // discovery, and store dispatch then recognize the name without modification.
 // The Dolt family remains hand-wired because proxied mode returns a unit of
 // work provider rather than a store.
+//
+// The seam covers opening and discovering an existing registered workspace, not
+// provisioning one: bd init and bd bootstrap create or import Dolt only and
+// reject registered names, so a downstream registrant supplies its own
+// workspace-creation path.
+//
+// Registration is init-time wiring. A registrant calls Register once during
+// process initialization, before any concurrent store access; OSS never
+// deregisters, and Deregister exists only for isolated single-threaded contract
+// tests. This registry and the backendnames set that config validation reads are
+// updated together under this package's lock, so as long as callers honor the
+// init-only rule the two never diverge. Do not Register or Deregister
+// concurrently with store dispatch.
 package backends
 
 import (
@@ -83,4 +96,16 @@ func Registered(name string) bool {
 	defer mu.RUnlock()
 	_, ok := registry[name]
 	return ok
+}
+
+// WorkspaceIsBeadsDir reports whether name is a registered backend whose
+// workspace is identified by the .beads directory alone — metadata.json plus a
+// remote store — with no separately discoverable local database. It is the
+// single authority for that classification so CLI and library discovery route
+// such workspaces to the .beads directory instead of returning "no database".
+func WorkspaceIsBeadsDir(name string) bool {
+	mu.RLock()
+	defer mu.RUnlock()
+	backend, ok := registry[name]
+	return ok && backend.WorkspaceIsBeadsDir
 }
