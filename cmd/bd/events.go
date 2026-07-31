@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -69,7 +69,14 @@ Record contract (stable for external consumers):
   comment   object  {"id","author","text","created_at","source"} for comment; omitted otherwise
 
 Poll with the highest seq seen to consume new mutations incrementally, or pass
---follow to keep printing new records as they are committed (Ctrl-C to stop).`,
+--follow to keep printing new records as they are committed (Ctrl-C to stop).
+
+Retention boundary: if --since is below the oldest retained record — the prefix
+you asked for was pruned — the read FAILS instead of silently skipping ahead or
+returning an empty success. With --json the failure carries
+{"code":"events_journal_truncated","since":N,"floor":F,"head":H}: floor is the
+oldest seq still retained, head the highest ever assigned. Resume from floor-1
+to continue with a known gap, or rebuild from a full export.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, _ []string) error {
@@ -152,15 +159,29 @@ type eventRecord struct {
 	Comment json.RawMessage `json:"comment,omitempty"`
 }
 
-// tailSelect builds the read query. CAST(ts AS CHAR) normalizes the DATETIME to
-// a string across drivers.
-func tailSelect(limit int) string {
-	q := `SELECT seq, CAST(ts AS CHAR), op, issue_id, issue_json, dep_json, comment_json
-	      FROM bd_events_journal WHERE seq > ? ORDER BY seq ASC`
-	if limit > 0 {
-		q += " LIMIT " + strconv.Itoa(limit)
+// reportEventsTruncated renders a pruned-past checkpoint as a machine-readable
+// failure. A consumer must be able to branch on this without parsing prose, so
+// JSON mode carries the code and the window it can still serve; the caller then
+// decides whether to resume from floor-1 and accept the gap or rebuild.
+func reportEventsTruncated(err error) error {
+	var trunc *storage.EventsJournalTruncatedError
+	if !errors.As(err, &trunc) {
+		return HandleErrorRespectJSON("reading events journal: %v", err)
 	}
-	return q
+	if jsonOutput {
+		if encErr := outputJSON(map[string]any{
+			"error": trunc.Error(),
+			"code":  storage.EventsJournalTruncatedCode,
+			"since": trunc.Since,
+			"floor": trunc.Floor,
+			"head":  trunc.Head,
+		}); encErr != nil {
+			return encErr
+		}
+		return &exitError{Code: 1}
+	}
+	return HandleErrorWithHint(trunc.Error(),
+		fmt.Sprintf("resume with --since %d to continue from the oldest retained record (accepting the gap), or re-import from scratch", trunc.Floor-1))
 }
 
 func runEventsTail(ctx context.Context, since int64, limit int, follow bool) error {
@@ -183,7 +204,7 @@ func runEventsTail(ctx context.Context, since int64, limit int, follow bool) err
 
 	last, err := emit(since)
 	if err != nil {
-		return HandleErrorRespectJSON("reading events journal: %v", err)
+		return reportEventsTruncated(err)
 	}
 	if !follow {
 		return nil
@@ -199,7 +220,7 @@ func runEventsTail(ctx context.Context, since int64, limit int, follow bool) err
 			return nil
 		case <-ticker.C:
 			if last, err = emit(last); err != nil {
-				return HandleErrorRespectJSON("reading events journal: %v", err)
+				return reportEventsTruncated(err)
 			}
 		}
 	}

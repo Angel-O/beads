@@ -59,7 +59,81 @@ func BuildEventsPruneWhere(before int64, retainDays int, now time.Time, rowsCeil
 // ReadEventsInTx returns journal rows with seq greater than since, ordered by
 // seq ascending. limit > 0 caps the result. It runs inside the caller's
 // transaction so it works on every store plumbing (embedded, server, proxied).
+//
+// It returns *storage.EventsJournalTruncatedError when since sits below the
+// retained window — see checkEventsTruncation for why that is a hard failure
+// rather than a silent skip.
 func ReadEventsInTx(ctx context.Context, tx DBTX, since int64, limit int) ([]storage.EventsJournalRow, error) {
+	out, err := readEventsRowsInTx(ctx, tx, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	if err := ComputeEventsTruncation(since, out, func() (int64, error) {
+		return readEventsHeadInTx(ctx, tx)
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ComputeEventsTruncation decides whether the rows a read returned are the
+// caller's contiguous continuation from since, or the remains of a window whose
+// prefix a prune already deleted. It returns *storage.EventsJournalTruncatedError
+// in the latter case and nil otherwise.
+//
+// This is the ONE place the decision lives, so every read plumbing that serves
+// a `--since` — the DBTX path and anything projecting the journal outward —
+// answers a pruned-past checkpoint identically. readHead is only invoked in the
+// ambiguous cases below.
+//
+// Seqs are gapless by construction (see nextEventSeq) and prune only ever
+// deletes a prefix (`seq < before`), so the only hole a reader can observe is a
+// missing prefix. That makes the common case free: when the first row returned
+// is exactly since+1 the read is contiguous and no extra query runs — which
+// matters because `bd events tail --follow` calls this every second.
+//
+// Only the two ambiguous shapes cost a counter read:
+//   - rows start above since+1: the prefix was pruned, floor is the first row.
+//   - no rows at all: either genuinely caught up (since >= head) or the whole
+//     journal was pruned out from under the caller (since < head), which is
+//     indistinguishable from "nothing new" at the SQL level and is exactly the
+//     silent-loss case this exists to catch.
+func ComputeEventsTruncation(since int64, rows []storage.EventsJournalRow, readHead func() (int64, error)) error {
+	if len(rows) > 0 && rows[0].Seq == since+1 {
+		return nil
+	}
+	head, err := readHead()
+	if err != nil {
+		return err
+	}
+	if len(rows) > 0 {
+		return &storage.EventsJournalTruncatedError{Since: since, Floor: rows[0].Seq, Head: head}
+	}
+	if since >= head {
+		return nil
+	}
+	// Empty journal: the floor is one past the head — nothing is retained, and
+	// the caller's checkpoint is provably behind it.
+	return &storage.EventsJournalTruncatedError{Since: since, Floor: head + 1, Head: head}
+}
+
+// readEventsHeadInTx returns the highest seq the counter has ever assigned.
+// Prune never touches the counter, so this is the head of the journal's history
+// even when every row has been deleted. A missing counter row means no mutation
+// has ever been journaled here, which is a head of 0.
+func readEventsHeadInTx(ctx context.Context, tx DBTX) (int64, error) {
+	var head int64
+	err := tx.QueryRowContext(ctx, "SELECT next_seq FROM bd_events_seq WHERE id = 0").Scan(&head)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("journal: read seq counter: %w", err)
+	}
+	return head, nil
+}
+
+func readEventsRowsInTx(ctx context.Context, tx DBTX, since int64, limit int) ([]storage.EventsJournalRow, error) {
 	// CAST(ts AS CHAR) normalizes the DATETIME to a stable string across drivers.
 	q := `SELECT seq, CAST(ts AS CHAR), op, issue_id, issue_json, dep_json, comment_json
 	      FROM bd_events_journal WHERE seq > ? ORDER BY seq ASC`

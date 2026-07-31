@@ -59,6 +59,42 @@ const (
 	EventCommentWrite EventOp = "comment"
 )
 
+// The engine journals SEVEN ops; the public event vocabulary is SIX. The
+// seventh, EventCommentWrite, is engine-only: the hosted exporter advances its
+// source cursor across a comment row without minting a wire event, so a comment
+// never reaches an external consumer as an event of its own (its effect is
+// already visible in the next issue snapshot). That reconciliation is the frozen
+// wire contract, not an implementation detail to be re-litigated per consumer.
+//
+// The split is stated here, once, so both halves are checkable from one place:
+// adding an op without deciding which side it lands on breaks
+// TestEventOpVocabularyIsFrozen.
+var (
+	// WireEventOps is the closed public vocabulary, in canonical order. These
+	// are the only ops that may appear in an event delivered to a consumer.
+	wireEventOps = []EventOp{EventCreate, EventUpdate, EventClose, EventDelete, EventDepAdd, EventDepRemove}
+	// engineOnlyEventOps are journaled but never minted as wire events.
+	engineOnlyEventOps = []EventOp{EventCommentWrite}
+)
+
+// WireEventOps returns the six-op public event vocabulary in canonical order.
+func WireEventOps() []EventOp { return append([]EventOp(nil), wireEventOps...) }
+
+// EngineOnlyEventOps returns the journaled ops that mint no wire event.
+func EngineOnlyEventOps() []EventOp { return append([]EventOp(nil), engineOnlyEventOps...) }
+
+// IsWireEventOp reports whether op is part of the public event vocabulary. A
+// journaled op that is not one is engine-only and must be skipped — not
+// dropped, not faulted on — by anything projecting the journal outward.
+func IsWireEventOp(op EventOp) bool {
+	for _, w := range wireEventOps {
+		if op == w {
+			return true
+		}
+	}
+	return false
+}
+
 // EventDep is the edge payload recorded for dependency operations.
 type EventDep struct {
 	Kind     string `json:"kind"`

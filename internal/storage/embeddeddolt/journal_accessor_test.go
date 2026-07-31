@@ -79,7 +79,10 @@ func TestEventsJournalAccessor(t *testing.T) {
 	if n != 3 {
 		t.Fatalf("prune with retain-rows=2 deleted %d, want 3 (keep newest 2)", n)
 	}
-	after, err := store.ReadEventsJournal(ctx, 0, 0)
+	// Reading from the retained floor-1 returns the surviving window. Reading
+	// from 0 now fails typed instead of presenting the suffix as a whole
+	// history — see TestEventsJournalRestartAndRetentionBoundary.
+	after, err := store.ReadEventsJournal(ctx, rows[2].Seq, 0)
 	must(err, "read after prune")
 	if len(after) != 2 {
 		t.Fatalf("after prune %d rows, want 2", len(after))

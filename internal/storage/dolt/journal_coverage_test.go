@@ -426,7 +426,9 @@ func TestEventsJournalAccessorServerStore(t *testing.T) {
 	if n != 3 {
 		t.Fatalf("prune retain-rows=2 deleted %d, want 3", n)
 	}
-	after, err := store.ReadEventsJournal(ctx, 0, 0)
+	// Resume from the retained floor-1: reading from 0 now fails typed rather
+	// than presenting the surviving suffix as a complete history.
+	after, err := store.ReadEventsJournal(ctx, rows[2].Seq, 0)
 	must(err, "read after")
 	if len(after) != 2 {
 		t.Fatalf("after prune %d rows, want 2", len(after))

@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/steveyegge/beads/internal/types"
@@ -238,6 +239,40 @@ type EventsJournalRow struct {
 	CommentJSON string
 }
 
+// EventsJournalTruncatedCode is the stable machine-readable code a consumer
+// matches on when its checkpoint has fallen below the retained journal window.
+const EventsJournalTruncatedCode = "events_journal_truncated"
+
+// EventsJournalTruncatedError reports that a sequential read cannot resume from
+// the caller's checkpoint because the rows it needs next were pruned.
+//
+// Without it, `WHERE seq > since` cannot distinguish "nothing new" from "your
+// prefix is gone": a consumer resuming past a prune would either see an empty
+// success and stall forever, or silently skip to the current floor and lose
+// every record in between. Both are silent data loss, so the read fails loudly
+// instead and hands back the window it can actually serve.
+//
+// Floor is the lowest seq still retained, or Head+1 when the journal holds no
+// rows at all. Head is the highest seq the counter has ever assigned; it never
+// decreases under a prune, so Floor > Head means "fully pruned, caught up to
+// Head". A consumer that receives this must decide explicitly — resume from
+// Floor-1 and accept the gap, or rebuild from scratch — and the engine does not
+// decide for it.
+type EventsJournalTruncatedError struct {
+	// Since is the checkpoint the caller presented.
+	Since int64
+	// Floor is the lowest retained seq (Head+1 when nothing is retained).
+	Floor int64
+	// Head is the highest seq ever assigned.
+	Head int64
+}
+
+func (e *EventsJournalTruncatedError) Error() string {
+	return fmt.Sprintf(
+		"events journal truncated: checkpoint %d is below the retained window [%d..%d]; records %d..%d were pruned",
+		e.Since, e.Floor, e.Head, e.Since+1, e.Floor-1)
+}
+
 // EventsJournalAccessor reads and prunes the durable events journal
 // (bd_events_journal) through the store's own transaction machinery. Unlike
 // RawDBAccessor — which only the server-mode store provides — this works on the
@@ -245,7 +280,8 @@ type EventsJournalRow struct {
 // Callers that need the journal should type-assert to this interface.
 type EventsJournalAccessor interface {
 	// ReadEventsJournal returns rows with seq greater than since, ordered by
-	// seq ascending, optionally capped by limit (0 = no cap).
+	// seq ascending, optionally capped by limit (0 = no cap). It returns
+	// *EventsJournalTruncatedError when since sits below the retained window.
 	ReadEventsJournal(ctx context.Context, since int64, limit int) ([]EventsJournalRow, error)
 	// PruneEventsJournal deletes rows with seq below before, honoring the
 	// retain-days / retain-rows floors (0 = floor disabled), and returns the

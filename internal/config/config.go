@@ -177,11 +177,17 @@ func Initialize() error {
 	// enable per-workspace via `bd config set events-journal true` or
 	// BD_EVENTS_JOURNAL=1. Read it with `bd events tail/export`.
 	v.SetDefault("events-journal", false)
-	// Retention floors for `bd events prune`. 0 disables a floor. retain-days
-	// keeps rows younger than N days; retain-rows always keeps the newest N rows.
+	// Retention floors for `bd events prune`. retain-days keeps rows younger
+	// than N days; retain-rows always keeps the newest N rows. Both default ON:
+	// a journal is only ever enabled because something is consuming it, and
+	// with both floors at 0 a single `bd events prune --before <large>` deletes
+	// the whole journal, stranding a consumer whose checkpoint is now below the
+	// floor with no way to recover the lost span. The defaults buy a consumer a
+	// week of downtime, or 100k mutations of backlog, whichever is larger.
+	// Setting either to 0 explicitly disables that floor.
 	// Env: BD_EVENTS_JOURNAL_RETAIN_DAYS / BD_EVENTS_JOURNAL_RETAIN_ROWS.
-	v.SetDefault("events-journal-retain-days", 0)
-	v.SetDefault("events-journal-retain-rows", 0)
+	v.SetDefault("events-journal-retain-days", 7)
+	v.SetDefault("events-journal-retain-rows", 100000)
 	v.SetDefault("db", "")
 	v.SetDefault("actor", "")
 	v.SetDefault("issue-prefix", "")
