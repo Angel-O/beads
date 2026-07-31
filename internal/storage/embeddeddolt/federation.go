@@ -148,10 +148,12 @@ func (s *EmbeddedDoltStore) GetFederationPeer(ctx context.Context, name string) 
 }
 
 // federationEnvMutex serializes mutation of the process-wide
-// DOLT_REMOTE_USER/DOLT_REMOTE_PASSWORD pair, mirroring package dolt's
-// federationEnvMutex: the in-process Dolt engine reads them from the process
-// environment, so concurrent peer operations would otherwise observe each
-// other's credentials.
+// DOLT_REMOTE_USER/DOLT_REMOTE_PASSWORD pair: the in-process Dolt engine
+// reads them from the process environment, so concurrent peer operations
+// would otherwise observe each other's credentials. This is a separate
+// lock from package dolt's federationEnvMutex, not the same lock; the two
+// stores never run remote operations concurrently, so serializing within
+// each package suffices.
 var federationEnvMutex sync.Mutex
 
 // withPeerAuth runs fn with the remote-auth username for peer. Credentials
