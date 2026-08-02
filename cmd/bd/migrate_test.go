@@ -16,6 +16,19 @@ import (
 
 // TestFormatDBList removed: formatDBList and dbInfo types were removed.
 
+func TestMigrateSchemaFlagBoundaries(t *testing.T) {
+	for _, name := range []string{"inspect", "dry-run"} {
+		if flag := migrateSchemaCmd.Flags().Lookup(name); flag != nil {
+			t.Errorf("migrate schema unexpectedly owns --%s", name)
+		}
+	}
+	for _, name := range []string{"json", "force"} {
+		if flag := migrateSchemaCmd.Flags().Lookup(name); flag == nil {
+			t.Errorf("migrate schema must own --%s", name)
+		}
+	}
+}
+
 func TestMigrateRespectsConfigJSON(t *testing.T) {
 	t.Skip("SQLite-specific: Dolt backend always uses 'dolt' directory, not custom database filenames")
 	// Test that migrate respects custom database name from metadata.json
