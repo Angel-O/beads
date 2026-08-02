@@ -17,15 +17,21 @@ import (
 // TestFormatDBList removed: formatDBList and dbInfo types were removed.
 
 func TestMigrateSchemaFlagBoundaries(t *testing.T) {
+	// Registration only: strict subprocess tests use the root persistent
+	// --json flag because local registration does not prove PersistentPreRunE
+	// will observe the flag as explicitly set.
 	for _, name := range []string{"inspect", "dry-run"} {
 		if flag := migrateSchemaCmd.Flags().Lookup(name); flag != nil {
-			t.Errorf("migrate schema unexpectedly owns --%s", name)
+			t.Errorf("migrate schema unexpectedly registers local --%s", name)
 		}
 	}
 	for _, name := range []string{"json", "force"} {
 		if flag := migrateSchemaCmd.Flags().Lookup(name); flag == nil {
-			t.Errorf("migrate schema must own --%s", name)
+			t.Errorf("migrate schema must register local --%s", name)
 		}
+	}
+	if flag := rootCmd.PersistentFlags().Lookup("json"); flag == nil {
+		t.Error("root command must register persistent --json")
 	}
 }
 

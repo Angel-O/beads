@@ -31,6 +31,21 @@ func bdMigrate(t *testing.T, bd, dir string, args ...string) string {
 	return stdout.String()
 }
 
+// bdMigrateJSON runs "bd --json migrate" so PersistentPreRunE observes the
+// explicit root flag even though migrate subcommands also register local flags.
+func bdMigrateJSON(t *testing.T, bd, dir string, args ...string) string {
+	t.Helper()
+	fullArgs := append([]string{"--json", "migrate"}, args...)
+	cmd := exec.Command(bd, fullArgs...)
+	cmd.Dir = dir
+	cmd.Env = bdEnv(dir)
+	stdout, stderr, err := runCommandBuffers(t, cmd)
+	if err != nil {
+		t.Fatalf("bd --json migrate %s failed: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), err, stdout.String(), stderr.String())
+	}
+	return stdout.String()
+}
+
 // extractNewRepoID pulls the fingerprint from the "  New: <hash>" line of
 // `bd migrate --update-repo-id --dry-run` output.
 func extractNewRepoID(t *testing.T, out string) string {
@@ -66,6 +81,13 @@ func withEmbeddedMigrateSQL(t *testing.T, beadsDir, database string, operation f
 	}
 }
 
+func setMigrateJSONConfigFalse(t *testing.T, beadsDir string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("json: false\n"), 0o600); err != nil {
+		t.Fatalf("write explicit false JSON config: %v", err)
+	}
+}
+
 func TestEmbeddedMigrate(t *testing.T) {
 	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
 		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
@@ -76,6 +98,7 @@ func TestEmbeddedMigrate(t *testing.T) {
 
 	t.Run("migrate_metadata_preview_and_inspection", func(t *testing.T) {
 		dir, beadsDir, _ := bdInit(t, bd, "--prefix", "mg")
+		setMigrateJSONConfigFalse(t, beadsDir)
 		bdCreate(t, bd, dir, "Inspect test issue", "--type", "task")
 		const staleVersion = "0.0.0"
 		setVersion := func(version string) {
@@ -106,7 +129,7 @@ func TestEmbeddedMigrate(t *testing.T) {
 
 		inspect := func() map[string]interface{} {
 			t.Helper()
-			out := bdMigrate(t, bd, dir, "--inspect", "--json")
+			out := bdMigrateJSON(t, bd, dir, "--inspect")
 			var result map[string]interface{}
 			if err := json.Unmarshal([]byte(out), &result); err != nil {
 				t.Fatalf("migrate --inspect --json returned invalid JSON: %v\n%s", err, out)
@@ -135,7 +158,7 @@ func TestEmbeddedMigrate(t *testing.T) {
 		}
 
 		before := inspect()
-		out := bdMigrate(t, bd, dir, "--dry-run", "--json")
+		out := bdMigrateJSON(t, bd, dir, "--dry-run")
 		var preview map[string]interface{}
 		if err := json.Unmarshal([]byte(out), &preview); err != nil {
 			t.Fatalf("migrate --dry-run --json returned invalid JSON: %v\n%s", err, out)
@@ -174,6 +197,7 @@ func TestEmbeddedMigrate(t *testing.T) {
 	t.Run("migrate_update_repo_id_honors_C", func(t *testing.T) {
 		dirA, _, _ := bdInit(t, bd, "--prefix", "ca")
 		dirB, beadsDirB, _ := bdInit(t, bd, "--prefix", "cb")
+		setMigrateJSONConfigFalse(t, beadsDirB)
 
 		runDryRun := func(cwd, target, home string) string {
 			cmd := exec.Command(bd, "-C", target, "migrate", "--update-repo-id", "--dry-run")
@@ -221,7 +245,7 @@ func TestEmbeddedMigrate(t *testing.T) {
 			return nil
 		})
 
-		cmd := exec.Command(bd, "-C", dirB, "migrate", "--update-repo-id", "--yes", "--json")
+		cmd := exec.Command(bd, "-C", dirB, "--json", "migrate", "--update-repo-id", "--yes")
 		cmd.Dir = dirA
 		cmd.Env = bdEnv(dirB)
 		stdout, stderr, err := runCommandBuffers(t, cmd)
@@ -252,10 +276,11 @@ func TestEmbeddedMigrate(t *testing.T) {
 	})
 
 	t.Run("migrate_schema_json_is_idempotent", func(t *testing.T) {
-		dir, _, _ := bdInit(t, bd, "--prefix", "sc")
+		dir, beadsDir, _ := bdInit(t, bd, "--prefix", "sc")
+		setMigrateJSONConfigFalse(t, beadsDir)
 		run := func() map[string]interface{} {
 			t.Helper()
-			out := bdMigrate(t, bd, dir, "schema", "--json")
+			out := bdMigrateJSON(t, bd, dir, "schema")
 			var result map[string]interface{}
 			if err := json.Unmarshal([]byte(out), &result); err != nil {
 				t.Fatalf("migrate schema --json returned invalid JSON: %v\n%s", err, out)
@@ -288,11 +313,12 @@ func TestEmbeddedMigrate(t *testing.T) {
 	})
 
 	t.Run("migrate_sync_persists_and_noops", func(t *testing.T) {
-		dir, _, _ := bdInit(t, bd, "--prefix", "ms")
+		dir, beadsDir, _ := bdInit(t, bd, "--prefix", "ms")
+		setMigrateJSONConfigFalse(t, beadsDir)
 		const branch = "beads-sync"
 		decode := func(args ...string) map[string]interface{} {
 			t.Helper()
-			out := bdMigrate(t, bd, dir, args...)
+			out := bdMigrateJSON(t, bd, dir, args...)
 			var result map[string]interface{}
 			if err := json.Unmarshal([]byte(out), &result); err != nil {
 				t.Fatalf("migrate %s returned invalid JSON: %v\n%s", strings.Join(args, " "), err, out)
@@ -300,7 +326,7 @@ func TestEmbeddedMigrate(t *testing.T) {
 			return result
 		}
 
-		dryRun := decode("sync", branch, "--dry-run", "--json")
+		dryRun := decode("sync", branch, "--dry-run")
 		if got, ok := dryRun["dry_run"].(bool); !ok || !got {
 			t.Errorf("migrate sync dry_run = %#v, want true", dryRun["dry_run"])
 		}
@@ -311,7 +337,7 @@ func TestEmbeddedMigrate(t *testing.T) {
 			t.Errorf("migrate sync dry-run changed = %#v, want true", dryRun["changed"])
 		}
 
-		applied := decode("sync", branch, "--json")
+		applied := decode("sync", branch)
 		if got, ok := applied["status"].(string); !ok || got != "success" {
 			t.Errorf("migrate sync status = %#v, want success", applied["status"])
 		}
@@ -330,7 +356,7 @@ func TestEmbeddedMigrate(t *testing.T) {
 			t.Errorf("reopened sync.branch = %q, want %q", got, branch)
 		}
 
-		noop := decode("sync", branch, "--json")
+		noop := decode("sync", branch)
 		if got, ok := noop["status"].(string); !ok || got != "noop" {
 			t.Errorf("same-value migrate sync status = %#v, want noop", noop["status"])
 		}
