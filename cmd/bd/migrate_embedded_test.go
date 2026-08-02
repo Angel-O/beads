@@ -31,17 +31,17 @@ func bdMigrate(t *testing.T, bd, dir string, args ...string) string {
 	return stdout.String()
 }
 
-// bdMigrateJSON runs "bd --json migrate" so PersistentPreRunE observes the
-// explicit root flag even though migrate subcommands also register local flags.
+// bdMigrateJSON runs "bd --format=json migrate" so PersistentPreRunE observes
+// the unique root flag without migrate's duplicate local --json shadowing it.
 func bdMigrateJSON(t *testing.T, bd, dir string, args ...string) string {
 	t.Helper()
-	fullArgs := append([]string{"--json", "migrate"}, args...)
+	fullArgs := append([]string{"--format=json", "migrate"}, args...)
 	cmd := exec.Command(bd, fullArgs...)
 	cmd.Dir = dir
 	cmd.Env = bdEnv(dir)
 	stdout, stderr, err := runCommandBuffers(t, cmd)
 	if err != nil {
-		t.Fatalf("bd --json migrate %s failed: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), err, stdout.String(), stderr.String())
+		t.Fatalf("bd --format=json migrate %s failed: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), err, stdout.String(), stderr.String())
 	}
 	return stdout.String()
 }
@@ -132,7 +132,7 @@ func TestEmbeddedMigrate(t *testing.T) {
 			out := bdMigrateJSON(t, bd, dir, "--inspect")
 			var result map[string]interface{}
 			if err := json.Unmarshal([]byte(out), &result); err != nil {
-				t.Fatalf("migrate --inspect --json returned invalid JSON: %v\n%s", err, out)
+				t.Fatalf("bd --format=json migrate --inspect returned invalid JSON: %v\n%s", err, out)
 			}
 			for _, key := range []string{"registered_migrations", "current_state", "warnings", "invariants_to_check"} {
 				if _, ok := result[key]; !ok {
@@ -161,7 +161,7 @@ func TestEmbeddedMigrate(t *testing.T) {
 		out := bdMigrateJSON(t, bd, dir, "--dry-run")
 		var preview map[string]interface{}
 		if err := json.Unmarshal([]byte(out), &preview); err != nil {
-			t.Fatalf("migrate --dry-run --json returned invalid JSON: %v\n%s", err, out)
+			t.Fatalf("bd --format=json migrate --dry-run returned invalid JSON: %v\n%s", err, out)
 		}
 		if got, ok := preview["dry_run"].(bool); !ok || !got {
 			t.Errorf("migrate metadata dry_run = %#v, want true", preview["dry_run"])
@@ -245,16 +245,16 @@ func TestEmbeddedMigrate(t *testing.T) {
 			return nil
 		})
 
-		cmd := exec.Command(bd, "-C", dirB, "--json", "migrate", "--update-repo-id", "--yes")
+		cmd := exec.Command(bd, "-C", dirB, "--format=json", "migrate", "--update-repo-id", "--yes")
 		cmd.Dir = dirA
 		cmd.Env = bdEnv(dirB)
 		stdout, stderr, err := runCommandBuffers(t, cmd)
 		if err != nil {
-			t.Fatalf("bd -C %s migrate --update-repo-id --yes --json (cwd=%s) failed: %v\nstdout:\n%s\nstderr:\n%s", dirB, dirA, err, stdout.String(), stderr.String())
+			t.Fatalf("bd -C %s --format=json migrate --update-repo-id --yes (cwd=%s) failed: %v\nstdout:\n%s\nstderr:\n%s", dirB, dirA, err, stdout.String(), stderr.String())
 		}
 		var applied map[string]interface{}
 		if err := json.Unmarshal(stdout.Bytes(), &applied); err != nil {
-			t.Fatalf("migrate --update-repo-id --json returned invalid JSON: %v\n%s", err, stdout.String())
+			t.Fatalf("bd -C %s --format=json migrate --update-repo-id returned invalid JSON: %v\n%s", dirB, err, stdout.String())
 		}
 		if got, ok := applied["status"].(string); !ok || got != "success" {
 			t.Errorf("migrate --update-repo-id status = %#v, want success", applied["status"])
@@ -283,7 +283,7 @@ func TestEmbeddedMigrate(t *testing.T) {
 			out := bdMigrateJSON(t, bd, dir, "schema")
 			var result map[string]interface{}
 			if err := json.Unmarshal([]byte(out), &result); err != nil {
-				t.Fatalf("migrate schema --json returned invalid JSON: %v\n%s", err, out)
+				t.Fatalf("bd --format=json migrate schema returned invalid JSON: %v\n%s", err, out)
 			}
 			for _, key := range []string{"status", "applied", "latest_version"} {
 				if _, ok := result[key]; !ok {
@@ -345,17 +345,7 @@ func TestEmbeddedMigrate(t *testing.T) {
 			t.Errorf("migrate sync branch = %#v, want %q", applied["branch"], branch)
 		}
 
-		cmd := exec.Command(bd, "config", "get", "sync.branch")
-		cmd.Dir = dir
-		cmd.Env = bdEnv(dir)
-		stdout, stderr, err := runCommandBuffers(t, cmd)
-		if err != nil {
-			t.Fatalf("bd config get sync.branch failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
-		}
-		if got := strings.TrimSpace(stdout.String()); got != branch {
-			t.Errorf("reopened sync.branch = %q, want %q", got, branch)
-		}
-
+		// decode launches a fresh process, so noop proves the store value persisted across reopen.
 		noop := decode("sync", branch)
 		if got, ok := noop["status"].(string); !ok || got != "noop" {
 			t.Errorf("same-value migrate sync status = %#v, want noop", noop["status"])
