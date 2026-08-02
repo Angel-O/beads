@@ -122,6 +122,38 @@ func TestInstallHooksRefusesTrackedHook(t *testing.T) {
 	}
 }
 
+// A tracked hook that bd OWNS (section markers) must still be maintainable:
+// teams commit .beads/hooks/ like shared .beads-hooks/, and refusing would
+// break reinstall/upgrade for them (caught by TestEmbeddedHooks in CI).
+func TestInstallHooksAllowsTrackedBdOwnedHook(t *testing.T) {
+	repoDir := setupGuardTestRepo(t)
+
+	hooksDir := filepath.Join(repoDir, "hooks")
+	if err := os.MkdirAll(hooksDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	bdHook := "#!/usr/bin/env sh\n" + generateHookSection("pre-commit")
+	if err := os.WriteFile(filepath.Join(hooksDir, "pre-commit"), []byte(bdHook), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"add", "hooks/pre-commit"},
+		{"commit", "-m", "commit bd-managed hook"},
+		{"config", "core.hooksPath", "hooks"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Skipf("git %v failed: %v\n%s", args, err, out)
+		}
+	}
+	git.ResetCaches()
+
+	if err := installHooksWithOptions(managedHookNames, false, false, false, false); err != nil {
+		t.Fatalf("reinstall over a tracked bd-owned hook must succeed, got: %v", err)
+	}
+}
+
 // bd-5vdt8: injecting the bd section into a hook bd does not own must
 // preserve the original as a .backup sidecar.
 func TestInstallHooksBacksUpForeignHook(t *testing.T) {

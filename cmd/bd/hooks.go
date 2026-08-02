@@ -796,10 +796,28 @@ func guardHookWritePath(hookPath string, allowTracked bool) error {
 	if allowTracked {
 		return nil
 	}
-	if isGitTrackedFile(hookPath) {
-		return fmt.Errorf("%s is tracked by git; bd will not modify committed files\nUntrack it (git rm --cached) or move hooks to an untracked directory and re-run", hookPath)
+	// A tracked file is refused only when bd does NOT own it: writing into a
+	// foreign tracked file dirties every clone that shares it (the wy-81fnur
+	// incident). A bd-owned hook the user chose to commit (e.g. a team-shared
+	// .beads/hooks/) is bd's to maintain — same policy as shared installs.
+	if isGitTrackedFile(hookPath) && !isBdOwnedHookFile(hookPath) {
+		return fmt.Errorf("%s is tracked by git and not a bd-managed hook; bd will not modify committed files it does not own\nUntrack it (git rm --cached) or move hooks to an untracked directory and re-run", hookPath)
 	}
 	return nil
+}
+
+// isBdOwnedHookFile reports whether the hook file at path is bd-managed:
+// either section-marker format or a legacy bd hook (shim or inline).
+func isBdOwnedHookFile(path string) bool {
+	content, err := os.ReadFile(path) // #nosec G304 -- path is a hook location bd resolved
+	if err != nil {
+		return false
+	}
+	if strings.Contains(string(content), hookSectionBeginPrefix) {
+		return true
+	}
+	versionInfo, err := getHookVersion(path)
+	return err == nil && versionInfo.IsBdHook
 }
 
 // isGitTrackedFile reports whether path is tracked by git in the repository
