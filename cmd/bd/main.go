@@ -464,9 +464,10 @@ func loadServerModeFromBeadsDir(beadsDir string) error {
 	if err != nil {
 		return fmt.Errorf("load %s: %w (storage mode unknown; data commands will refuse to run rather than fall back to the embedded store)", configfile.ConfigPath(beadsDir), err)
 	}
-	if cfg == nil {
-		return nil
-	}
+	// Absent metadata.json keeps the fresh-repo embedded default unless
+	// env/config.yaml supply a remote host (GH#3545) — inference must not
+	// depend on metadata existing.
+	cfg = normalizeLoadedConfig(cfg)
 	warnSharedServerEmbeddedMismatch(cfg)
 	psm := cfg.IsDoltProxiedServerMode()
 	sm := cfg.IsDoltServerMode()
@@ -880,11 +881,11 @@ var rootCmd = &cobra.Command{
 		// per-command context and losing Ctrl-C entirely.
 		setRootContext(setupGracefulShutdown())
 
-		// Initialize OTel (no-op unless BD_OTEL_METRICS_URL or BD_OTEL_STDOUT=true).
-		// Must run before any DB access so SQL spans nest under command spans.
-		if err := telemetry.Init(rootCtx, "bd", Version); err != nil {
-			debug.Logf("warning: telemetry init failed: %v", err)
-		}
+		// Initialize OTel. Telemetry is opt-in — initTelemetry is a noop
+		// unless BD_OTEL_ENABLED=true or a legacy BD_OTEL_* selector is set.
+		// Must run before any DB access so SQL spans nest under the command
+		// span.
+		initTelemetry(rootCtx, Version)
 
 		// Materialize the user-level metrics config only when metrics are
 		// actually enabled. When metrics are disabled (BD_DISABLE_METRICS or a
@@ -910,13 +911,7 @@ var rootCmd = &cobra.Command{
 
 		// Start root span for this command. rootCtx now carries the span, so
 		// all downstream DB and AI calls become child spans automatically.
-		rootCtx, commandSpan = telemetry.Tracer("bd").Start(rootCtx, "bd.command."+cmd.Name(),
-			oteltrace.WithAttributes(
-				attribute.String("bd.command", cmd.Name()),
-				attribute.String("bd.version", Version),
-				attribute.String("bd.args", scrubArgsForTelemetry(os.Args[1:], secretFlagTokens(cmd))),
-			),
-		)
+		rootCtx, commandSpan = startCommandSpan(rootCtx, cmd.Name(), Version, os.Args[1:], secretFlagTokens(cmd))
 
 		// Apply verbosity flags early (before any output)
 		debug.SetVerbose(verboseFlag)
@@ -1185,6 +1180,14 @@ var rootCmd = &cobra.Command{
 					// or unknown metadata likewise must reach config validation
 					// instead of becoming a generic "no database" result.
 					dbPath = bd
+				} else if cfg == nil && cfgErr == nil &&
+					configfile.DefaultConfig().HostImpliesServerMode() {
+					// Metadata-less workspace whose server lives at a
+					// remote host named by BEADS_DOLT_SERVER_HOST or
+					// config.yaml (GH#3545): there is no local database
+					// directory to discover, so route the .beads dir as
+					// a server workspace instead of "no database found".
+					dbPath = bd
 				}
 			}
 		}
@@ -1385,7 +1388,14 @@ var rootCmd = &cobra.Command{
 		// deployments that empty relic answers every query with an empty
 		// result set and exit 0 (false-empty), which readers misinterpret as
 		// "no work". Absent metadata.json (cfg == nil, cfgErr == nil) keeps
-		// the fresh-repo embedded default below.
+		// the fresh-repo embedded default below — unless env/config.yaml
+		// supply a remote host (GH#3545): host inference must not depend
+		// on metadata existing, so substitute the default config and let
+		// the normal mode/connection resolution run.
+		if cfg == nil && configfile.DefaultConfig().HostImpliesServerMode() {
+			logConfigDiscovery(beadsDir, "no metadata.json; host inference (GH#3545) selects server mode")
+			cfg = configfile.DefaultConfig()
+		}
 		if cfg != nil {
 			warnSharedServerEmbeddedMismatch(cfg)
 			doltCfg.ProxiedServer = cfg.IsDoltProxiedServerMode()
