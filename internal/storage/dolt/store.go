@@ -2937,6 +2937,19 @@ func (s *DoltStore) commitWorkingSet(ctx context.Context, message string, mode c
 	return nil
 }
 
+// commitWorkingSetAfterSQLCommit preserves the no-replay boundary for a Dolt
+// publication that follows an already-visible SQL mutation. commitWorkingSet
+// classifies DOLT_COMMIT response loss itself; this wrapper adds the same
+// sentinel to earlier publication failures such as a lost DOLT_ADD response.
+func (s *DoltStore) commitWorkingSetAfterSQLCommit(ctx context.Context, message string, mode configCommitMode) error {
+	err := s.commitWorkingSet(ctx, message, mode)
+	if err == nil || errors.Is(err, ErrCommitIndeterminate) || !isIndeterminateCommitResponse(err) {
+		return err
+	}
+	return s.recordDoltPublicationFailure(ctx,
+		fmt.Errorf("publish working set after SQL commit: %w: %w", err, ErrCommitIndeterminate))
+}
+
 // concludeOpenMerge commits an open merge whose resolution left the working
 // set clean, so the merge is actually concluded rather than left open with
 // nothing to show for it. It is a no-op when no merge is in progress, and it
@@ -3933,7 +3946,7 @@ func (s *DoltStore) settleMergeInTx(ctx context.Context, tx *sql.Tx, pullErr err
 		}
 	}
 
-	return tx.Commit()
+	return s.commitSQLTx(ctx, "commit pull merge settlement", tx)
 }
 
 // recomputeBlockedAfterPull recomputes the denormalized is_blocked column for
@@ -3955,7 +3968,7 @@ func (s *DoltStore) recomputeBlockedAfterPull(ctx context.Context, fromCommit st
 	// Derived state converges: every clone computes the same values from the
 	// same merged graph, so committing is merge-safe. Commit no-ops when the
 	// recompute changed nothing.
-	if err := s.Commit(ctx, "bd: recompute is_blocked after pull"); err != nil && !isDoltNothingToCommit(err) {
+	if err := s.commitWorkingSetAfterSQLCommit(ctx, "bd: recompute is_blocked after pull", configExclude); err != nil && !isDoltNothingToCommit(err) {
 		return fmt.Errorf("commit is_blocked recompute: %w", err)
 	}
 	return nil
@@ -3980,6 +3993,10 @@ func (s *DoltStore) RecomputeAllBlocked(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	defer db.Close()
+	return s.recomputeAllBlockedWithDB(ctx, db)
+}
+
+func (s *DoltStore) recomputeAllBlockedWithDB(ctx context.Context, db *sql.DB) (int, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("begin is_blocked recompute: %w", err)
@@ -3993,8 +4010,8 @@ func (s *DoltStore) RecomputeAllBlocked(ctx context.Context) (int, error) {
 		_ = tx.Rollback()
 		return 0, err
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit is_blocked recompute: %w", err)
+	if err := s.commitSQLTx(ctx, "commit is_blocked recompute", tx); err != nil {
+		return 0, err
 	}
 	if changed > 0 {
 		// Stage only issues — the synced table is_blocked lives on (wisps are
@@ -4031,6 +4048,10 @@ func (s *DoltStore) recomputeBlockedTx(ctx context.Context, fromCommit string) e
 		return err
 	}
 	defer db.Close()
+	return s.recomputeBlockedTxWithDB(ctx, db, fromCommit)
+}
+
+func (s *DoltStore) recomputeBlockedTxWithDB(ctx context.Context, db *sql.DB, fromCommit string) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin is_blocked recompute: %w", err)
@@ -4039,8 +4060,8 @@ func (s *DoltStore) recomputeBlockedTx(ctx context.Context, fromCommit string) e
 		_ = tx.Rollback()
 		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit is_blocked recompute: %w", err)
+	if err := s.commitSQLTx(ctx, "commit is_blocked recompute", tx); err != nil {
+		return err
 	}
 	return nil
 }
@@ -4159,8 +4180,8 @@ func (s *DoltStore) autoResolveConflictsAfterCLIPull(ctx context.Context) (bool,
 			return false, err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("failed to commit resolved conflicts: %w", err)
+	if err := s.commitSQLTx(ctx, "commit resolved CLI pull conflicts", tx); err != nil {
+		return false, err
 	}
 	return true, nil
 }
