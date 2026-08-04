@@ -2592,7 +2592,7 @@ func existingWorkspaceDBName() string {
 	if beadsDir == "" {
 		return ""
 	}
-	cfg, err := configfile.Load(beadsDir)
+	cfg, err := configfile.LoadForDiscovery(beadsDir)
 	if err != nil || cfg == nil {
 		return ""
 	}
@@ -2611,7 +2611,7 @@ func existingWorkspaceDoltMode() string {
 	if beadsDir == "" {
 		return ""
 	}
-	cfg, err := configfile.Load(beadsDir)
+	cfg, err := configfile.LoadForDiscovery(beadsDir)
 	if err != nil || cfg == nil {
 		return ""
 	}
