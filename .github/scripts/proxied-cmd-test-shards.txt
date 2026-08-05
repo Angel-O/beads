@@ -47,6 +47,7 @@
 15 4 TestProxiedServerDuplicates
 15 4 TestProxiedServerMolBond
 15 4 TestProxiedServerQuery
+15 4 TestProxiedServerUnclaimIfAssigneeParity
 15 4 TestProxiedServerWispCreate
 
 15 5 TestProxiedServerCreate2
