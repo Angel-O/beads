@@ -124,6 +124,42 @@ func exportIssueIDs(records []map[string]any) map[string]bool {
 	return ids
 }
 
+// exportIssueRecordByID returns the issue record with the given id, or nil.
+func exportIssueRecordByID(records []map[string]any, id string) map[string]any {
+	for _, r := range records {
+		if r["_type"] == "issue" && r["id"] == id {
+			return r
+		}
+	}
+	return nil
+}
+
+// exportStrings coerces a JSON array field to []string.
+func exportStrings(v any) []string {
+	arr, _ := v.([]any)
+	out := make([]string, 0, len(arr))
+	for _, e := range arr {
+		if s, ok := e.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// exportCommentTexts extracts the text field of each comment object in order.
+func exportCommentTexts(v any) []string {
+	arr, _ := v.([]any)
+	out := make([]string, 0, len(arr))
+	for _, e := range arr {
+		if m, ok := e.(map[string]any); ok {
+			if s, ok := m["text"].(string); ok {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
 func exportMemoryKeys(records []map[string]any) []string {
 	var keys []string
 	for _, r := range records {
@@ -206,6 +242,103 @@ func TestProxiedServerExport(t *testing.T) {
 		}
 		if strings.Contains(stderr, "Exported") {
 			t.Errorf("summary must not print without -o; stderr:\n%s", stderr)
+		}
+	})
+
+	// Direct content oracle: the relational data must actually APPEAR in the
+	// export. The byte-identity round trip below is blind to symmetric
+	// omissions — a proxied read bug that drops a whole relation produces an
+	// impoverished stream that classic faithfully imports and re-exports, so
+	// bytes still match. These assertions pin the seeded content itself.
+	t.Run("relations_content_present", func(t *testing.T) {
+		stdout, stderr, err := bdProxiedRunBuffers(t, bd, p.dir, "export")
+		if err != nil {
+			t.Fatalf("bd export: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		}
+		records := exportLines(t, stdout)
+		child := exportIssueRecordByID(records, fx.child)
+		if child == nil {
+			t.Fatalf("export missing %s", fx.child)
+		}
+		if labels := exportStrings(child["labels"]); len(labels) != 2 || labels[0] != "alpha" || labels[1] != "zeta" {
+			t.Errorf("child labels = %v, want [alpha zeta]", labels)
+		}
+		if texts := exportCommentTexts(child["comments"]); len(texts) != 2 || texts[0] != "first comment" || texts[1] != "second comment" {
+			t.Errorf("child comments = %v, want [first comment, second comment]", texts)
+		}
+		if cc, _ := child["comment_count"].(float64); int(cc) != 2 {
+			t.Errorf("child comment_count = %v, want 2", child["comment_count"])
+		}
+		deps, _ := child["dependencies"].([]any)
+		dependsOn := map[string]bool{}
+		for _, d := range deps {
+			if m, ok := d.(map[string]any); ok {
+				if id, ok := m["depends_on_id"].(string); ok {
+					dependsOn[id] = true
+				}
+			}
+		}
+		if len(deps) != 2 || !dependsOn[fx.epic] || !dependsOn[fx.blocker] {
+			t.Errorf("child dependencies depend on %v, want both %s and %s", dependsOn, fx.epic, fx.blocker)
+		}
+		// Dependency COUNTS tally only 'blocks' edges (both stacks:
+		// domain/db/dependency.go:396, classic GetDependencyCountsInTx), so
+		// the parent-child edge appears in `dependencies` but not the count.
+		if dc, _ := child["dependency_count"].(float64); int(dc) != 1 {
+			t.Errorf("child dependency_count = %v, want 1 (blocks edge only)", child["dependency_count"])
+		}
+		blocker := exportIssueRecordByID(records, fx.blocker)
+		if blocker == nil {
+			t.Fatalf("export missing %s", fx.blocker)
+		}
+		if dc, _ := blocker["dependent_count"].(float64); int(dc) != 1 {
+			t.Errorf("blocker dependent_count = %v, want 1", blocker["dependent_count"])
+		}
+	})
+
+	// The plane-classification trap from review: a promoted no-history wisp
+	// is a durable issues-table row that still carries no_history=true —
+	// promote clears only Ephemeral — and its labels/comments live in the
+	// DURABLE plane. Classifying by row flags looks them up in the wisp plane
+	// and silently drops them; classification must follow table membership.
+	// Runs in its own project: the shape is deliberately NOT in the
+	// round-trip fixture because classic *import* routes by the same flags
+	// (issueops.IsWisp), re-planing the row into the wisps table — a
+	// pre-existing export/import infidelity (bd-r9uce) that would break the
+	// byte-identity oracle for reasons unrelated to this seam.
+	t.Run("promoted_no_history_relations", func(t *testing.T) {
+		pp := newSharedProxiedProject(t, bd, "pxp")
+		promoted := bdProxiedCreateSilent(t, bd, pp.dir, "Promoted no-history wisp", "--type", "task", "--priority", "3")
+		if out, err := bdProxiedRun(t, bd, pp.dir, "label", "add", promoted, "keepme"); err != nil {
+			t.Fatalf("label add: %v\n%s", err, out)
+		}
+		if out, err := bdProxiedRun(t, bd, pp.dir, "comment", promoted, "survived promotion"); err != nil {
+			t.Fatalf("comment: %v\n%s", err, out)
+		}
+		// `bd promote` is not yet ported to proxied mode (bd-27bfd); produce
+		// the promoted shape directly: durable row, no_history flipped on.
+		db := openProxiedDB(t, pp)
+		if _, err := db.Exec("UPDATE issues SET no_history = 1 WHERE id = ?", promoted); err != nil {
+			t.Fatalf("flip no_history: %v", err)
+		}
+
+		stdout, stderr, err := bdProxiedRunBuffers(t, bd, pp.dir, "export")
+		if err != nil {
+			t.Fatalf("bd export: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		}
+		records := exportLines(t, stdout)
+		rec := exportIssueRecordByID(records, promoted)
+		if rec == nil {
+			t.Fatalf("export missing promoted no-history row %s (durable table membership must include it)", promoted)
+		}
+		if labels := exportStrings(rec["labels"]); len(labels) != 1 || labels[0] != "keepme" {
+			t.Errorf("promoted labels = %v, want [keepme] (durable-plane labels dropped?)", labels)
+		}
+		if texts := exportCommentTexts(rec["comments"]); len(texts) != 1 || texts[0] != "survived promotion" {
+			t.Errorf("promoted comments = %v, want [survived promotion] (durable-plane comments dropped?)", texts)
+		}
+		if cc, _ := rec["comment_count"].(float64); int(cc) != 1 {
+			t.Errorf("promoted comment_count = %v, want 1", rec["comment_count"])
 		}
 	})
 

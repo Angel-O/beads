@@ -18,8 +18,9 @@ import (
 //     call pattern.
 //   - uowExportSource reads through a proxied-server unit of work, whose
 //     domain use cases are plane-pinned (issues vs wisps tables) where the
-//     classic bulk loaders partition internally — the impl re-creates that
-//     partitioning so both modes read the same rows.
+//     classic bulk loaders partition internally — the impl queries both
+//     planes with the full ID set and merges, so both modes read the same
+//     rows regardless of which table an issue lives in.
 //
 // Everything downstream of these reads is shared code; the acceptance bar for
 // the seam is byte-identical JSONL output across modes.
@@ -150,16 +151,21 @@ func (s *uowExportSource) GetAllConfig(ctx context.Context) (map[string]string, 
 // plane-pinned domain use cases:
 //
 //   - Labels, comments, and comment counts: the classic loaders partition IDs
-//     by wisps-table membership (issueops.PartitionWispIDsInTx) and read each
-//     partition from its own plane. Here the partition falls out of the rows
-//     themselves: an issue scanned from the wisps table carries Ephemeral or
-//     NoHistory (mutually exclusive), a durable row carries neither.
+//     by wisps-table membership (issueops.PartitionWispIDsInTx). Row flags are
+//     NOT a substitute for that partition — a promoted no-history wisp is a
+//     durable issues-table row that still carries NoHistory=true — so both
+//     planes are queried with the FULL ID set and merged. The planes are
+//     ID-disjoint (GH#4455 cross-table guard), so at most one plane returns
+//     rows for any id and the merge cannot collide.
 //   - Dependency records: domain GetIssueDependencyRecords already partitions
 //     internally (same issueops helper), so one call covers both planes.
 //   - Dependency counts: classic GetDependencyCountsInTx queries BOTH dep
 //     tables for EVERY id and sums (a wisp blocking a durable issue
 //     contributes to the durable issue's dependent_count), so both planes are
 //     queried for the full ID set and summed here too.
+//
+// Wisp-plane reads tolerate a rig without the wisp tables (IsTableNotExist),
+// mirroring the dependency-counts leg.
 func (s *uowExportSource) LoadExportRelations(ctx context.Context, issues []*types.Issue) (exportRelations, error) {
 	rel := exportRelations{
 		labels:        map[string][]string{},
@@ -170,52 +176,52 @@ func (s *uowExportSource) LoadExportRelations(ctx context.Context, issues []*typ
 	}
 
 	allIDs := make([]string, 0, len(issues))
-	var permIDs, wispIDs []string
 	for _, issue := range issues {
 		allIDs = append(allIDs, issue.ID)
-		if issue.Ephemeral || issue.NoHistory {
-			wispIDs = append(wispIDs, issue.ID)
-		} else {
-			permIDs = append(permIDs, issue.ID)
-		}
 	}
 	if len(allIDs) == 0 {
 		return rel, nil
 	}
 
-	if len(permIDs) > 0 {
-		labels, err := s.uw.LabelUseCase().GetLabelsForIssues(ctx, permIDs)
-		if err != nil {
-			return exportRelations{}, fmt.Errorf("load labels: %w", err)
-		}
-		mergeExportMap(rel.labels, labels)
-		comments, err := s.uw.CommentUseCase().GetCommentsForIssues(ctx, permIDs)
-		if err != nil {
-			return exportRelations{}, fmt.Errorf("load comments: %w", err)
-		}
-		mergeExportMap(rel.comments, comments)
-		counts, err := s.uw.CommentUseCase().GetCommentCounts(ctx, permIDs)
-		if err != nil {
-			return exportRelations{}, fmt.Errorf("load comment counts: %w", err)
-		}
-		mergeExportMap(rel.commentCounts, counts)
+	labels, err := s.uw.LabelUseCase().GetLabelsForIssues(ctx, allIDs)
+	if err != nil {
+		return exportRelations{}, fmt.Errorf("load labels: %w", err)
 	}
-	if len(wispIDs) > 0 {
-		labels, err := s.uw.LabelUseCase().GetLabelsForWisps(ctx, wispIDs)
-		if err != nil {
+	mergeExportMap(rel.labels, labels)
+	comments, err := s.uw.CommentUseCase().GetCommentsForIssues(ctx, allIDs)
+	if err != nil {
+		return exportRelations{}, fmt.Errorf("load comments: %w", err)
+	}
+	mergeExportMap(rel.comments, comments)
+	counts, err := s.uw.CommentUseCase().GetCommentCounts(ctx, allIDs)
+	if err != nil {
+		return exportRelations{}, fmt.Errorf("load comment counts: %w", err)
+	}
+	mergeExportMap(rel.commentCounts, counts)
+
+	wispLabels, err := s.uw.LabelUseCase().GetLabelsForWisps(ctx, allIDs)
+	if err != nil {
+		if !dberrors.IsTableNotExist(err) {
 			return exportRelations{}, fmt.Errorf("load wisp labels: %w", err)
 		}
-		mergeExportMap(rel.labels, labels)
-		comments, err := s.uw.CommentUseCase().GetCommentsForWisps(ctx, wispIDs)
-		if err != nil {
+	} else {
+		mergeExportMap(rel.labels, wispLabels)
+	}
+	wispComments, err := s.uw.CommentUseCase().GetCommentsForWisps(ctx, allIDs)
+	if err != nil {
+		if !dberrors.IsTableNotExist(err) {
 			return exportRelations{}, fmt.Errorf("load wisp comments: %w", err)
 		}
-		mergeExportMap(rel.comments, comments)
-		counts, err := s.uw.CommentUseCase().GetWispCommentCounts(ctx, wispIDs)
-		if err != nil {
+	} else {
+		mergeExportMap(rel.comments, wispComments)
+	}
+	wispCounts, err := s.uw.CommentUseCase().GetWispCommentCounts(ctx, allIDs)
+	if err != nil {
+		if !dberrors.IsTableNotExist(err) {
 			return exportRelations{}, fmt.Errorf("load wisp comment counts: %w", err)
 		}
-		mergeExportMap(rel.commentCounts, counts)
+	} else {
+		mergeExportMap(rel.commentCounts, wispCounts)
 	}
 
 	deps, err := s.uw.DependencyUseCase().GetIssueDependencyRecords(ctx, allIDs)
