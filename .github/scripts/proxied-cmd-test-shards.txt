@@ -42,6 +42,7 @@
 15 3 TestProxiedServerUpdate2
 15 3 TestProxiedServerUpdateConcurrentMetadata
 
+15 4 TestProxiedServerCascadeParity
 15 4 TestProxiedServerClose2
 15 4 TestProxiedServerDeleteConcurrent
 15 4 TestProxiedServerDuplicates
