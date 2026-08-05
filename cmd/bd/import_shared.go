@@ -1049,14 +1049,7 @@ func parseJSONLFile(path string) ([]*types.Issue, map[string]string, error) {
 			continue
 		}
 
-		// v0.35–v0.37 exported "wisp" (bool), renamed to "ephemeral" in v0.38+.
-		// map old field name so the flag is preserved on import.
-		if _, hasWisp := peek["wisp"]; hasWisp && !issue.Ephemeral {
-			var wisp bool
-			if err := json.Unmarshal(peek["wisp"], &wisp); err == nil && wisp {
-				issue.Ephemeral = true
-			}
-		}
+		applyImportWispPlane(peek, &issue)
 
 		issue.SetDefaults()
 		issues = append(issues, &issue)
@@ -1066,6 +1059,54 @@ func parseJSONLFile(path string) ([]*types.Issue, map[string]string, error) {
 	}
 
 	return issues, configEntries, nil
+}
+
+// applyImportWispPlane resolves which storage plane (wisps vs issues table) a
+// parsed import record routes to, shared by every JSONL parse loop
+// (parseImportRecords for `bd import` in both storage modes, parseJSONLFile
+// for bootstrap / init --from-jsonl / auto-import).
+//
+// The "wisp" peek key is the EXPLICIT wisps-plane marker (bd-r9uce): export
+// writes it for rows that live in the wisps table, precisely because row
+// flags cannot be trusted for the plane decision — a promoted no-history
+// wisp is a durable issues-table row that may still carry no_history=true
+// (PromoteFromEphemeralInTx used to clear only Ephemeral, and wild data
+// with that shape persists). Routing such a record by flags re-planes it
+// into the wisps table, after which its cross-plane relations are dropped
+// by the batch import and the row itself is no longer durable — silent data
+// loss across export→import→export. So:
+//
+//   - "wisp": true            => wisps plane, whatever the flags say. For
+//     v0.35–v0.37 exports (which spelled "ephemeral" as "wisp" and predate
+//     no_history) the record carries neither flag, so Ephemeral is restored
+//     from the marker — the legacy-alias behavior, preserved.
+//   - marker absent or false  => a no_history=true record is pinned to the
+//     ISSUES plane (the promoted shape). The flag itself is preserved on the
+//     row — clearing it would change the content hash and break the
+//     byte-identity of export→import→export — only the routing is pinned.
+//   - anything else           => no override; flag inference (issueops.IsWisp)
+//     already routes it correctly.
+func applyImportWispPlane(peek map[string]json.RawMessage, issue *types.Issue) {
+	wispMarker := false
+	if raw, ok := peek["wisp"]; ok {
+		// A malformed marker is treated as absent (best-effort, like the
+		// legacy-alias parse always was).
+		_ = json.Unmarshal(raw, &wispMarker)
+	}
+	if wispMarker {
+		if !issue.Ephemeral && !issue.NoHistory {
+			// Legacy v0.35–v0.37 alias for "ephemeral".
+			issue.Ephemeral = true
+		}
+		wisp := true
+		issue.WispPlaneOverride = &wisp
+		return
+	}
+	if issue.NoHistory && !issue.Ephemeral {
+		// Promoted no-history wisp: durable row, stray flag. Pin it durable.
+		durable := false
+		issue.WispPlaneOverride = &durable
+	}
 }
 
 // importFromLocalJSONLFull imports issues and memories from a local JSONL file
