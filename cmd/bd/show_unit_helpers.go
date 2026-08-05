@@ -10,6 +10,19 @@ import (
 	"github.com/steveyegge/beads/internal/validation"
 )
 
+// showJSONIssueDetails is the CLI-only detail projection. RowVersion remains
+// absent from generic Issue JSON and JSONL, while `bd show --json` exposes the
+// opaque token required by guarded clients under the storage-neutral name
+// `revision`.
+type showJSONIssueDetails struct {
+	*types.IssueDetails
+	Revision int64 `json:"revision,omitempty"`
+}
+
+func projectShowJSONDetails(details *types.IssueDetails) showJSONIssueDetails {
+	return showJSONIssueDetails{IssueDetails: details, Revision: details.RowVersion}
+}
+
 // validateIssueUpdatable checks if an issue can be updated.
 // Uses the centralized validation package for consistency.
 func validateIssueUpdatable(id string, issue *types.Issue) error {
