@@ -375,24 +375,39 @@ func (s *DoltStore) ClaimReadyIssue(ctx context.Context, filter types.WorkFilter
 	// no real row locking — FOR UPDATE / SKIP LOCKED are parse-only no-ops
 	// (https://www.dolthub.com/blog/2023-10-23-hold-my-beer/) — so retry is the
 	// safety net. withRetryTx owns BeginTx and the final Commit.
-	write := func() (*types.Issue, error) {
-		var claimed *types.Issue
-		err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
-			var err error
-			claimed, err = issueops.ClaimReadyIssueInTx(ctx, tx, filter, actor)
-			if err != nil {
-				return err
-			}
-			if claimed == nil {
-				return nil
-			}
+	//
+	// The write and its verify sit under withCircuitWrite so terminal circuit
+	// success is recorded once at the boundary, only after verifiedReadyClaim
+	// confirms the claim landed — not the instant withRetryTx's SQL commit
+	// returns. A commit that reports success but fails verification must leave
+	// the breaker untouched (matching ClaimIssue).
+	var claimed *types.Issue
+	err := s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		write := func() (*types.Issue, error) {
+			var got *types.Issue
+			werr := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+				var err error
+				got, err = issueops.ClaimReadyIssueInTx(ctx, tx, filter, actor)
+				if err != nil {
+					return err
+				}
+				if got == nil {
+					return nil
+				}
 
-			commitMsg := fmt.Sprintf("bd: claim ready %s", claimed.ID)
-			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
-		})
-		return claimed, err
+				commitMsg := fmt.Sprintf("bd: claim ready %s", got.ID)
+				return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
+			})
+			return got, werr
+		}
+		var verr error
+		claimed, verr = s.verifiedReadyClaim(ctx, actor, write)
+		return verr
+	})
+	if err != nil {
+		return nil, err
 	}
-	return s.verifiedReadyClaim(ctx, actor, write)
+	return claimed, nil
 }
 
 // verifiedReadyClaim resolves a ready-claim write by verify-by-re-read
@@ -482,14 +497,20 @@ func (s *DoltStore) ReclaimExpiredLeases(ctx context.Context, olderThan time.Dur
 func (s *DoltStore) UnclaimIssue(ctx context.Context, id string, actor string, force bool) error {
 	// verify-by-re-read (bd-zccb9): a phantom unclaim leaves the caller
 	// believing the issue is released while it still holds the claim.
-	return s.verifiedClaimWrite(ctx, id, unclaimed(), func() error {
-		return s.withRetryTx(ctx, func(tx *sql.Tx) error {
-			if err := issueops.UnclaimIssueInTx(ctx, tx, id, actor, force); err != nil {
-				return err
-			}
+	//
+	// withCircuitWrite wraps the write and its verification so circuit success
+	// is recorded once at the boundary, only after verifiedClaimWrite confirms
+	// the release landed — never the moment withRetryTx's SQL commit returns.
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.verifiedClaimWrite(ctx, id, unclaimed(), func() error {
+			return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+				if err := issueops.UnclaimIssueInTx(ctx, tx, id, actor, force); err != nil {
+					return err
+				}
 
-			commitMsg := fmt.Sprintf("bd: unclaim %s", id)
-			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
+				commitMsg := fmt.Sprintf("bd: unclaim %s", id)
+				return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
+			})
 		})
 	})
 }
@@ -502,15 +523,20 @@ func (s *DoltStore) UnclaimIssue(ctx context.Context, id string, actor string, f
 // UnclaimIssue so a concurrent writer that loses Dolt's optimistic commit-time
 // merge is retried rather than surfaced as a hard failure.
 func (s *DoltStore) UnclaimIssueIfAssignee(ctx context.Context, id string, actor string, expectedAssignee string) error {
-	// verify-by-re-read (bd-zccb9), same reasoning as UnclaimIssue.
-	return s.verifiedClaimWrite(ctx, id, unclaimed(), func() error {
-		return s.withRetryTx(ctx, func(tx *sql.Tx) error {
-			if err := issueops.UnclaimIssueIfAssigneeInTx(ctx, tx, id, actor, expectedAssignee); err != nil {
-				return err
-			}
+	// verify-by-re-read (bd-zccb9), same reasoning as UnclaimIssue: the write
+	// and its verification sit under withCircuitWrite so circuit success is
+	// recorded once at the boundary, only after verifiedClaimWrite confirms the
+	// release landed.
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.verifiedClaimWrite(ctx, id, unclaimed(), func() error {
+			return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+				if err := issueops.UnclaimIssueIfAssigneeInTx(ctx, tx, id, actor, expectedAssignee); err != nil {
+					return err
+				}
 
-			commitMsg := fmt.Sprintf("bd: unclaim %s", id)
-			return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
+				commitMsg := fmt.Sprintf("bd: unclaim %s", id)
+				return s.doltAddAndCommitInTx(ctx, tx, []string{"issues", "events"}, commitMsg)
+			})
 		})
 	})
 }

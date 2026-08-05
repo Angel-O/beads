@@ -311,6 +311,62 @@ func TestClaimReadyIssueDoltCommitResponseLossDoesNotDoubleClaim(t *testing.T) {
 	}
 }
 
+// TestClaimReadyIssueVerifyFailureDoesNotRecordCircuitSuccess pins the fix for
+// the verify-gated circuit-accounting major: when the SQL write commits but the
+// post-write verify-by-re-read contradicts the reported success, the breaker
+// must NOT be reset. withCircuitWrite records terminal success only after
+// verifiedReadyClaim returns nil, and the nested withRetryTx / verify reads
+// defer their own success reset to that boundary. Before the fix, withRetryTx
+// reset the breaker the instant the SQL commit returned — laundering a phantom
+// claim (reported success, failed verification) into breaker-health optimism.
+func TestClaimReadyIssueVerifyFailureDoesNotRecordCircuitSuccess(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	// The commit succeeds (no commitErr/sqlCommitErr), but the verify re-read
+	// returns ("", open) — checkedUpdate stays false — which cannot match
+	// claimedBy("alice"), so the claim reports success then fails verification.
+	driver := &claimCommitBoundaryDriver{readyIDs: []string{"ready-first"}}
+	store := newClaimCommitBoundaryStore(driver)
+	store.serverMode = true
+	breaker := newTestCircuitBreaker(t)
+	store.breaker = breaker
+	t.Cleanup(func() { _ = store.db.Close() })
+
+	// Prime the breaker to one failure short of tripping. If the operation
+	// preserves the counter, one further failure trips it; if the write reset it
+	// (the bug), the counter is back to zero and one failure leaves it closed.
+	for i := 0; i < circuitFailureThreshold-1; i++ {
+		breaker.RecordFailure()
+	}
+	if state := breaker.State(); state != circuitClosed {
+		t.Fatalf("circuit state after priming = %q, want %q", state, circuitClosed)
+	}
+
+	claimed, err := store.ClaimReadyIssue(context.Background(), types.WorkFilter{}, "alice")
+	if err == nil {
+		t.Fatal("ClaimReadyIssue() error = nil, want a verification failure")
+	}
+	if claimed != nil {
+		t.Fatalf("ClaimReadyIssue() claimed = %+v, want nil when verify contradicts the reported success", claimed)
+	}
+
+	// The write must have reported success (the SQL tx committed) so the buggy
+	// path's premature RecordSuccess would have fired here.
+	driver.mu.Lock()
+	if driver.claimMutations != 1 || driver.doltCommits != 1 || driver.txCommits != 1 {
+		t.Fatalf("write outcome = mutations:%d Dolt commits:%d SQL commits:%d, want 1,1,1 (write must report success)",
+			driver.claimMutations, driver.doltCommits, driver.txCommits)
+	}
+	driver.mu.Unlock()
+
+	// The verify failure must have left the breaker's failure counter intact:
+	// one more failure trips it. Had the write recorded success before verify,
+	// the counter would be zero and this single failure would leave it closed.
+	breaker.RecordFailure()
+	if state := breaker.State(); state != circuitOpen {
+		t.Fatalf("circuit state after verify-failed claim + one failure = %q, want %q (RecordSuccess must not fire before verify)", state, circuitOpen)
+	}
+}
+
 func TestUpdateIssueCheckedMixedCoordinationCommitLossIsNotMasked(t *testing.T) {
 	driver := &claimCommitBoundaryDriver{
 		commitErr:      testConnectionLoss,

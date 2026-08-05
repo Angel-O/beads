@@ -788,46 +788,62 @@ func (s *DoltStore) withRetryClassified(ctx context.Context, op func() error, re
 	bo := newServerRetryBackoff()
 	err := backoff.Retry(func() error {
 		attempts++
-		err := op()
-		var permanent *backoff.PermanentError
-		if err != nil && errors.As(err, &permanent) {
-			return err
-		}
-		if err != nil && errors.Is(err, ErrCommitIndeterminate) {
-			if s.breaker != nil && isConnectionError(err) {
-				s.breaker.RecordFailure()
-				if s.breaker.State() == circuitOpen {
-					doltMetrics.circuitTrips.Add(ctx, 1)
-					return backoff.Permanent(fmt.Errorf("%w (circuit breaker tripped)", err))
-				}
-			}
-			return backoff.Permanent(err)
-		}
-		if err != nil && retryable(err) {
-			// Record connection-level failures to the circuit breaker
-			if s.breaker != nil && isConnectionError(err) {
-				s.breaker.RecordFailure()
-				// Check if the breaker just tripped — if so, stop retrying
-				if s.breaker.State() == circuitOpen {
-					doltMetrics.circuitTrips.Add(ctx, 1)
-					return backoff.Permanent(fmt.Errorf("%w (circuit breaker tripped)", err))
-				}
-			}
-			return err // Retryable - backoff will retry
-		}
-		if err != nil {
-			return backoff.Permanent(err) // Non-retryable - stop immediately
-		}
-		// Success — reset the circuit breaker
-		if !circuitWriteManaged(ctx) && s.breaker != nil {
-			s.breaker.RecordSuccess()
-		}
-		return nil
+		return s.classifyManagedRetry(ctx, op(), retryable)
 	}, backoff.WithContext(bo, ctx))
 	if attempts > 1 {
 		doltMetrics.retryCount.Add(ctx, int64(attempts-1))
 	}
 	return err
+}
+
+// classifyManagedRetry maps one attempt's result to a backoff decision: nil to
+// stop on success, a bare error to retry, or a backoff.Permanent to stop on
+// failure. It owns the attempt's breaker accounting, deferring the success reset
+// to an outer withCircuitWrite boundary when one is active (circuitWriteManaged).
+func (s *DoltStore) classifyManagedRetry(ctx context.Context, err error, retryable func(error) bool) error {
+	if err == nil {
+		if !circuitWriteManaged(ctx) && s.breaker != nil {
+			s.breaker.RecordSuccess()
+		}
+		return nil
+	}
+	// An already-permanent error (e.g. a callback-entered RunInTransaction
+	// failure) is terminal and must not be re-wrapped.
+	var permanent *backoff.PermanentError
+	if errors.As(err, &permanent) {
+		return err
+	}
+	// An indeterminate commit is never replayed — replay could double-apply —
+	// but a connection loss still feeds the breaker before we stop.
+	if errors.Is(err, ErrCommitIndeterminate) {
+		if tripped := s.recordRetryFailure(ctx, err); tripped != nil {
+			return tripped
+		}
+		return backoff.Permanent(err)
+	}
+	if retryable(err) {
+		if tripped := s.recordRetryFailure(ctx, err); tripped != nil {
+			return tripped
+		}
+		return err // backoff will retry
+	}
+	return backoff.Permanent(err) // non-retryable — stop immediately
+}
+
+// recordRetryFailure records a connection-level failure to the breaker. It
+// returns a permanent "circuit breaker tripped" error when this failure trips
+// the breaker — signaling the retry loop to stop — and nil otherwise, including
+// when err is not a connection error or no breaker is configured.
+func (s *DoltStore) recordRetryFailure(ctx context.Context, err error) error {
+	if s.breaker == nil || !isConnectionError(err) {
+		return nil
+	}
+	s.breaker.RecordFailure()
+	if s.breaker.State() == circuitOpen {
+		doltMetrics.circuitTrips.Add(ctx, 1)
+		return backoff.Permanent(fmt.Errorf("%w (circuit breaker tripped)", err))
+	}
+	return nil
 }
 
 // doltTracer is the OTel tracer for SQL-level spans.

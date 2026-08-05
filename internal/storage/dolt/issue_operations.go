@@ -113,34 +113,50 @@ func updateClaimPostcondition(request issueops.UpdateRequest) (claimPostconditio
 }
 
 // hasNonCoordinationPatch reports whether an update also changes state that an
-// assignee/status re-read cannot prove. Keep this explicit so every patch
-// operation is visibly classified without making the request shape reflective.
+// assignee/status re-read cannot prove.
 func hasNonCoordinationPatch(patch issueops.IssuePatch) bool {
-	return patch.Title.Set ||
-		patch.Description.Set ||
-		patch.Design.Set ||
-		patch.AcceptanceCriteria.Set ||
-		patch.Notes.Set ||
-		patch.AppendNotes.Set ||
-		patch.SpecID.Set ||
-		patch.AwaitID.Set ||
-		patch.Priority.Set ||
-		patch.IssueType.Set ||
-		patch.Owner.Set ||
-		patch.ClosedBySession.Set ||
-		patch.EstimatedMinutes.Set ||
-		patch.ExternalRef.Set ||
-		patch.DueAt.Set ||
-		patch.DeferUntil.Set ||
-		patch.Persistence.Set ||
-		patch.ParentID.Set ||
-		len(patch.Labels.Add) != 0 ||
-		len(patch.Labels.Remove) != 0 ||
-		patch.Labels.Replace.Set ||
-		len(patch.Metadata.Set) != 0 ||
-		len(patch.Metadata.Unset) != 0 ||
-		patch.Metadata.Replace.Set ||
-		patch.Metadata.Merge.Set
+	for _, changed := range nonCoordinationPatchSignals(patch) {
+		if changed {
+			return true
+		}
+	}
+	return false
+}
+
+// nonCoordinationPatchSignals enumerates a "changed" bool for every settable
+// IssuePatch field except the coordination pair (Assignee, Status) — the only
+// two an assignee/status re-read can prove. Keep this explicit rather than
+// reflective so each field is visibly classified; add a signal here whenever
+// IssuePatch, LabelPatch, or MetadataPatch grows a field. TestNonCoordination*
+// fails until you do.
+func nonCoordinationPatchSignals(patch issueops.IssuePatch) []bool {
+	return []bool{
+		patch.Title.Set,
+		patch.Description.Set,
+		patch.Design.Set,
+		patch.AcceptanceCriteria.Set,
+		patch.Notes.Set,
+		patch.AppendNotes.Set,
+		patch.SpecID.Set,
+		patch.AwaitID.Set,
+		patch.Priority.Set,
+		patch.IssueType.Set,
+		patch.Owner.Set,
+		patch.ClosedBySession.Set,
+		patch.EstimatedMinutes.Set,
+		patch.ExternalRef.Set,
+		patch.DueAt.Set,
+		patch.DeferUntil.Set,
+		patch.Persistence.Set,
+		patch.ParentID.Set,
+		len(patch.Labels.Add) != 0,
+		len(patch.Labels.Remove) != 0,
+		patch.Labels.Replace.Set,
+		len(patch.Metadata.Set) != 0,
+		len(patch.Metadata.Unset) != 0,
+		patch.Metadata.Replace.Set,
+		patch.Metadata.Merge.Set,
+	}
 }
 
 func (o *issueOperations) Close(ctx context.Context, request issueops.CloseRequest) (issueops.CloseResult, error) {
