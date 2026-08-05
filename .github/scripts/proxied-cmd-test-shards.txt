@@ -84,6 +84,7 @@
 15 8 TestProxiedServerServeClaim
 15 8 TestProxiedServerServeReadParity
 
+15 9 TestProxiedServerBatchParity
 15 9 TestProxiedServerDep2
 15 9 TestProxiedServerGraph
 15 9 TestProxiedServerMolProgress
