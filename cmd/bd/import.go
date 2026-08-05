@@ -440,10 +440,10 @@ func renderImportOutcome(result importResultJSON, source string, dedupHits int) 
 	}
 	fmt.Fprintf(os.Stderr, " from %s", source)
 	if dedupHits > 0 {
-		fmt.Fprintf(os.Stderr, " (%d duplicates skipped)", dedupHits)
+		fmt.Fprintf(os.Stderr, " (%d duplicates skipped)", dedupHits) //nolint:gosec // G705: stderr, not a browser context
 	}
 	if staleSkipped := result.Skipped - dedupHits; staleSkipped > 0 {
-		fmt.Fprintf(os.Stderr, " (%d stale skipped; use --allow-stale to restore older rows)", staleSkipped)
+		fmt.Fprintf(os.Stderr, " (%d stale skipped; use --allow-stale to restore older rows)", staleSkipped) //nolint:gosec // G705: stderr, not a browser context
 	}
 	fmt.Fprintln(os.Stderr)
 	if len(result.UpdatedIssues) > 0 {

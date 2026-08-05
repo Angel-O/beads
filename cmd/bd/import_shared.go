@@ -389,7 +389,7 @@ func writeImportRowChunks(ctx context.Context, store storage.DoltStorage, ordere
 		if err := store.CreateIssuesWithFullOptions(ctx, ordered[start:end], actor, rowOpts); err != nil {
 			return fmt.Errorf("import chunk %d/%d failed, %d issues already committed (committed rows are durable; re-run the import to resume — it converges): %w", chunk, chunks, start, err)
 		}
-		fmt.Fprintf(importProgress, "bd import: %d/%d issues committed\n", end, total)
+		fmt.Fprintf(importProgress, "bd import: %d/%d issues committed\n", end, total) //nolint:gosec // G705: stderr, not a browser context
 	}
 	return nil
 }
