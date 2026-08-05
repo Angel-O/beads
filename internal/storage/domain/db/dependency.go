@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -348,31 +349,95 @@ func (r *dependencySQLRepositoryImpl) ListByIssueIDs(ctx context.Context, issueI
 		return result, nil
 	}
 
-	idPlaceholders, idArgs := buildInPlaceholders(issueIDs)
+	if len(issueIDs) > unfilteredDepScanThreshold {
+		return r.listByIssueIDsUnfiltered(ctx, issueIDs, opts)
+	}
+
 	typeWhere, typeArgs := buildTypeFilter(opts.Types)
 	table := pickDepTable(opts.UseWispsTable)
 
-	if opts.Direction == domain.DepDirectionBoth || opts.Direction == domain.DepDirectionOut {
-		//nolint:gosec // G201: table and depSelectColumns are hardcoded
-		q := fmt.Sprintf(
-			`SELECT %s FROM %s WHERE issue_id IN (%s)%s ORDER BY issue_id`,
-			depSelectColumns, table, idPlaceholders, typeWhere,
-		)
-		args := combineArgs(idArgs, typeArgs)
-		if err := r.queryDeps(ctx, q, args, result.Outgoing, true); err != nil {
-			return domain.DepBulkResult{}, fmt.Errorf("db: DependencySQLRepository.ListByIssueIDs (out): %w", err)
+	for _, batch := range chunkIDs(issueIDs) {
+		idPlaceholders, idArgs := buildInPlaceholders(batch)
+
+		if opts.Direction == domain.DepDirectionBoth || opts.Direction == domain.DepDirectionOut {
+			//nolint:gosec // G201: table and depSelectColumns are hardcoded
+			q := fmt.Sprintf(
+				`SELECT %s FROM %s WHERE issue_id IN (%s)%s ORDER BY issue_id`,
+				depSelectColumns, table, idPlaceholders, typeWhere,
+			)
+			args := combineArgs(idArgs, typeArgs)
+			if err := r.queryDeps(ctx, q, args, result.Outgoing, true); err != nil {
+				return domain.DepBulkResult{}, fmt.Errorf("db: DependencySQLRepository.ListByIssueIDs (out): %w", err)
+			}
+		}
+
+		if opts.Direction == domain.DepDirectionBoth || opts.Direction == domain.DepDirectionIn {
+			//nolint:gosec // G201: table, depSelectColumns, depTargetExpr are hardcoded
+			q := fmt.Sprintf(
+				`SELECT %s FROM %s WHERE %s IN (%s)%s ORDER BY issue_id`,
+				depSelectColumns, table, depTargetExpr, idPlaceholders, typeWhere,
+			)
+			args := combineArgs(idArgs, typeArgs)
+			if err := r.queryDeps(ctx, q, args, result.Incoming, false); err != nil {
+				return domain.DepBulkResult{}, fmt.Errorf("db: DependencySQLRepository.ListByIssueIDs (in): %w", err)
+			}
 		}
 	}
 
-	if opts.Direction == domain.DepDirectionBoth || opts.Direction == domain.DepDirectionIn {
-		//nolint:gosec // G201: table, depSelectColumns, depTargetExpr are hardcoded
-		q := fmt.Sprintf(
-			`SELECT %s FROM %s WHERE %s IN (%s)%s ORDER BY issue_id`,
-			depSelectColumns, table, depTargetExpr, idPlaceholders, typeWhere,
-		)
-		args := combineArgs(idArgs, typeArgs)
-		if err := r.queryDeps(ctx, q, args, result.Incoming, false); err != nil {
-			return domain.DepBulkResult{}, fmt.Errorf("db: DependencySQLRepository.ListByIssueIDs (in): %w", err)
+	return result, nil
+}
+
+func (r *dependencySQLRepositoryImpl) listByIssueIDsUnfiltered(ctx context.Context, issueIDs []string, opts domain.DepListOpts) (domain.DepBulkResult, error) {
+	result := domain.DepBulkResult{
+		Outgoing: make(map[string][]*types.Dependency),
+		Incoming: make(map[string][]*types.Dependency),
+	}
+
+	wantOutgoing := opts.Direction == domain.DepDirectionBoth || opts.Direction == domain.DepDirectionOut
+	wantIncoming := opts.Direction == domain.DepDirectionBoth || opts.Direction == domain.DepDirectionIn
+	if !wantOutgoing && !wantIncoming {
+		return result, nil
+	}
+
+	wanted := make(map[string]struct{}, len(issueIDs))
+	for _, id := range issueIDs {
+		wanted[id] = struct{}{}
+	}
+
+	typeWhere, typeArgs := buildTypeFilter(opts.Types)
+	whereSQL := ""
+	if typeWhere != "" {
+		whereSQL = " WHERE " + strings.TrimPrefix(typeWhere, " AND ")
+	}
+	table := pickDepTable(opts.UseWispsTable)
+
+	//nolint:gosec // G201: table and depSelectColumns are hardcoded; the type filter is parameterized.
+	q := fmt.Sprintf(`SELECT %s FROM %s%s ORDER BY issue_id`, depSelectColumns, table, whereSQL)
+	bySource := make(map[string][]*types.Dependency)
+	if err := r.queryDeps(ctx, q, typeArgs, bySource, true); err != nil {
+		return domain.DepBulkResult{}, fmt.Errorf("db: DependencySQLRepository.ListByIssueIDs (unfiltered): %w", err)
+	}
+
+	if wantOutgoing {
+		for id := range wanted {
+			if deps, ok := bySource[id]; ok {
+				result.Outgoing[id] = deps
+			}
+		}
+	}
+
+	if wantIncoming {
+		sources := make([]string, 0, len(bySource))
+		for id := range bySource {
+			sources = append(sources, id)
+		}
+		sort.Strings(sources)
+		for _, source := range sources {
+			for _, dep := range bySource[source] {
+				if _, ok := wanted[dep.DependsOnID]; ok {
+					result.Incoming[dep.DependsOnID] = append(result.Incoming[dep.DependsOnID], dep)
+				}
+			}
 		}
 	}
 
@@ -388,25 +453,28 @@ func (r *dependencySQLRepositoryImpl) CountsByIssueIDs(ctx context.Context, issu
 		result[id] = &types.DependencyCounts{}
 	}
 
-	idPlaceholders, idArgs := buildInPlaceholders(issueIDs)
 	table := pickDepTable(opts.UseWispsTable)
 
-	//nolint:gosec // G201: table is one of two hardcoded constants
-	outQ := fmt.Sprintf(
-		`SELECT issue_id, COUNT(*) FROM %s WHERE issue_id IN (%s) AND type = 'blocks' GROUP BY issue_id`,
-		table, idPlaceholders,
-	)
-	if err := scanCounts(ctx, r.runner, outQ, idArgs, result, func(c *types.DependencyCounts, n int) { c.DependencyCount = n }); err != nil {
-		return nil, fmt.Errorf("db: DependencySQLRepository.CountsByIssueIDs (out): %w", err)
-	}
+	for _, batch := range chunkIDs(issueIDs) {
+		idPlaceholders, idArgs := buildInPlaceholders(batch)
 
-	//nolint:gosec // G201: table and depTargetExpr are hardcoded
-	inQ := fmt.Sprintf(
-		`SELECT %s AS depends_on_id, COUNT(*) FROM %s WHERE %s IN (%s) AND type = 'blocks' GROUP BY %s`,
-		depTargetExpr, table, depTargetExpr, idPlaceholders, depTargetExpr,
-	)
-	if err := scanCounts(ctx, r.runner, inQ, idArgs, result, func(c *types.DependencyCounts, n int) { c.DependentCount = n }); err != nil {
-		return nil, fmt.Errorf("db: DependencySQLRepository.CountsByIssueIDs (in): %w", err)
+		//nolint:gosec // G201: table is one of two hardcoded constants
+		outQ := fmt.Sprintf(
+			`SELECT issue_id, COUNT(*) FROM %s WHERE issue_id IN (%s) AND type = 'blocks' GROUP BY issue_id`,
+			table, idPlaceholders,
+		)
+		if err := scanCounts(ctx, r.runner, outQ, idArgs, result, func(c *types.DependencyCounts, n int) { c.DependencyCount = n }); err != nil {
+			return nil, fmt.Errorf("db: DependencySQLRepository.CountsByIssueIDs (out): %w", err)
+		}
+
+		//nolint:gosec // G201: table and depTargetExpr are hardcoded
+		inQ := fmt.Sprintf(
+			`SELECT %s AS depends_on_id, COUNT(*) FROM %s WHERE %s IN (%s) AND type = 'blocks' GROUP BY %s`,
+			depTargetExpr, table, depTargetExpr, idPlaceholders, depTargetExpr,
+		)
+		if err := scanCounts(ctx, r.runner, inQ, idArgs, result, func(c *types.DependencyCounts, n int) { c.DependentCount = n }); err != nil {
+			return nil, fmt.Errorf("db: DependencySQLRepository.CountsByIssueIDs (in): %w", err)
+		}
 	}
 
 	return result, nil
@@ -423,26 +491,32 @@ func (r *dependencySQLRepositoryImpl) GetBlockingInfo(ctx context.Context, issue
 	}
 
 	table := pickDepTable(opts.UseWispsTable)
-	idPlaceholders, idArgs := buildInPlaceholders(issueIDs)
 
-	//nolint:gosec // G201: table and depTargetExpr are hardcoded constants
-	outQ := fmt.Sprintf(
-		"SELECT issue_id, %s AS depends_on_id, type FROM %s WHERE issue_id IN (%s) AND type IN ('blocks', 'parent-child')",
-		depTargetExpr, table, idPlaceholders,
-	)
-	outRows, err := r.scanBlockingRows(ctx, outQ, idArgs)
-	if err != nil {
-		return domain.BlockingInfo{}, fmt.Errorf("db: DependencySQLRepository.GetBlockingInfo: outbound: %w", err)
-	}
+	var outRows, inRows []blockingRow
+	for _, batch := range chunkIDs(issueIDs) {
+		idPlaceholders, idArgs := buildInPlaceholders(batch)
 
-	//nolint:gosec // G201: table and depTargetExpr are hardcoded constants
-	inQ := fmt.Sprintf(
-		"SELECT issue_id, %s AS depends_on_id, type FROM %s WHERE %s IN (%s) AND type = 'blocks'",
-		depTargetExpr, table, depTargetExpr, idPlaceholders,
-	)
-	inRows, err := r.scanBlockingRows(ctx, inQ, idArgs)
-	if err != nil {
-		return domain.BlockingInfo{}, fmt.Errorf("db: DependencySQLRepository.GetBlockingInfo: inbound: %w", err)
+		//nolint:gosec // G201: table and depTargetExpr are hardcoded constants
+		outQ := fmt.Sprintf(
+			"SELECT issue_id, %s AS depends_on_id, type FROM %s WHERE issue_id IN (%s) AND type IN ('blocks', 'parent-child')",
+			depTargetExpr, table, idPlaceholders,
+		)
+		batchOut, err := r.scanBlockingRows(ctx, outQ, idArgs)
+		if err != nil {
+			return domain.BlockingInfo{}, fmt.Errorf("db: DependencySQLRepository.GetBlockingInfo: outbound: %w", err)
+		}
+		outRows = append(outRows, batchOut...)
+
+		//nolint:gosec // G201: table and depTargetExpr are hardcoded constants
+		inQ := fmt.Sprintf(
+			"SELECT issue_id, %s AS depends_on_id, type FROM %s WHERE %s IN (%s) AND type = 'blocks'",
+			depTargetExpr, table, depTargetExpr, idPlaceholders,
+		)
+		batchIn, err := r.scanBlockingRows(ctx, inQ, idArgs)
+		if err != nil {
+			return domain.BlockingInfo{}, fmt.Errorf("db: DependencySQLRepository.GetBlockingInfo: inbound: %w", err)
+		}
+		inRows = append(inRows, batchIn...)
 	}
 
 	statusIDs := make(map[string]struct{})
@@ -537,13 +611,15 @@ func (r *dependencySQLRepositoryImpl) loadStatusByID(ctx context.Context, idSet 
 	for id := range idSet {
 		ids = append(ids, id)
 	}
-	placeholders, args := buildInPlaceholders(ids)
 	sourceByID := make(map[string]string, len(idSet))
 	for _, table := range []string{"issues", "wisps"} {
-		//nolint:gosec // G201: table is a hardcoded constant
-		q := fmt.Sprintf("SELECT id, status FROM %s WHERE id IN (%s)", table, placeholders)
-		if err := r.scanStatusRows(ctx, q, args, table, statusByID, sourceByID); err != nil {
-			return nil, err
+		for _, batch := range chunkIDs(ids) {
+			placeholders, args := buildInPlaceholders(batch)
+			//nolint:gosec // G201: table is a hardcoded constant
+			q := fmt.Sprintf("SELECT id, status FROM %s WHERE id IN (%s)", table, placeholders)
+			if err := r.scanStatusRows(ctx, q, args, table, statusByID, sourceByID); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return statusByID, nil
@@ -633,6 +709,26 @@ func scanCounts(ctx context.Context, runner Runner, q string, args []any, into m
 		}
 	}
 	return rows.Err()
+}
+
+const unfilteredDepScanThreshold = 2000
+
+func chunkIDs[T ~string](values []T) [][]T {
+	if len(values) == 0 {
+		return nil
+	}
+	if len(values) <= queryBatchSize {
+		return [][]T{values}
+	}
+	out := make([][]T, 0, (len(values)+queryBatchSize-1)/queryBatchSize)
+	for start := 0; start < len(values); start += queryBatchSize {
+		end := start + queryBatchSize
+		if end > len(values) {
+			end = len(values)
+		}
+		out = append(out, values[start:end])
+	}
+	return out
 }
 
 func buildInPlaceholders[T ~string](values []T) (string, []any) {

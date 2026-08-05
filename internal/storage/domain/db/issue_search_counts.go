@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/steveyegge/beads/internal/storage/dberrors"
@@ -55,7 +56,55 @@ func (r *issueSQLRepositoryImpl) searchAcrossIssuesAndWispsWithCounts(ctx contex
 		return finishSearchCountsPage(out, filter.Limit), nil
 	}
 
+	if filter.Limit <= 0 && filter.Offset <= 0 {
+		return r.searchMergedWithCounts(ctx, query, filter, wispDepsExist)
+	}
+
 	return r.searchUnionWithCounts(ctx, query, filter, wispDepsExist)
+}
+
+func (r *issueSQLRepositoryImpl) searchMergedWithCounts(ctx context.Context, query string, filter types.IssueFilter, wispDepsExist bool) (domain.SearchCountsPage, error) {
+	issues, err := r.runFilterSearchQuery(ctx, query, filter, issuesFilterTables, wispDepsExist)
+	if err != nil {
+		return domain.SearchCountsPage{}, fmt.Errorf("search merged with counts (issues): %w", err)
+	}
+
+	wisps, err := r.runFilterSearchQuery(ctx, query, filter, wispsFilterTables, true)
+	if err != nil && !dberrors.IsTableNotExist(err) {
+		return domain.SearchCountsPage{}, fmt.Errorf("search merged with counts (wisps): %w", err)
+	}
+
+	merged, err := mergeCountsPlanes(issues, wisps, filter.SortBy, filter.SortDesc)
+	if err != nil {
+		return domain.SearchCountsPage{}, fmt.Errorf("search merged with counts: %w", err)
+	}
+	return domain.SearchCountsPage{Items: merged}, nil
+}
+
+func mergeCountsPlanes(issues, wisps []*types.IssueWithCounts, sortBy string, sortDesc bool) ([]*types.IssueWithCounts, error) {
+	out := make([]*types.IssueWithCounts, 0, len(issues)+len(wisps))
+	seen := make(map[string]struct{}, len(issues))
+	for _, iwc := range issues {
+		if iwc == nil || iwc.Issue == nil {
+			continue
+		}
+		seen[iwc.Issue.ID] = struct{}{}
+		out = append(out, iwc)
+	}
+	for _, w := range wisps {
+		if w == nil || w.Issue == nil {
+			continue
+		}
+		if _, dup := seen[w.Issue.ID]; dup {
+			return nil, fmt.Errorf("id %q exists in both issues and wisps", w.Issue.ID)
+		}
+		seen[w.Issue.ID] = struct{}{}
+		out = append(out, w)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return sqlbuild.Less(out[i].Issue, out[j].Issue, sortBy, sortDesc)
+	})
+	return out, nil
 }
 
 func (r *issueSQLRepositoryImpl) searchUnionWithCounts(ctx context.Context, query string, filter types.IssueFilter, wispDepsExist bool) (domain.SearchCountsPage, error) {

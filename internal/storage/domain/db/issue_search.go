@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/steveyegge/beads/internal/storage/dberrors"
@@ -55,7 +56,55 @@ func (r *issueSQLRepositoryImpl) searchAcrossIssuesAndWisps(ctx context.Context,
 		return page, nil
 	}
 
+	if filter.Limit <= 0 && filter.Offset <= 0 {
+		return r.searchMerged(ctx, query, filter)
+	}
+
 	return r.searchUnion(ctx, query, filter)
+}
+
+func (r *issueSQLRepositoryImpl) searchMerged(ctx context.Context, query string, filter types.IssueFilter) (domain.SearchPage, error) {
+	issuePage, err := r.searchTable(ctx, query, filter, issuesFilterTables)
+	if err != nil {
+		return domain.SearchPage{}, fmt.Errorf("search merged (issues): %w", err)
+	}
+
+	wispPage, err := r.searchTable(ctx, query, filter, wispsFilterTables)
+	if err != nil && !dberrors.IsTableNotExist(err) {
+		return domain.SearchPage{}, fmt.Errorf("search merged (wisps): %w", err)
+	}
+
+	merged, err := mergeIssuePlanes(issuePage.Items, wispPage.Items, filter.SortBy, filter.SortDesc)
+	if err != nil {
+		return domain.SearchPage{}, fmt.Errorf("search merged: %w", err)
+	}
+	return domain.SearchPage{Items: merged}, nil
+}
+
+func mergeIssuePlanes(issues, wisps []*types.Issue, sortBy string, sortDesc bool) ([]*types.Issue, error) {
+	out := make([]*types.Issue, 0, len(issues)+len(wisps))
+	seen := make(map[string]struct{}, len(issues))
+	for _, issue := range issues {
+		if issue == nil {
+			continue
+		}
+		seen[issue.ID] = struct{}{}
+		out = append(out, issue)
+	}
+	for _, w := range wisps {
+		if w == nil {
+			continue
+		}
+		if _, dup := seen[w.ID]; dup {
+			return nil, fmt.Errorf("id %q exists in both issues and wisps", w.ID)
+		}
+		seen[w.ID] = struct{}{}
+		out = append(out, w)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return sqlbuild.Less(out[i], out[j], sortBy, sortDesc)
+	})
+	return out, nil
 }
 
 func (r *issueSQLRepositoryImpl) searchUnion(ctx context.Context, query string, filter types.IssueFilter) (domain.SearchPage, error) {
