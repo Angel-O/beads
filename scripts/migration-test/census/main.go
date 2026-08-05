@@ -287,91 +287,23 @@ func defaultCacheDir() (string, error) {
 }
 
 func generate(ctx context.Context, catalogPath, outputPath, cache string) (err error) {
-	if err := requireCensusPlatform(runtime.GOOS, runtime.GOARCH); err != nil {
-		return err
-	}
-	if err := enableHistoricalProcessContainment(); err != nil {
-		return err
-	}
-	if err := requireHistoricalDoltAutoDetectPortsFree(3306, 3307); err != nil {
-		return err
-	}
-	catalog, raw, err := readCatalog(catalogPath, true)
+	catalog, raw, err := prepareFreshGeneration(catalogPath, cache)
 	if err != nil {
 		return err
-	}
-	if err := os.MkdirAll(cache, 0o755); err != nil {
-		return fmt.Errorf("create census cache: %w", err)
-	}
-	if err := validateSourceBuildCache(cache, catalog); err != nil {
-		return fmt.Errorf("validate census cache before generation: %w", err)
 	}
 	observations := make([]observation, 0, len(catalog.Versions))
 	families := map[string]family{}
 	freshBinaries := make(map[freshBinaryKey]freshBinary, len(catalog.Versions))
 	for _, entry := range catalog.Versions {
-		binary, acquired, err := acquireBinary(ctx, entry, cache)
+		entryObservations, entryFamilies, binariesByAcquisition, err := acquireEntryObservations(ctx, entry, cache)
 		if err != nil {
-			return fmt.Errorf("%s: acquire binary: %w", entry.Version, err)
+			return err
 		}
-		fresh, err := bindFreshBinary(binary, acquired)
-		if err != nil {
-			return fmt.Errorf("%s: bind fresh binary: %w", entry.Version, err)
+		if err := bindEntryFreshBinaries(freshBinaries, entry.Version, entryObservations, entryFamilies, binariesByAcquisition); err != nil {
+			return err
 		}
-		binariesByAcquisition := map[acquisition]freshBinary{acquired: fresh}
-		binary, err = verifyFreshBinary(fresh)
-		if err != nil {
-			return fmt.Errorf("%s: verify fresh binary: %w", entry.Version, err)
-		}
-		releaseContext := withHistoricalBinaryBinding(ctx, fresh)
-		releaseObservations, releaseFamilies, failures, err := observeFreshRelease(releaseContext, binary, entry, acquired)
-		if err != nil {
-			return fmt.Errorf("%s: fresh observations: %w", entry.Version, err)
-		}
-		if failures.any() && acquired.Kind == "release-asset" {
-			sourceBinary, err := acquireSourceBuild(ctx, entry, cache)
-			if err != nil {
-				return fmt.Errorf("%s: acquire authenticated source fallback: %w", entry.Version, err)
-			}
-			sourceAcquired, err := recordAcquisition("source-build", entry, sourceBinary, "release-asset-runtime-failure")
-			if err != nil {
-				return fmt.Errorf("%s: record authenticated source fallback: %w", entry.Version, err)
-			}
-			sourceFresh, err := bindFreshBinary(sourceBinary, sourceAcquired)
-			if err != nil {
-				return fmt.Errorf("%s: bind authenticated source fallback: %w", entry.Version, err)
-			}
-			sourceBinary, err = verifyFreshBinary(sourceFresh)
-			if err != nil {
-				return fmt.Errorf("%s: verify authenticated source fallback: %w", entry.Version, err)
-			}
-			sourceContext := withHistoricalBinaryBinding(ctx, sourceFresh)
-			fallbackObservations, fallbackFamilies, fallbackErr := retryFreshFailures(sourceContext, sourceBinary, entry, sourceAcquired, failures, releaseObservations)
-			if fallbackErr != nil {
-				return fmt.Errorf("%s: authenticated source fallback failed: %w", entry.Version, fallbackErr)
-			}
-			binariesByAcquisition[sourceAcquired] = sourceFresh
-			releaseObservations = append(releaseObservations, fallbackObservations...)
-			releaseFamilies = append(releaseFamilies, fallbackFamilies...)
-		}
-		familyModes := make(map[string]string, len(releaseFamilies))
-		for _, observedFamily := range releaseFamilies {
-			familyModes[observedFamily.ID] = observedFamily.Mode
-		}
-		for _, observed := range releaseObservations {
-			mode := familyModes[observed.FamilyID]
-			fresh, found := binariesByAcquisition[observed.Acquisition]
-			if mode == "" || !found {
-				return fmt.Errorf("%s/%s: cannot bind fresh binary to observed family", entry.Version, observed.Scenario)
-			}
-			key := freshBinaryKey{version: observed.Version, mode: mode}
-			if prior, exists := freshBinaries[key]; exists && prior.acquisition != observed.Acquisition {
-				return fmt.Errorf("%s/%s: fresh binaries disagree on acquisition", observed.Version, mode)
-			}
-			freshBinaries[key] = fresh
-		}
-		observations = append(observations, releaseObservations...)
-		for _, observedFamily := range releaseFamilies {
+		observations = append(observations, entryObservations...)
+		for _, observedFamily := range entryFamilies {
 			families[observedFamily.ID] = observedFamily
 		}
 	}
@@ -400,6 +332,131 @@ func generate(ctx context.Context, catalogPath, outputPath, cache string) (err e
 		return err
 	}
 	return atomicfile.WriteFile(outputPath, raw, 0o644) //nolint:gosec // output is an explicit CLI argument.
+}
+
+// prepareFreshGeneration runs the census generation preflight guards and loads
+// the pinned catalog, returning the parsed catalog and its raw bytes.
+func prepareFreshGeneration(catalogPath, cache string) (catalog, []byte, error) {
+	if err := requireCensusPlatform(runtime.GOOS, runtime.GOARCH); err != nil {
+		return catalog{}, nil, err
+	}
+	if err := enableHistoricalProcessContainment(); err != nil {
+		return catalog{}, nil, err
+	}
+	if err := requireHistoricalDoltAutoDetectPortsFree(3306, 3307); err != nil {
+		return catalog{}, nil, err
+	}
+	parsed, raw, err := readCatalog(catalogPath, true)
+	if err != nil {
+		return catalog{}, nil, err
+	}
+	if err := os.MkdirAll(cache, 0o755); err != nil {
+		return catalog{}, nil, fmt.Errorf("create census cache: %w", err)
+	}
+	if err := validateSourceBuildCache(cache, parsed); err != nil {
+		return catalog{}, nil, fmt.Errorf("validate census cache before generation: %w", err)
+	}
+	return parsed, raw, nil
+}
+
+// acquireEntryObservations observes one catalog entry's fresh release, falling
+// back to an authenticated source build when a release-asset runtime fails. It
+// returns the entry's observations and families plus the fresh binaries keyed by
+// the acquisition that produced them.
+func acquireEntryObservations(ctx context.Context, entry catalogEntry, cache string) ([]observation, []family, map[acquisition]freshBinary, error) {
+	binary, acquired, err := acquireBinary(ctx, entry, cache)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("%s: acquire binary: %w", entry.Version, err)
+	}
+	fresh, err := bindFreshBinary(binary, acquired)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("%s: bind fresh binary: %w", entry.Version, err)
+	}
+	binariesByAcquisition := map[acquisition]freshBinary{acquired: fresh}
+	binary, err = verifyFreshBinary(fresh)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("%s: verify fresh binary: %w", entry.Version, err)
+	}
+	releaseContext := withHistoricalBinaryBinding(ctx, fresh)
+	releaseObservations, releaseFamilies, failures, err := observeFreshRelease(releaseContext, binary, entry, acquired)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("%s: fresh observations: %w", entry.Version, err)
+	}
+	if failures.any() && acquired.Kind == "release-asset" {
+		fallback, err := retryEntrySourceBuild(ctx, entry, cache, failures, releaseObservations)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		binariesByAcquisition[fallback.acquired] = fallback.fresh
+		releaseObservations = append(releaseObservations, fallback.observations...)
+		releaseFamilies = append(releaseFamilies, fallback.families...)
+	}
+	return releaseObservations, releaseFamilies, binariesByAcquisition, nil
+}
+
+// entrySourceFallback carries the authenticated source-build retry results for a
+// catalog entry whose release-asset runtime failed.
+type entrySourceFallback struct {
+	observations []observation
+	families     []family
+	acquired     acquisition
+	fresh        freshBinary
+}
+
+// retryEntrySourceBuild acquires and verifies an authenticated source build for
+// an entry whose release-asset runtime failed, then retries the failed fresh
+// observations against it.
+func retryEntrySourceBuild(ctx context.Context, entry catalogEntry, cache string, failures freshObservationFailures, releaseObservations []observation) (entrySourceFallback, error) {
+	sourceBinary, err := acquireSourceBuild(ctx, entry, cache)
+	if err != nil {
+		return entrySourceFallback{}, fmt.Errorf("%s: acquire authenticated source fallback: %w", entry.Version, err)
+	}
+	sourceAcquired, err := recordAcquisition("source-build", entry, sourceBinary, "release-asset-runtime-failure")
+	if err != nil {
+		return entrySourceFallback{}, fmt.Errorf("%s: record authenticated source fallback: %w", entry.Version, err)
+	}
+	sourceFresh, err := bindFreshBinary(sourceBinary, sourceAcquired)
+	if err != nil {
+		return entrySourceFallback{}, fmt.Errorf("%s: bind authenticated source fallback: %w", entry.Version, err)
+	}
+	sourceBinary, err = verifyFreshBinary(sourceFresh)
+	if err != nil {
+		return entrySourceFallback{}, fmt.Errorf("%s: verify authenticated source fallback: %w", entry.Version, err)
+	}
+	sourceContext := withHistoricalBinaryBinding(ctx, sourceFresh)
+	fallbackObservations, fallbackFamilies, err := retryFreshFailures(sourceContext, sourceBinary, entry, sourceAcquired, failures, releaseObservations)
+	if err != nil {
+		return entrySourceFallback{}, fmt.Errorf("%s: authenticated source fallback failed: %w", entry.Version, err)
+	}
+	return entrySourceFallback{
+		observations: fallbackObservations,
+		families:     fallbackFamilies,
+		acquired:     sourceAcquired,
+		fresh:        sourceFresh,
+	}, nil
+}
+
+// bindEntryFreshBinaries records, for each of an entry's observations, the fresh
+// binary that produced its family+mode, rejecting unbindable observations and
+// cross-entry acquisition disagreements.
+func bindEntryFreshBinaries(freshBinaries map[freshBinaryKey]freshBinary, entryVersion string, observations []observation, families []family, binariesByAcquisition map[acquisition]freshBinary) error {
+	familyModes := make(map[string]string, len(families))
+	for _, observedFamily := range families {
+		familyModes[observedFamily.ID] = observedFamily.Mode
+	}
+	for _, observed := range observations {
+		mode := familyModes[observed.FamilyID]
+		fresh, found := binariesByAcquisition[observed.Acquisition]
+		if mode == "" || !found {
+			return fmt.Errorf("%s/%s: cannot bind fresh binary to observed family", entryVersion, observed.Scenario)
+		}
+		key := freshBinaryKey{version: observed.Version, mode: mode}
+		if prior, exists := freshBinaries[key]; exists && prior.acquisition != observed.Acquisition {
+			return fmt.Errorf("%s/%s: fresh binaries disagree on acquisition", observed.Version, mode)
+		}
+		freshBinaries[key] = fresh
+	}
+	return nil
 }
 
 func requireCensusPlatform(goos, goarch string) error {
@@ -2365,36 +2422,15 @@ type storageMetadata struct {
 // detail for a historical SQLite storage database.
 func recognizeFreshTopology(workspace string) (freshTopology, error) {
 	beadsDir := filepath.Join(workspace, ".beads")
-	markers := []string{}
-	markers = append(markers, localVersionTopologyMarker(filepath.Join(beadsDir, ".local_version")))
-	hasLegacyDoltDirectory := false
-	hasEmbeddedDoltDirectory := false
-	for _, directory := range []string{"dolt", "embeddeddolt"} {
-		info, lstatErr := os.Lstat(filepath.Join(beadsDir, directory))
-		if errors.Is(lstatErr, os.ErrNotExist) {
-			continue
-		}
-		if lstatErr != nil {
-			return freshTopology{}, fmt.Errorf("inspect Dolt root %q: %w", directory, lstatErr)
-		}
-		if !info.IsDir() {
-			return freshTopology{}, fmt.Errorf("non-directory Dolt root %q", directory)
-		}
-		markers = append(markers, "directory:.beads/"+directory)
-		if directory == "dolt" {
-			hasLegacyDoltDirectory = true
-		} else {
-			hasEmbeddedDoltDirectory = true
-		}
+	markers := []string{localVersionTopologyMarker(filepath.Join(beadsDir, ".local_version"))}
+	doltMarkers, hasLegacyDoltDirectory, hasEmbeddedDoltDirectory, err := collectFreshDoltRoots(beadsDir)
+	if err != nil {
+		return freshTopology{}, err
 	}
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-	jsonlInfo, lstatErr := os.Lstat(jsonlPath)
-	if lstatErr != nil && !errors.Is(lstatErr, os.ErrNotExist) {
-		return freshTopology{}, fmt.Errorf("inspect JSONL root: %w", lstatErr)
-	}
-	hasJSONL := lstatErr == nil
-	if hasJSONL && !jsonlInfo.Mode().IsRegular() {
-		return freshTopology{}, errors.New("non-regular JSONL root")
+	markers = append(markers, doltMarkers...)
+	hasJSONL, err := recognizeFreshJSONLRoot(beadsDir)
+	if err != nil {
+		return freshTopology{}, err
 	}
 	sqliteRoots, err := inventorySQLiteRoots(beadsDir)
 	if err != nil {
@@ -2410,24 +2446,11 @@ func recognizeFreshTopology(workspace string) (freshTopology, error) {
 	if metadata.DoltMode != "" {
 		markers = append(markers, "metadata-dolt-mode:"+metadata.DoltMode)
 	}
-	hasDoltProfile := hasLegacyDoltDirectory || hasEmbeddedDoltDirectory ||
-		metadata.Backend == "dolt" || metadata.DoltMode == "server" || metadata.DoltMode == "embedded"
-	coexistingSQLite := ""
-	if len(sqliteRoots.active) > 0 && hasDoltProfile {
-		validMetadataSelector := metadata.Backend == "dolt" &&
-			((metadata.DoltMode == "" && (metadata.Database == "beads.db" || metadata.Database == "dolt")) ||
-				(metadata.DoltMode == "server" && metadata.Database == "dolt"))
-		if len(sqliteRoots.active) != 1 || filepath.Base(sqliteRoots.active[0]) != "beads.db" ||
-			!validMetadataSelector || !hasLegacyDoltDirectory || hasEmbeddedDoltDirectory {
-			return freshTopology{}, fmt.Errorf("ambiguous fresh storage profile: active SQLite and Dolt roots coexist (%s)", strings.Join(sqliteRoots.active, ", "))
-		}
-		coexistingSQLite = filepath.Join(".beads", "beads.db")
-		markers = append(
-			markers,
-			"metadata-database:"+metadata.Database,
-			"sqlite-coexisting:.beads/beads.db",
-		)
+	coexistingSQLite, coexistingMarkers, err := resolveCoexistingFreshSQLite(metadata, sqliteRoots, hasLegacyDoltDirectory, hasEmbeddedDoltDirectory)
+	if err != nil {
+		return freshTopology{}, err
 	}
+	markers = append(markers, coexistingMarkers...)
 	backupPaths := make([]string, 0, len(sqliteRoots.backups))
 	for _, backup := range sqliteRoots.backups {
 		backupPaths = append(backupPaths, filepath.Join(".beads", filepath.Base(backup)))
@@ -2435,32 +2458,109 @@ func recognizeFreshTopology(workspace string) (freshTopology, error) {
 	if len(backupPaths) > 0 {
 		markers = append(markers, "sqlite-backups:pre-dolt")
 	}
+	return classifyFreshTopologyMode(metadata, sqliteRoots, hasLegacyDoltDirectory, hasEmbeddedDoltDirectory, hasJSONL, coexistingSQLite, backupPaths, markers)
+}
+
+// collectFreshDoltRoots inspects the legacy and embedded Dolt roots under
+// beadsDir, returning their topology markers and which roots are present.
+func collectFreshDoltRoots(beadsDir string) (markers []string, hasLegacy, hasEmbedded bool, err error) {
+	for _, directory := range []string{"dolt", "embeddeddolt"} {
+		info, lstatErr := os.Lstat(filepath.Join(beadsDir, directory))
+		if errors.Is(lstatErr, os.ErrNotExist) {
+			continue
+		}
+		if lstatErr != nil {
+			return nil, false, false, fmt.Errorf("inspect Dolt root %q: %w", directory, lstatErr)
+		}
+		if !info.IsDir() {
+			return nil, false, false, fmt.Errorf("non-directory Dolt root %q", directory)
+		}
+		markers = append(markers, "directory:.beads/"+directory)
+		if directory == "dolt" {
+			hasLegacy = true
+		} else {
+			hasEmbedded = true
+		}
+	}
+	return markers, hasLegacy, hasEmbedded, nil
+}
+
+// recognizeFreshJSONLRoot reports whether a regular issues.jsonl root exists
+// under beadsDir, rejecting a present-but-non-regular JSONL root.
+func recognizeFreshJSONLRoot(beadsDir string) (bool, error) {
+	jsonlInfo, lstatErr := os.Lstat(filepath.Join(beadsDir, "issues.jsonl"))
+	if lstatErr != nil {
+		if errors.Is(lstatErr, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("inspect JSONL root: %w", lstatErr)
+	}
+	if !jsonlInfo.Mode().IsRegular() {
+		return false, errors.New("non-regular JSONL root")
+	}
+	return true, nil
+}
+
+// resolveCoexistingFreshSQLite validates whether an active SQLite database may
+// coexist with a Dolt storage profile, returning the coexisting SQLite path and
+// any topology markers it contributes.
+func resolveCoexistingFreshSQLite(metadata storageMetadata, sqliteRoots sqliteRootInventory, hasLegacyDoltDirectory, hasEmbeddedDoltDirectory bool) (string, []string, error) {
+	hasDoltProfile := hasLegacyDoltDirectory || hasEmbeddedDoltDirectory ||
+		metadata.Backend == "dolt" || metadata.DoltMode == "server" || metadata.DoltMode == "embedded"
+	if len(sqliteRoots.active) == 0 || !hasDoltProfile {
+		return "", nil, nil
+	}
+	validMetadataSelector := metadata.Backend == "dolt" &&
+		((metadata.DoltMode == "" && (metadata.Database == "beads.db" || metadata.Database == "dolt")) ||
+			(metadata.DoltMode == "server" && metadata.Database == "dolt"))
+	if len(sqliteRoots.active) != 1 || filepath.Base(sqliteRoots.active[0]) != "beads.db" ||
+		!validMetadataSelector || !hasLegacyDoltDirectory || hasEmbeddedDoltDirectory {
+		return "", nil, fmt.Errorf("ambiguous fresh storage profile: active SQLite and Dolt roots coexist (%s)", strings.Join(sqliteRoots.active, ", "))
+	}
+	markers := []string{
+		"metadata-database:" + metadata.Database,
+		"sqlite-coexisting:.beads/beads.db",
+	}
+	return filepath.Join(".beads", "beads.db"), markers, nil
+}
+
+// classifyFreshTopologyMode resolves the final fresh storage mode from the
+// collected roots, metadata, and accumulated markers.
+func classifyFreshTopologyMode(metadata storageMetadata, sqliteRoots sqliteRootInventory, hasLegacyDoltDirectory, hasEmbeddedDoltDirectory, hasJSONL bool, coexistingSQLite string, backupPaths, markers []string) (freshTopology, error) {
 	sort.Strings(markers)
+	doltMode := func(mode string) freshTopology {
+		return freshTopology{
+			Mode:             mode,
+			DoltDatabase:     metadata.DoltDatabase,
+			MetadataDatabase: metadata.Database,
+			CoexistingSQLite: coexistingSQLite,
+			SQLiteBackups:    backupPaths,
+			Markers:          markers,
+		}
+	}
 	if metadata.DoltMode == "server" {
-		return freshTopology{Mode: "dolt-server", DoltDatabase: metadata.DoltDatabase, MetadataDatabase: metadata.Database, CoexistingSQLite: coexistingSQLite, SQLiteBackups: backupPaths, Markers: markers}, nil
+		return doltMode("dolt-server"), nil
 	}
 	// Before v0.63, "embedded" Dolt lived under .beads/dolt. Keep that
 	// historical root in the legacy family; current embedded storage is
 	// distinguished by .beads/embeddeddolt.
 	if hasLegacyDoltDirectory {
-		return freshTopology{Mode: "dolt-legacy", DoltDatabase: metadata.DoltDatabase, MetadataDatabase: metadata.Database, CoexistingSQLite: coexistingSQLite, SQLiteBackups: backupPaths, Markers: markers}, nil
+		return doltMode("dolt-legacy"), nil
 	}
 	if metadata.DoltMode == "embedded" {
-		return freshTopology{Mode: "dolt-embedded", DoltDatabase: metadata.DoltDatabase, MetadataDatabase: metadata.Database, CoexistingSQLite: coexistingSQLite, SQLiteBackups: backupPaths, Markers: markers}, nil
+		return doltMode("dolt-embedded"), nil
 	}
 	if metadata.Backend == "dolt" {
-		return freshTopology{Mode: "dolt-legacy", DoltDatabase: metadata.DoltDatabase, MetadataDatabase: metadata.Database, CoexistingSQLite: coexistingSQLite, SQLiteBackups: backupPaths, Markers: markers}, nil
+		return doltMode("dolt-legacy"), nil
 	}
 	if hasEmbeddedDoltDirectory {
-		return freshTopology{Mode: "dolt-embedded", DoltDatabase: metadata.DoltDatabase, MetadataDatabase: metadata.Database, CoexistingSQLite: coexistingSQLite, SQLiteBackups: backupPaths, Markers: markers}, nil
+		return doltMode("dolt-embedded"), nil
 	}
 	if len(sqliteRoots.active) != 1 {
-		if len(sqliteRoots.candidates) == 0 {
-			if hasJSONL {
-				markers = append(markers, "data:.beads/issues.jsonl")
-				sort.Strings(markers)
-				return freshTopology{Mode: "jsonl", JSONL: filepath.Join(".beads", "issues.jsonl"), Markers: markers}, nil
-			}
+		if len(sqliteRoots.candidates) == 0 && hasJSONL {
+			markers = append(markers, "data:.beads/issues.jsonl")
+			sort.Strings(markers)
+			return freshTopology{Mode: "jsonl", JSONL: filepath.Join(".beads", "issues.jsonl"), Markers: markers}, nil
 		}
 		return freshTopology{}, fmt.Errorf("unsupported fresh storage profile: expected exactly one active .beads/*.db SQLite database, found %d", len(sqliteRoots.active))
 	}

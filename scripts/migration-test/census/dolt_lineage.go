@@ -566,9 +566,9 @@ func observeRollingDoltFamily(
 		if endpoint.host == "" || endpoint.port < 1 {
 			return family{}, errors.New("active Dolt server observation has no endpoint")
 		}
-		database, err := discoverActiveDoltServerDatabase(ctx, binary, workspace, environment, endpoint.host, endpoint.port)
-		if err != nil {
-			return family{}, fmt.Errorf("discover active Dolt server database: %w", err)
+		database, derr := discoverActiveDoltServerDatabase(ctx, binary, workspace, environment, endpoint.host, endpoint.port)
+		if derr != nil {
+			return family{}, fmt.Errorf("discover active Dolt server database: %w", derr)
 		}
 		runner := pinnedDoltServerRunner(binary, workspace, database, environment, endpoint.port)
 		runner.host = endpoint.host
@@ -585,9 +585,9 @@ func observeRollingDoltFamily(
 		}
 		layout, err = collectServerDoltLayout(ctx, topology.Markers, runner, embeddedRunner)
 	case "dolt-embedded":
-		metadata, err := readStorageMetadata(filepath.Join(workspace, ".beads", "metadata.json"))
-		if err != nil {
-			return family{}, err
+		metadata, merr := readStorageMetadata(filepath.Join(workspace, ".beads", "metadata.json"))
+		if merr != nil {
+			return family{}, merr
 		}
 		if metadata.DoltDatabase == "" {
 			return family{}, errors.New("embedded Dolt metadata has no database name")
@@ -596,9 +596,9 @@ func observeRollingDoltFamily(
 			binary: binary, workspace: workspace, dataDir: filepath.Join(workspace, ".beads", "embeddeddolt"),
 			database: metadata.DoltDatabase, environment: environment,
 		}
-		fingerprint, err := collectDolt(ctx, runner)
-		if err != nil {
-			return family{}, err
+		fingerprint, ferr := collectDolt(ctx, runner)
+		if ferr != nil {
+			return family{}, ferr
 		}
 		layout, err = marshalDoltLayout(topology.Markers, fingerprint)
 	default:

@@ -50,10 +50,8 @@ func generateRollingDoltLineageWithRuntime(ctx context.Context, releases catalog
 		}
 	}()
 
+	pass := &rollingDoltPass{ctx: ctx, executor: executor, acquire: runtime.acquire, cache: cache, allFamilies: allFamilies, rollingOnly: make(map[string]family)}
 	frontiers := make(map[string]map[string]*retainedDoltFrontier, len(scenarios))
-	rollingOnly := make(map[string]family)
-	transitions := make([]lineageTransition, 0)
-	outcomes := make([]lineageOutcome, 0)
 	for _, entry := range releases.Versions {
 		for _, scenario := range scenarios {
 			if !scenario.compatible(entry.Version) {
@@ -62,86 +60,142 @@ func generateRollingDoltLineageWithRuntime(ctx context.Context, releases catalog
 			if len(frontiers[scenario.Name]) == 0 && len(freshByVersion[entry.Version][scenario.Name]) == 0 {
 				continue
 			}
-			targetRuntime, err := rollingDoltTargetRuntime(scenario, entry.Version)
-			if err != nil {
-				return lineageSet{}, nil, err
-			}
-			acquired, err := rollingDoltTargetAcquisition(entry.Version, targetRuntime, acquisitions[entry.Version])
-			if err != nil {
-				return lineageSet{}, nil, err
-			}
-			binary, err := runtime.acquire(ctx, entry, cache, targetRuntime.Mode, acquired)
-			if err != nil {
-				return lineageSet{}, nil, fmt.Errorf("%s/%s: acquire recorded binary: %w", entry.Version, scenario.Name, err)
-			}
-			next := make(map[string]*retainedDoltFrontier, len(frontiers[scenario.Name]))
-			executor.BeginBatch()
-			for _, familyID := range sortedDoltFrontierIDs(frontiers[scenario.Name]) {
-				frontier := frontiers[scenario.Name][familyID]
-				transition, observed, err := executor.Advance(ctx, frontier, rollingDoltTarget{Version: entry.Version, Binary: binary, Runtime: targetRuntime})
-				if err != nil {
-					if observed.ID == "" || !validMode(observed.Mode) {
-						executor.EndBatch()
-						return lineageSet{}, nil, fmt.Errorf("%s: advance %s family %s: %w", entry.Version, scenario.Name, familyID, err)
-					}
-					outcome := lineageOutcome{
-						FromFamilyID: familyID, TargetVersion: entry.Version, Scenario: scenario.Name,
-						Mode: scenario.Mode, RuntimeMode: targetRuntime.Mode, Acquisition: acquired,
-					}
-					if observed.ID == familyID {
-						outcome.Outcome = lineageOutcomeUnchangedRefusal
-					} else {
-						outcome.Outcome = lineageOutcomeMutatingFailure
-						outcome.ToFamilyID = observed.ID
-						if _, known := allFamilies[observed.ID]; !known {
-							rollingOnly[observed.ID] = observed
-						}
-					}
-					outcomes = append(outcomes, outcome)
-					if _, merged := next[observed.ID]; !merged {
-						next[observed.ID] = frontier
-					}
-					continue
-				}
-				transition.Acquisition = acquired
-				transition.RuntimeMode = targetRuntime.Mode
-				transitions = append(transitions, transition)
-				if _, known := allFamilies[observed.ID]; !known {
-					rollingOnly[observed.ID] = observed
-				}
-				if _, merged := next[observed.ID]; !merged {
-					next[observed.ID] = frontier
-				}
-			}
-			if canonical := executor.EndBatch(); canonical != nil {
-				next = make(map[string]*retainedDoltFrontier, len(canonical))
-				for _, frontier := range canonical {
-					if frontier.Scenario.Name == scenario.Name {
-						next[frontier.FamilyID] = frontier
-					}
-				}
-			}
-			for _, expected := range freshByVersion[entry.Version][scenario.Name] {
-				if _, exists := next[expected.ID]; exists {
-					continue
-				}
-				frontier, err := executor.Retain(ctx, rollingDoltSource{Scenario: scenario, Version: entry.Version, Binary: binary, FamilyID: expected.ID})
-				if err != nil {
-					return lineageSet{}, nil, fmt.Errorf("%s: retain fresh %s family %s: %w", entry.Version, scenario.Name, expected.ID, err)
-				}
-				next[expected.ID] = frontier
+			next, stepErr := pass.stepScenario(scenario, entry, frontiers[scenario.Name], freshByVersion[entry.Version][scenario.Name], acquisitions[entry.Version])
+			if stepErr != nil {
+				return lineageSet{}, nil, stepErr
 			}
 			frontiers[scenario.Name] = next
 		}
 	}
-	sortLineageTransitions(transitions)
-	sortLineageOutcomes(outcomes)
-	families := make([]family, 0, len(rollingOnly))
-	for _, candidate := range rollingOnly {
+	sortLineageTransitions(pass.transitions)
+	sortLineageOutcomes(pass.outcomes)
+	families := make([]family, 0, len(pass.rollingOnly))
+	for _, candidate := range pass.rollingOnly {
 		families = append(families, candidate)
 	}
 	sort.Slice(families, func(i, j int) bool { return families[i].ID < families[j].ID })
-	return lineageSet{SchemaVersion: lineageSchemaVersion, Transitions: transitions, Outcomes: outcomes}, families, nil
+	return lineageSet{SchemaVersion: lineageSchemaVersion, Transitions: pass.transitions, Outcomes: pass.outcomes}, families, nil
+}
+
+// rollingDoltPass carries the mutable accumulators for one rolling Dolt lineage
+// generation so the release/scenario/family nesting can be split into focused
+// steps without changing observation, ordering, or merge semantics.
+type rollingDoltPass struct {
+	ctx         context.Context
+	executor    rollingDoltFrontierExecutor
+	acquire     func(context.Context, catalogEntry, string, string, acquisition) (string, error)
+	cache       string
+	allFamilies map[string]family
+	rollingOnly map[string]family
+	transitions []lineageTransition
+	outcomes    []lineageOutcome
+}
+
+// stepScenario advances one rolling scenario across one release version and
+// returns the retained frontier for the next version.
+func (p *rollingDoltPass) stepScenario(scenario lineageScenario, entry catalogEntry, current map[string]*retainedDoltFrontier, expectedFresh []family, recorded map[string]acquisition) (map[string]*retainedDoltFrontier, error) {
+	targetRuntime, err := rollingDoltTargetRuntime(scenario, entry.Version)
+	if err != nil {
+		return nil, err
+	}
+	acquired, err := rollingDoltTargetAcquisition(entry.Version, targetRuntime, recorded)
+	if err != nil {
+		return nil, err
+	}
+	binary, err := p.acquire(p.ctx, entry, p.cache, targetRuntime.Mode, acquired)
+	if err != nil {
+		return nil, fmt.Errorf("%s/%s: acquire recorded binary: %w", entry.Version, scenario.Name, err)
+	}
+	next := make(map[string]*retainedDoltFrontier, len(current))
+	p.executor.BeginBatch()
+	for _, familyID := range sortedDoltFrontierIDs(current) {
+		if err := p.advanceFamily(scenario, entry, targetRuntime, acquired, binary, current[familyID], familyID, next); err != nil {
+			p.executor.EndBatch()
+			return nil, err
+		}
+	}
+	if canonical := p.executor.EndBatch(); canonical != nil {
+		next = make(map[string]*retainedDoltFrontier, len(canonical))
+		for _, frontier := range canonical {
+			if frontier.Scenario.Name == scenario.Name {
+				next[frontier.FamilyID] = frontier
+			}
+		}
+	}
+	if err := p.retainFreshFamilies(scenario, entry, binary, expectedFresh, next); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
+// advanceFamily advances one retained family frontier by one release version,
+// recording either a lineage transition or a mutation/refusal outcome and
+// merging the observed family into next.
+func (p *rollingDoltPass) advanceFamily(scenario lineageScenario, entry catalogEntry, targetRuntime lineageScenario, acquired acquisition, binary string, frontier *retainedDoltFrontier, familyID string, next map[string]*retainedDoltFrontier) error {
+	transition, observed, err := p.executor.Advance(p.ctx, frontier, rollingDoltTarget{Version: entry.Version, Binary: binary, Runtime: targetRuntime})
+	if err != nil {
+		if observed.ID == "" || !validMode(observed.Mode) {
+			return fmt.Errorf("%s: advance %s family %s: %w", entry.Version, scenario.Name, familyID, err)
+		}
+		p.recordFailureOutcome(scenario, entry, targetRuntime, acquired, familyID, observed)
+		p.mergeObserved(next, observed.ID, frontier)
+		return nil
+	}
+	transition.Acquisition = acquired
+	transition.RuntimeMode = targetRuntime.Mode
+	p.transitions = append(p.transitions, transition)
+	p.noteRollingOnly(observed)
+	p.mergeObserved(next, observed.ID, frontier)
+	return nil
+}
+
+// recordFailureOutcome appends the unchanged-refusal or mutating-failure outcome
+// for a family whose advance returned an error but a valid observed family.
+func (p *rollingDoltPass) recordFailureOutcome(scenario lineageScenario, entry catalogEntry, targetRuntime lineageScenario, acquired acquisition, familyID string, observed family) {
+	outcome := lineageOutcome{
+		FromFamilyID: familyID, TargetVersion: entry.Version, Scenario: scenario.Name,
+		Mode: scenario.Mode, RuntimeMode: targetRuntime.Mode, Acquisition: acquired,
+	}
+	if observed.ID == familyID {
+		outcome.Outcome = lineageOutcomeUnchangedRefusal
+	} else {
+		outcome.Outcome = lineageOutcomeMutatingFailure
+		outcome.ToFamilyID = observed.ID
+		p.noteRollingOnly(observed)
+	}
+	p.outcomes = append(p.outcomes, outcome)
+}
+
+// retainFreshFamilies retains a workspace for every fresh family of this
+// scenario/version that no advance already produced.
+func (p *rollingDoltPass) retainFreshFamilies(scenario lineageScenario, entry catalogEntry, binary string, expected []family, next map[string]*retainedDoltFrontier) error {
+	for _, candidate := range expected {
+		if _, exists := next[candidate.ID]; exists {
+			continue
+		}
+		frontier, err := p.executor.Retain(p.ctx, rollingDoltSource{Scenario: scenario, Version: entry.Version, Binary: binary, FamilyID: candidate.ID})
+		if err != nil {
+			return fmt.Errorf("%s: retain fresh %s family %s: %w", entry.Version, scenario.Name, candidate.ID, err)
+		}
+		next[candidate.ID] = frontier
+	}
+	return nil
+}
+
+// noteRollingOnly records a family first observed during rolling migration so it
+// is emitted alongside the fresh families.
+func (p *rollingDoltPass) noteRollingOnly(observed family) {
+	if _, known := p.allFamilies[observed.ID]; !known {
+		p.rollingOnly[observed.ID] = observed
+	}
+}
+
+// mergeObserved keeps the first frontier retained for an observed family within
+// the batch, matching the original left-to-right merge.
+func (p *rollingDoltPass) mergeObserved(next map[string]*retainedDoltFrontier, observedID string, frontier *retainedDoltFrontier) {
+	if _, merged := next[observedID]; !merged {
+		next[observedID] = frontier
+	}
 }
 
 // rollingDoltTargetAcquisition chooses the authenticated executable for one

@@ -9,12 +9,21 @@ ARG GO_SHA256=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053
 ARG DOLT_VERSION=v2.1.8
 ARG DOLT_SHA256=f66318f08ed66e409fc39363ae0fff8ce6fbf6dba9f5bac632b91527b9632a74
 
-# The base image deliberately omits CA certificates. Bootstrap the exact
-# certificate package before switching to the immutable Ubuntu snapshot.
+# The base image deliberately omits CA certificates, and the Ubuntu snapshot
+# service is HTTPS-only (a plain-http request 301-redirects to https), so apt
+# needs a trust store before it can read the pinned snapshot. Bootstrap ONLY
+# that trust material -- and deliberately UNPINNED -- from the base image's
+# default repositories: an unpinned install always resolves to a currently
+# available version, so a scheduled rebuild never breaks when a specific version
+# is pruned or superseded in those mutable live repos. ca-certificates/openssl
+# are not part of the reproducibility-critical toolchain (gcc/g++/libicu/libc/
+# dolt, pinned below); they only establish TLS to fetch the snapshot and the
+# Go/Dolt tarballs. Every EXACT-pinned package is then installed from the
+# immutable snapshot, so no pinned version is ever sourced from a mutable repo.
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ca-certificates=20260601~24.04.1 \
-      openssl=3.0.13-0ubuntu3.11 \
+      ca-certificates \
+      openssl \
  && rm -rf /var/lib/apt/lists/* \
  && printf '%s\n' \
       'Types: deb' \
@@ -25,7 +34,6 @@ RUN apt-get update \
       > /etc/apt/sources.list.d/ubuntu.sources \
  && apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ca-certificates=20260601~24.04.1 \
       curl=8.5.0-2ubuntu10.11 \
       gcc=4:13.2.0-7ubuntu1 \
       g++=4:13.2.0-7ubuntu1 \

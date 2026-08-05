@@ -201,6 +201,13 @@ func routeManifestForFamilies(result census, routeFamily func(family) ([]string,
 		sort.Slice(families, func(i, j int) bool { return families[i].FamilyID < families[j].FamilyID })
 		manifest.Groups = append(manifest.Groups, routeGroup{Route: route, Families: families})
 	}
+	total := 0
+	for _, group := range manifest.Groups {
+		total += len(group.Families)
+	}
+	if total != len(result.Families) {
+		return routeManifest{}, fmt.Errorf("route manifest groups %d families do not equal census family count %d", total, len(result.Families))
+	}
 	return manifest, nil
 }
 
@@ -219,135 +226,256 @@ func routeForFamily(candidate family) ([]string, string, error) {
 	return routeForValidatedFamily(candidate)
 }
 
+// routableLayout is the decoded fingerprint payload the router classifies. It
+// mirrors the census family layout and, like the original inline decode, uses a
+// permissive json.Unmarshal (no DisallowUnknownFields) so forward-compatible
+// payloads still route.
+type routableLayout struct {
+	Topology               []string        `json:"topology"`
+	Schema                 json.RawMessage `json:"schema"`
+	Stores                 json.RawMessage `json:"stores"`
+	Databases              json.RawMessage `json:"databases"`
+	CoexistingSQLiteSchema json.RawMessage `json:"coexisting_sqlite_schema"`
+	RetainedBackupSchemas  json.RawMessage `json:"retained_backup_schemas"`
+}
+
+// routeClassifier inspects a decoded family and either claims it (matched=true,
+// returning a route or an error) or declines it (matched=false, err=nil) so the
+// next classifier in priority order can try.
+type routeClassifier func(candidate family, layout routableLayout, markers topologyMarkers) (topology []string, route string, matched bool, err error)
+
 // routeForValidatedFamily classifies a family whose fingerprint payload was
-// already validated at the census read boundary.
+// already validated at the census read boundary. It decodes the layout, then
+// consults each topology classifier in priority order; the first that matches
+// (or fails) is authoritative, and an unclaimed family is inconsistent.
 func routeForValidatedFamily(candidate family) ([]string, string, error) {
-	var layout struct {
-		Topology               []string        `json:"topology"`
-		Schema                 json.RawMessage `json:"schema"`
-		Stores                 json.RawMessage `json:"stores"`
-		Databases              json.RawMessage `json:"databases"`
-		CoexistingSQLiteSchema json.RawMessage `json:"coexisting_sqlite_schema"`
-		RetainedBackupSchemas  json.RawMessage `json:"retained_backup_schemas"`
-	}
-	if err := json.Unmarshal(candidate.Layout, &layout); err != nil || len(layout.Topology) == 0 {
-		return nil, "", errors.New("layout has no valid topology")
-	}
-	if !sort.StringsAreSorted(layout.Topology) || hasDuplicate(layout.Topology) {
-		return nil, "", errors.New("topology is not canonical")
-	}
-	markers, err := classifyTopology(layout.Topology)
+	layout, markers, err := decodeRoutableLayout(candidate)
 	if err != nil {
 		return nil, "", err
 	}
-	if !validCoexistingSQLiteSchema(layout.CoexistingSQLiteSchema, markers.sqliteCoexisting) {
-		return nil, "", errors.New("Dolt topology has inconsistent coexisting SQLite schema")
+	classifiers := []routeClassifier{
+		routeMetadataDoltDatabase,
+		routeDualRootEmbedded,
+		routeCoexistingSQLite,
+		routeByProviderMode,
 	}
-	if !markers.sqliteCoexisting && markers.metadataDatabase != "" && markers.metadataDoltDatabase == "" {
-		return nil, "", errors.New("metadata database selector requires coexisting SQLite")
-	}
-	if markers.metadataDoltDatabase == "" && len(layout.Databases) != 0 {
-		return nil, "", errors.New("database fingerprints require a metadata-selected Dolt database")
-	}
-	if markers.metadataDoltDatabase != "" && markers.legacy && markers.embedded {
-		expectedTopology := []string{
-			"directory:.beads/dolt",
-			"directory:.beads/embeddeddolt",
-			"local-version:other-valid",
-			"metadata-backend:dolt",
-			"metadata-database:dolt",
-			"metadata-dolt-database:beads_census",
-		}
-		if candidate.Mode == "dolt-legacy" && reflect.DeepEqual(layout.Topology, expectedTopology) &&
-			!markers.sqliteCoexisting && !markers.database && !markers.data && !markers.sqliteBackups &&
-			markers.provider == "dolt" && markers.metadataDatabase == "dolt" && !markers.doltModeSeen &&
-			markers.localVersion == "local-version:other-valid" && len(layout.RetainedBackupSchemas) == 0 {
-			if err := requireMultiDatabaseSchemas(layout.Databases, layout.Schema, markers.metadataDoltDatabase); err != nil {
-				return nil, "", err
-			}
-			if err := requireDualRootStores(layout.Stores, layout.Schema); err != nil {
-				return nil, "", err
-			}
-			return layout.Topology, "dual-root-export-union-import", nil
-		}
-	}
-	if markers.metadataDoltDatabase != "" {
-		if markers.sqliteCoexisting || markers.embedded || markers.database || markers.data || len(layout.Stores) != 0 ||
-			candidate.Mode != "dolt-legacy" || !markers.legacy || markers.provider != "dolt" ||
-			markers.metadataDatabase != "dolt" || markers.doltModeSeen ||
-			!markers.localVersionSeen || (markers.localVersion != "local-version:absent-or-invalid" && markers.localVersion != "local-version:legacy-server" && markers.localVersion != "local-version:other-valid") ||
-			markers.sqliteBackups || len(layout.RetainedBackupSchemas) != 0 {
-			return nil, "", errors.New("multi-database topology is inconsistent with legacy Dolt metadata")
-		}
-		if err := requireMultiDatabaseSchemas(layout.Databases, layout.Schema, markers.metadataDoltDatabase); err != nil {
+	for _, classify := range classifiers {
+		topology, route, matched, err := classify(candidate, layout, markers)
+		if err != nil {
 			return nil, "", err
 		}
-		return layout.Topology, "multi-database-export-union-import", nil
-	}
-	if markers.legacy && markers.embedded {
-		if markers.sqliteCoexisting || markers.database || markers.data {
-			return nil, "", errors.New("dual-Dolt-root topology has conflicting primary storage markers")
+		if matched {
+			return topology, route, nil
 		}
-		if !validRetainedSQLiteBackupSchemas(layout.RetainedBackupSchemas, markers.sqliteBackups) {
-			return nil, "", errors.New("Dolt topology has inconsistent retained SQLite backup schemas")
-		}
-		if err := requireDualRootStores(layout.Stores, layout.Schema); err != nil {
-			return nil, "", err
-		}
-		if (candidate.Mode == "dolt-legacy" && markers.providerOK && (markers.doltMode == "" || markers.doltMode == "embedded")) ||
-			(candidate.Mode == "dolt-server" && markers.providerOK && markers.doltMode == "server") {
-			return layout.Topology, "dual-root-export-union-import", nil
-		}
-		return nil, "", errors.New("dual-root topology is inconsistent with provider mode")
-	}
-	if markers.sqliteCoexisting {
-		legacyMode := candidate.Mode == "dolt-legacy" && markers.doltMode == ""
-		serverMode := candidate.Mode == "dolt-server" && markers.doltMode == "server"
-		selectorOK := (legacyMode && (markers.metadataDatabase == "beads.db" || markers.metadataDatabase == "dolt")) ||
-			(serverMode && markers.metadataDatabase == "dolt")
-		if (legacyMode || serverMode) && len(layout.Stores) == 0 &&
-			validRetainedSQLiteBackupSchemas(layout.RetainedBackupSchemas, markers.sqliteBackups) &&
-			markers.legacy && !markers.embedded && !markers.database && !markers.data &&
-			markers.provider == "dolt" && selectorOK {
-			return layout.Topology, "dual-root-export-union-import", nil
-		}
-		return nil, "", errors.New("coexisting SQLite topology is inconsistent with provider mode")
-	}
-	switch candidate.Mode {
-	case "sqlite":
-		providerOK := markers.provider == "" || markers.provider == "sqlite"
-		backupsOK := validRetainedSQLiteBackupSchemas(layout.RetainedBackupSchemas, markers.sqliteBackups)
-		if len(layout.Stores) == 0 && providerOK && backupsOK &&
-			markers.database && !markers.data && !markers.legacy && !markers.embedded && markers.doltMode == "" {
-			return layout.Topology, "sealed-copy-export-import", nil
-		}
-	case "jsonl":
-		if len(layout.Stores) == 0 && len(layout.RetainedBackupSchemas) == 0 &&
-			!markers.sqliteBackups && markers.data && !markers.database && !markers.legacy && !markers.embedded && markers.provider == "" && markers.doltMode == "" {
-			return layout.Topology, "head-init-from-jsonl", nil
-		}
-	case "dolt-legacy":
-		if len(layout.Stores) == 0 && validRetainedSQLiteBackupSchemas(layout.RetainedBackupSchemas, markers.sqliteBackups) &&
-			markers.legacy && !markers.embedded && !markers.database && !markers.data &&
-			markers.providerOK && (markers.doltMode == "" || markers.doltMode == "embedded") {
-			return layout.Topology, "sealed-copy-export-import", nil
-		}
-	case "dolt-server":
-		if len(layout.Stores) == 0 && validRetainedSQLiteBackupSchemas(layout.RetainedBackupSchemas, markers.sqliteBackups) &&
-			markers.legacy && !markers.embedded && !markers.database && !markers.data &&
-			markers.providerOK && markers.doltMode == "server" {
-			return layout.Topology, "sealed-copy-export-import", nil
-		}
-	case "dolt-embedded":
-		if len(layout.Stores) == 0 && validRetainedSQLiteBackupSchemas(layout.RetainedBackupSchemas, markers.sqliteBackups) &&
-			!markers.legacy && markers.embedded && !markers.database && !markers.data &&
-			markers.providerOK && (markers.doltMode == "" || markers.doltMode == "embedded") {
-			return layout.Topology, "sealed-copy-direct-head-migration", nil
-		}
-	default:
-		return nil, "", fmt.Errorf("unknown provider mode %q", candidate.Mode)
 	}
 	return nil, "", errors.New("topology is inconsistent with provider mode")
+}
+
+// decodeRoutableLayout unmarshals and canonicality-checks the family layout and
+// derives its topology markers, applying the cross-cutting invariants that hold
+// before any per-topology classification runs.
+func decodeRoutableLayout(candidate family) (routableLayout, topologyMarkers, error) {
+	var layout routableLayout
+	if err := json.Unmarshal(candidate.Layout, &layout); err != nil || len(layout.Topology) == 0 {
+		return routableLayout{}, topologyMarkers{}, errors.New("layout has no valid topology")
+	}
+	if !sort.StringsAreSorted(layout.Topology) || hasDuplicate(layout.Topology) {
+		return routableLayout{}, topologyMarkers{}, errors.New("topology is not canonical")
+	}
+	markers, err := classifyTopology(layout.Topology)
+	if err != nil {
+		return routableLayout{}, topologyMarkers{}, err
+	}
+	if !validCoexistingSQLiteSchema(layout.CoexistingSQLiteSchema, markers.sqliteCoexisting) {
+		return routableLayout{}, topologyMarkers{}, errors.New("Dolt topology has inconsistent coexisting SQLite schema")
+	}
+	if !markers.sqliteCoexisting && markers.metadataDatabase != "" && markers.metadataDoltDatabase == "" {
+		return routableLayout{}, topologyMarkers{}, errors.New("metadata database selector requires coexisting SQLite")
+	}
+	if markers.metadataDoltDatabase == "" && len(layout.Databases) != 0 {
+		return routableLayout{}, topologyMarkers{}, errors.New("database fingerprints require a metadata-selected Dolt database")
+	}
+	return layout, markers, nil
+}
+
+// routeMetadataDoltDatabase classifies families that select a Dolt metadata
+// database: either the canonical empty dual-root census family or a consistent
+// legacy multi-database family. Selecting a metadata Dolt database is
+// authoritative, so a non-canonical, non-consistent family is rejected here
+// rather than falling through.
+func routeMetadataDoltDatabase(candidate family, layout routableLayout, markers topologyMarkers) ([]string, string, bool, error) {
+	if markers.metadataDoltDatabase == "" {
+		return nil, "", false, nil
+	}
+	if markers.legacy && markers.embedded && isCanonicalMetadataDoltDualRoot(candidate, layout, markers) {
+		if err := requireMultiDatabaseSchemas(layout.Databases, layout.Schema, markers.metadataDoltDatabase); err != nil {
+			return nil, "", true, err
+		}
+		if err := requireDualRootStores(layout.Stores, layout.Schema); err != nil {
+			return nil, "", true, err
+		}
+		return layout.Topology, "dual-root-export-union-import", true, nil
+	}
+	if !isConsistentMultiDatabaseLegacy(candidate, layout, markers) {
+		return nil, "", true, errors.New("multi-database topology is inconsistent with legacy Dolt metadata")
+	}
+	if err := requireMultiDatabaseSchemas(layout.Databases, layout.Schema, markers.metadataDoltDatabase); err != nil {
+		return nil, "", true, err
+	}
+	return layout.Topology, "multi-database-export-union-import", true, nil
+}
+
+// isCanonicalMetadataDoltDualRoot reports whether the family is the canonical
+// empty dual-root census family selecting a Dolt metadata database.
+func isCanonicalMetadataDoltDualRoot(candidate family, layout routableLayout, markers topologyMarkers) bool {
+	expectedTopology := []string{
+		"directory:.beads/dolt",
+		"directory:.beads/embeddeddolt",
+		"local-version:other-valid",
+		"metadata-backend:dolt",
+		"metadata-database:dolt",
+		"metadata-dolt-database:beads_census",
+	}
+	return candidate.Mode == "dolt-legacy" && reflect.DeepEqual(layout.Topology, expectedTopology) &&
+		!markers.sqliteCoexisting && !markers.database && !markers.data && !markers.sqliteBackups &&
+		markers.provider == "dolt" && markers.metadataDatabase == "dolt" && !markers.doltModeSeen &&
+		markers.localVersion == "local-version:other-valid" && len(layout.RetainedBackupSchemas) == 0
+}
+
+// isConsistentMultiDatabaseLegacy reports whether a metadata-Dolt-database
+// family is a well-formed legacy multi-database layout eligible for
+// multi-database-export-union-import.
+func isConsistentMultiDatabaseLegacy(candidate family, layout routableLayout, markers topologyMarkers) bool {
+	return !(markers.sqliteCoexisting || markers.embedded || markers.database || markers.data || len(layout.Stores) != 0 ||
+		candidate.Mode != "dolt-legacy" || !markers.legacy || markers.provider != "dolt" ||
+		markers.metadataDatabase != "dolt" || markers.doltModeSeen ||
+		!markers.localVersionSeen || (markers.localVersion != "local-version:absent-or-invalid" && markers.localVersion != "local-version:legacy-server" && markers.localVersion != "local-version:other-valid") ||
+		markers.sqliteBackups || len(layout.RetainedBackupSchemas) != 0)
+}
+
+// routeDualRootEmbedded classifies coexisting legacy+embedded dual-Dolt-root
+// families. Presence of both roots is authoritative.
+func routeDualRootEmbedded(candidate family, layout routableLayout, markers topologyMarkers) ([]string, string, bool, error) {
+	if !(markers.legacy && markers.embedded) {
+		return nil, "", false, nil
+	}
+	if markers.sqliteCoexisting || markers.database || markers.data {
+		return nil, "", true, errors.New("dual-Dolt-root topology has conflicting primary storage markers")
+	}
+	if !validRetainedSQLiteBackupSchemas(layout.RetainedBackupSchemas, markers.sqliteBackups) {
+		return nil, "", true, errors.New("Dolt topology has inconsistent retained SQLite backup schemas")
+	}
+	if err := requireDualRootStores(layout.Stores, layout.Schema); err != nil {
+		return nil, "", true, err
+	}
+	if isDualRootProviderConsistent(candidate, markers) {
+		return layout.Topology, "dual-root-export-union-import", true, nil
+	}
+	return nil, "", true, errors.New("dual-root topology is inconsistent with provider mode")
+}
+
+// isDualRootProviderConsistent reports whether a dual-root family's declared
+// provider mode matches its recorded Dolt runtime mode.
+func isDualRootProviderConsistent(candidate family, markers topologyMarkers) bool {
+	return (candidate.Mode == "dolt-legacy" && markers.providerOK && (markers.doltMode == "" || markers.doltMode == "embedded")) ||
+		(candidate.Mode == "dolt-server" && markers.providerOK && markers.doltMode == "server")
+}
+
+// routeCoexistingSQLite classifies Dolt families that retain a coexisting SQLite
+// metadata store. Presence of coexisting SQLite is authoritative.
+func routeCoexistingSQLite(candidate family, layout routableLayout, markers topologyMarkers) ([]string, string, bool, error) {
+	if !markers.sqliteCoexisting {
+		return nil, "", false, nil
+	}
+	if isCoexistingSQLiteConsistent(candidate, layout, markers) {
+		return layout.Topology, "dual-root-export-union-import", true, nil
+	}
+	return nil, "", true, errors.New("coexisting SQLite topology is inconsistent with provider mode")
+}
+
+// isCoexistingSQLiteConsistent reports whether a coexisting-SQLite family's
+// provider mode and metadata selector are mutually consistent.
+func isCoexistingSQLiteConsistent(candidate family, layout routableLayout, markers topologyMarkers) bool {
+	legacyMode := candidate.Mode == "dolt-legacy" && markers.doltMode == ""
+	serverMode := candidate.Mode == "dolt-server" && markers.doltMode == "server"
+	selectorOK := (legacyMode && (markers.metadataDatabase == "beads.db" || markers.metadataDatabase == "dolt")) ||
+		(serverMode && markers.metadataDatabase == "dolt")
+	return (legacyMode || serverMode) && len(layout.Stores) == 0 &&
+		validRetainedSQLiteBackupSchemas(layout.RetainedBackupSchemas, markers.sqliteBackups) &&
+		markers.legacy && !markers.embedded && !markers.database && !markers.data &&
+		markers.provider == "dolt" && selectorOK
+}
+
+// routeByProviderMode classifies single-root families by their declared provider
+// mode. A known mode whose invariants fail declines (matched=false) so the
+// caller emits the final inconsistency error; an unknown mode is rejected here.
+func routeByProviderMode(candidate family, layout routableLayout, markers topologyMarkers) ([]string, string, bool, error) {
+	switch candidate.Mode {
+	case "sqlite":
+		if isSealedCopySQLiteFamily(layout, markers) {
+			return layout.Topology, "sealed-copy-export-import", true, nil
+		}
+	case "jsonl":
+		if isHeadInitFromJSONLFamily(layout, markers) {
+			return layout.Topology, "head-init-from-jsonl", true, nil
+		}
+	case "dolt-legacy":
+		if isSealedCopyDoltLegacyFamily(layout, markers) {
+			return layout.Topology, "sealed-copy-export-import", true, nil
+		}
+	case "dolt-server":
+		if isSealedCopyDoltServerFamily(layout, markers) {
+			return layout.Topology, "sealed-copy-export-import", true, nil
+		}
+	case "dolt-embedded":
+		if isSealedCopyDoltEmbeddedFamily(layout, markers) {
+			return layout.Topology, "sealed-copy-direct-head-migration", true, nil
+		}
+	default:
+		return nil, "", true, fmt.Errorf("unknown provider mode %q", candidate.Mode)
+	}
+	return nil, "", false, nil
+}
+
+// isSealedCopySQLiteFamily reports whether a sqlite-mode family is a plain sealed
+// SQLite copy eligible for sealed-copy-export-import.
+func isSealedCopySQLiteFamily(layout routableLayout, markers topologyMarkers) bool {
+	providerOK := markers.provider == "" || markers.provider == "sqlite"
+	backupsOK := validRetainedSQLiteBackupSchemas(layout.RetainedBackupSchemas, markers.sqliteBackups)
+	return len(layout.Stores) == 0 && providerOK && backupsOK &&
+		markers.database && !markers.data && !markers.legacy && !markers.embedded && markers.doltMode == ""
+}
+
+// isHeadInitFromJSONLFamily reports whether a jsonl-mode family is a data-only
+// export eligible for head-init-from-jsonl.
+func isHeadInitFromJSONLFamily(layout routableLayout, markers topologyMarkers) bool {
+	return len(layout.Stores) == 0 && len(layout.RetainedBackupSchemas) == 0 &&
+		!markers.sqliteBackups && markers.data && !markers.database && !markers.legacy && !markers.embedded && markers.provider == "" && markers.doltMode == ""
+}
+
+// isSealedCopyDoltLegacyFamily reports whether a dolt-legacy-mode single-root
+// family is a sealed legacy Dolt copy eligible for sealed-copy-export-import.
+func isSealedCopyDoltLegacyFamily(layout routableLayout, markers topologyMarkers) bool {
+	return len(layout.Stores) == 0 && validRetainedSQLiteBackupSchemas(layout.RetainedBackupSchemas, markers.sqliteBackups) &&
+		markers.legacy && !markers.embedded && !markers.database && !markers.data &&
+		markers.providerOK && (markers.doltMode == "" || markers.doltMode == "embedded")
+}
+
+// isSealedCopyDoltServerFamily reports whether a dolt-server-mode single-root
+// family is a sealed legacy Dolt copy eligible for sealed-copy-export-import.
+func isSealedCopyDoltServerFamily(layout routableLayout, markers topologyMarkers) bool {
+	return len(layout.Stores) == 0 && validRetainedSQLiteBackupSchemas(layout.RetainedBackupSchemas, markers.sqliteBackups) &&
+		markers.legacy && !markers.embedded && !markers.database && !markers.data &&
+		markers.providerOK && markers.doltMode == "server"
+}
+
+// isSealedCopyDoltEmbeddedFamily reports whether a dolt-embedded-mode single-root
+// family is a sealed embedded Dolt copy eligible for
+// sealed-copy-direct-head-migration.
+func isSealedCopyDoltEmbeddedFamily(layout routableLayout, markers topologyMarkers) bool {
+	return len(layout.Stores) == 0 && validRetainedSQLiteBackupSchemas(layout.RetainedBackupSchemas, markers.sqliteBackups) &&
+		!markers.legacy && markers.embedded && !markers.database && !markers.data &&
+		markers.providerOK && (markers.doltMode == "" || markers.doltMode == "embedded")
 }
 
 type doltFamilyLayout struct {
