@@ -432,7 +432,7 @@ func wireDeferredImportDeps(ctx context.Context, store storage.DoltStorage, defe
 		if err := store.CreateIssuesWithFullOptions(ctx, depRows[start:end], actor, depOpts); err != nil {
 			return fmt.Errorf("import dependency pass chunk %d/%d failed (all %d issue rows are committed; re-run the import to resume — it converges): %w", chunk, depChunks, rowTotal, err)
 		}
-		fmt.Fprintf(importProgress, "bd import: deferred dependencies wired for %d/%d issues\n", end, depTotal)
+		fmt.Fprintf(importProgress, "bd import: deferred dependencies wired for %d/%d issues\n", end, depTotal) //nolint:gosec // G705: stderr, not a browser context
 	}
 	return nil
 }
