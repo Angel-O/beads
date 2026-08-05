@@ -242,6 +242,52 @@ func TestLegacyUpgradeGuardMetadataLessSQLiteAndCurrentEmbeddedPrecedence(t *tes
 	})
 }
 
+func TestLegacyUpgradeGuardServerSelectionBeatsStaleEmbeddedRepository(t *testing.T) {
+	tests := []struct {
+		name        string
+		version     string
+		wantRefusal bool
+	}{
+		{name: "historical witness", version: "0.62.0", wantRefusal: true},
+		{name: "missing witness", wantRefusal: true},
+		{name: "malformed witness", version: "not-a-version", wantRefusal: true},
+		{name: "current witness", version: "1.1.2"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			beadsDir := t.TempDir()
+			metadata := []byte(`{"backend":"dolt","dolt_mode":"server","dolt_database":"selected_server_db"}`)
+			if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tt.version != "" {
+				if err := os.WriteFile(filepath.Join(beadsDir, localVersionFile), []byte(tt.version+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Mkdir(filepath.Join(beadsDir, "dolt"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			staleRepo := filepath.Join(beadsDir, "embeddeddolt", "stale", ".dolt")
+			if err := os.MkdirAll(staleRepo, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(staleRepo, "repo-entry"), []byte("opaque"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			err := guardLegacyUpgradeWorkspace(beadsDir)
+			if tt.wantRefusal && !isLegacyUpgradeRefusal(err) {
+				t.Fatalf("guardLegacyUpgradeWorkspace() = %v, want migration refusal", err)
+			}
+			if !tt.wantRefusal && err != nil {
+				t.Fatalf("current selected server workspace was refused: %v", err)
+			}
+		})
+	}
+}
+
 func TestLegacyUpgradeGuardRefusesOldDoltRootWithoutTrustingVersionWitness(t *testing.T) {
 	tests := []struct {
 		name     string

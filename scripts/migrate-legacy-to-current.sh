@@ -356,9 +356,15 @@ case "$strategy" in
         ;;
 esac
 
-[ -s "$export_jsonl" ] || die 'historical export was empty'
+[ -f "$export_jsonl" ] && [ ! -L "$export_jsonl" ] ||
+    die 'historical export was not written as a non-symlink regular file'
+# Only the direct strategy uses the candidate's authenticated SQLite reader.
+# Older exporter failures must not be allowed to masquerade as an empty source.
+if [ "$strategy" != direct ] && [ ! -s "$export_jsonl" ]; then
+    die 'historical export was empty'
+fi
 jq -s -e '
-    length > 0 and all(.[];
+    all(.[];
         type == "object" and
         (if (._type // "") == "memory"
          then (.key | type) == "string" and (.value | type) == "string"
@@ -376,7 +382,12 @@ verify_current_cutover "$destination/cutover/.beads"
 
 candidate_export="$destination/candidate-export.jsonl"
 run_at "$destination/cutover" "$new_bd" export --all -o "$candidate_export" >/dev/null
-[ -s "$candidate_export" ] || die 'candidate export was empty after import'
+[ -f "$candidate_export" ] && [ ! -L "$candidate_export" ] ||
+    die 'candidate export was not written as a non-symlink regular file'
+# A zero-record candidate is valid only for a zero-record expected export.
+if [ -s "$export_jsonl" ] && [ ! -s "$candidate_export" ]; then
+    die 'candidate export was empty after import'
+fi
 normalize_export "$export_jsonl" > "$destination/expected-normalized.json"
 normalize_export "$candidate_export" > "$destination/candidate-normalized.json"
 if ! cmp -s "$destination/expected-normalized.json" "$destination/candidate-normalized.json"; then

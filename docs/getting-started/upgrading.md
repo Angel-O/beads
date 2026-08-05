@@ -248,20 +248,27 @@ It runs in both server and embedded modes.
 If you're upgrading from a much older version of bd, inspect the storage layout
 and metadata before running the current binary. A `.beads/dolt/` directory alone
 does not identify a legacy workspace: supported current server mode uses that
-directory too. Current `bd` recognizes legacy server mode only when the metadata
-and bounded `.local_version` witness agree.
+directory too. Current `bd` evaluates explicit server metadata, the presence of
+that local root, and the bounded `.local_version` witness together. An explicit
+server selection is not overridden by a stale `.beads/embeddeddolt/` repository.
 
 | Storage layout | Upgrade path |
 |---|---|
-| `.beads/embeddeddolt/` | Direct current-era upgrade |
-| Current metadata selecting `backend: dolt`, `dolt_mode: server`, with an absent, malformed, or non-historical `.local_version` | Normal current server-mode upgrade |
-| `.beads/dolt/` with missing metadata or persisted `dolt_mode` blank/`embedded` | Explicit legacy Dolt export/import |
-| Historical server metadata plus `.local_version` from v0.55.4 through v0.62.0 | Explicit legacy Dolt export/import |
+| Current embedded metadata with `.beads/embeddeddolt/` and no explicit server selection | Direct current-era upgrade |
+| Explicit server metadata plus `.local_version` from v0.55.4 through v0.62.0, whether or not `.beads/dolt/` exists | Explicit legacy Dolt export/import |
+| Explicit server metadata plus `.beads/dolt/` and a valid witness whose major version is 1 or newer | Normal current server-mode upgrade |
+| Explicit server metadata plus `.beads/dolt/` and a missing, malformed, or pre-v1 witness | Explicit legacy Dolt export/import |
+| Explicit server metadata without `.beads/dolt/`, and a missing, malformed, or non-historical witness | Normal current server-mode compatibility path |
+| `.beads/dolt/` with missing metadata or persisted `dolt_mode` blank/`embedded` | Explicit legacy Dolt export/import, except for the configured shared-server compatibility path described below |
 | One `.beads/*.db` file, such as `beads.db` or `vc.db` | Sealed SQLite bridge |
 
 Current `bd` refuses recognized historical SQLite and legacy Dolt layouts before
 opening storage or rewriting metadata. This is intentional: preserve the source
 and complete the matching explicit migration below.
+
+PostgreSQL and MySQL are removed backends, not supported cross-era upgrade
+paths. Current `bd` refuses metadata that selects either backend, and the sealed
+bridge below accepts SQLite sources only.
 
 ### `.beads/embeddeddolt/`: direct upgrade
 
@@ -304,14 +311,20 @@ binary, then import the export into a fresh current project. Keep the original
 and snapshot unchanged until the cutover has been reviewed. The SQLite
 sealed-copy helper below does not start or manage a Dolt SQL server.
 
-Current server metadata is admitted as a compatibility layout when its
-`.local_version` witness is absent, malformed, or outside the historical range.
-When current shared-server mode is explicitly selected, a `.beads/dolt/` root
-without a v0.55.4–v0.62.0 witness is also admitted for compatibility. Neither
-admission can prove the workspace is modern. If you know the workspace was
-created by v0.55.4 through v0.62.0, use this explicit bridge even when the
-witness is absent, malformed, or non-historical. Otherwise, follow the normal
-`bd migrate --dry-run` and `bd migrate` flow for the server.
+Explicit server metadata with a v0.55.4–v0.62.0 witness is always refused,
+including when there is no local `.beads/dolt/` root. When that root does exist,
+the guard admits explicit server mode only with a syntactically valid witness
+whose major version is 1 or newer; a missing, malformed, or pre-v1 witness fails
+closed. Without the local root, a missing, malformed, or non-historical witness
+is admitted only as a compatibility layout.
+
+The configured shared-server compatibility path applies only when persisted
+metadata is missing or leaves `dolt_mode` blank/`embedded`; it does not override
+an explicit server selection with a local root. Compatibility admission cannot
+prove that a workspace is modern. If you know it was created by v0.55.4 through
+v0.62.0, use this explicit bridge even when its witness was lost or damaged.
+Otherwise, follow the normal `bd migrate --dry-run` and `bd migrate` flow for
+an admitted server workspace.
 
 ### One `.beads/*.db` file: sealed SQLite bridge
 

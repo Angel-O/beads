@@ -38,11 +38,11 @@ func guardLegacyUpgradeWorkspace(beadsDir string) error {
 	if err := validateConfiguredBackend(cfg); err != nil {
 		return err
 	}
-	if embeddeddolt.HasRepository(beadsDir) {
+	serverMode := cfg != nil && strings.EqualFold(cfg.DoltMode, configfile.DoltModeServer)
+	if embeddeddolt.HasRepository(beadsDir) && !serverMode {
 		return nil
 	}
 	version, ok := legacyUpgradeVersionWitness(beadsDir)
-	serverMode := cfg != nil && strings.EqualFold(cfg.DoltMode, configfile.DoltModeServer)
 	if serverMode && ok && legacyServerVersion(version) {
 		return legacyUpgradeRefusal(fmt.Sprintf("legacy Dolt server workspace from bd %s", version))
 	}

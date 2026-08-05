@@ -589,6 +589,46 @@ migrate_schema_current() {
         die "$version: schema migration $label did not report the exact no-op output"
 }
 
+verify_empty_public_sqlite_bridge() {
+    local version="$1" source="$2" before after export_file
+    public_bridge_destination="${workspace}.empty-public-bridge"
+    [ ! -e "$public_bridge_destination" ] && [ ! -L "$public_bridge_destination" ] ||
+        die "$version: empty public bridge destination already exists"
+    before=$(classic_source_fingerprint) ||
+        die "$version: could not fingerprint empty SQLite source before public bridge"
+    if ! timeout --kill-after=5s "$((OP_TIMEOUT * 4))" \
+        "$PROJECT_ROOT/scripts/migrate-legacy-to-current.sh" \
+        --source "$workspace" --destination "$public_bridge_destination" \
+        --source-version "$version" --old-bd "$source" --new-bd "$candidate" \
+        --prefix histclassic > "$workspace/empty-public-bridge.out" \
+        2> "$workspace/empty-public-bridge.err"; then
+        die "$version: empty public sealed-copy bridge failed"
+    fi
+    after=$(classic_source_fingerprint) ||
+        die "$version: could not fingerprint empty SQLite source after public bridge"
+    [ "$after" = "$before" ] ||
+        die "$version: empty public bridge changed the historical source"
+    jq -e '.backend == "dolt" and .dolt_mode == "embedded"' \
+        "$public_bridge_destination/cutover/.beads/metadata.json" >/dev/null ||
+        die "$version: empty public bridge did not create an embedded cutover"
+    [ -d "$public_bridge_destination/cutover/.beads/embeddeddolt" ] ||
+        die "$version: empty public bridge did not create embedded storage"
+    for export_file in export.jsonl candidate-export.jsonl; do
+        [ -f "$public_bridge_destination/$export_file" ] &&
+            [ ! -L "$public_bridge_destination/$export_file" ] &&
+            [ ! -s "$public_bridge_destination/$export_file" ] ||
+            die "$version: empty public bridge $export_file was not a zero-byte regular file"
+        jq -s -e 'length == 0' "$public_bridge_destination/$export_file" >/dev/null ||
+            die "$version: empty public bridge $export_file did not represent zero records"
+    done
+    for export_file in expected-normalized.json candidate-normalized.json; do
+        jq -e 'type == "array" and length == 0' "$public_bridge_destination/$export_file" >/dev/null ||
+            die "$version: empty public bridge $export_file was not []"
+    done
+    rm -rf -- "$public_bridge_destination"
+    public_bridge_destination=""
+}
+
 verify_public_sqlite_bridge() {
     local version="$1" source="$2" prefix="$3" before after canonicalizer
     local -a args
@@ -678,6 +718,7 @@ run_classic_sqlite_upgrade() {
         # this isolated workspace. The candidate bridge remains noninteractive.
         run_in_workspace "$source" init --quiet --prefix histclassic || die "$version: source init failed"
     fi
+    verify_empty_public_sqlite_bridge "$version" "$source"
     create_historical_fixture "$version" "$source"
     export_classic_sqlite_with_candidate "$version" "$export_file"
     before=$(classic_source_fingerprint) || die "$version: could not snapshot historical SQLite source"
