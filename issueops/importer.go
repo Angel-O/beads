@@ -15,9 +15,11 @@ type ImportBatchRequest struct {
 	// conditionally rewritten (see AllowStale), and labels, comments and
 	// dependencies merge idempotently.
 	Issues []*Issue
-	// Memories maps full config keys (the caller applies its kv prefixes) to
-	// values, imported alongside the issues in the same transaction.
-	Memories map[string]string
+	// Memories are the memory records, in file order, imported alongside the
+	// issues in the same transaction. Keys are full config keys (the caller
+	// applies its kv prefixes); a duplicated key writes twice and the later
+	// record wins, which is the classic import's sequential behavior.
+	Memories []ImportMemory
 	// AllowStale imports rows even when their updated_at is older than the
 	// stored issue's. When false, the engine's conditional upsert rejects the
 	// stale row inside the transaction and reports it in StaleRejectedIDs —
@@ -36,6 +38,12 @@ type ImportBatchRequest struct {
 	// Source names where the rows came from (a file basename or "stdin") and
 	// appears in the history entry's message.
 	Source string
+}
+
+// ImportMemory is one memory record ('bd remember') carried by an import.
+type ImportMemory struct {
+	Key   string
+	Value string
 }
 
 // SkippedDependency reports one dependency edge the import dropped rather

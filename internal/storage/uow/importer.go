@@ -3,7 +3,6 @@ package uow
 import (
 	"context"
 	"fmt"
-	"sort"
 
 	"github.com/steveyegge/beads/internal/storage"
 	storageissueops "github.com/steveyegge/beads/internal/storage/issueops"
@@ -92,18 +91,11 @@ func (o *importer) ImportBatch(ctx context.Context, request publicops.ImportBatc
 			result.Created = len(request.Issues) - len(staleRejected)
 		}
 
-		if len(request.Memories) > 0 {
-			keys := make([]string, 0, len(request.Memories))
-			for key := range request.Memories {
-				keys = append(keys, key)
+		for _, memory := range request.Memories {
+			if err := uw.ConfigUseCase().SetConfig(ctx, memory.Key, memory.Value); err != nil {
+				return publicops.ImportBatchResult{}, "", fmt.Errorf("import memory %q: %w", memory.Key, err)
 			}
-			sort.Strings(keys)
-			for _, key := range keys {
-				if err := uw.ConfigUseCase().SetConfig(ctx, key, request.Memories[key]); err != nil {
-					return publicops.ImportBatchResult{}, "", fmt.Errorf("import memory %q: %w", key, err)
-				}
-			}
-			result.MemoriesImported = len(request.Memories)
+			result.MemoriesImported++
 		}
 
 		// config.yaml is authoritative for issue_prefix on the import flow
