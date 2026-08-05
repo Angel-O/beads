@@ -134,6 +134,7 @@
 
 15 15 TestProxiedServerMolShow
 15 15 TestProxiedServerOrphans
+15 15 TestProxiedServerRecomputeBlocked
 15 15 TestProxiedServerShow2
 15 15 TestProxiedServerUnclaim
 15 15 TestProxiedServerUpdate3
