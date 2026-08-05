@@ -456,7 +456,7 @@ func runShowProxiedDefault(ctx context.Context, uw uow.UnitOfWork, in *showProxi
 
 		if jsonOutput {
 			details := proxiedBuildDetails(ctx, uw, issue, isWisp, in)
-			allDetails = append(allDetails, details)
+			allDetails = append(allDetails, projectShowJSONDetails(details))
 			continue
 		}
 

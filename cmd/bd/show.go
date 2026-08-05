@@ -236,7 +236,7 @@ var showCmd = &cobra.Command{
 						break
 					}
 				}
-				allDetails = append(allDetails, details)
+				allDetails = append(allDetails, projectShowJSONDetails(details))
 				result.Close()
 				continue
 			}
