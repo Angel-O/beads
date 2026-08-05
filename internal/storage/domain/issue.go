@@ -39,6 +39,7 @@ type IssueSQLRepository interface {
 	Insert(ctx context.Context, issue *types.Issue, actor string, opts InsertIssueOpts) error
 	InsertBatch(ctx context.Context, issues []*types.Issue, actor string, opts InsertIssueOpts) error
 	MovePersistence(ctx context.Context, id string, mode types.PersistenceMode) (changed bool, err error)
+	PromoteFromEphemeral(ctx context.Context, id, actor string) error
 	Update(ctx context.Context, id string, updates map[string]any, actor string, opts IssueTableOpts) error
 	Claim(ctx context.Context, id, actor string, opts IssueTableOpts) (ClaimRowResult, error)
 	Get(ctx context.Context, id string, opts IssueTableOpts) (*types.Issue, error)
@@ -75,6 +76,7 @@ type IssueSQLRepository interface {
 	GetStaleIssues(ctx context.Context, filter types.StaleFilter) ([]*types.Issue, error)
 	GetEpicsEligibleForClosure(ctx context.Context) ([]*types.EpicStatus, error)
 	UnclaimIssue(ctx context.Context, id, actor string, force bool) error
+	HeartbeatIssue(ctx context.Context, id, actor string) error
 	ReclaimExpiredLeases(ctx context.Context, olderThan time.Duration, filter types.ReclaimFilter, actor string) ([]types.ReclaimedLease, error)
 }
 
@@ -282,6 +284,7 @@ type IssueUseCase interface {
 	GetStaleIssues(ctx context.Context, filter types.StaleFilter) ([]*types.Issue, error)
 	GetEpicsEligibleForClosure(ctx context.Context) ([]*types.EpicStatus, error)
 	Unclaim(ctx context.Context, id, actor string, force bool) error
+	Heartbeat(ctx context.Context, id, actor string) error
 	ReclaimExpiredLeases(ctx context.Context, olderThan time.Duration, filter types.ReclaimFilter, actor string) ([]types.ReclaimedLease, error)
 
 	CreateIssue(ctx context.Context, params CreateIssueParams, actor string) (CreateIssueResult, error)
@@ -318,6 +321,7 @@ type IssueUseCase interface {
 	GetNewlyUnblockedByCloseWisp(ctx context.Context, closedID string) ([]*types.Issue, error)
 	ApplyWispGraph(ctx context.Context, plan GraphPlan, actor string) (GraphApplyResult, error)
 	ClaimReadyWisp(ctx context.Context, filter types.WorkFilter, actor string) (ClaimReadyResult, error)
+	PromoteWisp(ctx context.Context, id, actor string) error
 }
 
 type CloseIssueParams struct {
@@ -744,6 +748,18 @@ func (u *issueUseCaseImpl) isWispID(ctx context.Context, id string) (bool, error
 		return false, fmt.Errorf("probe wisps table: %w", err)
 	}
 	return found, nil
+}
+
+// PromoteWisp moves an active wisp to the Dolt-versioned issues plane,
+// preserving its id, wisp_type, labels, dependencies, events, and comments.
+// One-way: the promoted row is no longer ephemeral, so purge won't reclaim
+// it. The repository error passes through unwrapped — the CLI surfaces it
+// verbatim and its text is part of the classic error contract.
+func (u *issueUseCaseImpl) PromoteWisp(ctx context.Context, id, actor string) error {
+	if id == "" {
+		return fmt.Errorf("promote wisp: id must not be empty")
+	}
+	return u.issueRepo.PromoteFromEphemeral(ctx, id, actor)
 }
 
 func (u *issueUseCaseImpl) SearchIssues(ctx context.Context, query string, filter types.IssueFilter) (SearchPage, error) {
@@ -1796,6 +1812,20 @@ func (u *issueUseCaseImpl) Unclaim(ctx context.Context, id, actor string, force 
 	}
 	if err := u.issueRepo.UnclaimIssue(ctx, id, actor, force); err != nil {
 		return fmt.Errorf("Unclaim: %w", err)
+	}
+	return nil
+}
+
+// Heartbeat refreshes the lease on an issue actor holds in_progress. The
+// write touches ONLY the ephemeral leases table (bd-lrgn1), so the caller
+// must run it under uow.RunTxEphemeral's no-Dolt-commit form — a heartbeat
+// mints no Dolt commit and no history in any mode (bd-aq0ql).
+func (u *issueUseCaseImpl) Heartbeat(ctx context.Context, id, actor string) error {
+	if id == "" {
+		return fmt.Errorf("Heartbeat: id must not be empty")
+	}
+	if err := u.issueRepo.HeartbeatIssue(ctx, id, actor); err != nil {
+		return fmt.Errorf("Heartbeat: %w", err)
 	}
 	return nil
 }

@@ -19,6 +19,7 @@
 15 1 TestProxiedServerDelete
 15 1 TestProxiedServerDoltRemoteRemove
 15 1 TestProxiedServerExport
+15 1 TestProxiedServerGateLifecycle
 15 1 TestProxiedServerMolCurrent
 15 1 TestProxiedServerPathHelpers
 15 1 TestProxiedServerTodo
@@ -66,6 +67,7 @@
 15 7 TestProxiedServerClose
 15 7 TestProxiedServerCloseConcurrent
 15 7 TestProxiedServerExternalCreate
+15 7 TestProxiedServerHeartbeat
 15 7 TestProxiedServerMolStale
 15 7 TestProxiedServerReadyWisp
 15 7 TestProxiedServerReclaim
@@ -74,6 +76,7 @@
 15 8 TestProxiedServerGC
 15 8 TestProxiedServerGateCheck
 15 8 TestProxiedServerMolLastActivity
+15 8 TestProxiedServerPromote
 15 8 TestProxiedServerQuick
 15 8 TestProxiedServerReopenConcurrent
 15 8 TestProxiedServerServeClaim
@@ -113,12 +116,14 @@
 15 13 TestProxiedServerConfig
 15 13 TestProxiedServerConfigConcurrent
 15 13 TestProxiedServerGateList
+15 13 TestProxiedServerMemory
 15 13 TestProxiedServerMultiStatementSQL
 15 13 TestProxiedServerReopen
 15 13 TestProxiedServerStatuses
 
 15 14 TestProxiedServerComment
 15 14 TestProxiedServerContext
+15 14 TestProxiedServerKV
 15 14 TestProxiedServerNote
 15 14 TestProxiedServerSearch
 15 14 TestProxiedServerShow
