@@ -79,11 +79,6 @@ func cliCompatibleMigrationSQL(name, sqlText string) string {
 		// schema delta: create the ephemeral leases table, drop the issues/
 		// wisps lease columns 0054 added. row_lock stays (see the migration).
 		return cliMigration0055MoveLeasesToTable
-	case "0022_ensure_lease_granted_node.up.sql":
-		// The Dolt CLI test path cannot execute the runtime migration's
-		// prepared DDL guard. Fresh bundles always carry leases, so direct DDL
-		// captures the final schema shape here.
-		return cliMigration0022EnsureLeaseGrantedNode
 	default:
 		return sqlText
 	}
@@ -124,8 +119,6 @@ ALTER TABLE issues DROP COLUMN lease_expires_at;
 ALTER TABLE issues DROP COLUMN heartbeat_at;
 ALTER TABLE wisps DROP COLUMN lease_expires_at;
 ALTER TABLE wisps DROP COLUMN heartbeat_at;`
-
-const cliMigration0022EnsureLeaseGrantedNode = `ALTER TABLE leases ADD COLUMN granted_node VARCHAR(255) NOT NULL DEFAULT '';`
 
 const cliMigration0041SplitDependenciesTarget = `DELETE FROM dolt_nonlocal_tables;
 CALL DOLT_COMMIT('-Am', 'disable nonlocal tables for fk migrations');

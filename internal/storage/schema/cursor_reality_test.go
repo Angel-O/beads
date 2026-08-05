@@ -28,6 +28,22 @@ func stubSentinelTables(t *testing.T, present map[string]bool, probeErr error) *
 	return &probed
 }
 
+func stubSentinelColumns(t *testing.T, present map[string]bool, probeErr error) *[]string {
+	t.Helper()
+	var probed []string
+	orig := sentinelColumnExists
+	t.Cleanup(func() { sentinelColumnExists = orig })
+	sentinelColumnExists = func(_ context.Context, _ DBConn, table, column string) (bool, error) {
+		key := table + "." + column
+		probed = append(probed, key)
+		if probeErr != nil {
+			return false, probeErr
+		}
+		return present[key], nil
+	}
+	return &probed
+}
+
 // TestCursorContradictedBySchema is the gh 5033 / gh 4356 regression: the
 // cursor is a claim about the schema, and a claim the schema contradicts must
 // not be believed. Before this, a database whose clone-local wisp tables were
@@ -40,11 +56,13 @@ func TestCursorContradictedBySchema(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		present map[string]bool
+		columns map[string]bool
 		want    bool
 	}{
 		{
 			name:    "no wisp tables at all",
 			present: map[string]bool{},
+			columns: map[string]bool{},
 			want:    true,
 		},
 		{
@@ -53,21 +71,37 @@ func TestCursorContradictedBySchema(t *testing.T) {
 			// where wisp_dependencies is the missing one.
 			name:    "wisps present, wisp_dependencies absent",
 			present: map[string]bool{"wisps": true},
+			columns: map[string]bool{},
 			want:    true,
 		},
 		{
 			name:    "wisp_dependencies present, wisps absent",
 			present: map[string]bool{"wisp_dependencies": true},
+			columns: map[string]bool{},
+			want:    true,
+		},
+		{
+			name:    "leases table absent",
+			present: map[string]bool{"wisps": true, "wisp_dependencies": true},
+			columns: map[string]bool{},
+			want:    true,
+		},
+		{
+			name:    "leases granted_node absent",
+			present: map[string]bool{"wisps": true, "wisp_dependencies": true},
+			columns: map[string]bool{},
 			want:    true,
 		},
 		{
 			name:    "schema corroborates the cursor",
 			present: map[string]bool{"wisps": true, "wisp_dependencies": true},
+			columns: map[string]bool{"leases.granted_node": true},
 			want:    false,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stubSentinelTables(t, tc.present, nil)
+			stubSentinelColumns(t, tc.columns, nil)
 			got, err := ignoredSource.cursorContradictedBySchema(ctx, nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -100,6 +134,7 @@ func TestCursorProbeErrorIsNotTreatedAsContradicted(t *testing.T) {
 // it — including never probing.
 func TestMainSourceIsNotProbed(t *testing.T) {
 	probed := stubSentinelTables(t, map[string]bool{}, nil)
+	columnProbed := stubSentinelColumns(t, map[string]bool{}, nil)
 
 	got, err := mainSource.cursorContradictedBySchema(context.Background(), nil)
 	if err != nil {
@@ -110,6 +145,9 @@ func TestMainSourceIsNotProbed(t *testing.T) {
 	}
 	if len(*probed) != 0 {
 		t.Errorf("mainSource probed %v; it was deliberately left unguarded", *probed)
+	}
+	if len(*columnProbed) != 0 {
+		t.Errorf("mainSource probed column sentinels %v; it was deliberately left unguarded", *columnProbed)
 	}
 	if len(ignoredSource.sentinelTables) == 0 {
 		t.Error("ignoredSource has no sentinel tables; the gh 5033 guard is inert")
@@ -176,6 +214,38 @@ func TestMigrationWorkNeededWhenWispTablesAbsent(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestMigrationWorkNeededWhenLeaseGrantedNodeAbsent keeps the historical
+// ignored-v16 ordinal collision on the actual MigrateUp short-circuit path:
+// both cursors claim at-latest and both table sentinels corroborate that
+// claim, but the clone-local leases shape does not.
+func TestMigrationWorkNeededWhenLeaseGrantedNodeAbsent(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion())
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", LatestIgnoredVersion())
+	for range ignoredSource.sentinelTables {
+		mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.TABLES")).
+			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.COLUMNS")).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	needed, err := migrationWorkNeeded(context.Background(), db)
+	if err != nil {
+		t.Fatalf("migrationWorkNeeded: %v", err)
+	}
+	if !needed {
+		t.Fatal("migrationWorkNeeded = false with an at-latest cursor and missing leases.granted_node; frozen ignored 0016 would never replay")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet ordered sentinel probes: %v", err)
 	}
 }
 
