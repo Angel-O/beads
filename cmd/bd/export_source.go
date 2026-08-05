@@ -44,7 +44,7 @@ type exportSource interface {
 	// comment counts, and dependency counts for the searched issues.
 	LoadExportRelations(ctx context.Context, issues []*types.Issue) (exportRelations, error)
 	// WispPlaneIDs reports which of ids currently live in the WISPS table.
-	// Export uses it to stamp the explicit "wisp" plane marker on records
+	// Export uses it to stamp the explicit "wisp_plane" marker on records
 	// whose row flags are ambiguous: a no_history=true row is either an
 	// unpromoted no-history wisp (wisps table) or a promoted one (durable
 	// issues-table row that may still carry the stray flag), and only table

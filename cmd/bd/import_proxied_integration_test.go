@@ -186,7 +186,7 @@ func TestProxiedServerImport(t *testing.T) {
 	})
 
 	// bd-r9uce: import routes the storage plane by the export stream's
-	// explicit "wisp" marker, never by the no_history flag. A no_history=true
+	// explicit "wisp_plane" marker, never by the no_history flag. A no_history=true
 	// record WITHOUT the marker is a promoted no-history wisp — a durable
 	// issues-table row whose stray flag must not re-plane it into the wisps
 	// table (which would drop its cross-plane relations as "cross-bucket");
@@ -214,7 +214,7 @@ func TestProxiedServerImport(t *testing.T) {
 		},
 			// A genuine unpromoted no-history wisp: same flags, but carrying
 			// the explicit plane marker.
-			`{"id":"impw-wisp-real","title":"Real no-history wisp","status":"open","issue_type":"task","priority":2,"no_history":true,"wisp":true,"created_at":"2026-08-01T12:00:00Z","updated_at":"2026-08-01T12:00:00Z"}`,
+			`{"id":"impw-wisp-real","title":"Real no-history wisp","status":"open","issue_type":"task","priority":2,"no_history":true,"wisp_plane":true,"created_at":"2026-08-01T12:00:00Z","updated_at":"2026-08-01T12:00:00Z"}`,
 		)
 		path := filepath.Join(p.dir, "planes.jsonl")
 		if err := os.WriteFile(path, []byte(fixture), 0o644); err != nil {

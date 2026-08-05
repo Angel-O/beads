@@ -335,7 +335,7 @@ func TestProxiedServerExport(t *testing.T) {
 	// DURABLE plane. Classifying by row flags looks them up in the wisp plane
 	// and silently drops them; classification must follow table membership.
 	// Since bd-r9uce the shape lives IN the round-trip fixture (fx.promoted):
-	// import now routes by the explicit "wisp" plane marker instead of the
+	// import now routes by the explicit "wisp_plane" marker instead of the
 	// flags, so the cross_mode_byte_identical oracle below covers it too.
 	// The export half pinned here: relations present, and NO plane marker on
 	// the record (it is durable — stamping it would re-plane it on import).
@@ -352,7 +352,7 @@ func TestProxiedServerExport(t *testing.T) {
 		if noHist, _ := rec["no_history"].(bool); !noHist {
 			t.Fatalf("promoted row lost no_history in export: %v", rec)
 		}
-		if _, marked := rec["wisp"]; marked {
+		if _, marked := rec["wisp_plane"]; marked {
 			t.Errorf("promoted row carries the wisps-plane marker; it is durable and must not be stamped: %v", rec)
 		}
 		if labels := exportStrings(rec["labels"]); len(labels) != 1 || labels[0] != "keepme" {

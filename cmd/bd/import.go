@@ -229,8 +229,8 @@ func runImportFromReader(ctx context.Context, r io.Reader, source string) error 
 // records — the `bd import` / `bd import -` parse loop, shared by the classic
 // and proxied modes. Same record vocabulary as parseJSONLFile (the bootstrap
 // reader): the optional _schema header and tombstones are skipped, and the
-// "wisp" boolean is honored as the explicit wisps-plane marker (and the
-// legacy alias for "ephemeral") via applyImportWispPlane.
+// "wisp_plane" boolean is honored as the explicit wisps-plane marker (and
+// the legacy "wisp" alias for "ephemeral") via applyImportWispPlane.
 func parseImportRecords(r io.Reader) ([]*types.Issue, []memoryRecord, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
