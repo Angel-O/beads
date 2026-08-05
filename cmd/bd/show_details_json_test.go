@@ -74,3 +74,30 @@ func TestProjectShowJSONDetailsExposesRevision(t *testing.T) {
 		}
 	}
 }
+
+// TestProjectShowJSONDetailsEmitsZeroRevision pins the legacy-zero wire
+// behavior: RowVersion == 0 is the migration-0054 backfill token, a legitimate
+// CAS value a guarded client must be able to read. The projection drops
+// omitempty so `revision` is always emitted, including 0 — an absent field must
+// never stand in for a legacy-zero row.
+func TestProjectShowJSONDetailsEmitsZeroRevision(t *testing.T) {
+	details := &types.IssueDetails{Issue: types.Issue{
+		ID:         "be-legacy-zero",
+		Title:      "Legacy un-mutated issue",
+		RowVersion: 0,
+	}}
+
+	data, err := json.Marshal(projectShowJSONDetails(details))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	js := string(data)
+	if !strings.Contains(js, `"revision":0`) {
+		t.Errorf("expected revision:0 to be emitted for a legacy-zero row, got: %s", js)
+	}
+	for _, forbidden := range []string{"row_version", "RowVersion", "row_lock"} {
+		if strings.Contains(js, forbidden) {
+			t.Errorf("show JSON leaked storage field %q: %s", forbidden, js)
+		}
+	}
+}

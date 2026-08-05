@@ -14,9 +14,17 @@ import (
 // absent from generic Issue JSON and JSONL, while `bd show --json` exposes the
 // opaque token required by guarded clients under the storage-neutral name
 // `revision`.
+//
+// The field is emitted WITHOUT omitempty. 0 is a legitimate, comparable token:
+// a guarded write that expects 0 matches an un-mutated legacy migration-0054
+// row and fails any current (non-zero) row — correct CAS semantics. Omitting it
+// would leave a guarded client unable to read the 0 it must send on exactly the
+// legacy rows the token protects, and would make an absent field ambiguously
+// mean either "legacy-zero" or "no token". `revision` is therefore always
+// present, including 0.
 type showJSONIssueDetails struct {
 	*types.IssueDetails
-	Revision int64 `json:"revision,omitempty"`
+	Revision int64 `json:"revision"`
 }
 
 func projectShowJSONDetails(details *types.IssueDetails) showJSONIssueDetails {
