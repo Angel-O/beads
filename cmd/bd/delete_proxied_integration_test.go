@@ -30,7 +30,16 @@ func TestProxiedServerDelete(t *testing.T) {
 		t.Fatalf("read HEAD before preview: %v", err)
 	}
 
-	preview := bdProxiedDeleteJSON(t, bd, p.dir, "--json", target.ID)
+	// Embedded parity (bd-paurh): with external dependents and neither
+	// --cascade nor --force, delete refuses and tells the caller how to
+	// proceed instead of silently cascading.
+	refusal := bdProxiedDeleteFail(t, bd, p.dir, target.ID)
+	if !strings.Contains(refusal, "has dependents not in deletion set") ||
+		!strings.Contains(refusal, "--cascade") || !strings.Contains(refusal, "--force") {
+		t.Errorf("bare delete with dependents: got %q, want refusal naming --cascade/--force", refusal)
+	}
+
+	preview := bdProxiedDeleteJSON(t, bd, p.dir, "--json", "--cascade", target.ID)
 	previewWant := map[string]any{
 		"schema_version":       float64(1),
 		"would_delete":         float64(3),
@@ -41,6 +50,8 @@ func TestProxiedServerDelete(t *testing.T) {
 		"not_found":            nil,
 		"connected":            []any{survivor.ID},
 		"dry_run":              false,
+		"cascade":              true,
+		"would_orphan":         float64(0),
 	}
 	if !deleteJSONEqual(preview, previewWant) {
 		t.Errorf("preview JSON: got %#v, want %#v", preview, previewWant)
@@ -56,7 +67,7 @@ func TestProxiedServerDelete(t *testing.T) {
 		t.Errorf("preview advanced HEAD: before=%s after=%s", headBefore, headAfterPreview)
 	}
 
-	deleted := bdProxiedDeleteJSON(t, bd, p.dir, "--json", target.ID, "--force")
+	deleted := bdProxiedDeleteJSON(t, bd, p.dir, "--json", "--cascade", target.ID, "--force")
 	deletedWant := map[string]any{
 		"schema_version":       float64(1),
 		"deleted":              []any{target.ID},
@@ -65,6 +76,7 @@ func TestProxiedServerDelete(t *testing.T) {
 		"labels_removed":       float64(1),
 		"events_removed":       float64(4),
 		"references_updated":   float64(1),
+		"orphaned_issues":      nil,
 	}
 	if !deleteJSONEqual(deleted, deletedWant) {
 		t.Errorf("delete JSON: got %#v, want %#v", deleted, deletedWant)
@@ -115,6 +127,53 @@ func TestProxiedServerDelete(t *testing.T) {
 
 func deleteJSONEqual(got, want map[string]any) bool {
 	return reflect.DeepEqual(got, want)
+}
+
+// TestProxiedServerDeleteForceOrphans pins the embedded-parity --force
+// semantics (bd-paurh): without --cascade, --force deletes ONLY the named IDs,
+// orphans external dependents, and cleans up the dependency links touching the
+// deleted rows.
+func TestProxiedServerDeleteForceOrphans(t *testing.T) {
+	requireSharedProxiedServer(t)
+	t.Parallel()
+	bd := buildEmbeddedBD(t)
+	p := newSharedProxiedProject(t, bd, "delfo")
+
+	target := bdProxiedCreate(t, bd, p.dir, "Orphan target", "--type", "task")
+	dependent := bdProxiedCreate(t, bd, p.dir, "Orphaned dependent", "--type", "task", "--deps", "depends-on:"+target.ID)
+	descendant := bdProxiedCreate(t, bd, p.dir, "Orphan descendant", "--type", "task", "--parent", dependent.ID)
+
+	deleted := bdProxiedDeleteJSON(t, bd, p.dir, "--json", target.ID, "--force")
+	if got, want := deleted["deleted_count"], float64(1); got != want {
+		t.Errorf("deleted_count: got %v, want %v (force without cascade must delete only the named ID)", got, want)
+	}
+	if got, want := deleted["orphaned_issues"], []any{dependent.ID}; !reflect.DeepEqual(got, want) {
+		t.Errorf("orphaned_issues: got %#v, want %#v", got, want)
+	}
+
+	db := openProxiedDB(t, p)
+	ctx := context.Background()
+	assertRowAbsent(t, db, "issues", target.ID)
+	assertRowExists(t, db, "issues", dependent.ID)
+	assertRowExists(t, db, "issues", descendant.ID)
+
+	var depRows int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM dependencies WHERE issue_id = ? OR depends_on_issue_id = ?",
+		target.ID, target.ID).Scan(&depRows); err != nil {
+		t.Fatalf("count dependency rows touching deleted id: %v", err)
+	}
+	if depRows != 0 {
+		t.Errorf("dependency links touching deleted %s: got %d, want 0 (orphan cleanup)", target.ID, depRows)
+	}
+	var survivingDeps int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM dependencies WHERE issue_id = ?", descendant.ID).Scan(&survivingDeps); err != nil {
+		t.Fatalf("count surviving dependency rows: %v", err)
+	}
+	if survivingDeps != 1 {
+		t.Errorf("descendant->dependent link: got %d rows, want 1 (untouched)", survivingDeps)
+	}
 }
 
 func TestProxiedServerDeleteWisp(t *testing.T) {
