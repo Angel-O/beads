@@ -13,6 +13,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
+	publicops "github.com/steveyegge/beads/issueops"
 )
 
 // claimCommitBoundaryDriver models a permanent claim through its SQL mutation,
@@ -364,6 +365,134 @@ func TestClaimReadyIssueVerifyFailureDoesNotRecordCircuitSuccess(t *testing.T) {
 	breaker.RecordFailure()
 	if state := breaker.State(); state != circuitOpen {
 		t.Fatalf("circuit state after verify-failed claim + one failure = %q, want %q (RecordSuccess must not fire before verify)", state, circuitOpen)
+	}
+}
+
+// TestIssueOperationsUpdateClaimVerifyFailureDoesNotRecordCircuitSuccess pins the
+// fix for the verify-gated circuit-accounting major on the IssueLifecycle.Update
+// facade (the twin of the ClaimReadyIssue regression above). A facade claim whose
+// SQL/Dolt write commits but whose post-write verify-by-re-read contradicts the
+// reported success must NOT reset the breaker. verifiedUpdate now runs the write
+// and its verify under withCircuitWrite, so the nested runIssueOperationTx
+// inherits the managed context and defers its success reset to the boundary,
+// which records success only after verifiedClaimWrite returns nil. Before the fix,
+// withRetryTx reset the breaker the instant the SQL commit returned — laundering a
+// phantom facade claim (reported success, failed verification) into breaker-health
+// optimism.
+func TestIssueOperationsUpdateClaimVerifyFailureDoesNotRecordCircuitSuccess(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	// The commit succeeds (no commitErr/sqlCommitErr), but every verify re-read
+	// returns ("", open) — checkedUpdate stays false — which cannot match
+	// claimedAs("alice", in_progress), so the facade claim reports success then
+	// fails verification.
+	driver := &claimCommitBoundaryDriver{}
+	store := newClaimCommitBoundaryStore(driver)
+	store.serverMode = true
+	breaker := newTestCircuitBreaker(t)
+	store.breaker = breaker
+	t.Cleanup(func() { _ = store.db.Close() })
+
+	// Prime the breaker to one failure short of tripping. If the operation
+	// preserves the counter, one further failure trips it; if the write reset it
+	// (the bug), the counter is back to zero and one failure leaves it closed.
+	for i := 0; i < circuitFailureThreshold-1; i++ {
+		breaker.RecordFailure()
+	}
+	if state := breaker.State(); state != circuitClosed {
+		t.Fatalf("circuit state after priming = %q, want %q", state, circuitClosed)
+	}
+
+	operations := &issueOperations{store: store}
+	_, err := operations.Update(context.Background(), publicops.UpdateRequest{
+		Actor:   "alice",
+		IssueID: "claim-boundary",
+		Claim:   true,
+	})
+	if err == nil {
+		t.Fatal("facade claim Update error = nil, want a verification failure")
+	}
+	if !strings.Contains(err.Error(), "did not land") {
+		t.Fatalf("facade claim Update error = %v, want a verify 'did not land' failure", err)
+	}
+
+	// The write must have reported success (the SQL tx committed and DOLT_COMMIT
+	// landed) so the buggy path's premature RecordSuccess would have fired here.
+	driver.mu.Lock()
+	if driver.claimMutations != 1 || driver.doltCommits != 1 || driver.txCommits != 1 {
+		t.Fatalf("write outcome = mutations:%d Dolt commits:%d SQL commits:%d, want 1,1,1 (write must report success)",
+			driver.claimMutations, driver.doltCommits, driver.txCommits)
+	}
+	driver.mu.Unlock()
+
+	// The verify failure must have left the breaker's failure counter intact: one
+	// more failure trips it. Had the write recorded success before verify, the
+	// counter would be zero and this single failure would leave it closed.
+	breaker.RecordFailure()
+	if state := breaker.State(); state != circuitOpen {
+		t.Fatalf("circuit state after verify-failed facade claim + one failure = %q, want %q (RecordSuccess must not fire before verify)", state, circuitOpen)
+	}
+}
+
+// TestIssueOperationsUpdateGuardedVerifyFailureDoesNotRecordCircuitSuccess is the
+// coordination-only guarded twin of the facade-claim regression above. A guarded
+// status write whose compare-and-set precondition passes and whose write commits,
+// but whose post-write verify shows the coordination state did not land, must not
+// reset the breaker either. The guarded branch is verifiable for the same reason a
+// claim is — its postcondition is provable from an assignee/status re-read — so it
+// travels the same withCircuitWrite boundary and must defer success accounting the
+// same way.
+func TestIssueOperationsUpdateGuardedVerifyFailureDoesNotRecordCircuitSuccess(t *testing.T) {
+	t.Setenv("BEADS_TEST_MODE", "")
+	// checkedUpdate stays false, so every SELECT assignee,status returns
+	// ("", open). The CAS read sees open and matches ExpectedStatus open, so the
+	// guard passes and the write runs; the post-write verify sees open again,
+	// which cannot match the wanted status in_progress, so the update reports
+	// success then fails verification.
+	driver := &claimCommitBoundaryDriver{}
+	store := newClaimCommitBoundaryStore(driver)
+	store.serverMode = true
+	breaker := newTestCircuitBreaker(t)
+	store.breaker = breaker
+	t.Cleanup(func() { _ = store.db.Close() })
+
+	for i := 0; i < circuitFailureThreshold-1; i++ {
+		breaker.RecordFailure()
+	}
+	if state := breaker.State(); state != circuitClosed {
+		t.Fatalf("circuit state after priming = %q, want %q", state, circuitClosed)
+	}
+
+	operations := &issueOperations{store: store}
+	expectedStatus := types.StatusOpen
+	_, err := operations.Update(context.Background(), publicops.UpdateRequest{
+		Actor:          "alice",
+		IssueID:        "claim-boundary",
+		ExpectedStatus: &expectedStatus,
+		Patch: publicops.IssuePatch{
+			Status: publicops.Field[publicops.Status]{Set: true, Value: types.StatusInProgress},
+		},
+	})
+	if err == nil {
+		t.Fatal("guarded coordination Update error = nil, want a verification failure")
+	}
+	if !strings.Contains(err.Error(), "did not land") {
+		t.Fatalf("guarded coordination Update error = %v, want a verify 'did not land' failure", err)
+	}
+
+	// A coordination-only status write trips neither driver mutation counter (its
+	// UPDATE leads with updated_at and back-tick-quotes the status column), so the
+	// write-reported-success signal is the committed SQL tx plus the landed
+	// DOLT_COMMIT — exactly what would have fired the buggy premature RecordSuccess.
+	driver.mu.Lock()
+	if driver.doltCommits != 1 || driver.txCommits != 1 {
+		t.Fatalf("write outcome = Dolt commits:%d SQL commits:%d, want 1,1 (write must report success)",
+			driver.doltCommits, driver.txCommits)
+	}
+	driver.mu.Unlock()
+
+	breaker.RecordFailure()
+	if state := breaker.State(); state != circuitOpen {
+		t.Fatalf("circuit state after verify-failed guarded update + one failure = %q, want %q (RecordSuccess must not fire before verify)", state, circuitOpen)
 	}
 }
 

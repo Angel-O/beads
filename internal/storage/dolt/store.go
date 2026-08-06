@@ -2913,8 +2913,20 @@ func (s *DoltStore) commitWorkingSet(ctx context.Context, message string, mode c
 
 	// GH#2455: stage each dirty table individually, skipping config unless the
 	// mode opts it in, to avoid sweeping up stale issue_prefix changes from
-	// concurrent operations. Query dolt_status first.
-	rows, err := conn.QueryContext(ctx, "SELECT table_name FROM dolt_status")
+	// concurrent operations. Exclude dolt_ignore'd tables (wisps, wisp_%, leases)
+	// with the same anti-join HasCommittablePending uses: they surface in
+	// dolt_status but are never stageable, and the fail-hard DOLT_ADD loop below
+	// must see only tables it can actually stage. A dirty wisp or lease row is the
+	// normal steady state; staging it depends on Dolt's version-specific
+	// ignored-table DOLT_ADD behavior (a silent no-op on 2.2.0), so filtering here
+	// keeps ordinary commits from failing whenever an ignored table is dirty.
+	rows, err := conn.QueryContext(ctx, `
+		SELECT s.table_name FROM dolt_status s
+		WHERE NOT EXISTS (
+			SELECT 1 FROM dolt_ignore di
+			WHERE di.ignored = 1
+			AND s.table_name LIKE di.pattern
+		)`)
 	if err != nil {
 		// If dolt_status fails, fall back to nothing (rare edge case).
 		return fmt.Errorf("failed to query dolt_status: %w", err)

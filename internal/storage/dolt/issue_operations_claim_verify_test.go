@@ -1,6 +1,7 @@
 package dolt
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -191,7 +192,7 @@ func TestIssueOperationsGuardedVerifyDoesNotMaskIndeterminateMixedUpdate(t *test
 			Status: publicops.Field[publicops.Status]{Set: true, Value: types.StatusOpen},
 			Title:  publicops.Field[string]{Set: true, Value: "must not be inferred"},
 		},
-	}, func() error {
+	}, func(context.Context) error {
 		return indeterminate
 	})
 	if !errors.Is(err, ErrCommitIndeterminate) {
@@ -230,7 +231,7 @@ func TestIssueOperationsClaimVerifyDoesNotMaskIndeterminateMixedClaim(t *testing
 		Patch: publicops.IssuePatch{
 			Title: publicops.Field[string]{Set: true, Value: "must not be inferred"},
 		},
-	}, func() error {
+	}, func(context.Context) error {
 		return indeterminate
 	})
 	if !errors.Is(err, ErrCommitIndeterminate) {
@@ -258,7 +259,7 @@ func TestIssueOperationsClaimCoordinationPatchRetainsIndeterminate(t *testing.T)
 		Patch: publicops.IssuePatch{
 			Status: publicops.Field[publicops.Status]{Set: true, Value: types.StatusInProgress},
 		},
-	}, func() error {
+	}, func(context.Context) error {
 		return indeterminate
 	})
 	if !errors.Is(err, ErrCommitIndeterminate) {
@@ -279,7 +280,7 @@ func TestIssueOperationsClaimVerifyFailsLoudlyOnLostFacadeClaim(t *testing.T) {
 	id := claimVerifyTestIssue(t, s)
 	operations := &issueOperations{store: s}
 
-	err := operations.verifiedUpdate(ctx, publicops.UpdateRequest{Actor: "alice", IssueID: id, Claim: true}, func() error {
+	err := operations.verifiedUpdate(ctx, publicops.UpdateRequest{Actor: "alice", IssueID: id, Claim: true}, func(context.Context) error {
 		return nil // lie: report success without writing anything
 	})
 	if err == nil {
@@ -306,7 +307,7 @@ func TestIssueOperationsClaimVerifyLeavesOrdinaryUpdatesUnwrapped(t *testing.T) 
 	request := publicops.UpdateRequest{Actor: "alice", IssueID: id, Patch: publicops.IssuePatch{
 		Title: publicops.Field[string]{Set: true, Value: "retitled"},
 	}}
-	if err := operations.verifiedUpdate(ctx, request, func() error { return nil }); err != nil {
+	if err := operations.verifiedUpdate(ctx, request, func(context.Context) error { return nil }); err != nil {
 		t.Fatalf("ordinary update must keep its exit status, got: %v", err)
 	}
 }

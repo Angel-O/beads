@@ -187,9 +187,6 @@ func (s *DoltStore) verifiedClaimWrite(ctx context.Context, id string, post clai
 	}
 	assignee, status, verr := s.readClaimState(ctx, id)
 	if verr != nil {
-		if err != nil {
-			return err
-		}
 		return fmt.Errorf("%s of %s reported success but could not be verified (server degraded?): %w — re-read the issue before trusting the %s",
 			post.op, id, verr, post.op)
 	}

@@ -48,7 +48,7 @@ func (o *issueOperations) Create(ctx context.Context, request issueops.CreateReq
 func (o *issueOperations) Update(ctx context.Context, request issueops.UpdateRequest) (issueops.UpdateResult, error) {
 	snapshot := storageissueops.CloneUpdateRequest(request)
 	var result issueops.UpdateResult
-	err := o.verifiedUpdate(ctx, snapshot, func() error {
+	err := o.verifiedUpdate(ctx, snapshot, func(ctx context.Context) error {
 		// The message names the issue because that is the one `bd dolt log`
 		// affordance callers actually grep, and it is what the CLI's own
 		// per-command commit wrote before updates moved onto this path.
@@ -68,12 +68,25 @@ func (o *issueOperations) Update(ctx context.Context, request issueops.UpdateReq
 // landed, even when the claim state already matches. The facade reaches the
 // same writes as ClaimIssue and UpdateIssueWithOptions, so under a degraded
 // server its exit status is no more trustworthy than theirs.
-func (o *issueOperations) verifiedUpdate(ctx context.Context, request issueops.UpdateRequest, write func() error) error {
+//
+// A verifying update runs write and its post-write re-read under withCircuitWrite
+// so terminal circuit success is recorded once at the boundary, only after
+// verifiedClaimWrite returns nil — matching issueClaimer.Claim and the store's
+// ClaimIssue. write is invoked with the circuit-managed context so its nested
+// runIssueOperationTx defers success to that boundary instead of recording it
+// eagerly when the SQL commit lands but before the re-read can fail. A
+// non-verifying update keeps the original context and its eager accounting,
+// leaving the ordinary patch path unchanged.
+func (o *issueOperations) verifiedUpdate(ctx context.Context, request issueops.UpdateRequest, write func(context.Context) error) error {
 	post, verify := updateClaimPostcondition(request)
 	if !verify {
-		return write()
+		return write(ctx)
 	}
-	return o.store.verifiedClaimWrite(ctx, request.IssueID, post, write)
+	return o.store.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return o.store.verifiedClaimWrite(ctx, request.IssueID, post, func() error {
+			return write(ctx)
+		})
+	})
 }
 
 // updateClaimPostcondition derives the row state a facade update must leave
