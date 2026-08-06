@@ -136,6 +136,10 @@ type DependencySQLRepository interface {
 	Delete(ctx context.Context, issueID, dependsOnID, actor string, opts DepInsertOpts) (DepDeleteResult, error)
 	HasCycle(ctx context.Context, issueID, dependsOnID string) (bool, error)
 	ListByIssueIDs(ctx context.Context, issueIDs []string, opts DepListOpts) (DepBulkResult, error)
+	// ListByIssueFilter and ListByReadyFilter scope a dependency read to a page
+	// by joining against the page's own id subquery, so no id list is sent.
+	ListByIssueFilter(ctx context.Context, query string, filter types.IssueFilter, opts DepListOpts) (DepBulkResult, error)
+	ListByReadyFilter(ctx context.Context, filter types.WorkFilter, opts DepListOpts) (DepBulkResult, error)
 	ListWithIssueMetadata(ctx context.Context, sourceID string, opts DepListOpts) ([]*types.IssueWithDependencyMetadata, error)
 	IterWithIssueMetadata(ctx context.Context, sourceID string, opts DepListOpts) (storage.Iter[types.IssueWithDependencyMetadata], error)
 	CountByID(ctx context.Context, sourceID string, opts DepListOpts) (int64, error)
@@ -177,6 +181,8 @@ type DependencyUseCase interface {
 	GetBlockingInfo(ctx context.Context, issueIDs []string) (BlockingInfo, error)
 	IsBlocked(ctx context.Context, issueID string) (bool, []string, error)
 	GetForIssueIDs(ctx context.Context, ids []string) (map[string][]*types.Dependency, error)
+	GetForIssueFilter(ctx context.Context, query string, filter types.IssueFilter) (map[string][]*types.Dependency, error)
+	GetForReadyFilter(ctx context.Context, filter types.WorkFilter) (map[string][]*types.Dependency, error)
 	DetectCycles(ctx context.Context) ([][]*types.Issue, error)
 
 	GetDependencyTree(ctx context.Context, rootID string, opts DepTreeOpts) ([]*types.TreeNode, error)
@@ -444,6 +450,53 @@ func (u *dependencyUseCaseImpl) GetForIssueIDs(ctx context.Context, ids []string
 		out[id] = append(out[id], deps...)
 	}
 	return out, nil
+}
+
+// hydrateDepsForPage merges a page's outgoing edges from both dependency planes.
+// A missing wisp_dependencies table is tolerated the same way GetForIssueIDs
+// tolerates it. The returned map is never nil on success, which lets callers use
+// a nil map to mean "not preloaded".
+func hydrateDepsForPage(
+	issues func(DepListOpts) (DepBulkResult, error),
+	label string,
+) (map[string][]*types.Dependency, error) {
+	issueRes, err := issues(DepListOpts{Direction: DepDirectionOut})
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", label, err)
+	}
+	out := issueRes.Outgoing
+	if out == nil {
+		out = make(map[string][]*types.Dependency)
+	}
+
+	wispRes, err := issues(DepListOpts{Direction: DepDirectionOut, UseWispsTable: true})
+	if err != nil && !dberrors.IsTableNotExist(err) {
+		return nil, fmt.Errorf("%s (wisps): %w", label, err)
+	}
+	for id, deps := range wispRes.Outgoing {
+		out[id] = append(out[id], deps...)
+	}
+	return out, nil
+}
+
+func hydrateDepsForIssueFilter(ctx context.Context, depRepo DependencySQLRepository, query string, filter types.IssueFilter) (map[string][]*types.Dependency, error) {
+	return hydrateDepsForPage(func(opts DepListOpts) (DepBulkResult, error) {
+		return depRepo.ListByIssueFilter(ctx, query, filter, opts)
+	}, "GetForIssueFilter")
+}
+
+func hydrateDepsForReadyFilter(ctx context.Context, depRepo DependencySQLRepository, filter types.WorkFilter) (map[string][]*types.Dependency, error) {
+	return hydrateDepsForPage(func(opts DepListOpts) (DepBulkResult, error) {
+		return depRepo.ListByReadyFilter(ctx, filter, opts)
+	}, "GetForReadyFilter")
+}
+
+func (u *dependencyUseCaseImpl) GetForIssueFilter(ctx context.Context, query string, filter types.IssueFilter) (map[string][]*types.Dependency, error) {
+	return hydrateDepsForIssueFilter(ctx, u.depRepo, query, filter)
+}
+
+func (u *dependencyUseCaseImpl) GetForReadyFilter(ctx context.Context, filter types.WorkFilter) (map[string][]*types.Dependency, error) {
+	return hydrateDepsForReadyFilter(ctx, u.depRepo, filter)
 }
 
 func (u *dependencyUseCaseImpl) ListByWispIDs(ctx context.Context, wispIDs []string, filter DepListFilter) (DepBulkResult, error) {

@@ -19,6 +19,12 @@ import (
 )
 
 func NewIssueSQLRepository(runner Runner) domain.IssueSQLRepository {
+	return newIssueSQLRepository(runner)
+}
+
+// newIssueSQLRepository returns the concrete type so callers inside this package
+// can reach the unexported query builders that are not on the exported interface.
+func newIssueSQLRepository(runner Runner) *issueSQLRepositoryImpl {
 	return &issueSQLRepositoryImpl{
 		runner: runner,
 		events: NewEventsSQLRepository(runner),

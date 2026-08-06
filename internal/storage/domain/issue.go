@@ -272,6 +272,11 @@ type IssueUseCase interface {
 	SearchIssues(ctx context.Context, query string, filter types.IssueFilter) (SearchPage, error)
 	SearchIssuesWithCounts(ctx context.Context, query string, filter types.IssueFilter) (SearchCountsPage, error)
 	SearchIssueIDs(ctx context.Context, query string, filter types.IssueFilter) ([]string, error)
+	// ListWithDependencies and GetReadyWorkWithDependencies return a page together
+	// with its outgoing dependency edges, hydrated by joining against the page's
+	// own id subquery rather than an id list built from the returned rows.
+	ListWithDependencies(ctx context.Context, query string, filter types.IssueFilter) (SearchPage, map[string][]*types.Dependency, error)
+	GetReadyWorkWithDependencies(ctx context.Context, filter types.WorkFilter) (SearchPage, map[string][]*types.Dependency, error)
 	GetReadyWork(ctx context.Context, filter types.WorkFilter) (SearchPage, error)
 	GetReadyWorkWithCounts(ctx context.Context, filter types.WorkFilter) (SearchCountsPage, error)
 	GetDescendants(ctx context.Context, rootID string, filter types.IssueFilter) ([]*types.Issue, error)
@@ -770,6 +775,30 @@ func (u *issueUseCaseImpl) SearchIssues(ctx context.Context, query string, filte
 		return SearchPage{}, fmt.Errorf("SearchIssues: %w", err)
 	}
 	return out, nil
+}
+
+func (u *issueUseCaseImpl) ListWithDependencies(ctx context.Context, query string, filter types.IssueFilter) (SearchPage, map[string][]*types.Dependency, error) {
+	page, err := u.SearchIssues(ctx, query, filter)
+	if err != nil {
+		return SearchPage{}, nil, err
+	}
+	deps, err := hydrateDepsForIssueFilter(ctx, u.depRepo, query, filter)
+	if err != nil {
+		return SearchPage{}, nil, fmt.Errorf("ListWithDependencies: %w", err)
+	}
+	return page, deps, nil
+}
+
+func (u *issueUseCaseImpl) GetReadyWorkWithDependencies(ctx context.Context, filter types.WorkFilter) (SearchPage, map[string][]*types.Dependency, error) {
+	page, err := u.GetReadyWork(ctx, filter)
+	if err != nil {
+		return SearchPage{}, nil, err
+	}
+	deps, err := hydrateDepsForReadyFilter(ctx, u.depRepo, filter)
+	if err != nil {
+		return SearchPage{}, nil, fmt.Errorf("GetReadyWorkWithDependencies: %w", err)
+	}
+	return page, deps, nil
 }
 
 func (u *issueUseCaseImpl) SearchIssueIDs(ctx context.Context, query string, filter types.IssueFilter) ([]string, error) {

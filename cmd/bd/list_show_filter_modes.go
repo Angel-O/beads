@@ -239,7 +239,7 @@ func runListProxiedHierarchicalParent(ctx context.Context, uw uow.UnitOfWork, in
 		return nil
 	}
 
-	depsByIssueID, err := loadDepsForIssues(ctx, uw, treeIssues)
+	depsByIssueID, err := loadDepsForIssues(ctx, uw, treeIssues, nil)
 	if err != nil {
 		return err
 	}

@@ -65,14 +65,14 @@ func runListProxiedSearch(_ *cobra.Command, ctx context.Context, in listInput) e
 		return emitProxiedListJSONResult(page.Items, in, page.HasMore)
 	}
 
-	page, err := uw.IssueUseCase().SearchIssues(ctx, "", filter)
+	page, deps, err := uw.IssueUseCase().ListWithDependencies(ctx, "", filter)
 	if err != nil {
 		return err
 	}
 
 	issues, hasMore := workapi.FinishPage(page.Items, in.SortBy, in.Reverse, in.effectiveLimit, page.HasMore)
 
-	return renderProxiedListText(ctx, uw, issues, in, hasMore)
+	return renderProxiedListText(ctx, uw, issues, in, hasMore, deps)
 }
 
 func runListProxiedReady(_ *cobra.Command, ctx context.Context, in listInput) error {
@@ -92,14 +92,14 @@ func runListProxiedReady(_ *cobra.Command, ctx context.Context, in listInput) er
 		return emitProxiedListJSONResult(page.Items, in, page.HasMore)
 	}
 
-	page, err := uw.IssueUseCase().GetReadyWork(ctx, wf)
+	page, deps, err := uw.IssueUseCase().GetReadyWorkWithDependencies(ctx, wf)
 	if err != nil {
 		return err
 	}
 
 	issues, hasMore := workapi.FinishPage(page.Items, in.SortBy, in.Reverse, in.effectiveLimit, page.HasMore)
 
-	return renderProxiedListText(ctx, uw, issues, in, hasMore)
+	return renderProxiedListText(ctx, uw, issues, in, hasMore, deps)
 }
 
 func runListProxiedWatch(_ *cobra.Command, ctx context.Context, in listInput) error {
@@ -147,7 +147,7 @@ func runListProxiedWatch(_ *cobra.Command, ctx context.Context, in listInput) er
 			issues, hasMore = workapi.FinishPage(page.Items, in.SortBy, in.Reverse, in.effectiveLimit, page.HasMore)
 		}
 
-		deps, err := loadDepsForIssues(ctx, uw, issues)
+		deps, err := loadDepsForIssues(ctx, uw, issues, nil)
 		if err != nil {
 			return nil, false, nil, err
 		}
@@ -208,7 +208,14 @@ func emitProxiedListJSONResult(iwc []*types.IssueWithCounts, in listInput, hasMo
 	return nil
 }
 
-func loadDepsForIssues(ctx context.Context, uw uow.UnitOfWork, issues []*types.Issue) (map[string][]*types.Dependency, error) {
+// loadDepsForIssues falls back to an id-list read for pages that no filter
+// subquery reproduces: the watch loop and the hierarchical --parent tree, which
+// is built by recursive traversal rather than one filtered query. A non-nil
+// preloaded map is used as-is.
+func loadDepsForIssues(ctx context.Context, uw uow.UnitOfWork, issues []*types.Issue, preloaded map[string][]*types.Dependency) (map[string][]*types.Dependency, error) {
+	if preloaded != nil {
+		return preloaded, nil
+	}
 	ids := make([]string, len(issues))
 	for i, issue := range issues {
 		ids[i] = issue.ID
@@ -216,9 +223,9 @@ func loadDepsForIssues(ctx context.Context, uw uow.UnitOfWork, issues []*types.I
 	return uw.DependencyUseCase().GetForIssueIDs(ctx, ids)
 }
 
-func renderProxiedListText(ctx context.Context, uw uow.UnitOfWork, issues []*types.Issue, in listInput, truncated bool) error {
+func renderProxiedListText(ctx context.Context, uw uow.UnitOfWork, issues []*types.Issue, in listInput, truncated bool, deps map[string][]*types.Dependency) error {
 	if in.formatStr != "" {
-		depsByIssueID, err := loadDepsForIssues(ctx, uw, issues)
+		depsByIssueID, err := loadDepsForIssues(ctx, uw, issues, deps)
 		if err != nil {
 			return err
 		}
@@ -230,7 +237,7 @@ func renderProxiedListText(ctx context.Context, uw uow.UnitOfWork, issues []*typ
 	}
 
 	if in.prettyFormat {
-		depsByIssueID, err := loadDepsForIssues(ctx, uw, issues)
+		depsByIssueID, err := loadDepsForIssues(ctx, uw, issues, deps)
 		if err != nil {
 			return err
 		}

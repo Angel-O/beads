@@ -11,14 +11,37 @@ import (
 )
 
 func (r *issueSQLRepositoryImpl) getReadyWorkIDPage(ctx context.Context, filter types.WorkFilter) (idSrcPage, bool, error) {
-	issuePreds, err := r.buildReadyWorkPredicates(ctx, filter, issuesFilterTables)
+	unionSQL, allArgs, err := r.buildReadyWorkIDSubquery(ctx, filter)
 	if err != nil {
 		return idSrcPage{}, false, err
 	}
 
+	rows, err := r.runner.QueryContext(ctx, unionSQL, allArgs...)
+	if err != nil {
+		return idSrcPage{}, false, fmt.Errorf("ready work union: query: %w", err)
+	}
+	page, err := scanIDSrcPage(rows, true)
+	if err != nil {
+		return idSrcPage{}, false, fmt.Errorf("ready work union: %w", err)
+	}
+	hasMore := page.trimToLimit(filter.Limit)
+	return page, hasMore, nil
+}
+
+// buildReadyWorkIDSubquery returns the id-and-source page query getReadyWorkIDPage
+// executes. It is split out so the dependency repository can embed it as a
+// subquery and scope a dependency read to the ready page without materializing
+// the ids. The returned args are ordered issue-predicates, wisp-predicates, then
+// sort args, matching the placeholder order in the SQL.
+func (r *issueSQLRepositoryImpl) buildReadyWorkIDSubquery(ctx context.Context, filter types.WorkFilter) (string, []any, error) {
+	issuePreds, err := r.buildReadyWorkPredicates(ctx, filter, issuesFilterTables)
+	if err != nil {
+		return "", nil, err
+	}
+
 	wispsEmpty, probeErr := r.wispsTableEmptyOrMissing(ctx)
 	if probeErr != nil {
-		return idSrcPage{}, false, fmt.Errorf("ready work union: wisps probe: %w", probeErr)
+		return "", nil, fmt.Errorf("ready work union: wisps probe: %w", probeErr)
 	}
 
 	subqueries := make([]string, 0, 2)
@@ -39,7 +62,7 @@ func (r *issueSQLRepositoryImpl) getReadyWorkIDPage(ctx context.Context, filter 
 		// work — issueops.getReadyWispsInTx filters them the same way.
 		wispPreds, err := r.buildReadyWorkPredicates(ctx, filter, wispsFilterTables)
 		if err != nil {
-			return idSrcPage{}, false, err
+			return "", nil, err
 		}
 		//nolint:gosec // G201: whereSQL composed from hardcoded fragments and ? placeholders.
 		wispSub := fmt.Sprintf(
@@ -65,16 +88,7 @@ func (r *issueSQLRepositoryImpl) getReadyWorkIDPage(ctx context.Context, filter 
 	)
 	allArgs = append(allArgs, sortOrder.Args...)
 
-	rows, err := r.runner.QueryContext(ctx, unionSQL, allArgs...)
-	if err != nil {
-		return idSrcPage{}, false, fmt.Errorf("ready work union: query: %w", err)
-	}
-	page, err := scanIDSrcPage(rows, true)
-	if err != nil {
-		return idSrcPage{}, false, fmt.Errorf("ready work union: %w", err)
-	}
-	hasMore := page.trimToLimit(filter.Limit)
-	return page, hasMore, nil
+	return unionSQL, allArgs, nil
 }
 
 func (r *issueSQLRepositoryImpl) getReadyWorkUnion(ctx context.Context, filter types.WorkFilter) (domain.SearchPage, error) {

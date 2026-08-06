@@ -379,6 +379,71 @@ func (r *dependencySQLRepositoryImpl) ListByIssueIDs(ctx context.Context, issueI
 	return result, nil
 }
 
+// listByPageSubquery scopes a dependency read to a page of issues by joining
+// against the page's own id subquery. Unlike ListByIssueIDs it sends no id list,
+// so the statement size does not grow with the page.
+//
+// The ORDER BY is a total order: issue_id alone leaves rows with the same source
+// in whatever order the join produced them.
+func (r *dependencySQLRepositoryImpl) listByPageSubquery(ctx context.Context, idSub string, idArgs []any, opts domain.DepListOpts) (domain.DepBulkResult, error) {
+	result := domain.DepBulkResult{
+		Outgoing: make(map[string][]*types.Dependency),
+		Incoming: make(map[string][]*types.Dependency),
+	}
+
+	table := pickDepTable(opts.UseWispsTable)
+	typeWhere, typeArgs := buildTypeFilter(opts.Types)
+	args := combineArgs(idArgs, typeArgs)
+
+	if opts.Direction == domain.DepDirectionBoth || opts.Direction == domain.DepDirectionOut {
+		//nolint:gosec // G201: table and depSelectColumns are hardcoded; idSub is composed from fixed table names and ? placeholders.
+		q := fmt.Sprintf(
+			`SELECT %s FROM %s JOIN (%s) page ON %s.issue_id = page.id%s ORDER BY issue_id, depends_on_id, type`,
+			depSelectColumns, table, idSub, table, typeWhere,
+		)
+		if err := r.queryDeps(ctx, q, args, result.Outgoing, true); err != nil {
+			return domain.DepBulkResult{}, fmt.Errorf("out: %w", err)
+		}
+	}
+
+	if opts.Direction == domain.DepDirectionBoth || opts.Direction == domain.DepDirectionIn {
+		//nolint:gosec // G201: table, depSelectColumns, depTargetExpr are hardcoded; idSub is composed from fixed table names and ? placeholders.
+		q := fmt.Sprintf(
+			`SELECT %s FROM %s JOIN (%s) page ON %s = page.id%s ORDER BY issue_id, depends_on_id, type`,
+			depSelectColumns, table, idSub, depTargetExpr, typeWhere,
+		)
+		if err := r.queryDeps(ctx, q, args, result.Incoming, false); err != nil {
+			return domain.DepBulkResult{}, fmt.Errorf("in: %w", err)
+		}
+	}
+
+	return result, nil
+}
+
+func (r *dependencySQLRepositoryImpl) ListByIssueFilter(ctx context.Context, query string, filter types.IssueFilter, opts domain.DepListOpts) (domain.DepBulkResult, error) {
+	idSub, idArgs, err := buildPageIDSubquery(ctx, r.runner, query, filter)
+	if err != nil {
+		return domain.DepBulkResult{}, fmt.Errorf("db: DependencySQLRepository.ListByIssueFilter: %w", err)
+	}
+	res, err := r.listByPageSubquery(ctx, idSub, idArgs, opts)
+	if err != nil {
+		return domain.DepBulkResult{}, fmt.Errorf("db: DependencySQLRepository.ListByIssueFilter: %w", err)
+	}
+	return res, nil
+}
+
+func (r *dependencySQLRepositoryImpl) ListByReadyFilter(ctx context.Context, filter types.WorkFilter, opts domain.DepListOpts) (domain.DepBulkResult, error) {
+	idSub, idArgs, err := newIssueSQLRepository(r.runner).buildReadyWorkIDSubquery(ctx, filter)
+	if err != nil {
+		return domain.DepBulkResult{}, fmt.Errorf("db: DependencySQLRepository.ListByReadyFilter: %w", err)
+	}
+	res, err := r.listByPageSubquery(ctx, idSub, idArgs, opts)
+	if err != nil {
+		return domain.DepBulkResult{}, fmt.Errorf("db: DependencySQLRepository.ListByReadyFilter: %w", err)
+	}
+	return res, nil
+}
+
 func (r *dependencySQLRepositoryImpl) CountsByIssueIDs(ctx context.Context, issueIDs []string, opts domain.DepCountsOpts) (map[string]*types.DependencyCounts, error) {
 	result := make(map[string]*types.DependencyCounts)
 	if len(issueIDs) == 0 {

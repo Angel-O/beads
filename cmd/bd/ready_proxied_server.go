@@ -140,7 +140,7 @@ func runReadyProxiedList(ctx context.Context, uw uow.UnitOfWork, in readyInput) 
 		return nil
 	}
 
-	page, err := uw.IssueUseCase().GetReadyWork(ctx, in.filter)
+	page, allDeps, err := uw.IssueUseCase().GetReadyWorkWithDependencies(ctx, in.filter)
 	if err != nil {
 		return HandleError("%v", err)
 	}
@@ -163,7 +163,7 @@ func runReadyProxiedList(ctx context.Context, uw uow.UnitOfWork, in readyInput) 
 		return nil
 	}
 
-	parentEpicMap := buildParentEpicMapProxied(ctx, uw, issues)
+	parentEpicMap := buildParentEpicMapProxied(ctx, uw, issues, allDeps)
 	usePlain := in.plainFormat || !in.prettyFormat
 	if usePlain {
 		fmt.Printf("\n%s Ready work (%d issues with no active blockers):\n\n", ui.RenderAccent("📋"), len(issues))
@@ -247,7 +247,7 @@ func runReadyProxiedExplain(ctx context.Context, uw uow.UnitOfWork, _ readyInput
 	if err != nil {
 		return HandleErrorRespectJSON("%v", err)
 	}
-	readyPage, err := uw.IssueUseCase().GetReadyWork(ctx, filter)
+	readyPage, allDeps, err := uw.IssueUseCase().GetReadyWorkWithDependencies(ctx, filter)
 	if err != nil {
 		return HandleErrorRespectJSON("%v", err)
 	}
@@ -269,10 +269,6 @@ func runReadyProxiedExplain(ctx context.Context, uw uow.UnitOfWork, _ readyInput
 	depCounts := make(map[string]*types.DependencyCounts, len(depCountsMap))
 	for k, v := range depCountsMap {
 		depCounts[k] = v
-	}
-	allDeps, err := uw.DependencyUseCase().GetForIssueIDs(ctx, readyIDs)
-	if err != nil {
-		debug.Logf("warning: failed to get dependency records: %v", err)
 	}
 
 	cycles, err := uw.DependencyUseCase().DetectCycles(ctx)
@@ -456,16 +452,11 @@ func runReadyProxiedGated(ctx context.Context, uw uow.UnitOfWork, _ readyInput) 
 	return renderGatedReadyMolecules(molecules)
 }
 
-func buildParentEpicMapProxied(ctx context.Context, uw uow.UnitOfWork, issues []*types.Issue) map[string]string {
-	if len(issues) == 0 {
-		return nil
-	}
-	ids := make([]string, len(issues))
-	for i, issue := range issues {
-		ids[i] = issue.ID
-	}
-	allDeps, err := uw.DependencyUseCase().GetForIssueIDs(ctx, ids)
-	if err != nil {
+// buildParentEpicMapProxied takes the caller's already-hydrated edges for the
+// same page rather than re-reading them; allDeps nil means the caller had none
+// to share and the map cannot be built.
+func buildParentEpicMapProxied(ctx context.Context, uw uow.UnitOfWork, issues []*types.Issue, allDeps map[string][]*types.Dependency) map[string]string {
+	if len(issues) == 0 || allDeps == nil {
 		return nil
 	}
 	parentIDs := make(map[string]bool)

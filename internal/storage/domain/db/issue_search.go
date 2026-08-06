@@ -103,6 +103,10 @@ func (r *issueSQLRepositoryImpl) searchUnion(ctx context.Context, query string, 
 }
 
 func (r *issueSQLRepositoryImpl) buildUnionSubquery(query string, filter types.IssueFilter, tables filterTables, srcTag string) (string, []any, error) {
+	return buildUnionSubquery(query, filter, tables, srcTag)
+}
+
+func buildUnionSubquery(query string, filter types.IssueFilter, tables filterTables, srcTag string) (string, []any, error) {
 	plan := buildLabelDrivenSearch(filter, tables)
 	whereClauses, args, err := buildIssueFilterClauses(query, plan.Filter, tables)
 	if err != nil {
@@ -386,8 +390,12 @@ func scanDepRow(rows *sql.Rows) (*types.Dependency, error) {
 }
 
 func (r *issueSQLRepositoryImpl) wispsTableEmptyOrMissing(ctx context.Context) (bool, error) {
+	return wispsTableEmptyOrMissing(ctx, r.runner)
+}
+
+func wispsTableEmptyOrMissing(ctx context.Context, runner Runner) (bool, error) {
 	var probe int
-	err := r.runner.QueryRowContext(ctx, "SELECT 1 FROM wisps LIMIT 1").Scan(&probe)
+	err := runner.QueryRowContext(ctx, "SELECT 1 FROM wisps LIMIT 1").Scan(&probe)
 	switch {
 	case err == nil:
 		return false, nil
@@ -398,6 +406,75 @@ func (r *issueSQLRepositoryImpl) wispsTableEmptyOrMissing(ctx context.Context) (
 	default:
 		return false, err
 	}
+}
+
+func buildTableIDSubquery(query string, filter types.IssueFilter, tables filterTables) (string, []any, error) {
+	plan := buildLabelDrivenSearch(filter, tables)
+	whereClauses, args, err := buildIssueFilterClauses(query, plan.Filter, tables)
+	if err != nil {
+		return "", nil, err
+	}
+	whereClauses, args = plan.MergeInto(whereClauses, args)
+
+	whereSQL := ""
+	if len(whereClauses) > 0 {
+		whereSQL = "WHERE " + strings.Join(whereClauses, " AND ")
+	}
+	selectKw := "SELECT"
+	if plan.Distinct {
+		selectKw = "SELECT DISTINCT"
+	}
+
+	//nolint:gosec // G201: fragments composed from fixed table names and ? placeholders.
+	sub := fmt.Sprintf("%s id FROM %s %s %s %s",
+		selectKw, plan.FromSQL, whereSQL,
+		orderBySQL(filter.SortBy, filter.SortDesc, ""),
+		limitOffsetSQL(filter.Limit, filter.Offset))
+	return sub, args, nil
+}
+
+// buildPageIDSubquery reproduces, as a subquery selecting ids alone, the row set
+// searchAcrossIssuesAndWisps returns for the same (query, filter). Callers join
+// against it to scope a second query to the page without materializing the ids.
+//
+// It deliberately errs toward a superset: every branch that could touch wisps
+// builds the union, including the Ephemeral case that searchAcrossIssuesAndWisps
+// handles by trying wisps first and falling through. A joined row that the page
+// then drops is harmless; a missing one loses data from the render.
+func buildPageIDSubquery(ctx context.Context, runner Runner, query string, filter types.IssueFilter) (string, []any, error) {
+	if filter.SkipWisps {
+		return buildTableIDSubquery(query, filter, issuesFilterTables)
+	}
+
+	// Not an optimization: a UNION against a wisps table that does not exist
+	// fails outright, so the probe has to gate the union, not just skip it.
+	empty, err := wispsTableEmptyOrMissing(ctx, runner)
+	if err != nil {
+		return "", nil, fmt.Errorf("probe wisps: %w", err)
+	}
+	if empty {
+		return buildTableIDSubquery(query, filter, issuesFilterTables)
+	}
+
+	iSub, iArgs, err := buildUnionSubquery(query, filter, issuesFilterTables, "i")
+	if err != nil {
+		return "", nil, fmt.Errorf("page ids (issues): %w", err)
+	}
+	wSub, wArgs, err := buildUnionSubquery(query, filter, wispsFilterTables, "w")
+	if err != nil {
+		return "", nil, fmt.Errorf("page ids (wisps): %w", err)
+	}
+
+	//nolint:gosec // G201: subqueries built from hardcoded table names and ? placeholders.
+	sub := fmt.Sprintf("SELECT id FROM (%s UNION ALL %s) merged %s %s",
+		iSub, wSub,
+		unionOrderBySQL(filter.SortBy, filter.SortDesc),
+		limitOffsetSQL(filter.Limit, filter.Offset))
+
+	args := make([]any, 0, len(iArgs)+len(wArgs))
+	args = append(args, iArgs...)
+	args = append(args, wArgs...)
+	return sub, args, nil
 }
 
 func buildLabelDrivenSearch(filter types.IssueFilter, tables filterTables) sqlbuild.LabelSearchPlan {
