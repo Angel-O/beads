@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
@@ -464,32 +465,31 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 	}
 	defer conn.Close()
 
-	// Ensure cleanup on a fresh connection: canceling an in-flight query makes
-	// go-sql-driver/mysql invalidate the operation connection.
+	// Arm cleanup before creating the branch: a lost create response can make
+	// the branch exist even when the call fails, and canceling an in-flight
+	// query makes go-sql-driver/mysql invalidate the operation connection, so
+	// cleanup reopens a fresh one.
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), federationStagingCleanupTimeout)
-		defer cancel()
-		var cleanupErr error
-		if err := conn.Close(); err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("discard operation connection: %w", err))
-		}
-		cleanupConn, err := db.Conn(cleanupCtx)
-		if err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("acquire cleanup connection: %w", err))
-		} else {
-			defer cleanupConn.Close()
-			if err := schema.DrainCall(cleanupCtx, cleanupConn, "CALL DOLT_CHECKOUT(?)", sourceBranch); err != nil {
-				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("restore branch %s: %w", sourceBranch, err))
-			}
-			if err := deleteFederationStagingBranch(cleanupCtx, cleanupConn, stagingBranch); err != nil {
-				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete staging branch: %w", err))
-			}
-		}
-		if cleanupErr != nil {
+		if cleanupErr := cleanupFilteredStaging(ctx, db, conn, sourceBranch, stagingBranch); cleanupErr != nil {
 			retErr = errors.Join(retErr, fmt.Errorf("federation filter: cleanup: %w", cleanupErr))
 		}
 	}()
 
+	if err := s.stageFilteredBranch(ctx, conn, sourceBranch, stagingBranch, excludeTypes); err != nil {
+		return err
+	}
+
+	// Push staging branch to peer, mapped to the peer's expected branch name.
+	refspec := stagingBranch + ":" + sourceBranch
+	return s.pushRefToPeer(ctx, peer, refspec)
+}
+
+// stageFilteredBranch creates the UUID staging branch from sourceBranch on the
+// pinned connection, deletes the excluded issue types on it, recomputes and
+// commits is_blocked when any rows were removed, and restores sourceBranch so
+// the caller can push the staging ref. Branch state is session-scoped, so every
+// step stays on conn.
+func (s *DoltStore) stageFilteredBranch(ctx context.Context, conn *sql.Conn, sourceBranch, stagingBranch string, excludeTypes []string) error {
 	// Create staging branch from the current branch. Cleanup is already armed:
 	// a lost response can make this call fail after Dolt created the branch.
 	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH(?, ?)", stagingBranch, sourceBranch); err != nil {
@@ -501,7 +501,26 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 		return fmt.Errorf("federation filter: checkout staging: %w", err)
 	}
 
-	// Delete excluded issues from the committed issues table.
+	if deleteExcludedIssues(ctx, conn, excludeTypes) {
+		if err := s.commitFilteredStaging(ctx, conn); err != nil {
+			return err
+		}
+	}
+
+	// Restore original branch context before pushing.
+	if err := versioncontrolops.CheckoutBranch(ctx, conn, sourceBranch); err != nil {
+		return fmt.Errorf("federation filter: restore branch %s: %w", sourceBranch, err)
+	}
+	return nil
+}
+
+// deleteExcludedIssues removes issues matching excludeTypes from the committed
+// issues table on conn's current (staging) branch and reports whether any rows
+// were deleted. The special type "wisp" matches ephemeral rows. A DELETE error
+// is intentionally ignored (deleted stays false for that type), preserving the
+// pre-existing best-effort filtering behavior; the caller only recomputes and
+// commits when something was actually removed.
+func deleteExcludedIssues(ctx context.Context, conn *sql.Conn, excludeTypes []string) bool {
 	deleted := false
 	for _, excludeType := range excludeTypes {
 		var result interface{ RowsAffected() (int64, error) }
@@ -517,27 +536,43 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 			}
 		}
 	}
+	return deleted
+}
 
-	if deleted {
-		if err := s.commitFilteredStaging(ctx, conn); err != nil {
-			return err
+// cleanupFilteredStaging discards the operation connection (an in-flight cancel
+// invalidates it), then restores sourceBranch and deletes stagingBranch on a
+// fresh, uncanceled, bounded connection. Errors are joined; a non-nil result is
+// wrapped by the caller with the "federation filter: cleanup" context.
+func cleanupFilteredStaging(ctx context.Context, db *sql.DB, conn *sql.Conn, sourceBranch, stagingBranch string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), federationStagingCleanupTimeout)
+	defer cancel()
+	var cleanupErr error
+	if err := conn.Close(); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("discard operation connection: %w", err))
+	}
+	cleanupConn, err := db.Conn(cleanupCtx)
+	if err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("acquire cleanup connection: %w", err))
+	} else {
+		defer cleanupConn.Close()
+		if err := schema.DrainCall(cleanupCtx, cleanupConn, "CALL DOLT_CHECKOUT(?)", sourceBranch); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("restore branch %s: %w", sourceBranch, err))
+		}
+		if err := deleteFederationStagingBranch(cleanupCtx, cleanupConn, stagingBranch); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete staging branch: %w", err))
 		}
 	}
-
-	// Restore original branch context before pushing.
-	if err := versioncontrolops.CheckoutBranch(ctx, conn, sourceBranch); err != nil {
-		return fmt.Errorf("federation filter: restore branch %s: %w", sourceBranch, err)
-	}
-
-	// Push staging branch to peer, mapped to the peer's expected branch name.
-	refspec := stagingBranch + ":" + sourceBranch
-	return s.pushRefToPeer(ctx, peer, refspec)
+	return cleanupErr
 }
 
 func deleteFederationStagingBranch(ctx context.Context, conn *sql.Conn, stagingBranch string) error {
 	err := schema.DrainCall(ctx, conn, "CALL DOLT_BRANCH('-Df', ?)", stagingBranch)
 	var mysqlErr *mysql.MySQLError
-	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1105 && mysqlErr.Message == "branch not found" {
+	// Dolt reports a missing branch as generic error 1105; match the message as
+	// a case-insensitive substring (as RemoteRefUnavailableErr does) because
+	// Dolt may append the branch/ref name to this class of error.
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1105 &&
+		strings.Contains(strings.ToLower(mysqlErr.Message), "branch not found") {
 		return nil
 	}
 	return err
