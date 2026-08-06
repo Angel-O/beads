@@ -144,7 +144,12 @@ func runDeleteProxiedPreviewTx(ctx context.Context, in *deleteInput) error {
 	}
 	if result.blocked != nil {
 		// Classic parity: render the preview, then fail with the refusal
-		// (which itself says how to proceed).
+		// (which itself says how to proceed). In JSON mode the preview payload
+		// above already carries the refusal in its "error" key — emitting
+		// jsonStdoutError too would put two JSON docs on stdout.
+		if in.jsonOutput {
+			return &exitError{Code: 1}
+		}
 		return HandleErrorRespectJSON("%v", result.blocked)
 	}
 	return nil

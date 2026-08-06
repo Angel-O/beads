@@ -118,6 +118,9 @@ type DeleteIssuesParams struct {
 	//   Cascade=false, Force=false → refuse if any external dependent exists
 	//                                (*DeleteBlockedError, naming the blockers)
 	//   Cascade=false, Force=true  → orphan external dependents (delete only IDs)
+	// One deliberate divergence from embedded: a wisp NAMED in IDs counts like
+	// any other issue here and can trip the refusal, where embedded partitions
+	// wisps out before the dependent check. Strictly safer; kept on purpose.
 	EnforceCascadePolicy bool
 	Force                bool
 }

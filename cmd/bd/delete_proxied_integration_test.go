@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"reflect"
 	"strings"
 	"sync"
@@ -173,6 +174,42 @@ func TestProxiedServerDeleteForceOrphans(t *testing.T) {
 	}
 	if survivingDeps != 1 {
 		t.Errorf("descendant->dependent link: got %d rows, want 1 (untouched)", survivingDeps)
+	}
+}
+
+// The blocked refusal in --json mode must put exactly ONE JSON document on
+// stdout — the preview payload, carrying the refusal in its "error" key. The
+// jsonStdoutError doc used to be emitted on top of it (#5371 review).
+func TestProxiedServerDeleteBlockedJSONSingleDoc(t *testing.T) {
+	requireSharedProxiedServer(t)
+	t.Parallel()
+	bd := buildEmbeddedBD(t)
+	p := newSharedProxiedProject(t, bd, "delete-blocked-json")
+
+	target := bdProxiedCreate(t, bd, p.dir, "Blocked target", "--type", "task")
+	bdProxiedCreate(t, bd, p.dir, "External dependent", "--type", "task", "--deps", "depends-on:"+target.ID)
+
+	stdout, stderr, err := bdProxiedDeleteRaw(t, bd, p.dir, "--json", target.ID)
+	if err == nil {
+		t.Fatalf("blocked --json delete should fail; stdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	start := strings.Index(stdout, "{")
+	if start < 0 {
+		t.Fatalf("no JSON object in blocked --json output:\n%s", stdout)
+	}
+	dec := json.NewDecoder(strings.NewReader(stdout[start:]))
+	var payload map[string]any
+	if err := dec.Decode(&payload); err != nil {
+		t.Fatalf("parse blocked --json payload: %v\nraw: %s", err, stdout[start:])
+	}
+	errMsg, _ := payload["error"].(string)
+	if !strings.Contains(errMsg, "has dependents not in deletion set") {
+		t.Errorf("blocked --json payload error: got %q, want the dependents refusal", errMsg)
+	}
+	var extra any
+	if decErr := dec.Decode(&extra); decErr != io.EOF {
+		t.Errorf("blocked --json emitted more than one JSON doc (second decode: err=%v doc=%v)\nraw: %s",
+			decErr, extra, stdout[start:])
 	}
 }
 
