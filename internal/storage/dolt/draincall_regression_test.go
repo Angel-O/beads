@@ -243,7 +243,7 @@ func TestCommitCommitResponseLossIsIndeterminate(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT table_name FROM dolt_status")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT s.table_name FROM dolt_status")).
 		WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("issues"))
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
 		WithArgs("issues").
@@ -273,7 +273,7 @@ func TestCommitPropagatesDoltAddFailureBeforeCommit(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	stageErr := errors.New("stage issues failed")
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT table_name FROM dolt_status")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT s.table_name FROM dolt_status")).
 		WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("issues"))
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
 		WithArgs("issues").
@@ -302,7 +302,7 @@ func TestPublicCommitAmbiguousConnectionFailuresTripCircuit(t *testing.T) {
 		{
 			name: "Commit",
 			expect: func(mock sqlmock.Sqlmock) {
-				mock.ExpectQuery(regexp.QuoteMeta("SELECT table_name FROM dolt_status")).
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT s.table_name FROM dolt_status")).
 					WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("issues"))
 				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
 					WithArgs("issues").
@@ -318,7 +318,7 @@ func TestPublicCommitAmbiguousConnectionFailuresTripCircuit(t *testing.T) {
 		{
 			name: "CommitMergeResolution",
 			expect: func(mock sqlmock.Sqlmock) {
-				mock.ExpectQuery(regexp.QuoteMeta("SELECT table_name FROM dolt_status")).
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT s.table_name FROM dolt_status")).
 					WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("issues"))
 				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
 					WithArgs("issues").

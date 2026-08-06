@@ -140,7 +140,7 @@ func TestCommitWorkingSetAfterSQLCommitResponseLossIsIndeterminate(t *testing.T)
 		{
 			name: "DOLT_ADD",
 			setup: func(mock sqlmock.Sqlmock, responseLoss error) {
-				mock.ExpectQuery(regexp.QuoteMeta("SELECT table_name FROM dolt_status")).
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT s.table_name FROM dolt_status")).
 					WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("issues"))
 				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
 					WithArgs("issues").
@@ -150,7 +150,7 @@ func TestCommitWorkingSetAfterSQLCommitResponseLossIsIndeterminate(t *testing.T)
 		{
 			name: "DOLT_COMMIT",
 			setup: func(mock sqlmock.Sqlmock, responseLoss error) {
-				mock.ExpectQuery(regexp.QuoteMeta("SELECT table_name FROM dolt_status")).
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT s.table_name FROM dolt_status")).
 					WillReturnRows(sqlmock.NewRows([]string{"table_name"}).AddRow("issues"))
 				mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
 					WithArgs("issues").
