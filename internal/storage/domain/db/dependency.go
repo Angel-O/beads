@@ -15,14 +15,19 @@ import (
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/types"
+	publicops "github.com/steveyegge/beads/issueops"
 )
 
 func NewDependencySQLRepository(runner Runner) domain.DependencySQLRepository {
-	return &dependencySQLRepositoryImpl{runner: runner}
+	return &dependencySQLRepositoryImpl{
+		runner: runner,
+		events: NewEventsSQLRepository(runner),
+	}
 }
 
 type dependencySQLRepositoryImpl struct {
 	runner Runner
+	events domain.EventsSQLRepository
 }
 
 var _ domain.DependencySQLRepository = (*dependencySQLRepositoryImpl)(nil)
@@ -38,8 +43,15 @@ func pickDepTable(useWisps bool) string {
 	return "dependencies"
 }
 
-func (r *dependencySQLRepositoryImpl) pickDepTargetColumn(ctx context.Context, dependsOnID string) (string, error) {
-	if strings.HasPrefix(dependsOnID, "external:") {
+// pickDepTargetColumn classifies an edge's target the same way the in-tx store
+// bodies do, through issueops.IsExternalDepTarget: a target this database
+// cannot hold — an "external:" reference or an issue belonging to another
+// repository — goes to depends_on_external, which carries no foreign key.
+// Only a target that could plausibly be local is probed against wisps and
+// otherwise treated as a local issue, where fk_dep_issue_target still refuses
+// an id that is genuinely missing.
+func (r *dependencySQLRepositoryImpl) pickDepTargetColumn(ctx context.Context, issueID, dependsOnID string) (string, error) {
+	if issueops.IsExternalDepTarget(issueID, dependsOnID) {
 		return "depends_on_external", nil
 	}
 	var probe int
@@ -67,7 +79,10 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 		return errors.New("db: DependencySQLRepository.Insert: DependsOnID must not be empty")
 	}
 	if dep.IssueID == dep.DependsOnID {
-		return fmt.Errorf("db: DependencySQLRepository.Insert: %s cannot depend on itself", dep.IssueID)
+		// Lead with the sentinel so this defensive repo-layer guard renders like
+		// every other self-dep site ("cannot add self-dependency: X cannot depend
+		// on itself") instead of appending the sentinel text.
+		return fmt.Errorf("db: DependencySQLRepository.Insert: %w: %s cannot depend on itself", domain.ErrSelfDependency, dep.IssueID)
 	}
 
 	metadata := dep.Metadata
@@ -75,6 +90,20 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 		metadata = "{}"
 	}
 
+	if !opts.HierarchyValidated {
+		if err := r.ValidateBlockingHierarchy(ctx, dep); err != nil {
+			return err
+		}
+	}
+	if !opts.CycleValidated && isSchedulingDependency(dep.Type) {
+		cycle, err := r.HasCycle(ctx, dep.IssueID, dep.DependsOnID)
+		if err != nil {
+			return fmt.Errorf("db: DependencySQLRepository.Insert: cycle check: %w", err)
+		}
+		if cycle {
+			return domain.ErrDependencyCycle
+		}
+	}
 	table := pickDepTable(opts.UseWispsTable)
 
 	var existingType string
@@ -95,14 +124,18 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 			}
 			return nil
 		}
-		return fmt.Errorf("db: DependencySQLRepository.Insert: %s -> %s already exists with type %q (requested %q)",
-			dep.IssueID, dep.DependsOnID, existingType, dep.Type)
+		return &domain.DependencyTypeConflictError{
+			IssueID:       dep.IssueID,
+			DependsOnID:   dep.DependsOnID,
+			ExistingType:  existingType,
+			RequestedType: string(dep.Type),
+		}
 	case errors.Is(err, sql.ErrNoRows):
 	default:
 		return fmt.Errorf("db: DependencySQLRepository.Insert: check existing: %w", err)
 	}
 
-	targetCol, err := r.pickDepTargetColumn(ctx, dep.DependsOnID)
+	targetCol, err := r.pickDepTargetColumn(ctx, dep.IssueID, dep.DependsOnID)
 	if err != nil {
 		return fmt.Errorf("db: DependencySQLRepository.Insert: %w", err)
 	}
@@ -119,6 +152,33 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 		time.Now().UTC(), actor, metadata, dep.ThreadID,
 	); err != nil {
 		return fmt.Errorf("db: DependencySQLRepository.Insert: %w", err)
+	}
+	if dep.Type == types.DepParentChild {
+		if err := issueops.TouchDependencyCoordinationTableInTx(ctx, r.runner, dep.DependsOnID, table); err != nil {
+			return fmt.Errorf("db: DependencySQLRepository.Insert: %w", err)
+		}
+	}
+
+	// Record the dependency_added event on the source's event table, matching the
+	// embedded/issueops AddDependencyInTx path so the bd CLI and library callers
+	// observe the same history from either write plumbing. Reached only on the
+	// genuine new-edge path; the idempotent same-type refresh returned earlier.
+	// Gated on EmitEvent so only the explicit dep verbs emit: create-with-deps
+	// and reparent call Insert directly without it, so an implicit parent-child /
+	// --deps / waits-for edge produces no event. The embedded structural paths
+	// (createIssueWithDeps, reparent) match this by calling the plain,
+	// no-event AddDependency/tx.AddDependency, whose issueops.AddDependencyInTx
+	// EmitEvent gate is likewise unset — so both backends stay silent on implicit
+	// edges and emit only for the explicit bd dep add / bd link verbs.
+	if opts.EmitEvent {
+		if err := r.events.Record(ctx, domain.Event{
+			IssueID:  dep.IssueID,
+			Type:     types.EventDependencyAdded,
+			Actor:    actor,
+			NewValue: fmt.Sprintf("Added dependency: %s %s %s", dep.IssueID, dep.Type, dep.DependsOnID),
+		}, domain.RecordEventOpts{UseWispsTable: opts.UseWispsTable}); err != nil {
+			return fmt.Errorf("db: DependencySQLRepository.Insert: record dependency_added event: %w", err)
+		}
 	}
 
 	// is_blocked maintenance mirrors the classic AddDependencyInTx flow
@@ -156,6 +216,16 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 		return fmt.Errorf("db: DependencySQLRepository.Insert: mark is_blocked (affected): %w", err)
 	}
 	return nil
+}
+
+func (r *dependencySQLRepositoryImpl) ValidateBlockingHierarchy(ctx context.Context, dep *types.Dependency) error {
+	if dep == nil {
+		return errors.New("db: DependencySQLRepository.ValidateBlockingHierarchy: dep must not be nil")
+	}
+	if issueops.IsExternalDepTarget(dep.IssueID, dep.DependsOnID) {
+		return nil
+	}
+	return issueops.CheckBlockingHierarchyInTx(ctx, r.runner, dep, nil)
 }
 
 // markDirectBlockedSource mirrors issueops.markDirectBlockingDependencySourceInTx:
@@ -221,6 +291,21 @@ func (r *dependencySQLRepositoryImpl) Delete(ctx context.Context, issueID, depen
 		return domain.DepDeleteResult{}, fmt.Errorf("db: DependencySQLRepository.Delete: %s -> %s: %w", issueID, dependsOnID, err)
 	}
 
+	// The type lookup above returned Found:false when no edge existed, so reaching
+	// here means a row was deleted — record the dependency_removed event on the
+	// source's event table, matching the embedded/issueops RemoveDependencyInTx path.
+	// Gated on EmitEvent so only the explicit `bd dep remove` verb emits.
+	if opts.EmitEvent {
+		if err := r.events.Record(ctx, domain.Event{
+			IssueID:  issueID,
+			Type:     types.EventDependencyRemoved,
+			Actor:    actor,
+			NewValue: fmt.Sprintf("Removed dependency on %s", dependsOnID),
+		}, domain.RecordEventOpts{UseWispsTable: opts.UseWispsTable}); err != nil {
+			return domain.DepDeleteResult{}, fmt.Errorf("db: DependencySQLRepository.Delete: record dependency_removed event: %w", err)
+		}
+	}
+
 	dt := types.DependencyType(depType)
 	var affectedIssues, affectedWisps []string
 	var aerr error
@@ -244,52 +329,15 @@ func (r *dependencySQLRepositoryImpl) HasCycle(ctx context.Context, issueID, dep
 		return false, errors.New("db: DependencySQLRepository.HasCycle: issueID and dependsOnID must not be empty")
 	}
 
-	var one int
-	err := r.runner.QueryRowContext(ctx, `
-		SELECT 1 FROM dependencies
-		WHERE issue_id = ? AND depends_on_issue_id = ?
-		  AND type IN ('blocks', 'conditional-blocks')
-		LIMIT 1
-	`, dependsOnID, issueID).Scan(&one)
-	switch {
-	case err == nil:
-		return true, nil
-	case !errors.Is(err, sql.ErrNoRows):
-		return false, fmt.Errorf("db: DependencySQLRepository.HasCycle: direct probe (dependencies): %w", err)
-	}
-	err = r.runner.QueryRowContext(ctx, `
-		SELECT 1 FROM wisp_dependencies
-		WHERE issue_id = ? AND depends_on_issue_id = ?
-		  AND type IN ('blocks', 'conditional-blocks')
-		LIMIT 1
-	`, dependsOnID, issueID).Scan(&one)
-	switch {
-	case err == nil:
-		return true, nil
-	case !errors.Is(err, sql.ErrNoRows):
-		return false, fmt.Errorf("db: DependencySQLRepository.HasCycle: direct probe (wisp_dependencies): %w", err)
-	}
-
-	var count int
-	err = r.runner.QueryRowContext(ctx, `
-		WITH RECURSIVE reachable(node) AS (
-			SELECT ?
-			UNION
-			SELECT d.depends_on_issue_id FROM (
-				SELECT issue_id, depends_on_issue_id, type FROM dependencies
-				UNION ALL
-				SELECT issue_id, depends_on_issue_id, type FROM wisp_dependencies
-			) d
-			JOIN reachable r ON d.issue_id = r.node
-			WHERE d.type IN ('blocks', 'conditional-blocks')
-			  AND d.depends_on_issue_id IS NOT NULL
-		)
-		SELECT COUNT(*) FROM reachable WHERE node = ?
-	`, dependsOnID, issueID).Scan(&count)
+	cycle, err := issueops.WouldCreateSchedulingCycleInTx(ctx, r.runner, issueID, dependsOnID, nil)
 	if err != nil {
 		return false, fmt.Errorf("db: DependencySQLRepository.HasCycle: %w", err)
 	}
-	return count > 0, nil
+	return cycle, nil
+}
+
+func isSchedulingDependency(t types.DependencyType) bool {
+	return t == types.DepBlocks || t == types.DepConditionalBlocks || t == types.DepParentChild
 }
 
 func (r *dependencySQLRepositoryImpl) ListByIssueIDs(ctx context.Context, issueIDs []string, opts domain.DepListOpts) (domain.DepBulkResult, error) {
@@ -757,4 +805,103 @@ func (r *dependencySQLRepositoryImpl) IsBlocked(ctx context.Context, issueID str
 		return false, nil, fmt.Errorf("db: DependencySQLRepository.IsBlocked %s: %w", issueID, err)
 	}
 	return blocked, blockers, nil
+}
+
+func (r *dependencySQLRepositoryImpl) DetectCycles(ctx context.Context) ([][]*types.Issue, error) {
+	out, err := issueops.DetectCyclesInTx(ctx, r.runner)
+	if err != nil {
+		return nil, fmt.Errorf("db: DependencySQLRepository.DetectCycles: %w", err)
+	}
+	return out, nil
+}
+
+func (r *dependencySQLRepositoryImpl) DetectCycleReport(ctx context.Context) (publicops.CycleReport, error) {
+	out, err := issueops.DetectCycleReportInTx(ctx, r.runner)
+	if err != nil {
+		return publicops.CycleReport{}, fmt.Errorf("db: DependencySQLRepository.DetectCycleReport: %w", err)
+	}
+	return out, nil
+}
+
+// WalkDependencyTree runs the SHARED walk body, unwrapped.
+//
+// It does NOT wrap the error the way its siblings above do, and that is the one
+// thing to keep when editing it: the body publishes issueops.ErrValidation,
+// storage.ErrNotFound and *issueops.ErrTooManyRows as the role's own vocabulary,
+// and every one of those is classified by errors.Is/errors.As at both front
+// doors and in the HTTP problem mapping. A `fmt.Errorf("db: ...: %w")` would keep
+// them matchable but would also put this repository's name into the message a
+// user reads, which the direct route never does for the same refusal.
+func (r *dependencySQLRepositoryImpl) WalkDependencyTree(ctx context.Context, req publicops.WalkTreeRequest) (publicops.TreeResult, error) {
+	return issueops.WalkDependencyTreeInTx(ctx, r.runner, req)
+}
+
+func (r *dependencySQLRepositoryImpl) GetTree(ctx context.Context, rootID string, opts domain.DepTreeOpts) ([]*types.TreeNode, error) {
+	if rootID == "" {
+		return nil, errors.New("db: DependencySQLRepository.GetTree: rootID must not be empty")
+	}
+	if opts.Direction == domain.DepDirectionBoth {
+		return nil, errors.New("db: DependencySQLRepository.GetTree: DepDirectionBoth not supported; callers must invoke once per direction and merge")
+	}
+	maxDepth := opts.MaxDepth
+	if maxDepth <= 0 {
+		maxDepth = 50
+	}
+	reverse := opts.Direction == domain.DepDirectionIn
+	out, err := issueops.GetDependencyTreeInTx(ctx, r.runner, rootID, maxDepth, opts.ShowAllPaths, reverse)
+	if err != nil {
+		return nil, fmt.Errorf("db: DependencySQLRepository.GetTree: %w", err)
+	}
+	return out, nil
+}
+
+func (r *dependencySQLRepositoryImpl) CycleThroughEdges(ctx context.Context, edges [][2]string) (string, error) {
+	if len(edges) == 0 {
+		return "", nil
+	}
+	graph := make(map[string][]string)
+	if err := issueops.AppendSchedulingGraphInTx(ctx, r.runner, []string{"dependencies"}, graph); err != nil {
+		return "", fmt.Errorf("db: DependencySQLRepository.CycleThroughEdges: %w", err)
+	}
+	if err := issueops.AppendSchedulingGraphInTx(ctx, r.runner, []string{"wisp_dependencies"}, graph); err != nil && !dberrors.IsTableNotExist(err) {
+		return "", fmt.Errorf("db: DependencySQLRepository.CycleThroughEdges (wisps): %w", err)
+	}
+	return issueops.CycleThroughEdgesInGraph(graph, edges), nil
+}
+
+// WispSourceIDs classifies a batch of ids by plane in one scoped query. It is
+// the proxied twin of the in-tx probe the store-backed dependency editor runs,
+// and shares its implementation so the two answer the same question — down to
+// treating a missing wisps table as "no wisps" rather than an error.
+func (r *dependencySQLRepositoryImpl) WispSourceIDs(ctx context.Context, ids []string) (map[string]struct{}, error) {
+	set, err := issueops.WispIDSetInTx(ctx, r.runner, ids)
+	if err != nil {
+		return nil, fmt.Errorf("db: DependencySQLRepository.WispSourceIDs: %w", err)
+	}
+	return set, nil
+}
+
+func (r *dependencySQLRepositoryImpl) GetDependencyRecordsForIssues(ctx context.Context, issueIDs []string) (map[string][]*types.Dependency, error) {
+	if len(issueIDs) == 0 {
+		return map[string][]*types.Dependency{}, nil
+	}
+	out, err := issueops.GetDependencyRecordsForIssuesInTx(ctx, r.runner, issueIDs)
+	if err != nil {
+		return nil, fmt.Errorf("db: DependencySQLRepository.GetDependencyRecordsForIssues: %w", err)
+	}
+	return out, nil
+}
+
+func (r *dependencySQLRepositoryImpl) GetWispDependencyRecordsForIDs(ctx context.Context, wispIDs []string) (map[string][]*types.Dependency, error) {
+	if len(wispIDs) == 0 {
+		return map[string][]*types.Dependency{}, nil
+	}
+	out, err := issueops.GetDependencyRecordsForIssuesFromTableInTx(ctx, r.runner, "wisp_dependencies", wispIDs)
+	if err != nil {
+		if dberrors.IsTableNotExist(err) {
+			return map[string][]*types.Dependency{}, nil
+		}
+		return nil, fmt.Errorf("db: DependencySQLRepository.GetWispDependencyRecordsForIDs: %w", err)
+	}
+	return out, nil
 }

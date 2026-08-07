@@ -14,7 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
+	storageissueops "github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -744,92 +745,6 @@ func TestDepTreeStatusFlag(t *testing.T) {
 	}
 }
 
-func TestFilterTreeByStatus(t *testing.T) {
-	tree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "BD-1", Title: "Parent", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-		{
-			Issue:    types.Issue{ID: "BD-2", Title: "Open Child", Status: types.StatusOpen},
-			Depth:    1,
-			ParentID: "BD-1",
-		},
-		{
-			Issue:    types.Issue{ID: "BD-3", Title: "Closed Child", Status: types.StatusClosed},
-			Depth:    1,
-			ParentID: "BD-1",
-		},
-		{
-			Issue:    types.Issue{ID: "BD-4", Title: "Open Grandchild", Status: types.StatusOpen},
-			Depth:    2,
-			ParentID: "BD-3",
-		},
-	}
-
-	t.Run("filter to open only", func(t *testing.T) {
-		filtered := filterTreeByStatus(tree, types.StatusOpen)
-
-		// Should include BD-1, BD-2, and BD-4 (matching)
-		// Plus BD-3 as ancestor of BD-4
-		ids := make(map[string]bool)
-		for _, node := range filtered {
-			ids[node.ID] = true
-		}
-
-		if !ids["BD-1"] {
-			t.Error("Expected BD-1 (root open) in filtered tree")
-		}
-		if !ids["BD-2"] {
-			t.Error("Expected BD-2 (open child) in filtered tree")
-		}
-		if !ids["BD-3"] {
-			t.Error("Expected BD-3 (ancestor of open node) in filtered tree")
-		}
-		if !ids["BD-4"] {
-			t.Error("Expected BD-4 (open grandchild) in filtered tree")
-		}
-	})
-
-	t.Run("filter to closed only", func(t *testing.T) {
-		filtered := filterTreeByStatus(tree, types.StatusClosed)
-
-		ids := make(map[string]bool)
-		for _, node := range filtered {
-			ids[node.ID] = true
-		}
-
-		// Should include BD-3 (matching) and BD-1 (ancestor)
-		if !ids["BD-1"] {
-			t.Error("Expected BD-1 (ancestor) in filtered tree")
-		}
-		if !ids["BD-3"] {
-			t.Error("Expected BD-3 (closed) in filtered tree")
-		}
-		if ids["BD-2"] {
-			t.Error("BD-2 should not be in closed-filtered tree")
-		}
-		if ids["BD-4"] {
-			t.Error("BD-4 should not be in closed-filtered tree")
-		}
-	})
-
-	t.Run("filter to non-existent status", func(t *testing.T) {
-		filtered := filterTreeByStatus(tree, types.StatusBlocked)
-		if len(filtered) != 0 {
-			t.Errorf("Expected empty tree when filtering to non-matching status, got %d nodes", len(filtered))
-		}
-	})
-
-	t.Run("filter empty tree", func(t *testing.T) {
-		filtered := filterTreeByStatus([]*types.TreeNode{}, types.StatusOpen)
-		if len(filtered) != 0 {
-			t.Errorf("Expected empty tree, got %d nodes", len(filtered))
-		}
-	})
-}
-
 func TestFormatTreeNode(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1048,7 +963,7 @@ func TestRenderTreeOutputShowsDependencyTypeLabelsInMixedGraph(t *testing.T) {
 			EdgeFromParent: types.DepBlocks,
 		},
 	}
-	tree := mergeBidirectionalTrees(downTree, upTree, "BD-root")
+	tree := storageissueops.MergeBidirectionalTree(downTree, upTree, "BD-root")
 
 	old := os.Stdout
 	r, w, _ := os.Pipe()
@@ -1085,263 +1000,6 @@ func TestTreeNodeJSONIncludesEdgeFromParent(t *testing.T) {
 
 	if !strings.Contains(string(got), `"edge_from_parent":"parent-child"`) {
 		t.Fatalf("TreeNode JSON missing edge_from_parent: %s", got)
-	}
-}
-
-func TestMergeBidirectionalTrees_Empty(t *testing.T) {
-	// Test merging empty trees
-	downTree := []*types.TreeNode{}
-	upTree := []*types.TreeNode{}
-	rootID := "test-root"
-
-	result := mergeBidirectionalTrees(downTree, upTree, rootID)
-
-	if len(result) != 0 {
-		t.Errorf("Expected empty result for empty trees, got %d nodes", len(result))
-	}
-}
-
-func TestMergeBidirectionalTrees_OnlyDown(t *testing.T) {
-	// Test with only down tree (dependencies)
-	downTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "test-root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-		{
-			Issue:    types.Issue{ID: "dep-1", Title: "Dependency 1", Status: types.StatusOpen},
-			Depth:    1,
-			ParentID: "test-root",
-		},
-		{
-			Issue:    types.Issue{ID: "dep-2", Title: "Dependency 2", Status: types.StatusOpen},
-			Depth:    1,
-			ParentID: "test-root",
-		},
-	}
-	upTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "test-root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-	}
-
-	result := mergeBidirectionalTrees(downTree, upTree, "test-root")
-
-	// Should have all nodes from down tree
-	if len(result) != 3 {
-		t.Errorf("Expected 3 nodes, got %d", len(result))
-	}
-
-	// Verify downTree nodes are present
-	hasRoot := false
-	hasDep1 := false
-	hasDep2 := false
-	for _, node := range result {
-		if node.ID == "test-root" {
-			hasRoot = true
-		}
-		if node.ID == "dep-1" {
-			hasDep1 = true
-		}
-		if node.ID == "dep-2" {
-			hasDep2 = true
-		}
-	}
-	if !hasRoot || !hasDep1 || !hasDep2 {
-		t.Error("Expected all down tree nodes in result")
-	}
-}
-
-func TestMergeBidirectionalTrees_WithDependents(t *testing.T) {
-	// Test with both dependencies and dependents
-	downTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "test-root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-		{
-			Issue:    types.Issue{ID: "dep-1", Title: "Dependency 1", Status: types.StatusOpen},
-			Depth:    1,
-			ParentID: "test-root",
-		},
-	}
-	upTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "test-root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-		{
-			Issue:    types.Issue{ID: "dependent-1", Title: "Dependent 1", Status: types.StatusOpen},
-			Depth:    1,
-			ParentID: "test-root",
-		},
-	}
-
-	result := mergeBidirectionalTrees(downTree, upTree, "test-root")
-
-	// Should have dependent first, then down tree nodes (3 total, root appears once)
-	// Pattern: dependent node(s), then root + dependencies
-	if len(result) < 3 {
-		t.Errorf("Expected at least 3 nodes, got %d", len(result))
-	}
-
-	// Find dependent-1 and dep-1 in result
-	foundDependentID := false
-	foundDepID := false
-	for _, node := range result {
-		if node.ID == "dependent-1" {
-			foundDependentID = true
-		}
-		if node.ID == "dep-1" {
-			foundDepID = true
-		}
-	}
-
-	if !foundDependentID {
-		t.Error("Expected dependent-1 in merged result")
-	}
-	if !foundDepID {
-		t.Error("Expected dep-1 in merged result")
-	}
-}
-
-func TestMergeBidirectionalTrees_MultipleDepth(t *testing.T) {
-	// Test with multi-level hierarchies
-	downTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-		{
-			Issue:    types.Issue{ID: "dep-1", Title: "Dep 1", Status: types.StatusOpen},
-			Depth:    1,
-			ParentID: "root",
-		},
-		{
-			Issue:    types.Issue{ID: "dep-1-1", Title: "Dep 1.1", Status: types.StatusOpen},
-			Depth:    2,
-			ParentID: "dep-1",
-		},
-	}
-	upTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-		{
-			Issue:    types.Issue{ID: "dependent-1", Title: "Dependent 1", Status: types.StatusOpen},
-			Depth:    1,
-			ParentID: "root",
-		},
-		{
-			Issue:    types.Issue{ID: "dependent-1-1", Title: "Dependent 1.1", Status: types.StatusOpen},
-			Depth:    2,
-			ParentID: "dependent-1",
-		},
-	}
-
-	result := mergeBidirectionalTrees(downTree, upTree, "root")
-
-	// Should include all nodes from both trees (minus duplicate root)
-	if len(result) < 5 {
-		t.Errorf("Expected at least 5 nodes, got %d", len(result))
-	}
-
-	// Verify all IDs are present (except we might have root twice from both trees)
-	expectedIDs := map[string]bool{
-		"root":          false,
-		"dep-1":         false,
-		"dep-1-1":       false,
-		"dependent-1":   false,
-		"dependent-1-1": false,
-	}
-
-	for _, node := range result {
-		if _, exists := expectedIDs[node.ID]; exists {
-			expectedIDs[node.ID] = true
-		}
-	}
-
-	for id, found := range expectedIDs {
-		if !found {
-			t.Errorf("Expected ID %s in merged result", id)
-		}
-	}
-}
-
-func TestMergeBidirectionalTrees_ExcludesRootFromUp(t *testing.T) {
-	// Test that root is excluded from upTree
-	downTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-	}
-	upTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-	}
-
-	result := mergeBidirectionalTrees(downTree, upTree, "root")
-
-	// Should have exactly 1 node (root)
-	if len(result) != 1 {
-		t.Errorf("Expected 1 node (root only), got %d", len(result))
-	}
-
-	if result[0].ID != "root" {
-		t.Errorf("Expected root node, got %s", result[0].ID)
-	}
-}
-
-func TestMergeBidirectionalTrees_PreservesDepth(t *testing.T) {
-	// Test that depth values are preserved from original trees
-	downTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-		{
-			Issue:    types.Issue{ID: "dep-1", Title: "Dep 1", Status: types.StatusOpen},
-			Depth:    5, // Non-standard depth to verify preservation
-			ParentID: "root",
-		},
-	}
-	upTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-		{
-			Issue:    types.Issue{ID: "dependent-1", Title: "Dependent 1", Status: types.StatusOpen},
-			Depth:    3, // Different depth
-			ParentID: "root",
-		},
-	}
-
-	result := mergeBidirectionalTrees(downTree, upTree, "root")
-
-	// Find nodes and verify their depths are preserved
-	for _, node := range result {
-		if node.ID == "dep-1" && node.Depth != 5 {
-			t.Errorf("Expected dep-1 depth=5, got %d", node.Depth)
-		}
-		if node.ID == "dependent-1" && node.Depth != 3 {
-			t.Errorf("Expected dependent-1 depth=3, got %d", node.Depth)
-		}
 	}
 }
 
@@ -1450,6 +1108,101 @@ func TestIsChildOf(t *testing.T) {
 				t.Errorf("isChildOf(%q, %q) = %v, want %v", tt.childID, tt.parentID, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestDepRoutedTargetOpensReadOnly is the regression guard for the dep/link
+// target-resolution invariant: a cross-rig dependency target is resolved by ID
+// only, so resolveIDWithRouting must open the routed foreign store read-only,
+// while resolveIDForMutation (used for the mutated source issue) opens it
+// writable. Opening a dep/link target writable re-exposes GH#3231 open-time
+// mutations against a foreign project.
+//
+// NOTE: This test uses os.Chdir and cannot run in parallel with other tests.
+func TestDepRoutedTargetOpensReadOnly(t *testing.T) {
+	ctx := context.Background()
+
+	tmpDir := t.TempDir()
+	townBeadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(townBeadsDir, 0755); err != nil {
+		t.Fatalf("create town beads dir: %v", err)
+	}
+	rigBeadsDir := filepath.Join(tmpDir, "rig", ".beads")
+	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
+		t.Fatalf("create rig beads dir: %v", err)
+	}
+
+	townDBPath := filepath.Join(townBeadsDir, "dolt")
+	townStore := newTestStoreIsolatedDB(t, townDBPath, "hq")
+
+	rigDBPath := filepath.Join(rigBeadsDir, "dolt")
+	rigStore := newTestStoreIsolatedDB(t, rigDBPath, "gt")
+	if err := rigStore.CreateIssue(ctx, &types.Issue{
+		ID:        "gt-target1",
+		Title:     "Routed dep target",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}, "test"); err != nil {
+		t.Fatalf("create rig issue: %v", err)
+	}
+	// Release the rig store before routing reopens it.
+	rigStore.Close()
+
+	routesPath := filepath.Join(townBeadsDir, "routes.jsonl")
+	if err := os.WriteFile(routesPath, []byte(`{"prefix":"gt-","path":"rig"}`), 0644); err != nil {
+		t.Fatalf("write routes.jsonl: %v", err)
+	}
+
+	oldDbPath := dbPath
+	dbPath = townDBPath
+	t.Cleanup(func() { dbPath = oldDbPath })
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+
+	// Target-only resolution (the dep/link target) must open the routed store
+	// read-only.
+	roID, roStore, roCleanup, err := resolveIDWithRouting(ctx, townStore, "gt-target1")
+	if err != nil {
+		t.Fatalf("resolveIDWithRouting (target) failed: %v", err)
+	}
+	if roID != "gt-target1" {
+		t.Errorf("resolved target ID = %q, want gt-target1", roID)
+	}
+	roDolt, ok := roStore.(*dolt.DoltStore)
+	if !ok {
+		roCleanup()
+		t.Fatalf("routed target store is %T, want *dolt.DoltStore", roStore)
+	}
+	if !roDolt.IsReadOnly() {
+		roCleanup()
+		t.Fatal("dep/link target must be resolved read-only, but routed store is writable (GH#3231)")
+	}
+	roCleanup()
+
+	// Source resolution (the mutated issue's store) must open the routed store
+	// writable so the dependency write commits on the target head (#4141).
+	rwID, rwStore, rwCleanup, err := resolveIDForMutation(ctx, townStore, "gt-target1")
+	if err != nil {
+		t.Fatalf("resolveIDForMutation (source) failed: %v", err)
+	}
+	defer rwCleanup()
+	if rwID != "gt-target1" {
+		t.Errorf("resolved source ID = %q, want gt-target1", rwID)
+	}
+	rwDolt, ok := rwStore.(*dolt.DoltStore)
+	if !ok {
+		t.Fatalf("routed source store is %T, want *dolt.DoltStore", rwStore)
+	}
+	if rwDolt.IsReadOnly() {
+		t.Fatal("source resolution must open the routed store writable, but it is read-only")
 	}
 }
 
@@ -1590,172 +1343,4 @@ func TestDepListCrossRigRouting(t *testing.T) {
 	}
 
 	t.Log("Successfully resolved cross-rig dependencies via routing")
-}
-
-type fakeCycleTx struct {
-	storage.Transaction
-	gotEdges [][2]string
-	path     string
-	err      error
-}
-
-func (f *fakeCycleTx) CycleThroughEdges(_ context.Context, edges [][2]string) (string, error) {
-	f.gotEdges = edges
-	return f.path, f.err
-}
-
-// bd-6dnrw.8 / bd-578h9.9: the bulk-add cycle gate must pass only blocking
-// edge types to the in-tx check, skip the check entirely when no blocking
-// edges are present, and propagate check failures.
-func TestNewCycleThroughEdges(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	edges := []bulkDepEdge{
-		{IssueID: "bd-a", DependsOnID: "bd-b", Type: types.DepBlocks},
-		{IssueID: "bd-c", DependsOnID: "bd-d", Type: types.DependencyType("related")},
-	}
-
-	tx := &fakeCycleTx{path: "bd-a → bd-b → bd-a"}
-	path, err := newCycleThroughEdges(ctx, tx, edges)
-	if err != nil || path != "bd-a → bd-b → bd-a" {
-		t.Errorf("cycle through new edge: got (%q, %v), want rendered path", path, err)
-	}
-	if len(tx.gotEdges) != 1 || tx.gotEdges[0] != [2]string{"bd-a", "bd-b"} {
-		t.Errorf("edges passed to check = %v, want only the blocking edge", tx.gotEdges)
-	}
-
-	tx = &fakeCycleTx{}
-	path, err = newCycleThroughEdges(ctx, tx, []bulkDepEdge{
-		{IssueID: "bd-c", DependsOnID: "bd-d", Type: types.DependencyType("related")},
-	})
-	if err != nil || path != "" {
-		t.Errorf("non-blocking-only batch: got (%q, %v), want gate skipped", path, err)
-	}
-	if tx.gotEdges != nil {
-		t.Errorf("non-blocking-only batch ran the check with edges %v", tx.gotEdges)
-	}
-
-	_, err = newCycleThroughEdges(ctx, &fakeCycleTx{err: fmt.Errorf("boom")}, edges)
-	if err == nil {
-		t.Error("check failure must propagate as error, not pass the gate")
-	}
-}
-
-// bd-578h9.9: a pre-existing committed cycle touching an endpoint of the
-// batch must not block unrelated bulk wiring — only cycles that traverse a
-// new edge gate the commit.
-func TestBulkDepAddCycleGateIgnoresPreexistingCycleAtEndpoint(t *testing.T) {
-	t.Parallel()
-	tmpDir := t.TempDir()
-	s := newTestStore(t, filepath.Join(tmpDir, ".beads", "beads.db"))
-	ctx := context.Background()
-
-	for _, id := range []string{"test-pre-a", "test-pre-b", "test-pre-c"} {
-		issue := &types.Issue{
-			ID: id, Title: id, Status: types.StatusOpen,
-			Priority: 1, IssueType: types.TypeTask, CreatedAt: time.Now(),
-		}
-		if err := s.CreateIssue(ctx, issue, "test"); err != nil {
-			t.Fatalf("create %s: %v", id, err)
-		}
-	}
-	// Commit the cycle a <-> b first (SkipCycleCheck stands in for legacy
-	// data that predates cycle validation).
-	if err := s.RunInTransaction(ctx, "test: seed cycle", func(tx storage.Transaction) error {
-		for _, pair := range [][2]string{{"test-pre-a", "test-pre-b"}, {"test-pre-b", "test-pre-a"}} {
-			dep := &types.Dependency{IssueID: pair[0], DependsOnID: pair[1], Type: types.DepBlocks}
-			if err := tx.AddDependencyWithOptions(ctx, dep, "test", storage.DependencyAddOptions{SkipCycleCheck: true}); err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("seed cycle: %v", err)
-	}
-
-	// Bulk-add the unrelated edge a -> c through the same gate the CLI uses.
-	edges := []bulkDepEdge{{IssueID: "test-pre-a", DependsOnID: "test-pre-c", Type: types.DepBlocks}}
-	err := s.RunInTransaction(ctx, "test: bulk unrelated edge", func(tx storage.Transaction) error {
-		dep := &types.Dependency{IssueID: "test-pre-a", DependsOnID: "test-pre-c", Type: types.DepBlocks}
-		if err := tx.AddDependencyWithOptions(ctx, dep, "test", storage.DependencyAddOptions{SkipCycleCheck: true}); err != nil {
-			return err
-		}
-		cyclePath, cycleErr := newCycleThroughEdges(ctx, tx, edges)
-		if cycleErr != nil {
-			return cycleErr
-		}
-		if cyclePath != "" {
-			return fmt.Errorf("dependency cycle would be created: %s", cyclePath)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("unrelated bulk edge was blocked: %v", err)
-	}
-
-	deps, err := s.GetDependencyRecords(ctx, "test-pre-a")
-	if err != nil {
-		t.Fatalf("GetDependencyRecords: %v", err)
-	}
-	var foundC bool
-	for _, dep := range deps {
-		if dep.DependsOnID == "test-pre-c" {
-			foundC = true
-		}
-	}
-	if !foundC {
-		t.Fatalf("edge a -> c did not commit: %#v", deps)
-	}
-}
-
-// bd-6dnrw.8: with SkipCycleCheck the per-edge guard is off, so the in-tx
-// whole-graph check must catch the cycle and the transaction roll back —
-// no cycle may ever commit.
-func TestBulkDepAddCycleGateRollsBack(t *testing.T) {
-	t.Parallel()
-	tmpDir := t.TempDir()
-	s := newTestStore(t, filepath.Join(tmpDir, ".beads", "beads.db"))
-	ctx := context.Background()
-
-	for _, id := range []string{"test-cyc-a", "test-cyc-b"} {
-		issue := &types.Issue{
-			ID: id, Title: id, Status: types.StatusOpen,
-			Priority: 1, IssueType: types.TypeTask, CreatedAt: time.Now(),
-		}
-		if err := s.CreateIssue(ctx, issue, "test"); err != nil {
-			t.Fatalf("create %s: %v", id, err)
-		}
-	}
-	if err := s.AddDependency(ctx, &types.Dependency{
-		IssueID: "test-cyc-a", DependsOnID: "test-cyc-b", Type: types.DependencyType("blocks"),
-	}, "test"); err != nil {
-		t.Fatalf("seed dependency: %v", err)
-	}
-
-	edges := []bulkDepEdge{{IssueID: "test-cyc-b", DependsOnID: "test-cyc-a", Type: types.DepBlocks}}
-	err := s.RunInTransaction(ctx, "test: bulk cycle gate", func(tx storage.Transaction) error {
-		dep := &types.Dependency{IssueID: "test-cyc-b", DependsOnID: "test-cyc-a", Type: types.DependencyType("blocks")}
-		if err := tx.AddDependencyWithOptions(ctx, dep, "test", storage.DependencyAddOptions{SkipCycleCheck: true}); err != nil {
-			return err
-		}
-		cyclePath, cycleErr := newCycleThroughEdges(ctx, tx, edges)
-		if cycleErr != nil {
-			return cycleErr
-		}
-		if cyclePath == "" {
-			return fmt.Errorf("in-tx check missed the cycle created by the uncommitted edge")
-		}
-		return fmt.Errorf("dependency cycle would be created: %s", cyclePath)
-	})
-	if err == nil || !strings.Contains(err.Error(), "dependency cycle would be created") {
-		t.Fatalf("expected cycle-gate error, got: %v", err)
-	}
-
-	deps, err := s.GetDependencyRecords(ctx, "test-cyc-b")
-	if err != nil {
-		t.Fatalf("GetDependencyRecords: %v", err)
-	}
-	if len(deps) != 0 {
-		t.Fatalf("cycle edge was committed despite gate: %#v", deps)
-	}
 }
