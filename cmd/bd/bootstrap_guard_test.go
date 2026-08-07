@@ -11,7 +11,7 @@ import (
 )
 
 // TestIsGitCodeRepoURL verifies the URL classifier that guards sync.remote
-// against accidental git code-repository URLs (vc-8djyca).
+// against accidental git code-repository URLs.
 func TestIsGitCodeRepoURL(t *testing.T) {
 	tests := []struct {
 		url  string
@@ -92,7 +92,7 @@ func setupSyncRemoteConfig(t *testing.T, beadsDir, remote string) func() {
 
 // TestDetectBootstrapAction_GitCodeRepoSyncRemoteBlocked verifies that a
 // sync.remote pointing at a git code-repository host is rejected (action=none)
-// instead of triggering DOLT_CLONE (vc-8djyca Layer 1).
+// instead of triggering DOLT_CLONE.
 func TestDetectBootstrapAction_GitCodeRepoSyncRemoteBlocked(t *testing.T) {
 	for _, remote := range []string{
 		"git+ssh://github.com/org/repo.git",
@@ -101,8 +101,7 @@ func TestDetectBootstrapAction_GitCodeRepoSyncRemoteBlocked(t *testing.T) {
 		"https://gitlab.com/group/repo.git",
 	} {
 		t.Run(remote, func(t *testing.T) {
-			restore := snapshotBootstrapEnv(t)
-			defer restore()
+			snapshotBootstrapEnv(t)
 
 			tmpDir := t.TempDir()
 			beadsDir := filepath.Join(tmpDir, ".beads")
@@ -140,8 +139,7 @@ func TestDetectBootstrapAction_ValidDoltSyncRemoteUnchanged(t *testing.T) {
 		"git+ssh://my-self-hosted-dolt.example.com/org/db",
 	} {
 		t.Run(remote, func(t *testing.T) {
-			restore := snapshotBootstrapEnv(t)
-			defer restore()
+			snapshotBootstrapEnv(t)
 
 			tmpDir := t.TempDir()
 			beadsDir := filepath.Join(tmpDir, ".beads")
@@ -174,7 +172,7 @@ func TestDetectBootstrapAction_ValidDoltSyncRemoteUnchanged(t *testing.T) {
 // that when the server is reachable but the DB appears absent on the first probe
 // (e.g. during a managed Dolt restart), the retry loop waits and eventually finds
 // the DB — returning action=none instead of falling through to sync/init
-// (vc-8djyca Layer 2).
+// .
 func TestDetectBootstrapAction_ServerTransientRestart_DBFoundAfterRetry(t *testing.T) {
 	t.Setenv("BEADS_DOLT_DATA_DIR", "")
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")

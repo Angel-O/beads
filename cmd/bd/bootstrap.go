@@ -347,7 +347,7 @@ func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPla
 	if syncRemote != "" {
 		if isGitCodeRepoURL(syncRemote) {
 			// Cloning from a git code-repo URL via DOLT_CLONE spins dolt to
-			// 1000% CPU and requires manual SIGKILL (vc-8djyca). Reject and
+			// 1000% CPU and requires manual SIGKILL. Reject and
 			// surface the misconfiguration rather than attempting the clone.
 			fmt.Fprintf(os.Stderr, "error: sync.remote %q looks like a git code-repository URL, not a Dolt remote — skipping clone\n", syncRemote)
 			plan.Action = "none"
@@ -439,7 +439,7 @@ func existingBootstrapDBPlan(beadsDir string, cfg *configfile.Config, isServer, 
 		// When the server is reachable but the DB appears absent, retry with
 		// exponential backoff before concluding the DB is genuinely missing.
 		// A managed Dolt restart completes in <30 s; three retries over 70 s
-		// cover all observed restart windows (vc-8djyca).
+		// cover all observed restart windows.
 		retryDelays := []time.Duration{10 * time.Second, 20 * time.Second, 40 * time.Second}
 		var result bootstrapServerDBCheck
 		for attempt := 0; ; attempt++ {
@@ -1087,7 +1087,7 @@ func init() {
 
 // isGitCodeRepoURL reports whether rawURL looks like a git code-repository
 // remote rather than a Dolt data remote. Used to block accidental DOLT_CLONE
-// against forges like github.com (vc-8djyca).
+// against forges like github.com.
 //
 // Rules (in priority order):
 //   - Dolt-native schemes (dolthub, s3, gs, az, file) → always false
