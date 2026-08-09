@@ -28,11 +28,38 @@ var neverSatisfiedTags = map[string]bool{"ignore": true, "never": true}
 // entrypoint and a real leg, carry a reason, and stop being waived the moment
 // the leg wires it.
 var unwiredContractEntrypoints = map[string]map[string]string{
+	"dolt": {
+		"RunBootstrapperRecordsExactlyOneHistoryEntry": bootstrapSplitWaiverReason,
+	},
+	"embeddeddolt": {
+		"RunBootstrapperRecordsExactlyOneHistoryEntry": bootstrapSplitWaiverReason,
+	},
 	"uow": {
+		"RunBootstrapperRecordsNoHistoryEntryOfItsOwn":                   bootstrapSplitWaiverReason,
 		"RunIssueOperationsCreateReverseNonBlockingStagesConcreteTables": stagingWaiverReason,
 		"RunIssueOperationsCreateParentChildRecomputesWaitsForClosure":   stagingWaiverReason,
 	},
 }
+
+// bootstrapSplitWaiverReason covers the one pair of entrypoints that is a
+// RATIFIED PER-LEG SPLIT rather than a gap.
+//
+// The bootstrap history contracts come in two halves that contradict each other
+// on purpose: the store legs assert the role records NO entry, because `bd
+// init`'s own commit records it and an in-role commit would double it, and the
+// unit-of-work leg asserts EXACTLY ONE, because the proxied init route has no
+// other commit point and a zero there would leave the identity unversioned.
+// Each leg wires the half that is true of the front door it stands behind, and
+// wiring the other half would assert a number that leg is right not to produce.
+//
+// This is the shape a lock like this has to be able to express. Every other
+// entry here says "this leg cannot run that contract"; this one says "that
+// contract is another leg's promise". Both stay checked: the pair is exhaustive
+// across the three legs, and if either half stopped being wired anywhere the
+// leg that owns it fails.
+const bootstrapSplitWaiverReason = "the bootstrap history contracts are a ratified per-leg split — the store " +
+	"legs pin zero because `bd init` commits the identity itself, the unit-of-work leg pins one because the " +
+	"proxied route has no other commit point; each leg wires its own half and the other half is not its promise"
 
 // stagingWaiverReason is why the two staging contracts stop at the two
 // store-backed legs.
@@ -89,8 +116,12 @@ func TestEveryLegWiresEveryRoleContract(t *testing.T) {
 			waived := unwiredContractEntrypoints[leg]
 
 			var missing []string
+			names := 0
 			for _, name := range entrypoints {
 				_, isWaived := waived[name]
+				if wired[name] {
+					names++
+				}
 				switch {
 				case wired[name] && isWaived:
 					t.Errorf("%s is waived as unwired for %s but the leg runs it: "+
@@ -100,13 +131,13 @@ func TestEveryLegWiresEveryRoleContract(t *testing.T) {
 				}
 			}
 			if len(missing) > 0 {
-				detail := ""
+				detail := fmt.Sprintf(" (%d waived)", len(waived))
 				if len(excluded) > 0 {
-					detail = fmt.Sprintf(" (ignoring %d file(s) no build includes: %s)",
+					detail += fmt.Sprintf(" (ignoring %d file(s) no build includes: %s)",
 						len(excluded), strings.Join(excluded, ", "))
 				}
-				t.Errorf("%s runs %d of the %d role contract entrypoints%s; it never names: %s",
-					leg, len(entrypoints)-len(missing), len(entrypoints), detail, strings.Join(missing, ", "))
+				t.Errorf("%s names %d of the %d role contract entrypoints%s; it never names: %s",
+					leg, names, len(entrypoints), detail, strings.Join(missing, ", "))
 			}
 
 			for _, name := range sortedNames(waived) {
