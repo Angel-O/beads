@@ -125,13 +125,23 @@ type ReaderFixture struct {
 // against the workspace vocabulary and errors — see
 // RunReaderListRejectsATypeOutsideTheWorkspaceVocabulary, whose comment names
 // the other side of it.
+//
+// THE DEFAULT EXCLUSION IS A SET, not a type. It seeded one member — the gate —
+// so dropping any OTHER member from that set left every assertion here true,
+// and the molecule was the member with no observer anywhere: a molecule is a
+// container for its steps rather than a piece of work, so a ready listing that
+// started offering them offers work that cannot be done. Both members are
+// seeded now, and each is separately shown to come back when its own type is
+// named, so a set that lost one is caught by a row rather than by nothing.
 func RunReaderReadyDefaultTypeExclusionsYieldToAnExplicitType(t *testing.T, ctx context.Context, fixture ReaderFixture) {
 	t.Helper()
 	scope := readerLabel(fixture, "rdytype")
 	task := readerID(fixture, "rdytype", "task")
 	gate := readerID(fixture, "rdytype", "gate")
+	molecule := readerID(fixture, "rdytype", "molecule")
 	seedReaderIssue(t, ctx, fixture, readerIssue(task, types.TypeTask, scope))
 	seedReaderIssue(t, ctx, fixture, readerIssue(gate, types.TypeGate, scope))
+	seedReaderIssue(t, ctx, fixture, readerIssue(molecule, types.TypeMolecule, scope))
 
 	page, err := fixture.Reader.Ready(ctx, publicops.ReadyRequest{Labels: []string{scope}})
 	if err != nil {
@@ -142,15 +152,25 @@ func RunReaderReadyDefaultTypeExclusionsYieldToAnExplicitType(t *testing.T, ctx 
 	// Naming the type drops the default exclusions. ExcludeTypes goes with
 	// them: the field's doc says it is ignored when IssueType is set, so
 	// asking for gates while excluding gates still answers with the gate.
-	page, err = fixture.Reader.Ready(ctx, publicops.ReadyRequest{
-		Labels:       []string{scope},
-		IssueType:    string(types.TypeGate),
-		ExcludeTypes: []string{string(types.TypeGate)},
-	})
-	if err != nil {
-		t.Fatalf("Ready with IssueType=gate: %v", err)
+	for _, excluded := range []struct {
+		issueType types.IssueType
+		want      string
+	}{
+		{types.TypeGate, gate},
+		{types.TypeMolecule, molecule},
+	} {
+		page, err = fixture.Reader.Ready(ctx, publicops.ReadyRequest{
+			Labels:       []string{scope},
+			IssueType:    string(excluded.issueType),
+			ExcludeTypes: []string{string(excluded.issueType)},
+		})
+		if err != nil {
+			t.Fatalf("Ready with IssueType=%s: %v", excluded.issueType, err)
+		}
+		assertReaderPageIDSet(t,
+			"Ready with IssueType="+string(excluded.issueType)+" and ExcludeTypes=["+string(excluded.issueType)+"]",
+			page, []string{excluded.want})
 	}
-	assertReaderPageIDSet(t, "Ready with IssueType=gate and ExcludeTypes=[gate]", page, []string{gate})
 
 	page, err = fixture.Reader.Ready(ctx, publicops.ReadyRequest{
 		Labels:    []string{scope},
