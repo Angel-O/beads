@@ -35,7 +35,17 @@ import (
 // THE ONES THE RAW SEAM ALREADY TYPES ARE NOT REPEATED. ErrNotOwner and
 // ErrAssigneeMismatch come back from the calls below already wrapped and in
 // this same order, so a pre-check for either is a branch nothing can make fail.
-// See the note beside the ownership call.
+// Both were written, and both were deleted after a mutation removing them left
+// the whole eleven-case contract green on the server-backed leg.
+//
+// THAT ONE LEG WAS SUFFICIENT EVIDENCE, and the reason is the paragraph above
+// rather than a shortcut: all three legs run THIS function and it reaches the
+// SAME two raw entry points, so there is no second implementation in which a
+// deleted pre-check could still have been load-bearing. The engdocs' standing
+// warning — "a mutation verdict is only true of the body you mutated" — is
+// answered here by there being one body to mutate. Where the three legs DO
+// differ is in what they version, which is why ReleaseWrite carries two facts
+// and why the wisp case runs on all three.
 //
 // WHICH REQUESTS ARE REFUSED IS UNCHANGED BY EITHER DECISION. The checks here
 // are the raw seam's own, in the raw seam's order, and the raw calls still run

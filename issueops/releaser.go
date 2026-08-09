@@ -49,6 +49,13 @@ type ReleaseRequest struct {
 	// wants, and it is safer than Force for the purpose because it cannot
 	// release a claim that has since moved.
 	//
+	// HOLDERS COMPARE BYTE FOR BYTE, not trimmed and not folded: " agent-a" is
+	// not agent-a and will refuse. The validation below trims only far enough to
+	// tell a blank expectation from a real one, and never writes the trimmed
+	// form back — the no-mutation promise above makes that permanent, so a
+	// caller that pads its expectation loses every time rather than
+	// intermittently. Compose it from a holder a read gave you.
+	//
 	// nil DISABLES THE CHECK and selects the unconditional path. It is a
 	// pointer so that "do not check" is distinct from a value — but unlike
 	// UpdateRequest.ExpectedAssignee, a non-nil pointer to "" is NOT a guard
@@ -105,17 +112,28 @@ type ReleaseResult struct {
 	//
 	// IT IS TRUE ON EVERY ANSWER THIS ROLE RETURNS WITHOUT AN ERROR, because
 	// every shape that would not write is refused above it: an unheld row is
-	// ErrNotClaimed rather than an idempotent no-op, which is the rule the raw
-	// release seam already has and the one this role keeps rather than
-	// loosening.
+	// ErrNotClaimed rather than an idempotent no-op.
 	//
-	// It is on the result rather than absent because ClaimResult.Changed is,
-	// and a caller holding both roles should not have to read the pair two
-	// ways — and because the one decision that could move it, making an unheld
-	// release idempotent the way an already-held re-claim is, would then be a
-	// change of ANSWER rather than of TYPE. Nothing returns it false today, and
-	// the conformance contract says so in its coverage paragraph rather than
-	// carrying a case that could not fail.
+	// THE ASYMMETRY WITH ClaimResult.Changed IS NOT AN INCONSISTENCY, and the
+	// reason is a fact about the two POST-STATES rather than a preference.
+	// Claimer can afford an idempotent answer because the state a claim leaves
+	// behind IDENTIFIES THE CLAIMANT: a re-claim finds assignee == Actor and
+	// StatusInProgress, which is the claim's own signature surviving on the row,
+	// so the role can tell "you already did this" from "somebody else holds it"
+	// and reports Changed false for exactly the first. A release leaves an
+	// ANONYMOUS post-state — assignee cleared, status open, started_at gone —
+	// which is the same row no matter who emptied it, or whether it was ever
+	// full. An idempotent release would therefore answer Changed false
+	// identically for "I already released this", "a reaper beat me to it" and
+	// "nothing ever claimed it", with NOTHING LEFT ON THE ROW to tell them
+	// apart. Those three want different things from a caller, so the role
+	// refuses instead and lets the caller decide which of them it can live
+	// with — see Releaser.Release's non-idempotence paragraph.
+	//
+	// So the field is here because ClaimResult.Changed is, and a caller holding
+	// both roles should not have to read the pair two ways. Nothing returns it
+	// false today, and the conformance contract says so in its coverage
+	// paragraph rather than carrying a case that could not fail.
 	Changed bool
 }
 
