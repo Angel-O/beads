@@ -25,18 +25,25 @@ import (
 // reach one list and miss the other.
 var roleAccessorNames = deriveRoleAccessorNames()
 
-// deriveRoleAccessorNames reports every storage.DoltStorage method that takes
-// nothing and returns (role interface, error), where the role belongs to the
-// public facade.
+// deriveRoleAccessorNames censuses the role accessors storage.DoltStorage
+// declares.
 func deriveRoleAccessorNames() []string {
+	names, _ := roleAccessorNamesOf(reflect.TypeOf((*storage.DoltStorage)(nil)).Elem())
+	return names
+}
+
+// roleAccessorNamesOf reports every method of surface that takes nothing and
+// returns (role interface, error), where the role belongs to the public facade,
+// alongside the accessor-shaped methods whose interface belongs to no facade
+// package. The sibling in internal/storage asserts that second list is empty;
+// this one reads the same interface, so one check covers both.
+func roleAccessorNamesOf(surface reflect.Type) (names, unclassified []string) {
 	facade := map[string]bool{
 		reflect.TypeOf((*issueops.Reader)(nil)).Elem().PkgPath():    true,
 		reflect.TypeOf((*memoryops.Memories)(nil)).Elem().PkgPath(): true,
 	}
 	errorType := reflect.TypeOf((*error)(nil)).Elem()
-	surface := reflect.TypeOf((*storage.DoltStorage)(nil)).Elem()
 
-	var names []string
 	for i := range surface.NumMethod() {
 		accessor := surface.Method(i)
 		signature := accessor.Type
@@ -44,13 +51,18 @@ func deriveRoleAccessorNames() []string {
 			continue
 		}
 		role := signature.Out(0)
-		if role.Kind() != reflect.Interface || !facade[role.PkgPath()] {
+		if role.Kind() != reflect.Interface {
+			continue
+		}
+		if !facade[role.PkgPath()] {
+			unclassified = append(unclassified, accessor.Name+" -> "+role.PkgPath()+"."+role.Name())
 			continue
 		}
 		names = append(names, accessor.Name)
 	}
 	sort.Strings(names)
-	return names
+	sort.Strings(unclassified)
+	return names, unclassified
 }
 
 // TestInstrumentedStorageDeclaresEveryRoleAccessor is the structural half of

@@ -29,19 +29,23 @@ var roleAccessorNames = deriveRoleAccessorNames()
 
 // deriveRoleAccessorNames censuses the role accessors DoltStorage declares.
 func deriveRoleAccessorNames() []string {
-	return roleAccessorNamesOf(reflect.TypeOf((*DoltStorage)(nil)).Elem())
+	names, _ := roleAccessorNamesOf(reflect.TypeOf((*DoltStorage)(nil)).Elem())
+	return names
 }
 
 // roleAccessorNamesOf reports every method of surface that takes nothing and
 // returns (role interface, error), where the role belongs to the public facade.
-func roleAccessorNamesOf(surface reflect.Type) []string {
+// It also reports the accessor-shaped methods whose interface belongs to no
+// facade package, because that is how a census shrinks in silence: a third
+// facade package would arrive in exactly that shape and every role in it would
+// simply stop being asked about.
+func roleAccessorNamesOf(surface reflect.Type) (names, unclassified []string) {
 	facade := map[string]bool{
 		reflect.TypeOf((*issueops.Reader)(nil)).Elem().PkgPath():    true,
 		reflect.TypeOf((*memoryops.Memories)(nil)).Elem().PkgPath(): true,
 	}
 	errorType := reflect.TypeOf((*error)(nil)).Elem()
 
-	var names []string
 	for i := range surface.NumMethod() {
 		accessor := surface.Method(i)
 		signature := accessor.Type
@@ -49,13 +53,30 @@ func roleAccessorNamesOf(surface reflect.Type) []string {
 			continue
 		}
 		role := signature.Out(0)
-		if role.Kind() != reflect.Interface || !facade[role.PkgPath()] {
+		if role.Kind() != reflect.Interface {
+			continue
+		}
+		if !facade[role.PkgPath()] {
+			unclassified = append(unclassified, accessor.Name+" -> "+role.PkgPath()+"."+role.Name())
 			continue
 		}
 		names = append(names, accessor.Name)
 	}
 	sort.Strings(names)
-	return names
+	sort.Strings(unclassified)
+	return names, unclassified
+}
+
+// TestEveryStoreRoleAccessorIsClassified fails when DoltStorage hands out an
+// interface the census cannot place. Every one of the twenty-four today is a
+// facade role, so this costs nothing and closes the path where a role surface
+// grows a package and the census quietly stops covering it.
+func TestEveryStoreRoleAccessorIsClassified(t *testing.T) {
+	_, unclassified := roleAccessorNamesOf(reflect.TypeOf((*DoltStorage)(nil)).Elem())
+	for _, accessor := range unclassified {
+		t.Errorf("accessor %s belongs to no known facade package: teach the census that package, "+
+			"or every role in it goes uncensused", accessor)
+	}
 }
 
 // rehearsalSurface is a fabricated store surface: DoltStorage plus one more
@@ -77,19 +98,15 @@ type rehearsalSurface interface {
 // decorator by the embedded interface, so nothing else in the build says a
 // word about it.
 func TestRoleAccessorCensusGrowsWithTheStoreSurface(t *testing.T) {
-	rehearsal := roleAccessorNamesOf(reflect.TypeOf((*rehearsalSurface)(nil)).Elem())
+	rehearsal, unclassified := roleAccessorNamesOf(reflect.TypeOf((*rehearsalSurface)(nil)).Elem())
 
-	if len(rehearsal) != len(roleAccessorNames)+1 {
-		t.Fatalf("census of the rehearsal surface has %d accessors, want the %d real ones plus Rehearser",
-			len(rehearsal), len(roleAccessorNames))
+	want := append(slices.Clone(roleAccessorNames), "Rehearser")
+	slices.Sort(want)
+	if !slices.Equal(rehearsal, want) {
+		t.Errorf("census of the rehearsal surface = %v, want the real accessors plus Rehearser (%v)", rehearsal, want)
 	}
-	if !slices.Contains(rehearsal, "Rehearser") {
-		t.Errorf("census %v never found the added accessor", rehearsal)
-	}
-	for _, name := range []string{"Rehearse", "RehearsalName"} {
-		if slices.Contains(rehearsal, name) {
-			t.Errorf("census counted %s, which returns no facade role", name)
-		}
+	if len(unclassified) != 0 {
+		t.Errorf("rehearsal surface reported %v as unclassified; every added method returns a facade role or no role at all", unclassified)
 	}
 }
 
