@@ -1976,6 +1976,211 @@ func RunReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix(t *testing.T,
 	}
 }
 
+// RunReaderListCountsAreBlocksOnlyWhereGetCountsEveryEdge pins the exact
+// cardinalities on BOTH read planes at once, and with them the fact that the
+// two planes count different things.
+//
+// A page row's DependencyCount and DependentCount are BLOCKS-ONLY — outgoing
+// blocks edges and reverse blockers — while a detail view's count EVERY
+// outgoing and incoming edge whatever its type. Two vocabularies on one role,
+// and a user sees both: `bd list` prints the first, `bd show` the second.
+//
+// WHAT THIS FIXTURE MAKES OBSERVABLE. Every existing count fixture in this file
+// seeds blocks edges alone — RunReaderGetDetailShapeMatchesTheSeededIssue,
+// RunReaderGetOptionalRowListsAreOffByDefault and
+// RunReaderListSkipCountsDropsTheCardinalitiesAndNothingElse all do — so under
+// them the two vocabularies produce identical numbers and an implementation
+// that swapped them, or that answered the page with the detail view's counts,
+// passes every one. The subject below carries three outgoing edges of three
+// types and three incoming ones, so the two answers are REQUIRED TO DIFFER and
+// the case fails if they agree.
+//
+// The list plane's numbers are also pinned exactly rather than as nonzero.
+// RunReaderListSkipCountsDropsTheCardinalitiesAndNothingElse needs its
+// premise-check to see nonzero counts and asks for no more than that, so a
+// mega-query that answered all three cardinalities with the same total edge
+// count satisfied it. Here CommentCount is 2, DependencyCount is 1 and
+// DependentCount is 2 — three different numbers on one row.
+//
+// PARENT IS THE FOURTH COLUMN and rides the same query as the counts without
+// being one. Its value is pinned against the seeded edge, and a second row with
+// no parent-child edge pins the nil, which is the arm a body returning the
+// row's own id or an empty string would fail.
+//
+// WHAT IT DEPENDS ON FROM OUTSIDE ITSELF: the id set it scopes on. Both reads
+// name one subject explicitly, so no other case's rows can reach either answer.
+func RunReaderListCountsAreBlocksOnlyWhereGetCountsEveryEdge(t *testing.T, ctx context.Context, fixture ReaderFixture) {
+	t.Helper()
+	id := func(name string) string { return readerID(fixture, "cntsplit", name) }
+	subject, orphan := id("subject"), id("orphan")
+	blocker, parent, related := id("blocker"), id("parent"), id("related")
+	blockedBy, alsoBlockedBy, child := id("blocked-by"), id("also-blocked-by"), id("child")
+
+	for _, member := range []string{subject, orphan, blocker, parent, related, blockedBy, alsoBlockedBy, child} {
+		seedReaderIssue(t, ctx, fixture, readerIssue(member, types.TypeTask, ""))
+	}
+	// Three out, three in, one type each way that the page counts and two it
+	// does not.
+	for _, edge := range []*types.Dependency{
+		{IssueID: subject, DependsOnID: blocker, Type: types.DepBlocks},
+		{IssueID: subject, DependsOnID: parent, Type: types.DepParentChild},
+		{IssueID: subject, DependsOnID: related, Type: types.DepRelatesTo},
+		{IssueID: blockedBy, DependsOnID: subject, Type: types.DepBlocks},
+		{IssueID: alsoBlockedBy, DependsOnID: subject, Type: types.DepBlocks},
+		{IssueID: child, DependsOnID: subject, Type: types.DepParentChild},
+	} {
+		if err := fixture.AddDependency(ctx, edge, "seed"); err != nil {
+			t.Fatalf("seed edge %s -> %s: %v", edge.IssueID, edge.DependsOnID, err)
+		}
+	}
+	for _, text := range []string{"one", "two"} {
+		if err := fixture.AddComment(ctx, subject, "seed", text); err != nil {
+			t.Fatalf("seed comment %q: %v", text, err)
+		}
+	}
+
+	page, err := fixture.Reader.List(ctx, publicops.ListRequest{IDFilter: readerIDFilter(subject, orphan)})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	assertReaderRowCounts(t, "List", page, readerCounts{
+		id: subject, dependencies: 1, dependents: 2, comments: 2, parent: &parent,
+	})
+	assertReaderRowCounts(t, "List", page, readerCounts{id: orphan})
+
+	details, err := fixture.Reader.Get(ctx, publicops.GetRequest{ID: subject})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	assertReaderCount(t, "Get DependencyCount", details.DependencyCount, 3)
+	assertReaderCount(t, "Get DependentCount", details.DependentCount, 3)
+	assertReaderCount(t, "Get CommentCount", details.CommentCount, 2)
+
+	// Said once more as the thing itself, so a future change that quietly
+	// unified the two vocabularies fails on the promise rather than on an
+	// arithmetic detail of this fixture.
+	row := readerRowByID(t, "List", page, subject)
+	if row == nil {
+		return
+	}
+	if details.DependencyCount != nil && int64(row.DependencyCount) == *details.DependencyCount {
+		t.Errorf("the page and the detail view both answered DependencyCount = %d; the page counts blocks edges and the detail view counts every edge, and this subject has both kinds",
+			row.DependencyCount)
+	}
+	if details.DependentCount != nil && int64(row.DependentCount) == *details.DependentCount {
+		t.Errorf("the page and the detail view both answered DependentCount = %d; the page counts reverse blockers and the detail view counts every incoming edge, and this subject has both kinds",
+			row.DependentCount)
+	}
+}
+
+// RunReaderReadyParentScopesToItsTransitiveDescendants pins
+// ReadyRequest.ParentID (reader.go:57-58) — a documented public field with no
+// coverage at any leg until now.
+//
+// The promise is RECURSIVE DESCENDANTS, and it is served two ways at once. Both
+// seams resolve the descendant id set by walking parent-child edges — one
+// through issueops.GetDescendantIDsInTx, the other through the unit-of-work
+// repository's own getDescendantIDs — and then OR that set with an id-prefix
+// clause that admits dotted rows carrying no parent-child edge at all
+// (sqlbuild.BuildReadyWorkWhere). A one-hop subquery in place of the walk is
+// the defect this field already shipped once, GH#3396.
+//
+// WHAT THIS FIXTURE MAKES OBSERVABLE. The audit leaf this came from gave every
+// descendant BOTH a dotted id and a parent-child edge, so either mechanism
+// alone answered it and neither could be shown to run: dropping the walk left
+// the id prefix covering for it, and dropping the prefix left the walk covering
+// for it. Here the two are separated. The ADOPTED row is a descendant by edge
+// with an id under no prefix, so only the walk reaches it; the DOTTED row is a
+// descendant by id with no edge, so only the prefix reaches it; and the
+// GRANDCHILD is two hops down AND carries an edge, which puts it outside the
+// prefix arm — the clause excludes rows that have a parent-child edge — so it
+// is the one row that can only arrive through a walk that recurses.
+//
+// WHAT IT DEPENDS ON FROM OUTSIDE ITSELF: nothing. ParentID is the scope, and
+// the decoy is a sibling of the parent rather than an unrelated row, so a
+// prefix rendered without its separator (`LIKE 'p%'` rather than `LIKE 'p.%'`)
+// takes the decoy and fails.
+func RunReaderReadyParentScopesToItsTransitiveDescendants(t *testing.T, ctx context.Context, fixture ReaderFixture) {
+	t.Helper()
+	parent := readerID(fixture, "rdypar", "p")
+	child := parent + ".1"
+	grandchild := parent + ".1.1"
+	dotted := parent + ".9"
+	adopted := readerID(fixture, "rdypar", "adopted")
+	decoy := parent + "x"
+
+	for _, member := range []string{parent, child, grandchild, dotted, adopted, decoy} {
+		seedReaderIssue(t, ctx, fixture, readerIssue(member, types.TypeTask, ""))
+	}
+	for _, edge := range []*types.Dependency{
+		{IssueID: child, DependsOnID: parent, Type: types.DepParentChild},
+		{IssueID: grandchild, DependsOnID: child, Type: types.DepParentChild},
+		{IssueID: adopted, DependsOnID: parent, Type: types.DepParentChild},
+	} {
+		if err := fixture.AddDependency(ctx, edge, "seed"); err != nil {
+			t.Fatalf("seed edge %s -> %s: %v", edge.IssueID, edge.DependsOnID, err)
+		}
+	}
+
+	page, err := fixture.Reader.Ready(ctx, publicops.ReadyRequest{ParentID: parent, Sort: "oldest"})
+	if err != nil {
+		t.Fatalf("Ready --parent: %v", err)
+	}
+	// The parent itself is not its own descendant, and neither the sibling
+	// decoy nor anything else in the workspace belongs to this answer.
+	assertReaderPageIDSet(t, "Ready --parent", page, []string{child, grandchild, dotted, adopted})
+}
+
+// RunReaderListParentReachesEveryDescendantAndOnlyItsOwn is the same field on
+// the listing plane (reader.go:213), where it is rendered differently: one
+// clause with a parent-child subquery ORed against the id prefix
+// (sqlbuild/filter.go), no precomputed id set and therefore no walk. That is
+// why it gets a case of its own rather than an arm — the ready arm's descendant
+// set is computed in Go and this one is not, so a break in either is invisible
+// from the other.
+//
+// THE SIBLING PARENTS DIFFER ONLY IN CASE, which is the half no id-prefix case
+// can borrow from elsewhere. The prefix is a LIKE against a binary-collated
+// column, and a backend that folded case there would answer one parent's
+// listing with the other parent's child — the bd-oyvc2.10 class. Both
+// directions are driven, because a fold is symmetric and asserting one of them
+// would leave the other reading as a pass.
+//
+// WHAT THIS FIXTURE MAKES OBSERVABLE that the reader contract could not: no
+// case in this file or in the querier's drives ParentID at all, so the whole
+// field — descendant reach, case sensitivity, and the exclusion of the parent
+// itself — was unpinned on all three legs.
+//
+// WHAT IT DEPENDS ON FROM OUTSIDE ITSELF: nothing beyond ParentID, which is the
+// scope. The rows carry no parent-child edges at all, so what is measured is
+// the prefix arm rather than the subquery arm; the ready case above owns the
+// edge-derived half.
+func RunReaderListParentReachesEveryDescendantAndOnlyItsOwn(t *testing.T, ctx context.Context, fixture ReaderFixture) {
+	t.Helper()
+	lower := readerID(fixture, "lspar", "pc")
+	upper := readerID(fixture, "lspar", "PC")
+	lowerChild, upperChild := lower+".1", upper+".1"
+	lowerGrandchild := lower + ".1.1"
+
+	for _, member := range []string{lower, upper, lowerChild, upperChild, lowerGrandchild} {
+		seedReaderIssue(t, ctx, fixture, readerIssue(member, types.TypeTask, ""))
+	}
+
+	for _, test := range []struct {
+		parent string
+		want   []string
+	}{
+		{lower, []string{lowerChild, lowerGrandchild}},
+		{upper, []string{upperChild}},
+	} {
+		page, err := fixture.Reader.List(ctx, publicops.ListRequest{ParentID: test.parent})
+		if err != nil {
+			t.Fatalf("List --parent %s: %v", test.parent, err)
+		}
+		assertReaderPageIDSet(t, "List --parent "+test.parent, page, test.want)
+	}
+}
+
 // readerIssue builds the seed every case starts from: an open, unassigned,
 // unblocked task that qualifies for ready work. A case that needs it to fail one
 // of those tests changes the field it means to test and nothing else.

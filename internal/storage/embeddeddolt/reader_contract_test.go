@@ -185,6 +185,26 @@ func TestEmbeddedReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix(t *t
 	conformance.RunReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
 }
 
+func TestEmbeddedReaderListCountsAreBlocksOnlyWhereGetCountsEveryEdge(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderListCountsAreBlocksOnlyWhereGetCountsEveryEdge(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderReadyParentScopesToItsTransitiveDescendants(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderReadyParentScopesToItsTransitiveDescendants(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+// The id prefix is a LIKE against a binary-collated column on this engine, so
+// the cased-sibling half of the case has its most plausible failure mode here.
+func TestEmbeddedReaderListParentReachesEveryDescendantAndOnlyItsOwn(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderListParentReachesEveryDescendantAndOnlyItsOwn(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
 // newEmbeddedReaderFixture composes the shared role kit with the reader
 // accessor. One environment per case: newTestEnv clones a pristine template
 // into the test's own temp dir, which costs a fraction of a second once the

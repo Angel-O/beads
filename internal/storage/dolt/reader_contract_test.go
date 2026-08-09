@@ -188,6 +188,27 @@ func TestReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix(t *testing.T
 	conformance.RunReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix(t, ctx, fixture)
 }
 
+// The two count vocabularies reach two different store methods here: the page
+// rides sqlbuild's mega-query and the detail view rides CountDependencies /
+// CountDependents, which count every edge type.
+func TestReaderListCountsAreBlocksOnlyWhereGetCountsEveryEdge(t *testing.T) {
+	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
+	defer cleanup()
+	conformance.RunReaderListCountsAreBlocksOnlyWhereGetCountsEveryEdge(t, ctx, fixture)
+}
+
+func TestReaderReadyParentScopesToItsTransitiveDescendants(t *testing.T) {
+	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
+	defer cleanup()
+	conformance.RunReaderReadyParentScopesToItsTransitiveDescendants(t, ctx, fixture)
+}
+
+func TestReaderListParentReachesEveryDescendantAndOnlyItsOwn(t *testing.T) {
+	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
+	defer cleanup()
+	conformance.RunReaderListParentReachesEveryDescendantAndOnlyItsOwn(t, ctx, fixture)
+}
+
 // newDoltReaderFixture composes the shared role kit with the reader accessor.
 // One store per case here rather than one per suite: setupTestStore gives each
 // test its own copy-on-write branch and costs a fraction of a second, so the

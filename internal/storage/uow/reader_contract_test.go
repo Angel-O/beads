@@ -119,6 +119,21 @@ func TestReaderContract(t *testing.T) {
 	t.Run("ReadyPageWiderThanTheHydrationBatchIsStillThatPrefix", func(t *testing.T) {
 		conformance.RunReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix(t, ctx, fixture)
 	})
+	// The two count vocabularies are two bodies here rather than two store
+	// methods: the page's numbers come out of this backend's own by-ids counts
+	// query, the detail view's out of the dependency use case's CountByIssueID
+	// with a direction and no type filter.
+	t.Run("ListCountsAreBlocksOnlyWhereGetCountsEveryEdge", func(t *testing.T) {
+		conformance.RunReaderListCountsAreBlocksOnlyWhereGetCountsEveryEdge(t, ctx, fixture)
+	})
+	// The descendant walk behind ParentID is this repository's own
+	// getDescendantIDs, not the shared issueops one.
+	t.Run("ReadyParentScopesToItsTransitiveDescendants", func(t *testing.T) {
+		conformance.RunReaderReadyParentScopesToItsTransitiveDescendants(t, ctx, fixture)
+	})
+	t.Run("ListParentReachesEveryDescendantAndOnlyItsOwn", func(t *testing.T) {
+		conformance.RunReaderListParentReachesEveryDescendantAndOnlyItsOwn(t, ctx, fixture)
+	})
 	// Last on purpose: the backend-failure half runs a request on a dead
 	// context, and this backend's provider is shared by every case above it.
 	t.Run("GetMissIsNotFoundAndBackendFailureDoesNotDecay", func(t *testing.T) {
