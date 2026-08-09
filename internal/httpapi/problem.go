@@ -77,16 +77,26 @@ const (
 	// and answering `not_claimable` about it would send a client somewhere
 	// there is nothing to find.
 	//
-	// IT COVERS BOTH CONDITIONS UNDER ONE CODE, with no member to tell them
-	// apart, and that is the deliberately narrow choice rather than the
-	// convenient one. Neither refusal is typed — ErrNotReleasable and
-	// ErrNotClaimed are bare sentinels whose observations live in prose — so
-	// there is nothing to publish that this surface would not have had to
-	// scrape out of a message, which is the one thing every extension member
-	// here exists to avoid. Starting with one code is also the only reversible
-	// direction: splitting it later is an ADDITION, which the document already
-	// tells clients to tolerate, while merging two published codes into one is
-	// the removal that breaks the wire.
+	// IT COVERS BOTH CONDITIONS UNDER ONE CODE, and that is a deliberate
+	// start-narrow CHOICE rather than a consequence of missing information.
+	//
+	// THE TWO CONDITIONS ARE FULLY DISTINGUISHABLE HERE. ErrNotClaimed and
+	// ErrNotReleasable are two distinct typed sentinels, and failRelease holds
+	// both in one case arm — so a future split needs no archaeology and no
+	// prose-scraping: it is a mapping change in that arm plus a code in this
+	// block and a line in the document. What IS unavailable typed is the
+	// OBSERVATION either refusal made — the status it saw, the emptiness of the
+	// assignee — because both format those into their messages and this surface
+	// does not scrape its own prose. That is why the code carries no extension
+	// member, and it is a narrower statement than "the refusals are
+	// indistinguishable", which they are not.
+	//
+	// The split is deferred rather than refused because one code is the
+	// reversible direction: splitting later is an ADDITION, which the document
+	// already tells clients to tolerate, while merging two published codes into
+	// one is the removal that breaks the wire. A client that needs the
+	// distinction before then reads the row, which the operation description
+	// tells it to do for a safety reason rather than a taste one.
 	CodeNotReleasable Code = "not_releasable"
 	// CodeNotClosable is close policy refusing an unforced close: open
 	// children, or a live blocker. The open-children refusal carries the count

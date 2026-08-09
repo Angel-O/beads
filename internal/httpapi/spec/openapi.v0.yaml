@@ -1783,11 +1783,30 @@ paths:
         claimant, and this operation has nothing left on the row to name.
 
 
-        A caller for which "already released" is the ordinary path — a retry
-        after a crash that cannot tell whether its first release landed —
-        treats that code as success. That is one line, and it is a line the
-        client writes knowingly rather than one this server writes on its
-        behalf.
+        ON `not_releasable`, READ THE ROW. Do NOT treat the code as "already
+        released", however ordinary that case is for you — it is the one
+        shortcut this operation's taxonomy makes unsafe, and it is unsafe in
+        the direction that strands work.
+
+
+        The code covers TWO conditions and publishes no member telling them
+        apart (see the `409` below). One of them is "nothing holds this". The
+        other is "the status will not accept a release", which is true of a row
+        that is CLOSED and equally true of a row parked in a status this
+        workspace configured — and such a row can still be ASSIGNED. A reaper
+        that read this code as success would book a claim as dropped while it
+        is still held, by an agent that is already gone, with nothing left to
+        free it. That is exactly the stranding this operation resolves ids
+        across both planes to prevent, reintroduced through the refusal
+        vocabulary instead of through the id.
+
+
+        So the recovery is a read: the row tells you which of the two you got —
+        an assignee, or none. That is one extra request on an uncommon path,
+        and it is the honest price of one code rather than two. A caller that
+        wants the distinction without the read should say so, and it arrives as
+        an ADDITION, which the `Problem.code` rules already tell clients to
+        tolerate.
 
 
         ## The two ways to release a claim you do not hold
@@ -1840,6 +1859,37 @@ paths:
           description: >-
             The claim is released. The issue is open and unassigned, and the
             body carries the row the release produced.
+
+
+            THE SET THIS SUCCEEDS OVER IS WIDER THAN `in_progress`, and a
+            client porting a guard needs to know it before it ports one. The
+            transition is defined over `open` AND `in_progress` alike, so a row
+            already in `open` that STILL HOLDS AN ASSIGNEE — the state a
+            partial write or an out-of-band status edit leaves behind — is
+            released here. A caller whose own release-if-current guarded on
+            `in_progress` did nothing for that row and reported no error; this
+            operation writes it. That is a genuine widening rather than a
+            restatement, and a client mapping "no error" to "I released it"
+            will now be right about rows it was previously never right about —
+            which is the point, and which is also why the mapping below is
+            written in terms of the CODES rather than in terms of success.
+
+
+            THE CODE-TO-OUTCOME MAPPING a release-if-current client wants,
+            stated here so it is written against a documented fact rather than
+            against a reading of the refusals. Four answers mean "no release
+            happened, and that is not an error": `not_releasable`,
+            `precondition_failed`, `already_claimed`, and `404`. A client
+            spelling that as a `(released, err)` pair returns
+            `(false, nil)` for all four.
+
+
+            `(false, nil)` MEANS "NO RELEASE HAPPENED". It does not mean the
+            claim is gone, and nothing here licenses that reading — see the
+            `not_releasable` paragraph in the operation description, which is
+            the one place the two readings come apart and the place a reaper
+            gets it wrong. A client that needs "is this row still held" asks a
+            READER; this operation answers whether IT released anything.
           content:
             application/json:
               schema:
@@ -1880,14 +1930,21 @@ paths:
 
 
             IT CARRIES NO MEMBER DISTINGUISHING THOSE TWO, and a client must
-            not look for one. The role reports both as bare sentinels — the
-            status it observed and the emptiness of the assignee travel in
-            prose — and this surface does not scrape its own prose to
+            not look for one. The OBSERVATIONS the two refusals made — the
+            status one saw, the emptiness of the assignee the other saw — travel
+            in their messages, and this surface does not scrape its own prose to
             manufacture a typed member. If the distinction ever earns one, it
             arrives as an ADDITION (a new member, or a second code), which the
             `Problem.code` rules already tell clients to tolerate; going the
             other way, merging two codes back into one, is the change that
             could not be made.
+
+
+            SO THE RECOVERY IS A READ, and it is a correctness rule rather than
+            a convenience: one of these two conditions leaves the row STILL
+            ASSIGNED, so a client that read this code as "already released"
+            books a claim as dropped while it stands. The operation description
+            says why that direction strands work. Read the row.
 
 
             `already_claimed` is the ownership fence: an unforced, unguarded

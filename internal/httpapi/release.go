@@ -236,7 +236,9 @@ func (s *Server) failRelease(w http.ResponseWriter, r *http.Request, request iss
 	case errors.Is(err, issueops.ErrNotClaimed), errors.Is(err, issueops.ErrNotReleasable):
 		refused()
 		s.fail(w, r, newResult(CodeNotReleasable,
-			"this issue holds no claim, or its status is neither `open` nor `in_progress`; nothing was written"))
+			"this issue holds no claim, or its status is neither `open` nor `in_progress`; nothing was written. "+
+				"Read the row rather than assuming the claim is gone: a status this workspace configured can refuse a "+
+				"release while the row is still assigned"))
 
 	case errors.Is(err, storage.ErrNotFound):
 		s.fail(w, r, NotFound())
