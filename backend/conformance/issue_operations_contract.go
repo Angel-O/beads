@@ -26,9 +26,27 @@ import (
 // against the same infra-type routing the stores' own CreateIssue applies: a
 // configured infra type is ephemeral and lives in the wisp tables, never in
 // issues.
+//
+// THE LAST ARM IS THE ONE THE FIXTURE USED TO HIDE. Every arm above it
+// configures types.infra to "agent", which is ALREADY in the built-in infra set
+// (agent/role/message), so a backend that unioned the configured names with the
+// defaults, or that ignored the key outright, answers identically to one that
+// replaced them. The promise is replacement: a workspace that names its own
+// infra types has said which types are ephemeral, and the ones it did not name
+// are durable. Getting that backwards versions rows the workspace asked to keep
+// out of history, or drops rows it expected versioned — silently, at create.
+//
+// audit_config_metadata_slots_repomtime.go's testAuditConfiguredInfraTypes pins
+// the replacement on the CONFIG READ. This pins it where it is consumed, on all
+// three legs, and the unit-of-work provider resolves the set through its own
+// config use case.
 func RunIssueOperationsCreateRoutesInfraTypesToWisps(t *testing.T, ctx context.Context, fixture IssueOperationsStagingFixture) {
 	t.Helper()
-	for key, value := range map[string]string{"types.custom": "agent", "types.infra": "agent"} {
+	// "gate" is in the vocabulary from the start but not yet infra: the last
+	// arm needs a name that is creatable AND outside the built-in infra set, so
+	// that promoting it proves the configured value was read rather than
+	// defaulted.
+	for key, value := range map[string]string{"types.custom": "agent,gate", "types.infra": "agent"} {
 		if err := fixture.SetConfig(ctx, key, value); err != nil {
 			t.Fatalf("SetConfig(%s): %v", key, err)
 		}
@@ -75,6 +93,40 @@ func RunIssueOperationsCreateRoutesInfraTypesToWisps(t *testing.T, ctx context.C
 	}
 	assertIssueOperationsRowCount(t, ctx, fixture, "issues", durable.Issue.ID, 1)
 	assertIssueOperationsRowCount(t, ctx, fixture, "wisps", durable.Issue.ID, 0)
+
+	// A configured set REPLACES the built-in one rather than adding to it. The
+	// workspace now says gate is its only infra type, so agent — a built-in
+	// infra name, and ephemeral in every arm above — has to come back durable.
+	if err := fixture.SetConfig(ctx, "types.infra", "gate"); err != nil {
+		t.Fatalf("SetConfig(types.infra, gate): %v", err)
+	}
+	evicted, err := fixture.Operations.Create(ctx, publicops.CreateRequest{
+		Actor: "writer",
+		Issue: &types.Issue{Title: "evicted infra type", Status: types.StatusOpen, Priority: 2, IssueType: types.IssueType("agent")},
+	})
+	if err != nil {
+		t.Fatalf("Create agent once the configured infra set no longer names it: %v", err)
+	}
+	if evicted.Issue.Ephemeral {
+		t.Errorf("create result Ephemeral = true for type agent, want false: a configured types.infra REPLACES the built-in set, it does not extend it")
+	}
+	assertIssueOperationsRowCount(t, ctx, fixture, "issues", evicted.Issue.ID, 1)
+	assertIssueOperationsRowCount(t, ctx, fixture, "wisps", evicted.Issue.ID, 0)
+
+	// The control: without it, a backend that had simply stopped routing
+	// anything to the wisps plane would pass the arm above.
+	promoted, err := fixture.Operations.Create(ctx, publicops.CreateRequest{
+		Actor: "writer",
+		Issue: &types.Issue{Title: "promoted infra type", Status: types.StatusOpen, Priority: 2, IssueType: types.IssueType("gate")},
+	})
+	if err != nil {
+		t.Fatalf("Create the newly configured infra type gate: %v", err)
+	}
+	if !promoted.Issue.Ephemeral {
+		t.Errorf("create result Ephemeral = false for the configured infra type gate, want true")
+	}
+	assertIssueOperationsRowCount(t, ctx, fixture, "wisps", promoted.Issue.ID, 1)
+	assertIssueOperationsRowCount(t, ctx, fixture, "issues", promoted.Issue.ID, 0)
 }
 
 // RunIssueOperationsCreateRejectsMissingDependencyTargets pins the facade
@@ -490,6 +542,91 @@ func RunIssueOperationsCreateInheritsParentLabels(t *testing.T, ctx context.Cont
 	}
 	assertIssueOperationsLabels(t, ctx, fixture, none.Issue.ID, "child of label-less parent")
 	assertIssueOperationsStringSet(t, "child of label-less parent result labels", none.Issue.Labels)
+}
+
+// RunIssueOperationsCreateUnderAParentMintsTheNextChildID pins the ID a create
+// with a ParentID and no id of its own comes back with. The minting itself is
+// already DRIVEN by RunIssueOperationsCreateInheritsParentLabels — which reads
+// the labels that ride along and never looks at the id — so the shape of the id
+// is unpinned on every leg today.
+//
+// TWO GENUINELY DIFFERENT BODIES ANSWER IT. The two stores reach
+// issueops.GetNextChildIDTx through the role's create; the unit-of-work
+// provider mints in internal/storage/domain/db/child_counter.go, which scans
+// and parses the suffix itself against its own parent-table probe. Neither is
+// pinned by any contract case, and the id is the one part of a create the
+// caller could not have supplied and cannot correct afterwards: it is the
+// handle every later command uses.
+//
+// THE FIXTURE IS THE MIGRATION, in two places.
+//
+// A SIBLING IS SEEDED OUT OF BAND, at .5, with no .3 or .4 beside it. A counter
+// that merely incremented per call would answer .3 here; the promise is that
+// the mint SELF-HEALS to one past the highest direct child that exists, which
+// is what keeps a restored or hand-edited workspace from minting an id that is
+// already taken. A case that only ever creates children in order cannot state
+// the difference.
+//
+// A GRANDCHILD IS SEEDED AT .5.1, which is the trap the scan is written around:
+// the ids are matched with a prefix pattern, and a pattern that does not stop
+// at the first separator counts .5.1 as a direct child and mints past it.
+//
+// The last arm carries the collation half (bd-oyvc2.10): two parents whose ids
+// differ ONLY IN CASE keep separate counters, because the scan's comparison is
+// case-sensitive. Where it is not, one team's beads silently advance another's.
+//
+// Residue left where it is: GetNextChildID's "advance the counter WITHOUT
+// creating an issue" and its wisp-parent routing stay audit-only. Neither is
+// expressible here — no role reserves an id, and this fixture has no hook that
+// seeds a wisp parent.
+func RunIssueOperationsCreateUnderAParentMintsTheNextChildID(t *testing.T, ctx context.Context, fixture IssueOperationsStagingFixture) {
+	t.Helper()
+
+	parent := fixture.IssuePrefix + "-childmint"
+	seedIssueOperationsLabeledIssue(t, ctx, fixture, parent)
+
+	assertIssueOperationsMintedChildID(t, ctx, fixture, parent, parent+".1", "the first child of a childless parent")
+	assertIssueOperationsMintedChildID(t, ctx, fixture, parent, parent+".2", "the second child")
+
+	// The out-of-band sibling and its own child. Neither is created through the
+	// role, so the counter never saw them go in.
+	seedIssueOperationsLabeledIssue(t, ctx, fixture, parent+".5")
+	seedIssueOperationsLabeledIssue(t, ctx, fixture, parent+".5.1")
+	assertIssueOperationsMintedChildID(t, ctx, fixture, parent, parent+".6",
+		"the child after a seeded .5 with a grandchild at .5.1")
+
+	lower := fixture.IssuePrefix + "-childcase"
+	upper := fixture.IssuePrefix + "-childCASE"
+	seedIssueOperationsLabeledIssue(t, ctx, fixture, lower)
+	seedIssueOperationsLabeledIssue(t, ctx, fixture, upper)
+	seedIssueOperationsLabeledIssue(t, ctx, fixture, upper+".7")
+	assertIssueOperationsMintedChildID(t, ctx, fixture, lower, lower+".1",
+		"the first child of a parent whose differently-cased twin already has one")
+}
+
+// assertIssueOperationsMintedChildID creates one child under parent with no id
+// of its own and holds the minted id to want, then checks the row is really
+// there: an id the caller cannot resolve afterwards is not an answer.
+func assertIssueOperationsMintedChildID(t *testing.T, ctx context.Context, fixture IssueOperationsStagingFixture, parent, want, label string) {
+	t.Helper()
+	created, err := fixture.Operations.Create(ctx, publicops.CreateRequest{
+		Actor:    "writer",
+		ParentID: parent,
+		Issue: &types.Issue{
+			Title: label, Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create %s under %s: %v", label, parent, err)
+	}
+	if created.Issue == nil {
+		t.Fatalf("create %s under %s returned no issue", label, parent)
+	}
+	if created.Issue.ID != want {
+		t.Errorf("%s was minted %q, want %q", label, created.Issue.ID, want)
+		return
+	}
+	assertIssueOperationsRowCount(t, ctx, fixture, "issues", want, 1)
 }
 
 // RunIssueOperationsUpdateFoldsMetadataIntoOneEvent pins a compound update to a

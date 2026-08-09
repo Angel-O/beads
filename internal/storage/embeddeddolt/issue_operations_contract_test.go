@@ -45,6 +45,13 @@ func TestEmbeddedIssueOperationsUpdateMetadataPatchOrdersMergeSetUnset(t *testin
 	conformance.RunIssueOperationsUpdateMetadataPatchOrdersMergeSetUnset(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "metaorder"))
 }
 
+func TestEmbeddedIssueOperationsCreateUnderAParentMintsTheNextChildID(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	te := newTestEnv(t, "childmint")
+	ctx := t.Context()
+	conformance.RunIssueOperationsCreateUnderAParentMintsTheNextChildID(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "childmint"))
+}
+
 func TestEmbeddedIssueOperationsCreateInheritsParentLabels(t *testing.T) {
 	skipUnlessEmbeddedDolt(t)
 	te := newTestEnv(t, "inherit")

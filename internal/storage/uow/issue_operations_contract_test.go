@@ -32,6 +32,11 @@ func TestIssueOperationsCreateInheritsParentLabels(t *testing.T) {
 	conformance.RunIssueOperationsCreateInheritsParentLabels(t, ctx, newUOWIssueOperationsFixture(t, ctx))
 }
 
+func TestIssueOperationsCreateUnderAParentMintsTheNextChildID(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsCreateUnderAParentMintsTheNextChildID(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
 func TestIssueOperationsCreateRefusesAForeignIDPrefix(t *testing.T) {
 	ctx := context.Background()
 	conformance.RunIssueOperationsCreateRefusesAForeignIDPrefix(t, ctx, newUOWIssueOperationsFixture(t, ctx))

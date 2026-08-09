@@ -31,6 +31,12 @@ func TestIssueOperationsCreateInheritsParentLabels(t *testing.T) {
 	conformance.RunIssueOperationsCreateInheritsParentLabels(t, ctx, fixture)
 }
 
+func TestIssueOperationsCreateUnderAParentMintsTheNextChildID(t *testing.T) {
+	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
+	defer cleanup()
+	conformance.RunIssueOperationsCreateUnderAParentMintsTheNextChildID(t, ctx, fixture)
+}
+
 func TestIssueOperationsCreateRefusesAForeignIDPrefix(t *testing.T) {
 	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
 	defer cleanup()
