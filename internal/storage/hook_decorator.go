@@ -20,6 +20,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/types"
+	memorybeadsv1 "github.com/steveyegge/beads/memorybeads/v1"
 )
 
 // HookFiringStore wraps a DoltStorage and fires hooks after mutations.
@@ -59,6 +60,17 @@ type Unwrapper interface {
 
 // Unwrap returns the underlying store, satisfying Unwrapper.
 func (h *HookFiringStore) Unwrap() DoltStorage { return h.inner }
+
+// MemoryModuleV1 preserves the optional versioned Memory Beads capability
+// across the hook decorator without adding it to DoltStorage.
+func (h *HookFiringStore) MemoryModuleV1() (memorybeadsv1.Module, error) {
+	if h == nil {
+		return memorybeadsv1.Acquire(nil)
+	}
+	return memorybeadsv1.Acquire(h.inner)
+}
+
+var _ memorybeadsv1.Source = (*HookFiringStore)(nil)
 
 // RoleFiresHooks reports whether an issue role taken off a store carries this
 // decorator's hook layer — that is, whether a landed write through it runs the

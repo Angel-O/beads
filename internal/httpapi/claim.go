@@ -17,6 +17,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/uow"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/issueops"
+	memorybeadsv1 "github.com/steveyegge/beads/memorybeads/v1"
 	"github.com/steveyegge/beads/memoryops"
 )
 
@@ -324,6 +325,7 @@ var (
 	_ uow.BatchCreatorSource      = timedProvider{}
 	_ uow.DependencyEditorSource  = timedProvider{}
 	_ uow.MemoriesSource          = timedProvider{}
+	_ memorybeadsv1.Source        = timedProvider{}
 )
 
 // IssueReader builds the reader OVER THIS WRAPPER rather than delegating to the
@@ -450,6 +452,13 @@ func (p timedProvider) DependencyEditor() (issueops.DependencyEditor, error) {
 // whose role is not an issueops role; the binding rule is the same.
 func (p timedProvider) Memories() (memoryops.Memories, error) {
 	return uow.NewMemories(p)
+}
+
+// MemoryModuleV1 binds the optional versioned module to this timing wrapper,
+// just like the role accessors above, so its future unit-of-work operations do
+// not bypass request timing.
+func (p timedProvider) MemoryModuleV1() (memorybeadsv1.Module, error) {
+	return uow.NewMemoryModuleV1(p)
 }
 
 func (p timedProvider) NewUOW(ctx context.Context) (uow.UnitOfWork, error) {

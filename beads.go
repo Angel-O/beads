@@ -28,6 +28,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/workspacegate"
+	memorybeadsv1 "github.com/steveyegge/beads/memorybeads/v1"
 )
 
 // Storage is the interface for beads storage operations. Its
@@ -378,6 +379,17 @@ var _ storage.DoltStorage = (*gatedStorage)(nil)
 // Unwrap exposes the inner store for storage.UnwrapStore, matching
 // HookFiringStore's decorator shape.
 func (g *gatedStorage) Unwrap() storage.DoltStorage { return g.DoltStorage }
+
+// MemoryModuleV1 preserves the optional versioned Memory Beads capability
+// across the public gated-storage decorator without widening Storage.
+func (g *gatedStorage) MemoryModuleV1() (memorybeadsv1.Module, error) {
+	if g == nil {
+		return memorybeadsv1.Acquire(nil)
+	}
+	return memorybeadsv1.Acquire(g.DoltStorage)
+}
+
+var _ memorybeadsv1.Source = (*gatedStorage)(nil)
 
 // Close closes the store, then releases the gates — but only on a clean
 // close. A failed or timed-out close can leave in-flight queries against
