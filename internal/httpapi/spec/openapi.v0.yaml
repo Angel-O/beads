@@ -7936,15 +7936,69 @@ components:
             maxLength: 255
           description: >-
             COMPLETE REPLACEMENT of the label set. An empty array clears every
-            label. Incremental add/remove is deferred: replacement is the only
-            shape whose result the client already knows without a read-back.
+            label.
 
 
-            This is the ONE member whose shape differs from `ApplyPatchBody`'s,
-            and the difference is that operation's rather than this one's: a plan
-            edits a set it did not compose, so it needs an ordered
-            add/remove/replace patch, while a caller patching one row it just
-            read already knows the set.
+            It is the REPLACE half of the same ordered edit `ApplyPatchBody`
+            spells as `labels.replace`, and `add_labels`/`remove_labels` are the
+            other two. All three may travel together and are applied in that
+            order — replace, then add, then remove — so REMOVAL WINS when one
+            label appears in more than one of them. That is the role's own
+            algebra, not this operation's arrangement of it.
+
+
+            THE SHAPE DIFFERS FROM `ApplyPatchBody`'s, which nests the three
+            under one `labels` object, and the difference is historical rather
+            than meaningful. This member shipped as a bare array; nesting it now
+            would RE-TYPE a published member, which is the one kind of change
+            this document has no additive route for. Two flat siblings is the
+            shape that could be added — and it is the shape `notes` and
+            `append_notes` already use for the same replace/increment pair.
+        add_labels:
+          type: array
+          items:
+            type: string
+            maxLength: 255
+          description: >-
+            Labels to add, applied AFTER any `labels` replacement.
+
+
+            IT IS NOT MUTUALLY EXCLUSIVE WITH `labels`, and that is the
+            difference from `append_notes`, which is. The role defines an order
+            over all three label edits, so sending a replacement and an addition
+            together has a defined result; notes have no such algebra, so there
+            the two are a contradiction and are refused.
+
+
+            IT IS WHY THIS PAIR EXISTS. A caller that reads a row, adds one
+            label and writes the whole set back silently drops any label another
+            writer added in between — and `bd label add` and every agent that
+            tags work concurrently are exactly that caller. A replacement can
+            only be composed safely by a writer that knows it is alone.
+
+
+            Repetition is free: a label named twice is applied once, and adding
+            one the issue already carries is a no-op that reports
+            `changed: false`. An EMPTY-STRING entry is DROPPED rather than
+            refused — a label row carrying `""` renders as nothing and matches
+            nothing, so writing one would only store junk, and refusing the
+            whole update would let one stray entry fail an otherwise-good edit.
+        remove_labels:
+          type: array
+          items:
+            type: string
+            maxLength: 255
+          description: >-
+            Labels to remove, applied AFTER `labels` and `add_labels`, so
+            REMOVAL WINS over both.
+
+
+            Removing a label the issue does not carry is a no-op that reports
+            `changed: false`; it is not a `404` and not a conflict. The same
+            repetition and empty-string rules as `add_labels` apply, and a value
+            longer than the column is refused here as it is there — the length
+            rule is about what a label may BE, not about whether this particular
+            row happens to carry one.
         estimated_minutes:
           type: integer
           nullable: true
