@@ -75,6 +75,37 @@ func resolveLabelTarget(ctx context.Context, id string) (string, error) {
 // ephemeral row's labels land in the ephemeral table — which is the four-way
 // switch the proxied route used to hand-roll, and the one place a front door
 // could put a wisp's label in the durable table by getting a boolean backwards.
+//
+// WHAT THE LOOP COSTS, stated in full because it is the one place this
+// migration is not free. Both routes used to put the whole edit in ONE
+// transaction — the direct one through transactHonoringAutoCommit, the proxied
+// one through uow.RunTx — and a per-issue role call cannot. So for N issues:
+//
+//   - N history entries where there was one, each naming its own issue;
+//   - under `--dolt-auto-commit on`, which is the DEFAULT, N Dolt version
+//     commits where the old transaction made one. Batch mode still makes zero,
+//     via issueOpsContext above, so the multiplication is only on the mode
+//     that was already committing per command;
+//   - a failure on the third id leaves the first two written, where the old
+//     shape rolled the good ones back with the bad one.
+//
+// PARTIAL APPLICATION IS ACCEPTABLE HERE, and that is an argument rather than
+// a shrug. issueops.ApplyLabelPatch computes the TARGET SET and returns
+// Changed false without writing when it equals the existing one, so an add and
+// a remove are both idempotent: re-running the same command over the same ids
+// is a no-op on the ids that already landed and does the remaining work on the
+// ids that did not. A partial batch therefore CONVERGES on retry, which is the
+// property that makes "landed some" a recoverable state rather than a
+// corrupted one. It would not be acceptable for an edit whose replay is not
+// the identity — which is exactly why this is stated here and not generalized.
+//
+// THE ATOMIC SHAPE IS EXPRESSIBLE ON THE FACADE ALREADY and is the named
+// follow-up, not a vague later: issueops.BatchApplier.ApplyBatch takes one
+// ItemUpdate per issue carrying this same IssuePatch, applies them in order and
+// commits them together, so the N calls collapse back to one transaction and
+// one history entry with no new role and no new request type. It is not in this
+// slice because it needs a cmd/bd accessor of its own and because its end gate
+// runs a hierarchy and cycle walk a label-only request has no use for.
 func applyLabelEdit(ctx context.Context, issueIDs []string, labels []string, operation string) error {
 	lifecycle, err := openIssueLifecycle()
 	if err != nil {
@@ -97,19 +128,18 @@ func applyLabelEdit(ctx context.Context, issueIDs []string, labels []string, ope
 		patch.Labels.Add = labels
 	}
 	for _, issueID := range issueIDs {
-		_, uerr := lifecycle.Update(ctx, issueops.UpdateRequest{
+		if _, uerr := lifecycle.Update(ctx, issueops.UpdateRequest{
 			Actor:   actor,
 			IssueID: issueID,
 			Patch:   patch,
-		})
-		// Marked per issue rather than once at the end: the edits land one
-		// call at a time, so a request that failed on its third id has still
-		// written its first two and the deferred commit has to know.
-		commandDidWrite.Store(true)
-		if uerr != nil {
+		}); uerr != nil {
 			return HandleErrorRespectJSON("label %s: %s label '%s' on %s: %v",
 				operation, operation, strings.Join(labels, "', '"), issueID, uerr)
 		}
+		// Marked per issue rather than once after the loop: the edits land one
+		// call at a time, so a request that failed on its third id has still
+		// written its first two and the deferred commit has to know about them.
+		commandDidWrite.Store(true)
 	}
 	return reportLabelEdit(issueIDs, labels, operation, jsonOutput)
 }
@@ -448,9 +478,14 @@ func runLabelAdd(ctx context.Context, args []string) error {
 	if len(labels) == 0 {
 		return HandleErrorRespectJSON("label cannot be empty")
 	}
-	// The reserved-prefix refusal is checked BEFORE anything is resolved, so a
-	// caller that both typo'd an id and reached for a reserved label is told
-	// about the label — the one of the two this command will never accept.
+	// The reserved-prefix refusal is checked BEFORE anything is resolved, and
+	// that ORDER CHANGED: the direct route used to resolve every id first and
+	// refuse the label afterwards. A caller that both typo'd an id and reached
+	// for a reserved label is now told about the label — the one of the two
+	// this command will never accept, at any id — rather than being sent to fix
+	// an id that was never going to be labeled. The proxied route already
+	// checked in this order, so this is the two routes agreeing on the earlier
+	// of the two answers rather than a new rule.
 	for _, label := range labels {
 		if strings.HasPrefix(label, "provides:") {
 			return HandleErrorRespectJSON("'provides:' labels are reserved for cross-project capabilities. Hint: use 'bd ship %s' instead", strings.TrimPrefix(label, "provides:"))
