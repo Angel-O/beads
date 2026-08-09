@@ -283,7 +283,7 @@ func (u *dependencyUseCaseImpl) add(ctx context.Context, dep *types.Dependency, 
 		return fmt.Errorf("add dep: hierarchy check: %w", err)
 	}
 
-	if isSchedulingDep(dep.Type) {
+	if types.IsSchedulingEdge(dep.Type) {
 		cycle, err := u.depRepo.HasCycle(ctx, dep.IssueID, dep.DependsOnID)
 		if err != nil {
 			return fmt.Errorf("add dep: cycle check: %w", err)
@@ -603,14 +603,6 @@ func (u *dependencyUseCaseImpl) GetBlockingInfo(ctx context.Context, issueIDs []
 	return out, nil
 }
 
-func isBlockingDep(t types.DependencyType) bool {
-	return t == types.DepBlocks || t == types.DepConditionalBlocks
-}
-
-func isSchedulingDep(t types.DependencyType) bool {
-	return isBlockingDep(t) || t == types.DepParentChild
-}
-
 func (u *dependencyUseCaseImpl) IsBlocked(ctx context.Context, issueID string) (bool, []string, error) {
 	return u.isBlocked(ctx, issueID, false)
 }
@@ -722,7 +714,7 @@ func (u *dependencyUseCaseImpl) AddDependencies(ctx context.Context, deps []*typ
 				}
 				return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: hierarchy check: %w", i, err)
 			}
-			if !opts.SkipPerEdgeCycleCheck && isSchedulingDep(dep.Type) {
+			if !opts.SkipPerEdgeCycleCheck && types.IsSchedulingEdge(dep.Type) {
 				cycle, err := u.depRepo.HasCycle(ctx, dep.IssueID, dep.DependsOnID)
 				if err != nil {
 					return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: cycle check: %w", i, err)
@@ -758,7 +750,7 @@ func (u *dependencyUseCaseImpl) AddDependencies(ctx context.Context, deps []*typ
 	}
 	var pairs [][2]string
 	for _, dep := range deps {
-		if !isSchedulingDep(dep.Type) {
+		if !types.IsSchedulingEdge(dep.Type) {
 			continue
 		}
 		pairs = append(pairs, [2]string{dep.IssueID, dep.DependsOnID})

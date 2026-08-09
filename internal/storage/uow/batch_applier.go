@@ -479,7 +479,7 @@ func (r *uowApplyRun) runEndGate(ctx context.Context) error {
 	}
 	var pairs [][2]string
 	for _, applied := range r.edges {
-		if !isApplySchedulingEdge(applied.dep.Type) {
+		if !types.IsSchedulingEdge(applied.dep.Type) {
 			continue
 		}
 		pairs = append(pairs, [2]string{applied.dep.IssueID, applied.dep.DependsOnID})
@@ -505,19 +505,6 @@ func (r *uowApplyRun) runEndGate(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-// isApplySchedulingEdge names the static combined-cycle set the gate walks:
-// blocks, conditional-blocks and parent-child. It is the private predicate
-// beside both other implementations of the same gate, spelled here because
-// neither exports one.
-func isApplySchedulingEdge(t types.DependencyType) bool {
-	switch t {
-	case types.DepBlocks, types.DepConditionalBlocks, types.DepParentChild:
-		return true
-	default:
-		return false
-	}
 }
 
 // resolve turns one ref into the id it names. A key is always already bound
