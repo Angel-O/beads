@@ -57,6 +57,25 @@ func DeleteInTx(ctx context.Context, tx *sql.Tx, req publicops.DeleteRequest) (p
 		return publicops.DeleteResult{}, &publicops.NotFoundError{IDs: missing}
 	}
 
+	// The version precondition sits between the existence probe and the
+	// dependents guard, where issueops.Deleter.Delete puts it: a version is a
+	// fact about a row, so a request naming a typo reports the typo; and a
+	// caller holding a stale token is not yet in a position to choose --cascade
+	// or --force, so the mismatch outranks that refusal.
+	//
+	// It reads ids[0] because ValidateDeleteRequest has already refused a
+	// multi-id request carrying one and NormalizeDeleteIDs has already
+	// collapsed duplicates, so exactly one distinct id is here. The read shares
+	// this transaction with the deletion below, which is what makes the pair a
+	// compare-and-delete; CheckVersionInTx is the same guard the update and
+	// close paths use, over the same row_lock token and with the same
+	// plane routing.
+	if req.ExpectedVersion != nil {
+		if err := CheckVersionInTx(ctx, tx, ids[0], *req.ExpectedVersion); err != nil {
+			return publicops.DeleteResult{}, err
+		}
+	}
+
 	idSet := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		idSet[id] = true

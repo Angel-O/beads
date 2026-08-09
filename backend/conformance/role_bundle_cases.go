@@ -186,6 +186,10 @@ var roleContractCases = []roleContract{
 		RunDeleterSettlesTheSurvivorsOfADeletedBlocker,
 		RunDeleterSettlesTheChildrenOfADeletedParent,
 		RunDeleterSettlesTheSurvivorsOfADeletedWispBlocker,
+		RunDeleterDeletesOnAMatchingExpectedVersion,
+		RunDeleterRefusesAStaleExpectedVersion,
+		RunDeleterVersionOutranksForceAndCascade,
+		RunDeleterRefusesAnExpectedVersionAcrossSeveralIDs,
 	),
 
 	roleCases("DependencyEditor", "DependencyEditor()", oncePerRole,
