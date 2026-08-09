@@ -426,6 +426,7 @@ func RunReaderListDefaultExclusionsAndTheirOverrides(t *testing.T, ctx context.C
 	gate := readerID(fixture, "lsdef", "gate")
 	template := readerID(fixture, "lsdef", "template")
 	wisp := readerID(fixture, "lsdef", "wisp")
+	infraWisp := readerID(fixture, "lsdef", "infrawisp")
 	flagOnly := readerID(fixture, "lsdef", "flagonly")
 	statusOnly := readerID(fixture, "lsdef", "statusonly")
 	flagAndStatus := readerID(fixture, "lsdef", "flagandstatus")
@@ -437,6 +438,14 @@ func RunReaderListDefaultExclusionsAndTheirOverrides(t *testing.T, ctx context.C
 	templateIssue.IsTemplate = true
 	wispIssue := readerIssue(wisp, types.TypeTask, "")
 	wispIssue.Ephemeral = true
+	// The SAME plane, an EXCLUDED TYPE. `message` is one of the built-in infra
+	// types, so this row is hidden twice over — once by the plane and once by
+	// the type — and it is the only row that can tell the two knobs apart. The
+	// wisp above is a task: it comes back under either one, so a body that
+	// wired the plane knob to the type branch answers every other row here
+	// correctly.
+	infraWispIssue := readerIssue(infraWisp, types.TypeMessage, "")
+	infraWispIssue.Ephemeral = true
 	// Open, pinned only by the FLAG: no status exclusion can hide it, so it
 	// isolates the flag predicate.
 	flagOnlyIssue := readerIssue(flagOnly, types.TypeTask, "")
@@ -462,12 +471,13 @@ func RunReaderListDefaultExclusionsAndTheirOverrides(t *testing.T, ctx context.C
 	seedReaderIssue(t, ctx, fixture, readerIssue(gate, types.TypeGate, ""))
 	seedReaderIssue(t, ctx, fixture, templateIssue)
 	seedReaderWisp(t, ctx, fixture, wispIssue)
+	seedReaderWisp(t, ctx, fixture, infraWispIssue)
 	seedReaderIssue(t, ctx, fixture, flagOnlyIssue)
 	seedReaderIssue(t, ctx, fixture, statusOnlyIssue)
 	seedReaderIssue(t, ctx, fixture, flagAndStatusIssue)
 	seedReaderIssue(t, ctx, fixture, flagAndClosedIssue)
 
-	scope := readerIDFilter(open, closed, gate, template, wisp, flagOnly, statusOnly, flagAndStatus, flagAndClosed)
+	scope := readerIDFilter(open, closed, gate, template, wisp, infraWisp, flagOnly, statusOnly, flagAndStatus, flagAndClosed)
 	for _, test := range []struct {
 		name string
 		req  publicops.ListRequest
@@ -482,12 +492,18 @@ func RunReaderListDefaultExclusionsAndTheirOverrides(t *testing.T, ctx context.C
 		{"NoPinnedFlag holds the flag predicate under AllFlag", publicops.ListRequest{IDFilter: scope, AllFlag: true, NoPinnedFlag: true}, []string{open, closed, statusOnly}},
 		{"IncludeGates", publicops.ListRequest{IDFilter: scope, IncludeGates: true}, []string{open, gate}},
 		{"IncludeTemplates", publicops.ListRequest{IDFilter: scope, IncludeTemplates: true}, []string{open, template}},
-		{"IncludeInfra reaches the ephemeral plane", publicops.ListRequest{IDFilter: scope, IncludeInfra: true}, []string{open, wisp}},
-		// The plane knob, beside the three type knobs it is not one of: it
-		// admits the same row IncludeInfra does and takes NO exclusion off
-		// with it, so the gate and the template stay hidden here where a
-		// field wired to the wrong branch would bring one of them back.
-		{"IncludeEphemeral reaches the plane and nothing else", publicops.ListRequest{IDFilter: scope, IncludeEphemeral: true}, []string{open, wisp}},
+		// IncludeInfra is BOTH knobs at once: it admits the plane and takes the
+		// infra-type exclusion off, so it is the only request here that reaches
+		// the infra-typed wisp.
+		{"IncludeInfra reaches the ephemeral plane and the infra types", publicops.ListRequest{IDFilter: scope, IncludeInfra: true}, []string{open, wisp, infraWisp}},
+		// The plane knob alone. It admits the plane and takes NO exclusion off
+		// with it: the gate and the template stay hidden, and so does the
+		// infra-typed wisp in the very plane it just admitted. That last row is
+		// the one that makes this an observation — a field wired to
+		// IncludeInfra's branch answers with it.
+		{"IncludeEphemeral reaches the plane and takes no type exclusion off", publicops.ListRequest{IDFilter: scope, IncludeEphemeral: true}, []string{open, wisp}},
+		// And they compose rather than fight: the union of the two answers.
+		{"IncludeEphemeral with IncludeInfra", publicops.ListRequest{IDFilter: scope, IncludeEphemeral: true, IncludeInfra: true}, []string{open, wisp, infraWisp}},
 	} {
 		page, err := fixture.Reader.List(ctx, test.req)
 		if err != nil {

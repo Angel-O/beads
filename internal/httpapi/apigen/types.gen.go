@@ -1018,7 +1018,9 @@ type ListIssuesParams struct {
 	// IncludeInfra Include the workspace's configured infrastructure issue types. This also admits the ephemeral plane those types live in, so it is strictly wider than `include_ephemeral`.
 	IncludeInfra *bool `form:"include_infra,omitempty" json:"include_infra,omitempty"`
 
-	// IncludeEphemeral Include ephemeral (non-synced) rows, merged into the same `(created_at DESC, id ASC)` order as the durable ones. It admits a PLANE and takes no type exclusion off: an ephemeral row that is also a template, a gate or an infra type stays hidden by its own predicate, and `include_infra` is the parameter that takes the infra one off.
+	// IncludeEphemeral Include the ephemeral tier — ephemeral rows and the non-synced rows stored beside them — merged into the same `(created_at DESC, id ASC)` order as the durable ones.
+	//
+	// It admits a TIER and takes no TYPE exclusion off, so a row whose type this operation already hides stays hidden. That includes the configured infrastructure types: ephemeral `agent`, `role` and `message` rows need `include_infra` as well as, or instead of, this one. What `include_ephemeral` alone reaches is the ephemeral rows of the types a listing already shows.
 	IncludeEphemeral *bool `form:"include_ephemeral,omitempty" json:"include_ephemeral,omitempty"`
 
 	// CreatedBefore Only issues created strictly before this instant (RFC 3339).

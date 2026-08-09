@@ -84,6 +84,14 @@ func ReadyFilterFromIssueFilter(filter types.IssueFilter) types.WorkFilter {
 	// and IncludeInfra's plane half with it — onto the --ready arm instead of
 	// dropping it there, which would answer a request that named the plane
 	// with the durable set and no error.
+	//
+	// THE PREDICATE IS NEGATIVE, on a field whose ZERO VALUE means admit. That
+	// is deliberate but it is a footgun worth naming: this fires for any filter
+	// that merely never set SkipWisps, not only for one that asked. Every
+	// caller today is handed a filter built by BuildListFilter, which decides
+	// that field for every request, so "unset" is not reachable here — a
+	// hand-built types.IssueFilter{} passed in from somewhere new would get the
+	// wisp plane it never asked for. Keep the construction on the builder.
 	if (filter.Ephemeral != nil && *filter.Ephemeral) || !filter.SkipWisps {
 		wf.IncludeEphemeral = true
 	}

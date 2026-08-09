@@ -207,24 +207,38 @@ type ListRequest struct {
 	IncludeTemplates bool
 	IncludeGates     bool
 	IncludeInfra     bool
-	// IncludeEphemeral admits the EPHEMERAL PLANE — the wisp-table rows a
-	// default listing never sees — and admits nothing else.
+	// IncludeEphemeral admits the EPHEMERAL PLANE — the wisps TABLE, which a
+	// default listing does not read at all — and admits nothing else.
+	//
+	// WHAT IS IN THAT PLANE is not only true ephemerals. The wisps table holds
+	// every row the durable plane does not: wisps proper (ephemeral = 1) AND
+	// no-history rows, which live there with ephemeral = 0. Both arrive
+	// together, because this selects a TABLE rather than testing a column.
 	//
 	// False, the zero value, is the listing every caller has today: the durable
-	// issues table alone. True merges the wisp plane IN ADDITION, so under the
+	// issues table alone. True merges the wisps table IN ADDITION, so under the
 	// same filters the answer is a SUPERSET of the false answer. It never
-	// narrows, and it never becomes ephemeral-only. Those are exactly
-	// ReadyRequest.IncludeEphemeral's semantics on the ready query; the two
-	// fields mean the same thing and are spelled the same way on purpose.
+	// narrows, and it never becomes ephemeral-only.
+	//
+	// IT IS NOT THE SAME MECHANISM AS ReadyRequest.IncludeEphemeral, despite
+	// the shared name and the shared "admit in addition" reading, and the
+	// difference is observable. The ready query reads BOTH planes either way
+	// and its flag adds a per-ROW predicate (ephemeral = 0) when unset; this
+	// one selects which TABLES are read at all. So a no-history row — in the
+	// wisps table with ephemeral = 0 — is already in a DEFAULT ready answer and
+	// is absent from a default listing until this flag is set. Match the two
+	// fields for intent, never for row-level equivalence.
 	//
 	// IT IS A PLANE KNOB, NOT A TYPE KNOB — the difference from the three
 	// fields above it. Each of those takes a TYPE exclusion back off; this
-	// takes none off, so an ephemeral row that is also a template, a gate or an
-	// infra type stays hidden by its own predicate. IncludeInfra is the field
-	// that does BOTH — it drops the infra-type exclusions AND admits the plane
-	// — so it is strictly wider and is not a substitute: a caller who wants the
-	// ephemeral rows of ORDINARY types, and not the infra vocabulary along with
-	// them, has only this field.
+	// takes none off, so an ephemeral row whose type a default listing already
+	// excludes stays excluded. THAT INCLUDES THE INFRA TYPES, which is the
+	// combination most likely to surprise: the configured infra vocabulary
+	// (agent, role and message by default) is excluded by TYPE, so ephemeral
+	// agent/role/message rows need IncludeInfra as well as — or instead of —
+	// this. IncludeInfra does BOTH, which makes it strictly wider; what this
+	// field alone reaches is the ephemeral rows of the types a listing already
+	// shows.
 	//
 	// THE MERGED ANSWER IS ONE ORDER. Both planes are ordered together by
 	// SortBy as if they were a single table — not the durable rows followed by

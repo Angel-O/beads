@@ -879,18 +879,22 @@ paths:
         only the order differs.
 
 
-        EPHEMERAL (WISP) ROWS ARE OUT OF SCOPE BY DEFAULT and are admitted by
-        `include_ephemeral`, which merges that plane IN ADDITION to the durable
+        EPHEMERAL ROWS ARE OUT OF SCOPE BY DEFAULT and are admitted by
+        `include_ephemeral`, which merges that tier IN ADDITION to the durable
         one. The merged page is ordered by the same `(created_at DESC, id ASC)`
-        key across both planes as if they were one table, and `cursor` pages
+        key across both tiers as if they were one table, and `cursor` pages
         across the merge without skipping or repeating a row.
 
 
+        `include_ephemeral` and `include_infra` are INDEPENDENT and compose:
+        the first admits a tier, the second takes the infrastructure TYPE
+        exclusions off (and admits the tier those types live in). Ephemeral
+        rows of an infrastructure type therefore need `include_infra`.
+
+
         The CLI has no `--include-ephemeral` flag for `bd list` yet, so this is
-        the one filter on this operation with no `bd list` spelling. The
-        nearest CLI equivalent is `--include-infra`, which is strictly wider:
-        it admits the plane AND takes the infra-type exclusions off.
-        `include_infra` here does the same, and the two compose.
+        the one filter on this operation with no `bd list` spelling;
+        `--include-infra` is the nearest one and is wider.
       parameters:
         - name: status
           in: query
@@ -991,12 +995,17 @@ paths:
         - name: include_ephemeral
           in: query
           description: >-
-            Include ephemeral (non-synced) rows, merged into the same
-            `(created_at DESC, id ASC)` order as the durable ones. It admits a
-            PLANE and takes no type exclusion off: an ephemeral row that is
-            also a template, a gate or an infra type stays hidden by its own
-            predicate, and `include_infra` is the parameter that takes the
-            infra one off.
+            Include the ephemeral tier — ephemeral rows and the non-synced
+            rows stored beside them — merged into the same
+            `(created_at DESC, id ASC)` order as the durable ones.
+
+
+            It admits a TIER and takes no TYPE exclusion off, so a row whose
+            type this operation already hides stays hidden. That includes the
+            configured infrastructure types: ephemeral `agent`, `role` and
+            `message` rows need `include_infra` as well as, or instead of,
+            this one. What `include_ephemeral` alone reaches is the ephemeral
+            rows of the types a listing already shows.
           schema:
             type: boolean
             default: false
