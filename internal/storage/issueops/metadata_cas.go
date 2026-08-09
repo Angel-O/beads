@@ -22,6 +22,12 @@ import (
 // the three legs are ONE reading plus two wrapper checks, which is what the
 // conformance contract's header says and what its cases are written for.
 //
+// CURRENT IS ALWAYS READ FROM THE ROW, on every path: the value that refused a
+// swap, the value an already-equal precondition matched, and the value a swap
+// landed. That is one invariant rather than three cases, and it is what makes
+// "feed Current back as your next Expected" a converging loop on a substrate
+// that renormalizes what it stores.
+//
 // It assumes a plan already produced by storage.PlanCompareAndSetKey — values
 // canonical, actor and key checked. The accessors plan BEFORE opening a
 // transaction, so a refused request costs no database work.
@@ -63,7 +69,7 @@ func CompareAndSetMetadataKeyInTx(
 		// It is the guard that does not depend on a layer below agreeing, and
 		// it is what keeps a swap over an unchanged key from paying for a
 		// whole-object rewrite on a row with large metadata.
-		return publicops.CompareAndSetKeyResult{Swapped: true, Current: plan.Value}, MetadataCASWrite{}, nil
+		return publicops.CompareAndSetKeyResult{Swapped: true, Current: current}, MetadataCASWrite{}, nil
 	}
 
 	if plan.Value == nil {
@@ -82,7 +88,26 @@ func CompareAndSetMetadataKeyInTx(
 	issueTable, _, eventTable, _ := WispTableRouting(IsActiveWispInTx(ctx, tx, plan.IssueID))
 	write := MetadataCASWrite{Wrote: true, Tables: ChangedTables{}}
 	write.Tables.Add(issueTable, eventTable)
-	return publicops.CompareAndSetKeyResult{Swapped: true, Current: plan.Value}, write, nil
+
+	// CURRENT IS RE-READ FROM THE ROW, never handed back from the plan, and the
+	// extra SELECT is the price of the promise. The metadata column decodes JSON
+	// through float64 and re-emits it, so the bytes that land are not always the
+	// bytes that were sent: 1.0 arrives as 1, an integer past 2^53 is rounded to
+	// the nearest double, 1e300 arrives as three hundred and one digits.
+	// Answering with plan.Value would make Current a statement about the request
+	// rather than about the row, and a caller that fed it straight back as its
+	// next Expected — the loop this role is shaped for — would compare its own
+	// spelling against the substrate's and never converge.
+	stored, err := readMetadataMapInTx(ctx, tx, plan.IssueID)
+	if err != nil {
+		return publicops.CompareAndSetKeyResult{}, MetadataCASWrite{}, err
+	}
+	landed, err := canonicalMetadataKey(stored, plan.Key)
+	if err != nil {
+		return publicops.CompareAndSetKeyResult{}, MetadataCASWrite{}, fmt.Errorf(
+			"metadata key %q on %s after the swap: %w", plan.Key, plan.IssueID, err)
+	}
+	return publicops.CompareAndSetKeyResult{Swapped: true, Current: landed}, write, nil
 }
 
 // MetadataCASWrite reports what one compare-and-set did to the row.

@@ -91,11 +91,20 @@ func PlanCompareAndSetKey(in issueops.CompareAndSetKeyRequest) (CompareAndSetKey
 // reader in this tree already does with them.
 //
 // NUMBERS KEEP THEIR SOURCE LITERAL, so 1 and 1.0 canonicalize differently and
-// do not match. That is a deliberate trade against the alternative: decoding
-// through float64 makes two int64s that differ past 2^53 canonicalize
-// IDENTICALLY, which would let a stale expectation win the one comparison a
-// compare-and-set exists to make. A silent false match on a coordination key is
-// worse than a surprising false mismatch on a value nothing writes both ways.
+// do not match. This function does not round-trip a number through float64, and
+// the reason is NOT that doing so would lose precision the store keeps: the
+// metadata column loses it first. go-mysql-server decodes JSON numbers into
+// float64 and re-emits them, measured — 9007199254740993 is stored as
+// ...992, 1.0 as 1, -0.0 as 0, 1e300 as three hundred and one digits. So the
+// substrate's own fidelity, not this rule, is what bounds a numeric value.
+//
+// What the literal rule buys is that this function stays a pure statement about
+// JSON rather than a copy of one engine's number handling — a copy that would
+// silently equate two values a TEXT-column backend can hold apart, on the one
+// comparison a compare-and-set exists to make. What it COSTS is that a caller
+// composing an expectation from its own spelling of a number can disagree with
+// the row; the role answers that by making Current the value the ROW holds, so
+// the documented loop converges. See issueops.CompareAndSetKeyRequest.Expected.
 func CanonicalMetadataValue(raw json.RawMessage) (json.RawMessage, error) {
 	if !json.Valid(raw) {
 		return nil, fmt.Errorf("not a well-formed JSON value: %q", truncateMetadataValue(raw))

@@ -262,7 +262,7 @@ type CompareAndSetMetadataRequest struct {
 	// Expected One metadata value: ANY JSON value — string, number, boolean, null, array or object — because typed values enter through the explicit JSON metadata path and persist in older rows. It is not a string, and a client must not decode it as one.
 	//
 	// Where a member of this type is OMITTED, the key is absent; where it is present holding `null`, the key exists and holds null. Those are different states and this surface reports both.
-	Expected *MetadataValue `json:"expected,omitempty"`
+	Expected MetadataValue `json:"expected,omitempty"`
 
 	// Key The single metadata key to read and write. It must match the workspace's metadata-key syntax — a letter or underscore, then letters, digits, underscores, dots and slashes — so a key the query layer could not later spell is refused rather than written.
 	//
@@ -272,7 +272,7 @@ type CompareAndSetMetadataRequest struct {
 	// Value One metadata value: ANY JSON value — string, number, boolean, null, array or object — because typed values enter through the explicit JSON metadata path and persist in older rows. It is not a string, and a client must not decode it as one.
 	//
 	// Where a member of this type is OMITTED, the key is absent; where it is present holding `null`, the key exists and holds null. Those are different states and this surface reports both.
-	Value *MetadataValue `json:"value,omitempty"`
+	Value MetadataValue `json:"value,omitempty"`
 }
 
 // CompareAndSetMetadataResponse defines model for CompareAndSetMetadataResponse.
@@ -280,7 +280,7 @@ type CompareAndSetMetadataResponse struct {
 	// Current One metadata value: ANY JSON value — string, number, boolean, null, array or object — because typed values enter through the explicit JSON metadata path and persist in older rows. It is not a string, and a client must not decode it as one.
 	//
 	// Where a member of this type is OMITTED, the key is absent; where it is present holding `null`, the key exists and holds null. Those are different states and this surface reports both.
-	Current *MetadataValue `json:"current,omitempty"`
+	Current MetadataValue `json:"current,omitempty"`
 
 	// Swapped Whether the precondition held and the transition applied. THIS IS THE VERDICT and the only member to dispatch on. False is a lost race — an answer, not a failure — and the response is still a 200.
 	Swapped bool `json:"swapped"`

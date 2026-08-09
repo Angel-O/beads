@@ -459,6 +459,45 @@ is worse than no case. Say which mechanism actually holds a promise in the
 contract's coverage paragraph, and name the substrate that would make it
 observable.
 
+## When the role's answer carries a JSON value
+
+Two traps, both found in review of `issueops.MetadataCAS` and both invisible to
+every test that asserts on wire BYTES.
+
+**A `*json.RawMessage` wire member cannot READ a present `null`.** `encoding/json`
+answers a JSON null against a pointer by setting the pointer to nil, before any
+`UnmarshalJSON` runs — so a generated client decoding `{"current":null}` gets
+exactly what it gets for a response with no `current` member at all. If those
+two mean different things on your operation, the generated client cannot tell
+them apart and no round-trip test on the server notices, because the server's
+own handler reads raw members. The fix is
+`x-go-type-skip-optional-pointer: true` beside the `x-go-type`, which makes the
+member a bare `json.RawMessage` — an `Unmarshaler` in its own right, so it
+receives the literal, while an omitted member still leaves it nil and
+`omitempty` still omits it on the way out. **The wire does not change in either
+direction**, which is why nothing else catches the regression: add a test that
+decodes a present null INTO the generated struct, or the next `make api-gen`
+takes the fix away. Add `nullable: true` too — the document is OpenAPI 3.0.3 and
+a validating gateway is entitled to reject a legitimate null without it.
+
+**Do not justify a rule with a precision the SUBSTRATE does not keep.** This
+role shipped with a comparison rule defended, in three places, as protecting
+int64s past 2^53 from a float64 round-trip. The metadata column is a
+go-mysql-server JSON column that decodes numbers through float64 itself:
+measured, `9007199254740993` stores as `...992`, `1.0` as `1`, `-0.0` as `0`,
+and `1e300` as three hundred and one digits. The defense was against a loss that
+had already happened one layer down. Two consequences worth generalizing:
+
+- **Measure the column before writing the promise.** One throwaway probe that
+  seeds a row and reads the raw bytes back settles it in a minute, and the same
+  probe is what tells you whether a canonicalization is observable at all.
+- **A result value the caller feeds back must be READ, not echoed.** Answering
+  with the request's own bytes made the "what you get is what a later read sees"
+  promise false and left the documented retry loop unable to converge on any
+  value the store renormalizes. Re-read it inside the deciding transaction — one
+  extra SELECT — and say in the leaf that the caller composes its next
+  expectation from that value and not from its own spelling.
+
 ## Retiring a test against a contract
 
 Once a role has a contract, the ad-hoc tests that predate it start to look

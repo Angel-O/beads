@@ -233,6 +233,70 @@ func RunMetadataCASComparesCanonically(t *testing.T, ctx context.Context, fixtur
 	metadataCASAssertStored(t, ctx, fixture, id, "shape", `"settled"`)
 }
 
+// RunMetadataCASReportsTheValueTheRowHolds is the pin on what Current MEANS,
+// and it is written around the fact that broke it: the metadata column decodes
+// JSON numbers through float64 and re-emits them, so what a caller sends is not
+// always what is stored.
+//
+// The three assertions are backend-INDEPENDENT on purpose. A backend that
+// stores a number verbatim satisfies all of them and so does one that
+// renormalizes; what none of them tolerates is a Current composed from the
+// REQUEST, which is what makes the difference invisible and a retry loop
+// non-convergent.
+func RunMetadataCASReportsTheValueTheRowHolds(t *testing.T, ctx context.Context, fixture MetadataCASFixture) {
+	t.Helper()
+	id := metadataCASSeedIssue(t, ctx, fixture, "rowholds", false)
+
+	const sent = `1.0`
+	result := metadataCASSwap(t, ctx, fixture, publicops.CompareAndSetKeyRequest{
+		Actor: "cas-tester", IssueID: id, Key: "token", Value: metadataCASValue(sent),
+	})
+	if !result.Swapped || result.Current == nil {
+		t.Fatalf("CompareAndSetKey = %+v, want a swap carrying a value", result)
+	}
+
+	// 1. Current IS the row. Compared against the raw column rather than
+	//    against what was sent, which is the whole point.
+	stored, ok := metadataCASReadKey(t, ctx, fixture, "issues", id, "token")
+	if !ok {
+		t.Fatal("the swap landed but the key is absent from the column")
+	}
+	if string(*result.Current) != string(stored) {
+		t.Errorf("Current = %s, but the column holds %s; Current must be read from the row, "+
+			"never handed back from the request", string(*result.Current), string(stored))
+	}
+
+	// 2. A loop that feeds Current back CONVERGES. This is the documented
+	//    pattern and the one that has to work on every substrate.
+	if again := metadataCASSwap(t, ctx, fixture, publicops.CompareAndSetKeyRequest{
+		Actor: "cas-tester", IssueID: id, Key: "token",
+		Expected: result.Current, Value: metadataCASValue(`"settled"`),
+	}); !again.Swapped {
+		t.Fatal("a swap expecting the Current a previous swap reported was refused; " +
+			"the documented retry loop cannot converge")
+	}
+
+	// 3. And where the substrate DID renormalize, re-sending the caller's own
+	//    literal is refused — the hazard the leaf tells callers to avoid by
+	//    composing from Current and by preferring strings for tokens. On a
+	//    substrate that stored the literal verbatim this arm is vacuous, which
+	//    is why it is guarded rather than asserted flat.
+	if string(stored) != sent {
+		t.Logf("this backend renormalized %s to %s on the way in", sent, string(stored))
+		metadataCASSwap(t, ctx, fixture, publicops.CompareAndSetKeyRequest{
+			Actor: "cas-tester", IssueID: id, Key: "token2", Value: metadataCASValue(sent),
+		})
+		lost := metadataCASSwap(t, ctx, fixture, publicops.CompareAndSetKeyRequest{
+			Actor: "cas-tester", IssueID: id, Key: "token2",
+			Expected: metadataCASValue(sent), Value: metadataCASValue(`"never"`),
+		})
+		if lost.Swapped {
+			t.Error("re-sending a literal the substrate renormalized won the swap; " +
+				"either the comparison stopped reading the row or the substrate changed")
+		}
+	}
+}
+
 // RunMetadataCASDistinguishesAnAbsentKeyFromAStoredNull pins the distinction
 // the substrate can see and the role therefore reports: a key holding JSON null
 // is PRESENT. A nil Expected must not match it, and an Expected of `null` must.
@@ -453,6 +517,55 @@ func RunMetadataCASResolvesAWispAnchor(t *testing.T, ctx context.Context, fixtur
 	}
 }
 
+// RunMetadataCASAWispSwapRecordsNoDurableHistory pins the ephemeral clause of
+// MetadataCAS.CompareAndSetKey: a swap on a wisp records NO durable history
+// entry — none, not "at most one" — because the wisp tables are ignored by the
+// version-control plane and an entry naming one would be the sync artifact that
+// ignoring them exists to prevent.
+//
+// It is a case of its own rather than a line in the wisp-resolution one because
+// it is a different promise, and because the promise was previously held by TWO
+// LAYERS COINCIDENTALLY AGREEING — the write routes its event to wisp_events,
+// and ChangedTables.Add drops the wisp tables — with nothing asserting either.
+//
+// THE DURABLE-EVENT COUNT IS UNCONDITIONAL and the version delta is not: the
+// raw count is a fact about a table every backend has, so it pins the promise
+// even where history cannot be observed.
+func RunMetadataCASAWispSwapRecordsNoDurableHistory(t *testing.T, ctx context.Context, fixture MetadataCASFixture) {
+	t.Helper()
+	id := metadataCASSeedIssue(t, ctx, fixture, "wisphistory", true)
+
+	settled := fixture.CountHistory != nil && fixture.CommitPending != nil
+	before := 0
+	if settled {
+		if err := fixture.CommitPending(ctx); err != nil {
+			t.Fatalf("settling the seeds: %v", err)
+		}
+		before = metadataCASHistory(t, ctx, fixture)
+	}
+
+	if result := metadataCASSwap(t, ctx, fixture, publicops.CompareAndSetKeyRequest{
+		Actor: "cas-tester", IssueID: id, Key: "phase", Value: metadataCASValue(`"ephemeral"`),
+	}); !result.Swapped {
+		t.Fatal("the swap on the wisp was refused")
+	}
+	metadataCASAssertStoredIn(t, ctx, fixture, "wisps", id, "phase", `"ephemeral"`)
+
+	var durable int
+	if err := fixture.QueryScalar(ctx, "SELECT COUNT(*) FROM events WHERE issue_id = ?", []any{id}, &durable); err != nil {
+		t.Fatalf("counting durable events for %s: %v", id, err)
+	}
+	if durable != 0 {
+		t.Errorf("a swap on a wisp wrote %d row(s) into the DURABLE events table, want none: "+
+			"an entry naming an ephemeral row is the sync artifact the ignored tables exist to prevent", durable)
+	}
+	if settled {
+		if got := metadataCASHistory(t, ctx, fixture) - before; got != 0 {
+			t.Errorf("a swap on a wisp recorded %d version-control entries, want none", got)
+		}
+	}
+}
+
 // RunMetadataCASRecordsExactlyOneHistoryEntry pins the version-control clause:
 // a swap that MOVED the value records one entry, and neither a lost race nor a
 // value-to-itself swap records any.
@@ -492,6 +605,41 @@ func RunMetadataCASRecordsExactlyOneHistoryEntry(t *testing.T, ctx context.Conte
 	})
 	if got := metadataCASHistory(t, ctx, fixture) - before; got != 0 {
 		t.Errorf("a swap over an already-equal value recorded %d history entries, want none", got)
+	}
+}
+
+// RunMetadataCASHistoryEntryNamesTheActor is why Actor is REQUIRED on this
+// request (CompareAndSetKeyRequest.Actor): a swap is a coordination write
+// between racing callers, and the one question asked of its trace afterwards is
+// which of them won.
+//
+// Nothing else holds it. Every other case would pass with the actor dropped on
+// the floor between the role and the row, because no result member carries it.
+func RunMetadataCASHistoryEntryNamesTheActor(t *testing.T, ctx context.Context, fixture MetadataCASFixture) {
+	t.Helper()
+	id := metadataCASSeedIssue(t, ctx, fixture, "actor", false)
+
+	metadataCASSwap(t, ctx, fixture, publicops.CompareAndSetKeyRequest{
+		Actor: "cas-winner", IssueID: id, Key: "gc.lease", Value: metadataCASValue(`"holder-a"`),
+	})
+	// A SECOND actor, so the case cannot pass on a body that stamps a constant
+	// — the seeding actor, the store's identity, or the first swap's.
+	metadataCASSwap(t, ctx, fixture, publicops.CompareAndSetKeyRequest{
+		Actor: "cas-successor", IssueID: id, Key: "gc.lease",
+		Expected: metadataCASValue(`"holder-a"`), Value: metadataCASValue(`"holder-b"`),
+	})
+
+	// COUNTED PER ACTOR, NOT READ OFF THE NEWEST ROW, and the difference is what
+	// makes this case able to fail for the right reason. created_at is
+	// second-granularity, so two swaps in one test share a timestamp and no
+	// tie-break orders them — an ORDER BY here picks arbitrarily between the two
+	// and the case decides its verdict on a coin toss. It was written that way
+	// first and failed on exactly that.
+	for _, actor := range []string{"cas-winner", "cas-successor"} {
+		if got := metadataCASEventsByActor(t, ctx, fixture, id, actor); got != 1 {
+			t.Errorf("%s has %d event(s) attributed to %q, want exactly 1: "+
+				"the actor a swap is asked for is the actor its trace must name", id, got, actor)
+		}
 	}
 }
 
@@ -687,6 +835,20 @@ func metadataCASUpdatedAt(t *testing.T, ctx context.Context, fixture MetadataCAS
 	return stamp
 }
 
+// metadataCASEventsByActor counts the durable events on an issue attributed to
+// one actor. It goes through the frozen kit's scalar seam rather than a new
+// fixture hook, because the events table is one every backend of this contract
+// already has and the kit already publishes a way to read it.
+func metadataCASEventsByActor(t *testing.T, ctx context.Context, fixture MetadataCASFixture, id, actor string) int {
+	t.Helper()
+	var count int
+	const query = "SELECT COUNT(*) FROM events WHERE issue_id = ? AND actor = ?"
+	if err := fixture.QueryScalar(ctx, query, []any{id, actor}, &count); err != nil {
+		t.Fatalf("counting events for %s attributed to %q: %v", id, actor, err)
+	}
+	return count
+}
+
 func metadataCASHistory(t *testing.T, ctx context.Context, fixture MetadataCASFixture) int {
 	t.Helper()
 	count, err := fixture.CountHistory(ctx)
@@ -705,6 +867,13 @@ func metadataCASHistory(t *testing.T, ctx context.Context, fixture MetadataCASFi
 // asserted through the implementation's own canonicalizer would go green on a
 // canonicalizer that changed. Object key order is the only thing it has to
 // settle, since the values these cases store are small.
+//
+// IT HAS A BLIND SPOT OF ITS OWN, stated here so no case is written in
+// ignorance of it: decoding into `any` puts every number through float64, so
+// this helper cannot tell 1 from 1.0 or two integers that differ past 2^53
+// apart. No case may assert a NUMERIC value through it — the one case about
+// numbers reads the raw column bytes instead
+// (RunMetadataCASReportsTheValueTheRowHolds).
 func canonicalizeForContract(raw json.RawMessage) (string, error) {
 	if len(raw) == 0 {
 		return "", errors.New("empty value")

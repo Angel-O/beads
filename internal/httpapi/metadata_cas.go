@@ -163,13 +163,16 @@ func metadataCASMember(members map[string]json.RawMessage, name string) *json.Ra
 // than a null one — the same distinction the request side makes, answered the
 // same way.
 //
-// apigen.MetadataValue is an ALIAS of json.RawMessage — the document declares
-// the member as any JSON value and pins the Go type to it — so this is a copy
-// rather than a conversion, and the signature is what states the wire type.
-func metadataCASWireValue(current *json.RawMessage) *apigen.MetadataValue {
+// THE WIRE MEMBER IS NOT A POINTER, and that is load-bearing rather than tidy.
+// apigen.MetadataValue is an alias of json.RawMessage, which is an Unmarshaler,
+// so a client decoding a present `null` gets the literal stored; a
+// *json.RawMessage would have been set to nil by encoding/json before the
+// Unmarshaler ran, collapsing the two states this operation reports. See the
+// schema's x-go-type-skip-optional-pointer note and
+// TestCASMetadataResponseDecodesAPresentNull.
+func metadataCASWireValue(current *json.RawMessage) apigen.MetadataValue {
 	if current == nil {
 		return nil
 	}
-	value := *current
-	return &value
+	return *current
 }

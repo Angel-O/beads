@@ -39,6 +39,9 @@ func TestMetadataCASContract(t *testing.T) {
 	t.Run("ComparesCanonically", func(t *testing.T) {
 		conformance.RunMetadataCASComparesCanonically(t, ctx, fixture)
 	})
+	t.Run("ReportsTheValueTheRowHolds", func(t *testing.T) {
+		conformance.RunMetadataCASReportsTheValueTheRowHolds(t, ctx, fixture)
+	})
 	t.Run("DistinguishesAnAbsentKeyFromAStoredNull", func(t *testing.T) {
 		conformance.RunMetadataCASDistinguishesAnAbsentKeyFromAStoredNull(t, ctx, fixture)
 	})
@@ -60,8 +63,14 @@ func TestMetadataCASContract(t *testing.T) {
 	t.Run("ResolvesAWispAnchor", func(t *testing.T) {
 		conformance.RunMetadataCASResolvesAWispAnchor(t, ctx, fixture)
 	})
+	t.Run("AWispSwapRecordsNoDurableHistory", func(t *testing.T) {
+		conformance.RunMetadataCASAWispSwapRecordsNoDurableHistory(t, ctx, fixture)
+	})
 	t.Run("RecordsExactlyOneHistoryEntry", func(t *testing.T) {
 		conformance.RunMetadataCASRecordsExactlyOneHistoryEntry(t, ctx, fixture)
+	})
+	t.Run("HistoryEntryNamesTheActor", func(t *testing.T) {
+		conformance.RunMetadataCASHistoryEntryNamesTheActor(t, ctx, fixture)
 	})
 	t.Run("ARefusedSwapRecordsNoHistory", func(t *testing.T) {
 		conformance.RunMetadataCASARefusedSwapRecordsNoHistory(t, ctx, fixture)

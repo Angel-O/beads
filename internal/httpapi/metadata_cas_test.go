@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/httpapi/apigen"
 	"github.com/steveyegge/beads/issueops"
 )
 
@@ -240,6 +241,107 @@ func TestCASMetadataMapsARoleValidationRefusalToTheDocumented400(t *testing.T) {
 	resp := ts.casMetadata(t, casMetadataPath, `{"actor":"alice","key":"k"}`)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, readAll(t, resp))
+	}
+}
+
+// TestCASMetadataResponseDecodesAPresentNull is the pin on the GENERATED
+// CLIENT, and it is the only test here that decodes rather than asserting on
+// the wire bytes — because the bug it exists to prevent is invisible at the
+// wire.
+//
+// A `current` member declared as *json.RawMessage cannot READ a present null:
+// encoding/json answers a JSON null against a pointer by setting the pointer to
+// nil, before any UnmarshalJSON runs, so `{"current":null}` and a response with
+// no `current` at all decode to the same value. On this operation those mean
+// OPPOSITE things — the key holds null, versus the key is absent — and a retry
+// loop that read the first as the second would swap with `expected` omitted,
+// mismatch, and never converge. A livelock on a stream of 200s.
+//
+// The schema's x-go-type-skip-optional-pointer is what makes the member a bare
+// json.RawMessage, which is an Unmarshaler and receives the literal. This test
+// is what keeps the next `make api-gen` from regenerating that away.
+func TestCASMetadataResponseDecodesAPresentNull(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		want *string
+	}{
+		{"a present null is the literal", `{"swapped":false,"current":null}`, strptr("null")},
+		{"an omitted member is nil", `{"swapped":false}`, nil},
+		{"an ordinary value round-trips", `{"swapped":true,"current":{"a":1}}`, strptr(`{"a":1}`)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var response apigen.CompareAndSetMetadataResponse
+			if err := json.Unmarshal([]byte(test.body), &response); err != nil {
+				t.Fatalf("decoding %s: %v", test.body, err)
+			}
+			switch {
+			case test.want == nil && response.Current != nil:
+				t.Fatalf("Current = %s, want nil: an omitted member is an ABSENT key", string(response.Current))
+			case test.want != nil && response.Current == nil:
+				t.Fatalf("Current = nil, want %s: a present null is a VALUE, and a client that "+
+					"cannot tell it from an absent key cannot converge on a null-valued key", *test.want)
+			case test.want != nil && string(response.Current) != *test.want:
+				t.Fatalf("Current = %s, want %s", string(response.Current), *test.want)
+			}
+		})
+	}
+}
+
+// TestAPointerMetadataValueCannotReadAPresentNull is the demonstration behind
+// the test above, and it is here so that the compile error a regenerated
+// pointer member produces has a companion that says WHY.
+//
+// It is not testing this package's code — it is testing the shape the schema
+// must not generate — which is exactly what makes it worth keeping: nothing
+// else in the tree records that the loss happens at decode time, silently, on a
+// well-formed response.
+func TestAPointerMetadataValueCannotReadAPresentNull(t *testing.T) {
+	var pointerShaped struct {
+		Current *json.RawMessage `json:"current,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(`{"current":null}`), &pointerShaped); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	if pointerShaped.Current != nil {
+		t.Skip("encoding/json no longer nils a pointer on a JSON null; " +
+			"x-go-type-skip-optional-pointer may no longer be load-bearing")
+	}
+
+	var valueShaped struct {
+		Current json.RawMessage `json:"current,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(`{"current":null}`), &valueShaped); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	if string(valueShaped.Current) != "null" {
+		t.Fatalf("the non-pointer shape read %q, want the literal null — the fix does not work either", valueShaped.Current)
+	}
+}
+
+// TestCASMetadataRequestCarriesAPresentNull is the same pin on the request
+// members, for a client that BUILDS its request through the generated type: an
+// `expected` of null must reach the wire as null rather than being omitted,
+// since omitting it asks a different question.
+func TestCASMetadataRequestCarriesAPresentNull(t *testing.T) {
+	encoded, err := json.Marshal(apigen.CompareAndSetMetadataRequest{
+		Actor: "alice", Key: "gc.lease", Expected: json.RawMessage("null"),
+	})
+	if err != nil {
+		t.Fatalf("encoding: %v", err)
+	}
+	if got := string(encoded); got != `{"actor":"alice","expected":null,"key":"gc.lease"}` {
+		t.Fatalf("encoded = %s, want a present null `expected` and no `value` member", got)
+	}
+	var decoded apigen.CompareAndSetMetadataRequest
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	if string(decoded.Expected) != "null" {
+		t.Fatalf("Expected = %v, want the literal null back", decoded.Expected)
+	}
+	if decoded.Value != nil {
+		t.Fatalf("Value = %s, want nil: the member was never sent", string(decoded.Value))
 	}
 }
 

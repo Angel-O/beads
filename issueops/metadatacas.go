@@ -45,19 +45,24 @@ type CompareAndSetKeyRequest struct {
 	// EQUALITY IS CANONICAL, NOT BYTE-WISE. Two JSON values are equal when
 	// their canonical encodings match: insignificant whitespace is ignored and
 	// object keys are compared as a set rather than in the order they were
-	// written, so a caller cannot lose a race to its own formatter. NUMBERS ARE
-	// COMPARED AS THEIR SOURCE LITERAL — 1 and 1.0 are NOT equal — because the
-	// alternative is decoding through float64, which silently equates two
-	// different int64s past 2^53 and would let a stale expectation win the one
-	// comparison this role exists to make.
+	// written, so a caller cannot lose a race to its own formatter.
 	//
-	// THE RULE IS THE ROLE'S, NOT THE SUBSTRATE'S, and on today's backends the
-	// substrate settles most of it first: the metadata column is a Dolt JSON
-	// column, so a stored value arrives with its whitespace gone, its keys
-	// sorted and a trailing .0 already collapsed. What the rule actually buys a
-	// caller there is the CALLER'S side — the expectation it composed — and it
-	// is stated as the role's promise rather than as an observation about a
-	// column, because a backend whose metadata is TEXT would settle none of it.
+	// NUMBERS ARE COMPARED AS THEIR SOURCE LITERAL: 1 and 1.0 are NOT equal.
+	// That is a CONSTRAINT ON CALLERS, not a precision guarantee, and the
+	// difference matters. The metadata column decodes JSON numbers through
+	// float64 and re-emits them, so a number is not always stored as it was
+	// written — measured on today's backends, 1.0 lands as 1, an integer past
+	// 2^53 is rounded to the nearest double, -0.0 lands as 0, and 1e300 lands as
+	// three hundred and one digits. The role cannot give a number back the
+	// fidelity the column took from it.
+	//
+	// SO COMPOSE AN Expected FROM A PREVIOUS Current, NEVER FROM YOUR OWN
+	// SPELLING OF A NUMBER. Current is the value the ROW holds, so a loop that
+	// feeds it back converges; a loop that re-sends a literal the column
+	// renormalized compares its spelling against the substrate's, is refused
+	// every time, and makes no progress. AND PREFER A STRING FOR A COORDINATION
+	// TOKEN — an id, an actor, an epoch stamp rendered as digits in quotes —
+	// which round-trips byte-for-byte and has none of this to reason about.
 	//
 	// A key stored holding JSON null is a PRESENT key, distinct from an absent
 	// one: nil Expected does not match it, and an Expected of `null` does. The
@@ -90,10 +95,14 @@ type CompareAndSetKeyResult struct {
 	// second read that could itself go stale. Reporting only the verdict would
 	// force exactly the read-then-act shape this role removes.
 	//
-	// The bytes are the value's CANONICAL encoding, not the bytes the winner
-	// wrote: a caller feeding Current straight back as Expected is comparing
-	// canonical forms on both sides, which is the comparison this role
-	// promises.
+	// IT IS ALWAYS READ FROM THE ROW, on every path — a refusal, a swap that
+	// landed, and a precondition that held over an already-equal value — inside
+	// the transaction that decided. It is therefore what a subsequent read sees,
+	// NOT an echo of what the caller sent: where the substrate renormalized the
+	// value on the way in, Current reports the substrate's form. That is what
+	// makes feeding it back as the next Expected a converging loop, and it is
+	// the only way a caller can SEE that a number it wrote was not the number
+	// that was stored.
 	Current *json.RawMessage
 }
 
@@ -178,9 +187,15 @@ type MetadataCAS interface {
 	//   - an Expected or Value that is not well-formed JSON: ErrValidation;
 	//   - an IssueID naming neither an issue nor a wisp: ErrNotFound.
 	//
-	// An issue whose stored metadata is not a JSON object is an error rather
+	// AN ISSUE WHOSE STORED METADATA IS NOT A JSON OBJECT is an error rather
 	// than an empty map: the role would otherwise report every key absent and
 	// let a create win against a blob it is about to destroy.
+	//
+	// That error is deliberately UNTYPED — it matches neither ErrValidation nor
+	// ErrNotFound, and a front door reports it as an internal failure. Both
+	// typed refusals would be lies a caller could act on: the request was
+	// well-formed and the issue exists. The row is corrupt, no retry converges,
+	// and an operator is the only one who can do anything about it.
 	//
 	// A SWAP THAT CHANGES NOTHING WRITES NOTHING. When the precondition holds
 	// and Value already equals what is stored — including the absent-to-absent
