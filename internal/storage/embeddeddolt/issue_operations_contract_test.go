@@ -171,6 +171,13 @@ func TestEmbeddedIssueOperationsCreateWritesEveryScalarField(t *testing.T) {
 	conformance.RunIssueOperationsCreateWritesEveryScalarField(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "createsurface"))
 }
 
+func TestEmbeddedIssueOperationsCreateClosedDerivesTheClosedStamp(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	te := newTestEnv(t, "createclosed")
+	ctx := t.Context()
+	conformance.RunIssueOperationsCreateClosedDerivesTheClosedStamp(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "createclosed"))
+}
+
 func TestEmbeddedIssueOperationsUpdateWritesEveryScalarPatchField(t *testing.T) {
 	skipUnlessEmbeddedDolt(t)
 	te := newTestEnv(t, "scalarsurface")

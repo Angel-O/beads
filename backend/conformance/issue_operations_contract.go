@@ -2102,6 +2102,16 @@ func RunIssueOperationsUpdateConditionalGuardsGateOrdinaryEdits(t *testing.T, ct
 // expectation table, because it is what a front door renders: a create that
 // stored every column and hydrated one of them away is a field the caller still
 // cannot see.
+//
+// THE CREATION STAMP RIDES ALONG, in both directions, because create is the one
+// verb entitled to write it and nothing here said so. A caller supplying
+// created_at and created_by is every import, restore and tracker-sync path in
+// the tree — they exist to reproduce a history, and a body that overwrote the
+// pair with "now" and "the importing agent" would relabel the whole backlog as
+// today's work by this account. A caller supplying NEITHER gets a stamp anyway,
+// which is the half testCreateAndGet (conformance.go) pinned and no contract
+// did. The preset is years in the past on purpose: created_at is DATETIME(0),
+// so a preset at "now" and a stamp of "now" are the same stored bytes.
 func RunIssueOperationsCreateWritesEveryScalarField(t *testing.T, ctx context.Context, fixture IssueOperationsStagingFixture) {
 	t.Helper()
 
@@ -2110,6 +2120,7 @@ func RunIssueOperationsCreateWritesEveryScalarField(t *testing.T, ctx context.Co
 	externalRef := "created-ref"
 	dueAt := time.Date(2033, 5, 6, 7, 8, 9, 0, time.UTC)
 	deferUntil := time.Date(2033, 4, 5, 6, 7, 8, 0, time.UTC)
+	createdAt := time.Date(2019, 3, 4, 5, 6, 7, 0, time.UTC)
 	created, err := fixture.Operations.Create(ctx, publicops.CreateRequest{
 		Actor:         "writer",
 		ForceIDPrefix: true,
@@ -2121,6 +2132,7 @@ func RunIssueOperationsCreateWritesEveryScalarField(t *testing.T, ctx context.Co
 			Assignee: "created-assignee", Owner: "created-owner", ClosedBySession: "created-session",
 			EstimatedMinutes: &minutes, ExternalRef: &externalRef,
 			DueAt: &dueAt, DeferUntil: &deferUntil,
+			CreatedAt: createdAt, CreatedBy: "created-author",
 		},
 	})
 	if err != nil {
@@ -2128,6 +2140,39 @@ func RunIssueOperationsCreateWritesEveryScalarField(t *testing.T, ctx context.Co
 	}
 	if created.Issue == nil {
 		t.Fatalf("full scalar create of %s returned no issue", id)
+	}
+	assertIssueOperationsStoredColumns(t, ctx, fixture, id, "after the full scalar create", []issueOperationsColumnValue{
+		{"created_at", createdAt.Format(issueOperationsStoredTimeLayout)},
+		{"created_by", "created-author"},
+	})
+	if !created.Issue.CreatedAt.Equal(createdAt) {
+		t.Errorf("create result created_at = %v, want the preset %v", created.Issue.CreatedAt.UTC(), createdAt)
+	}
+	if created.Issue.CreatedBy != "created-author" {
+		t.Errorf("create result created_by = %q, want the preset %q", created.Issue.CreatedBy, "created-author")
+	}
+
+	// The other direction: a request that names no creation time still gets
+	// one. An empty created_at is a row that sorts and ages as though it were
+	// created at the zero time, which is what `bd list --stale` and every
+	// age-based report read.
+	stamped := fixture.IssuePrefix + "-createstamp"
+	lower := time.Now().UTC().Add(-issueOperationsClockSlack).Format(issueOperationsStoredTimeLayout)
+	if _, err := fixture.Operations.Create(ctx, publicops.CreateRequest{
+		Actor:         "writer",
+		ForceIDPrefix: true,
+		Issue: &types.Issue{
+			ID: stamped, Title: stamped, Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask,
+		},
+	}); err != nil {
+		t.Fatalf("create %s without a creation time: %v", stamped, err)
+	}
+	upper := time.Now().UTC().Add(issueOperationsClockSlack).Format(issueOperationsStoredTimeLayout)
+	autoStamp := readIssueOperationsStoredColumns(t, ctx, fixture, stamped, "after a create with no creation time", []string{"created_at"})[0].value
+	// The stored layout sorts lexicographically, so a string comparison is a
+	// time comparison. A bare "not empty" check would accept the zero time.
+	if autoStamp < lower || autoStamp > upper {
+		t.Errorf("%s created_at = %q after a create that named none, want a stamp between %q and %q", stamped, autoStamp, lower, upper)
 	}
 
 	stored := []issueOperationsColumnValue{
@@ -2151,6 +2196,91 @@ func RunIssueOperationsCreateWritesEveryScalarField(t *testing.T, ctx context.Co
 	}
 	assertIssueOperationsStoredColumns(t, ctx, fixture, id, "after the full scalar create", stored)
 	assertIssueOperationsColumnValues(t, id, "in the create result", issueOperationsIssueScalars(created.Issue), stored)
+}
+
+// RunIssueOperationsCreateClosedDerivesTheClosedStamp pins what a create that
+// arrives already closed does about the column it did not fill: a closed issue
+// with no closed_at gets one derived from the timestamps it DID carry, one
+// second past the later of created_at and updated_at
+// (internal/storage/issueops/create.go PrepareIssueForInsert).
+//
+// The path is `bd import` and every restore and tracker-sync: rows arrive
+// closed, from a system that recorded when they were made and last touched but
+// not when they were finished. A backend that left the column NULL produces a
+// closed backlog with no completion dates — every cycle-time and throughput
+// report over the imported range silently drops those rows — and a backend that
+// stamped "now" dates the whole import to the day it ran.
+//
+// THE AUDIT CASE'S FIXTURE CANNOT SEE WHICH TIMESTAMP THE BODY READ.
+// audit_issue-lifecycle.go's testAuditCreateClosedDerivesClosedAt seeds
+// created_at and updated_at to the SAME instant, so max(created, updated) and
+// created and updated are all the same number, and a body that read any one of
+// them passes. The second arm below moves them apart, which is the whole of
+// what "max" means.
+//
+// The third arm is the guard on the other side: the derivation is a default,
+// not a policy. A caller that supplied its own completion time keeps it, and a
+// body that derived unconditionally would overwrite the one fact the import
+// actually knew.
+//
+// HOW MANY VOTES: one. All three legs reach PrepareIssueForInsert through
+// issueops.PreparePublicCreateRequest before any backend-specific create body
+// runs — the unit-of-work provider included (internal/storage/uow calls it in
+// Create before handing the issue to its own domain use case). The case is
+// worth having as a stated promise, but it is one body read three times, not a
+// second opinion.
+func RunIssueOperationsCreateClosedDerivesTheClosedStamp(t *testing.T, ctx context.Context, fixture IssueOperationsStagingFixture) {
+	t.Helper()
+
+	base := time.Date(2019, 3, 4, 5, 6, 7, 0, time.UTC)
+	supplied := time.Date(2019, 6, 7, 8, 9, 10, 0, time.UTC)
+	for index, test := range []struct {
+		name         string
+		createdAt    time.Time
+		updatedAt    time.Time
+		closedAt     *time.Time
+		wantClosedAt time.Time
+	}{
+		{
+			name: "from a row whose stamps agree", createdAt: base, updatedAt: base,
+			wantClosedAt: base.Add(time.Second),
+		},
+		{
+			// updated_at is LATER, so a body reading created_at alone lands a
+			// second past the wrong one.
+			name: "from the later of the two stamps", createdAt: base, updatedAt: base.Add(72 * time.Hour),
+			wantClosedAt: base.Add(72*time.Hour + time.Second),
+		},
+		{
+			name: "never over a stamp the caller supplied", createdAt: base, updatedAt: base,
+			closedAt: &supplied, wantClosedAt: supplied,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			id := fixture.IssuePrefix + "-createclosed-" + strconv.Itoa(index)
+			if _, err := fixture.Operations.Create(ctx, publicops.CreateRequest{
+				Actor:         "writer",
+				ForceIDPrefix: true,
+				Issue: &types.Issue{
+					ID: id, Title: id, Status: types.StatusClosed, Priority: 2, IssueType: types.TypeTask,
+					CreatedAt: test.createdAt, UpdatedAt: test.updatedAt, ClosedAt: test.closedAt,
+				},
+			}); err != nil {
+				t.Fatalf("create closed %s: %v", id, err)
+			}
+			// The two source columns are read back first: a create that
+			// normalized them to "now" would leave the expectation below
+			// describing a row that does not exist, and the case would fail
+			// somewhere unhelpful instead of saying so.
+			assertIssueOperationsStoredColumns(t, ctx, fixture, id, "the stamps the derivation reads", []issueOperationsColumnValue{
+				{"created_at", test.createdAt.Format(issueOperationsStoredTimeLayout)},
+				{"updated_at", test.updatedAt.Format(issueOperationsStoredTimeLayout)},
+			})
+			assertIssueOperationsStoredColumns(t, ctx, fixture, id, "the derived close stamp", []issueOperationsColumnValue{
+				{"closed_at", test.wantClosedAt.Format(issueOperationsStoredTimeLayout)},
+			})
+		})
+	}
 }
 
 // RunIssueOperationsUpdateWritesEveryScalarPatchField pins the whole scalar and
@@ -2526,6 +2656,12 @@ var issueOperationsClaimBystanderColumns = []string{
 // issueOperationsStoredTimeLayout is how Dolt renders a DATETIME cast to CHAR.
 // The columns carry no fractional seconds, so this round-trips exactly.
 const issueOperationsStoredTimeLayout = "2006-01-02 15:04:05"
+
+// issueOperationsClockSlack widens the window a case allows around a stamp the
+// implementation wrote from its own clock. Every backend here stamps in Go, in
+// this process, so the two clocks are the same one; the slack covers the
+// truncation to whole seconds and a slow call, not a clock skew.
+const issueOperationsClockSlack = 5 * time.Second
 
 // issueOperationsColumnValue names one stored column and the value it holds, so
 // a field-surface assertion reports WHICH column disagreed.

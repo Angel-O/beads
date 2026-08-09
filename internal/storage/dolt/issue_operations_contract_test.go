@@ -145,6 +145,12 @@ func TestIssueOperationsCreateWritesEveryScalarField(t *testing.T) {
 	conformance.RunIssueOperationsCreateWritesEveryScalarField(t, ctx, fixture)
 }
 
+func TestIssueOperationsCreateClosedDerivesTheClosedStamp(t *testing.T) {
+	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
+	defer cleanup()
+	conformance.RunIssueOperationsCreateClosedDerivesTheClosedStamp(t, ctx, fixture)
+}
+
 func TestIssueOperationsUpdateWritesEveryScalarPatchField(t *testing.T) {
 	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
 	defer cleanup()

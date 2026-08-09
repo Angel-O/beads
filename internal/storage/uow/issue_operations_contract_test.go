@@ -127,6 +127,11 @@ func TestIssueOperationsCreateWritesEveryScalarField(t *testing.T) {
 	conformance.RunIssueOperationsCreateWritesEveryScalarField(t, ctx, newUOWIssueOperationsFixture(t, ctx))
 }
 
+func TestIssueOperationsCreateClosedDerivesTheClosedStamp(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsCreateClosedDerivesTheClosedStamp(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
 func TestIssueOperationsUpdateWritesEveryScalarPatchField(t *testing.T) {
 	ctx := context.Background()
 	conformance.RunIssueOperationsUpdateWritesEveryScalarPatchField(t, ctx, newUOWIssueOperationsFixture(t, ctx))
