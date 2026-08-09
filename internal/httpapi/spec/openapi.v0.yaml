@@ -2217,9 +2217,10 @@ paths:
             duplicate `key`, a `Ref` with neither `key` nor `id` or with both, a
             `dep_add` with an unstorable `type` or pointing a row at ITSELF, a
             `waits-for` gate outside its two values, an item a workspace's own
-            validation refuses, an explicit `create.id` that already names a
-            stored row, and an edge endpoint that names nothing this database
-            can see.
+            validation refuses, and an edge endpoint that names nothing this
+            database can see. An explicit `create.id` that already names a
+            stored row is NOT here: it is a 409 `already_exists`, because that
+            body is well-formed and only the state refuses it.
 
 
             TWO OF THOSE ARE WORTH SPELLING OUT. A ref naming a key declared by
@@ -2279,7 +2280,7 @@ paths:
         '409':
           description: >-
             The request is well-formed and the STATE refuses it, and NOTHING WAS
-            WRITTEN. Four codes, and every one of them is a statement a caller
+            WRITTEN. Five codes, and every one of them is a statement a caller
             could not have made without reading state it does not hold.
 
 
@@ -2319,9 +2320,21 @@ paths:
             from the END GATE, which is the one place an edge that is legal on
             its own and illegal in the graph this request built is caught.
             Neither has a force bypass.
+
+
+            `already_exists` is a `create` item whose EXPLICIT `id` already
+            names a stored row. `param` is `items[i].create.id` and the item
+            members name which item carried it. There is no force bypass and
+            there is no upsert here: every create item refuses an occupied id,
+            and adopting a row that already exists is `update` — reference it by
+            `{"id": …}` instead. It is a 409 rather than a 400 because the body
+            is well-formed and stays well-formed: the identical request
+            succeeded before the id was taken, so recovery is to look at the
+            state (adopt the row, choose another id, or stop) rather than to fix
+            a malformed request.
           x-bd-codes:
-            [already_claimed, dependency_cycle, dependency_exists, not_closable,
-             precondition_failed]
+            [already_claimed, already_exists, dependency_cycle,
+             dependency_exists, not_closable, precondition_failed]
           content:
             application/problem+json:
               schema:
@@ -5812,9 +5825,11 @@ components:
           maxLength: 255
           description: >-
             An explicit id for the new row, CREATE-ONLY: an id that already
-            names a stored row is a `400` and the whole request is refused. It
-            is checked against the workspace's configured issue prefix unless
-            the request sets `force_id_prefix`.
+            names a stored row is a `409` `already_exists` and the whole request
+            is refused — never an adoption and never an overwrite. To act on a
+            row that already exists, send an `update` item referencing it by
+            `{"id": …}`. The id is checked against the workspace's configured
+            issue prefix unless the request sets `force_id_prefix`.
 
 
             Absent is the ordinary case and the server mints one. This is the
@@ -6909,7 +6924,7 @@ components:
             `invalid_cursor` (400), `not_found` (404), `already_claimed` (409),
             `not_claimable` (409), `not_closable` (409),
             `dependency_cycle` (409), `dependency_exists` (409),
-            `precondition_failed` (409),
+            `already_exists` (409), `precondition_failed` (409),
             `events_journal_disabled` (409), `events_journal_truncated` (410),
             `busy` (503),
             `db_unavailable` (503), `events_watch_saturated` (503),

@@ -20,11 +20,24 @@ import (
 //
 // It lives here rather than in an importable internal/workapi/store<role>
 // package because the items must see one another's writes, and
-// storage.DoltStorage publishes methods, not transactions. ALL THREE LEGS SHARE
-// THIS BODY: the two Dolt-backed stores wrap it in their own transaction, and
-// the unit-of-work provider reaches it through the domain issue repository. So
-// the three legs are ONE reading plus two wrapper checks, which is what the
-// conformance contract's header says and what its cases are written for.
+// storage.DoltStorage publishes methods, not transactions.
+//
+// TWO OF THE THREE LEGS SHARE IT: the Dolt-backed stores each wrap it in their
+// own transaction. THE UNIT-OF-WORK LEG DOES NOT, and cannot — it has a body of
+// its own in internal/storage/uow/batch_applier.go. The reason is mechanical
+// rather than chosen: this body composes ExecuteCreate, ExecuteUpdate and
+// ExecuteClose, every one of which takes a *sql.Tx, while a unit of work's
+// runner is a *sql.Conn with a transaction open on it, and neither publishes
+// the other. Reaching this function from there would mean widening three of the
+// oldest write paths in the tree to take an interface.
+//
+// So a three-leg contract run over this role is TWO INDEPENDENT VOTES plus an
+// engine check, not one reading plus two wrapper checks — which is what the
+// conformance contract's header states and what its cases are written for.
+// What keeps the two bodies from meaning different things is the sharing that
+// IS possible: the request validation (storage.PlanApplyBatch), the
+// commit-message rule (ApplyBatchCommitMessage) and the two leaf checks the end
+// gate runs are one definition each, reached from both.
 //
 // IT COMPOSES THE SINGLE-VERB BODIES rather than restating them. A create item
 // is ExecuteCreate, an update is ExecuteUpdate, a close is ExecuteClose: the

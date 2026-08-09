@@ -82,6 +82,23 @@ const (
 	// CodeDependencyExists is the pair that already carries an edge of a
 	// DIFFERENT type, with both types in `existing_type`/`requested_type`.
 	CodeDependencyExists Code = "dependency_exists"
+	// CodeAlreadyExists is a create whose EXPLICIT id already names a stored
+	// row. `param` names the offending member and, on a batch operation, the
+	// item members name which item carried it.
+	//
+	// A 409 rather than a 400, and the distinction is the one CodeNotClosable
+	// draws: the request is well-formed and stays well-formed: what refuses it
+	// is STATE the client cannot see without reading it, and recovery is to
+	// look at that state — adopt the row, pick another id, or stop. A 400 says
+	// "this body is malformed, fix it and it will work", which is false here:
+	// the identical body succeeded before the id was taken and would succeed
+	// again against a workspace that never took it.
+	//
+	// It is minted rather than folded into CodeInvalidArgument because the two
+	// are not narrowable later: widening a 400 to a 409 changes the status an
+	// existing client dispatches on, while a 409 that turns out to be
+	// unreachable retires for free.
+	CodeAlreadyExists Code = "already_exists"
 	// CodePreconditionFailed is a compare-and-set guard that MISSED on an
 	// operation whose contract is that a miss refuses everything. The expected
 	// values travel in typed extension members; a batch operation adds the
@@ -172,6 +189,7 @@ var codeStatus = map[Code]int{
 	CodeNotClosable:      http.StatusConflict,
 	CodeDependencyCycle:  http.StatusConflict,
 	CodeDependencyExists: http.StatusConflict,
+	CodeAlreadyExists:    http.StatusConflict,
 
 	CodePreconditionFailed: http.StatusConflict,
 
@@ -507,7 +525,7 @@ var operationCodes = map[string][]Code{
 	// resource this operation was asked to address.
 	OpApplyBatch: {
 		CodeInvalidArgument, CodeNotFound,
-		CodePreconditionFailed, CodeNotClosable, CodeAlreadyClaimed,
+		CodePreconditionFailed, CodeNotClosable, CodeAlreadyClaimed, CodeAlreadyExists,
 		CodeDependencyCycle, CodeDependencyExists,
 		CodeBusy, CodeDBUnavailable, CodeInternal,
 	},

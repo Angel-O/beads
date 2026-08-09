@@ -16,15 +16,20 @@ import (
 // pinned by unit tests in milliseconds, where a contract case would need a
 // database to observe the same thing.
 //
-// IT IS HERE RATHER THAN IN internal/workapi for the dependency direction
-// PlanCompareAndSetKey gives: the unit-of-work leg reaches the shared body
-// through the domain issue repository, so internal/storage/domain has to name
-// the plan type, and workapi already imports domain.
+// IT IS HERE BECAUSE BOTH BODIES NEED IT, and they sit in different packages:
+// the store-backed one in internal/storage/issueops and the unit-of-work one in
+// internal/storage/uow, each of which already imports this package. This is
+// NOT PlanCompareAndSetKey's reason — that plan type is here because
+// internal/storage/domain has to name it in a repository signature, and nothing
+// in domain names this one, because this role's unit-of-work leg has its own
+// body and reaches domain through ordinary use cases. It is here beside
+// PlanCompareAndSetKey, ValidateMetadataKey and the rest of this plane's
+// meaning because that is where a reader looks for it.
 //
 // What is NOT here is anything that needs a row. Whether a key's create item
 // lands on the durable or the ephemeral plane, whether an id exists, whether an
-// edge closes a cycle — all of that is the body's, in
-// internal/storage/issueops/batch_apply.go, which all three legs reach.
+// edge closes a cycle — all of that belongs to the bodies, and each of the two
+// runs it against its own transaction.
 
 // ApplyBatchPlan is a validated apply-batch request whose waits-for edges carry
 // normalized gate metadata. It is what an implementation works from, so no

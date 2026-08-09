@@ -945,12 +945,15 @@ func (s *Server) failApplyBatch(w http.ResponseWriter, r *http.Request, request 
 		s.refusedApplyBatch(r, err)
 		s.fail(w, r, at(InvalidArgument("", ReasonInvalidValue, "an issue cannot depend on itself"), "target"))
 
-	// An occupied explicit id is a 400 for the endpoint refusal's reason: it is
-	// about the request BODY, and there is no id in the path to have missed.
-	// Matched before ErrValidation because the create path wraps both.
+	// An occupied explicit id is a 409: the body is well-formed and stays
+	// well-formed, and what refuses it is STATE the client cannot see without
+	// reading it — so recovery is to look at that state (adopt the row, pick
+	// another id, or stop) rather than to fix a malformed request. The identical
+	// body succeeded before the id was taken. Matched before ErrValidation
+	// because the create path wraps both.
 	case errors.Is(err, storage.ErrAlreadyExists):
 		s.refusedApplyBatch(r, err)
-		s.fail(w, r, at(InvalidArgument("", ReasonInvalidValue,
+		s.fail(w, r, at(newResult(CodeAlreadyExists,
 			"a create item's `id` already names a stored row; nothing was written"), "id"))
 
 	case errors.Is(err, issueops.ErrCloseOpenChildren):

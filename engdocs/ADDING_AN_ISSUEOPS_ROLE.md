@@ -127,10 +127,21 @@ in; 13 is the HTTP surface, which lands with the command rather than after it.
    claiming three legs and one reading. **The test is mechanical: does every
    function your body calls take an interface `Runner` satisfies?** Ask it
    before you write the contract header, because the header's vote count is
-   what tells the next reader how much a three-leg run is worth — and a role
-   that shares its request VALIDATION, its commit-message rule and its end gate
-   while forking the body is still one definition of what the role MEANS, which
-   is what the sharing is for.
+   what tells the next reader how much a three-leg run is worth.
+
+   **THEN SHARE EVERYTHING THE FORK DOES NOT FORCE YOU TO DUPLICATE, and be
+   precise about which half that is.** `BatchApplier`'s two bodies share their
+   request VALIDATION and their commit-message rule outright — one function
+   each, called from both. Its end gate is the interesting case, because it is
+   shared at the LEAF and forked at the ORCHESTRATION: both legs reach the same
+   `issueops.CheckBlockingHierarchyInTx` and the same
+   `AppendSchedulingGraphInTx`/`CycleThroughEdgesInGraph` walk (the unit-of-work
+   leg through two repository methods that delegate to them), so the two cannot
+   disagree about what a conflict or a cycle IS — but which edges get collected,
+   in what order, and how the refusal is wrapped are written twice. That is the
+   shape to aim for and the shape to describe honestly: "the legs share their
+   end gate" would be a claim the code does not support, and the next reader
+   would trust it.
 
 4. **The unit-of-work body and its source interface.**
    `internal/storage/uow/<role>.go`, declaring `type <Role>Source interface {

@@ -776,10 +776,14 @@ func TestApplyBatchMapsTheRolesTypedRefusalsOntoTheDocumentedCodes(t *testing.T)
 			wantParam:  "items[0].dep_add.target",
 		},
 		{
+			// A 409, not a 400: the body is well-formed and stays well-formed —
+			// the identical request succeeded before the id was taken — so what
+			// refuses it is state the client has to READ, not a request it has
+			// to fix. `param` and the item members still name where.
 			name:       "an occupied explicit id",
 			err:        itemErr(0, issueops.ItemCreate, "root", "", storage.ErrAlreadyExists),
-			wantStatus: http.StatusBadRequest,
-			wantCode:   "invalid_argument",
+			wantStatus: http.StatusConflict,
+			wantCode:   "already_exists",
 			wantParam:  "items[0].create.id",
 		},
 		{
