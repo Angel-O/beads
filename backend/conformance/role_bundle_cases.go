@@ -526,5 +526,10 @@ var roleContractCases = []roleContract{
 		RunWorkspaceConfigProjectsCustomTypes,
 		RunWorkspaceConfigUnsetLeavesTheProjectionBehind,
 		RunWorkspaceConfigARefusedWriteRecordsNoHistory,
+		RunWorkspaceConfigKeysAreCaseSensitive,
+		RunWorkspaceConfigCustomStatusReadsAreOrderedByName,
+		RunWorkspaceConfigCustomTypeReadsAreOrderedByName,
+		RunWorkspaceConfigConfiguredInfraTypesReplaceTheDefaultSet,
+		RunWorkspaceConfigUnconfiguredVocabularyReadsAreEmptyNotErrors,
 	),
 }
