@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/domain/db"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 )
@@ -99,6 +101,12 @@ func (t *doltServerTx) Commit(ctx context.Context, message string) error {
 		// back and the caller retries them, so leave the pinned session in place
 		// for the retry rather than tearing it down here.
 		return err
+	}
+	if isIndeterminateCommitResponse(err) {
+		// The statement may have committed before its response disappeared. A
+		// later ROLLBACK cannot prove otherwise, so retain the no-replay marker
+		// even when session cleanup succeeds.
+		err = fmt.Errorf("uow: commit response indeterminate: %w: %w", err, storage.ErrCommitIndeterminate)
 	}
 	// A non-serialization DOLT_COMMIT failure leaves the transaction open on the
 	// pinned session. Roll it back before releasing the connection so the next

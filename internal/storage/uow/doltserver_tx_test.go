@@ -20,8 +20,11 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 func newMockTxProvider(t *testing.T) (*doltSQLProvider, sqlmock.Sqlmock) {
@@ -73,6 +76,56 @@ func TestDoltServerTxCommitAndRollbackFailurePoisonsConn(t *testing.T) {
 	err = tx.Commit(context.Background(), "msg")
 	require.ErrorContains(t, err, "commit exploded")
 	assert.Equal(t, 0, p.db.Stats().OpenConnections, "session with an open tx must be discarded, not pooled")
+}
+
+func TestDoltServerTxCommitResponseLossIsIndeterminate(t *testing.T) {
+	p, mock := newMockTxProvider(t)
+	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectPendingChanges(mock, 1)
+	responseLoss := errors.New("read: connection reset by peer")
+	mock.ExpectExec("DOLT_COMMIT").WillReturnError(responseLoss)
+	mock.ExpectExec("ROLLBACK").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	tx, err := p.BeginTx(context.Background())
+	require.NoError(t, err)
+
+	err = tx.Commit(context.Background(), "msg")
+	require.ErrorIs(t, err, responseLoss)
+	require.ErrorIs(t, err, storage.ErrCommitIndeterminate)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDoltServerTxDecodedCommitRejectionIsDefinite(t *testing.T) {
+	p, mock := newMockTxProvider(t)
+	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectPendingChanges(mock, 1)
+	rejection := &mysql.MySQLError{Number: 1105, Message: "definite rejection"}
+	mock.ExpectExec("DOLT_COMMIT").WillReturnError(rejection)
+	mock.ExpectExec("ROLLBACK").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	tx, err := p.BeginTx(context.Background())
+	require.NoError(t, err)
+
+	err = tx.Commit(context.Background(), "msg")
+	require.ErrorIs(t, err, rejection)
+	assert.False(t, errors.Is(err, storage.ErrCommitIndeterminate), "decoded server rejection must remain definite")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDoltServerTxPendingCheckFailureIsBeforePublication(t *testing.T) {
+	p, mock := newMockTxProvider(t)
+	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
+	statusErr := errors.New("status query connection failed")
+	mock.ExpectQuery(matchHasPending).WillReturnError(statusErr)
+	mock.ExpectExec("ROLLBACK").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	tx, err := p.BeginTx(context.Background())
+	require.NoError(t, err)
+
+	err = tx.Commit(context.Background(), "msg")
+	require.ErrorIs(t, err, statusErr)
+	assert.False(t, errors.Is(err, storage.ErrCommitIndeterminate), "failure before the commit statement must remain definite")
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestDoltServerTxRollbackFailurePoisonsConn(t *testing.T) {
@@ -173,7 +226,7 @@ func TestDoltServerTxCommitPropagatesNothingToCommit(t *testing.T) {
 	p, mock := newMockTxProvider(t)
 	mock.ExpectExec("START TRANSACTION").WillReturnResult(sqlmock.NewResult(0, 0))
 	expectPendingChanges(mock, 1)
-	mock.ExpectExec("DOLT_COMMIT").WillReturnError(errors.New("nothing to commit"))
+	mock.ExpectExec("DOLT_COMMIT").WillReturnError(&mysql.MySQLError{Number: 1105, Message: "nothing to commit"})
 	mock.ExpectExec("ROLLBACK").WillReturnResult(sqlmock.NewResult(0, 0))
 
 	tx, err := p.BeginTx(context.Background())

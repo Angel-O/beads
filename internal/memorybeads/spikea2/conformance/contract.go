@@ -36,6 +36,10 @@ type Fixture struct {
 	Publication PublicationControl
 	Branches    BranchControl
 	Maintain    func()
+	// Reconstruct returns a fresh Module object over the same provider
+	// repository and Project. It is optional because not every independent
+	// implementation exposes construction as a fixture seam.
+	Reconstruct func() Fixture
 }
 
 type Factory func(*testing.T) Fixture
@@ -121,6 +125,7 @@ func runStableOpaqueExactRevisions(t *testing.T, fixture Fixture) {
 		restore.Address.RevisionID: restore,
 	}
 	assertExactReads(t, ctx, fixture.Module, saved)
+	var mainBeforeReconstruction, durableBranchRevision a2.Revision
 
 	if fixture.Branches != nil {
 		// A provider-supported fast-forward merge keeps the exact address rather
@@ -189,14 +194,95 @@ func runStableOpaqueExactRevisions(t *testing.T, fixture Fixture) {
 			t.Fatalf("delete branch: %v", err)
 		}
 		assertExactReads(t, ctx, fixture.Module, saved)
+
+		if fixture.Reconstruct != nil {
+			// Keep one named view alive across provider maintenance and Module
+			// reconstruction. This distinguishes durable view identity from a map
+			// held by the original Go object.
+			mainBeforeReconstruction = readCurrent(t, ctx, fixture.Module, first.Address.BeadID)
+			if err := fixture.Branches.Fork("survives-reconstruction"); err != nil {
+				t.Fatalf("fork durable view: %v", err)
+			}
+			if err := fixture.Branches.Checkout("survives-reconstruction"); err != nil {
+				t.Fatalf("checkout durable view: %v", err)
+			}
+			durableBranchRevision = apply(t, ctx, fixture.Module, a2.Mutation{
+				BeadID:          first.Address.BeadID,
+				ExpectedCurrent: mainBeforeReconstruction.Address.RevisionID,
+				Key:             mainBeforeReconstruction.Key,
+				Aliases:         mainBeforeReconstruction.Aliases,
+				Title:           mainBeforeReconstruction.Title,
+				Lifecycle:       mainBeforeReconstruction.Lifecycle,
+				Body:            "durable branch head before reconstruction",
+				References:      mainBeforeReconstruction.References,
+				Author:          "Grace <grace@example.test>",
+				ChangeMessage:   "prove durable view reconstruction",
+				Origin:          a2.OriginNative,
+			})
+			saved[durableBranchRevision.Address.RevisionID] = durableBranchRevision
+			if err := fixture.Branches.Checkout("main"); err != nil {
+				t.Fatalf("restore main before reconstruction: %v", err)
+			}
+		}
 	}
 
 	if fixture.Maintain != nil {
 		fixture.Maintain()
 	}
-	assertExactReads(t, ctx, fixture.Module, saved)
+	active := fixture
+	if fixture.Reconstruct != nil {
+		active = fixture.Reconstruct()
+		if active.Module == nil || active.Branches == nil {
+			t.Fatal("reconstruction fixture must provide a fresh Module and durable branch controls")
+		}
+	}
+	assertExactReads(t, ctx, active.Module, saved)
 
-	history, err := fixture.Module.History(ctx, a2.HistoryRequest{BeadID: first.Address.BeadID})
+	if durableBranchRevision.Address.RevisionID != "" {
+		// A fresh Module starts at main, discovers the persisted named view, and
+		// sees each view's exact current head. The old and new Module objects then
+		// remain coherent over the same durable identity while keeping checkout
+		// context local to each object.
+		if got := readCurrent(t, ctx, active.Module, first.Address.BeadID); got.Address != mainBeforeReconstruction.Address {
+			t.Fatalf("reconstructed main head = %+v, want %+v", got.Address, mainBeforeReconstruction.Address)
+		}
+		if err := active.Branches.Checkout("survives-reconstruction"); err != nil {
+			t.Fatalf("reconstructed checkout of durable view: %v", err)
+		}
+		if got := readCurrent(t, ctx, active.Module, first.Address.BeadID); got.Address != durableBranchRevision.Address {
+			t.Fatalf("reconstructed durable-view head = %+v, want %+v", got.Address, durableBranchRevision.Address)
+		}
+		continued := apply(t, ctx, active.Module, a2.Mutation{
+			BeadID:          first.Address.BeadID,
+			ExpectedCurrent: durableBranchRevision.Address.RevisionID,
+			Key:             durableBranchRevision.Key,
+			Aliases:         durableBranchRevision.Aliases,
+			Title:           durableBranchRevision.Title,
+			Lifecycle:       durableBranchRevision.Lifecycle,
+			Body:            "continued through a fresh Module instance",
+			References:      durableBranchRevision.References,
+			Author:          "Grace <grace@example.test>",
+			ChangeMessage:   "continue durable view after reconstruction",
+			Origin:          a2.OriginNative,
+		})
+		if got, err := fixture.Module.Read(ctx, a2.ReadRequest{BeadID: continued.Address.BeadID, RevisionID: continued.Address.RevisionID}); err != nil || !reflect.DeepEqual(got, continued) {
+			t.Fatalf("original Module cannot resolve fresh Module publication: revision %+v error %v", got, err)
+		}
+		if got := readCurrent(t, ctx, fixture.Module, first.Address.BeadID); got.Address != mainBeforeReconstruction.Address {
+			t.Fatalf("fresh Module checkout leaked into original Module: got %+v, want %+v", got.Address, mainBeforeReconstruction.Address)
+		}
+		if err := active.Branches.Checkout("main"); err != nil {
+			t.Fatalf("restore reconstructed main: %v", err)
+		}
+		if err := active.Branches.DeleteBranch("survives-reconstruction"); err != nil {
+			t.Fatalf("delete reconstructed durable view: %v", err)
+		}
+		if _, err := active.Module.Read(ctx, a2.ReadRequest{BeadID: continued.Address.BeadID, RevisionID: continued.Address.RevisionID}); err != nil {
+			t.Fatalf("deleting reconstructed view removed its immutable revision: %v", err)
+		}
+	}
+
+	history, err := active.Module.History(ctx, a2.HistoryRequest{BeadID: first.Address.BeadID})
 	if err != nil {
 		t.Fatalf("history after maintenance: %v", err)
 	}
@@ -204,7 +290,7 @@ func runStableOpaqueExactRevisions(t *testing.T, fixture Fixture) {
 		t.Fatal("unbounded history unexpectedly incomplete")
 	}
 	for _, summary := range history.Revisions {
-		if _, err := fixture.Module.Read(ctx, a2.ReadRequest{BeadID: summary.Address.BeadID, RevisionID: summary.Address.RevisionID}); err != nil {
+		if _, err := active.Module.Read(ctx, a2.ReadRequest{BeadID: summary.Address.BeadID, RevisionID: summary.Address.RevisionID}); err != nil {
 			t.Fatalf("history advertised revision %q that exact read cannot retrieve: %v", summary.Address.RevisionID, err)
 		}
 	}
@@ -599,6 +685,26 @@ func runConflictHasNoGuessedHead(t *testing.T, fixture Fixture) {
 		got, err := fixture.Module.Read(ctx, a2.ReadRequest{BeadID: exact.Address.BeadID, RevisionID: exact.Address.RevisionID})
 		if err != nil || !reflect.DeepEqual(got, exact) {
 			t.Fatalf("exact competing revision %q = %+v error %v, want %+v", exact.Address.RevisionID, got, err, exact)
+		}
+	}
+	if fixture.Reconstruct != nil {
+		if fixture.Maintain != nil {
+			fixture.Maintain()
+		}
+		fresh := fixture.Reconstruct()
+		if fresh.Module == nil {
+			t.Fatal("reconstruction fixture returned no fresh Module")
+		}
+		_, err := fresh.Module.Read(ctx, a2.ReadRequest{BeadID: base.Address.BeadID})
+		reconstructed := requireConflict(t, err)
+		if reconstructed.BeadID != base.Address.BeadID || !sameRevisionSet(reconstructed.Heads, wantHeads) {
+			t.Fatalf("reconstructed conflict = %+v, want bead %q heads %v", reconstructed, base.Address.BeadID, wantHeads)
+		}
+		for _, exact := range []a2.Revision{left, right} {
+			got, err := fresh.Module.Read(ctx, a2.ReadRequest{BeadID: exact.Address.BeadID, RevisionID: exact.Address.RevisionID})
+			if err != nil || !reflect.DeepEqual(got, exact) {
+				t.Fatalf("reconstructed exact competing revision %q = %+v error %v, want %+v", exact.Address.RevisionID, got, err, exact)
+			}
 		}
 	}
 	history, err := fixture.Module.History(ctx, a2.HistoryRequest{BeadID: base.Address.BeadID})

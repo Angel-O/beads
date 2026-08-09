@@ -2,8 +2,9 @@
 
 ## Status
 
-Proposed — the acquisition seam was validated by spike A1 on 2026-08-08;
-the out-of-tree backend compile gate remains pending.
+Accepted — spike A1 validated the acquisition seam and its out-of-tree
+source-compatibility gate on 2026-08-08. The descriptor-only module remains
+spike evidence rather than a releasable operation contract.
 
 ## Context
 
@@ -40,23 +41,24 @@ or separate optional capability; the released interface is never widened.
   Public method-set guards fail if the optional accessor is added to that role
   or either public backend interface; those interface definitions remain
   unchanged, preserving current consumer and backend implementations.
-- A backend-typed value that does not opt in exercises typed unsupported
-  acquisition. It is not presented as a complete out-of-tree implementation.
+- A separate Go module under `memorybeads/v1/testdata/a1external` implements
+  the complete public `backend.DoltStorage` method set explicitly. It imports
+  public Beads packages only and does not anonymously embed the interface it
+  claims to implement. The same concrete value remains a valid caller without
+  `MemoryModuleV1` and receives typed unsupported acquisition.
 - The same `Acquire` call succeeds for server-backed Dolt, embedded Dolt, and
   proxied unit-of-work sources.
 - Hook, telemetry, notification, request-timing, and public gate decorators
   preserve the optional capability.
 - A provider that does not opt in returns `*beadserrors.ErrUnsupported`.
 
-The focused package suites pass in the normal and non-cgo build paths. These
-tests remain as compatibility guards beside the acquisition code.
-
-The branch deliberately does not call the backend-typed value a concrete
-out-of-tree implementation: embedding `backend.DoltStorage` would make that
-claim vacuous. Before A1 is declared complete or this package is released, a
-real out-of-tree backend must compile unchanged against the selected seam. The
-active flat-file backend work is the most direct candidate once it is cleanly
-based on the selected main revision.
+The parent compatibility test invokes that module with the network and
+workspace disabled, module updates forbidden, and its source hashed before and
+after the compile. This proves the checked-in external source compiles unchanged
+against the current checkout; it does not claim that the deliberately
+unsupported fixture has production storage behavior. The focused package
+suites pass in the normal and non-cgo build paths. These tests remain as
+compatibility guards beside the acquisition code.
 
 ## Consequences
 

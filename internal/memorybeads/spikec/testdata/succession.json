@@ -1,0 +1,70 @@
+{
+  "project_id": "project-succession",
+  "sequence": 30,
+  "memories": {
+    "mem-policy": {
+      "id": "mem-policy",
+      "key": "go-test-policy",
+      "title": "Go test policy",
+      "lifecycle": "active",
+      "current_revision": "rev-policy-1",
+      "revisions": [
+        {
+          "id": "rev-policy-1",
+          "body": "Run Go tests through ./scripts/test.sh so repository build tags and isolation are applied. Start with the narrow package and run make test once before handoff.",
+          "author": "Ada Maintainer <ada@example.test>",
+          "message": "Record the repository test policy",
+          "at": "2026-08-01T12:00:00Z"
+        }
+      ]
+    },
+    "mem-storage": {
+      "id": "mem-storage",
+      "key": "storage-boundary",
+      "title": "Storage boundary",
+      "lifecycle": "active",
+      "current_revision": "rev-storage-1",
+      "revisions": [
+        {
+          "id": "rev-storage-1",
+          "body": "Beads talks to storage through the provider interface. Storage-engine details stay behind that seam; widen the provider interface instead of importing engine internals into commands.",
+          "author": "Grace Maintainer <grace@example.test>",
+          "message": "Document the storage boundary",
+          "at": "2026-08-02T12:00:00Z"
+        }
+      ]
+    },
+    "mem-deploy": {
+      "id": "mem-deploy",
+      "key": "deployment-region",
+      "title": "Deployment region",
+      "lifecycle": "active",
+      "current_revision": "rev-deploy-1",
+      "revisions": [
+        {
+          "id": "rev-deploy-1",
+          "body": "The preview service is deployed in us-west-1.",
+          "author": "Lin Operator <lin@example.test>",
+          "message": "Record preview deployment region",
+          "at": "2026-08-03T12:00:00Z"
+        }
+      ]
+    }
+  },
+  "tasks": {
+    "task-1": {
+      "id": "task-1",
+      "title": "Validate the change",
+      "body": "Use the linked repository test policy when proposing the validation sequence. Do not assume the policy body is in this task.",
+      "references": [
+        {
+          "project_id": "project-succession",
+          "bead_id": "mem-policy",
+          "revision": "rev-policy-1",
+          "kind": "memory",
+          "type": "related"
+        }
+      ]
+    }
+  }
+}

@@ -3,12 +3,14 @@ package uow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/domain"
 )
 
@@ -237,6 +239,24 @@ func TestRunTx_PermanentErrorNotRetried(t *testing.T) {
 	}
 	if callCount != 1 {
 		t.Errorf("expected exactly 1 call (no retry for permanent error), got %d", callCount)
+	}
+}
+
+func TestRunTx_IndeterminateCommitIsNotRetried(t *testing.T) {
+	commitErr := fmt.Errorf("commit response lost: %w", storage.ErrCommitIndeterminate)
+	uw := &mockUnitOfWork{commitErr: commitErr}
+	provider := &mockUnitOfWorkProvider{uows: []*mockUnitOfWork{uw}}
+
+	var callCount int32
+	err := RunTx(context.Background(), provider, func(context.Context, UnitOfWork) (string, error) {
+		atomic.AddInt32(&callCount, 1)
+		return "test commit", nil
+	})
+	if !errors.Is(err, storage.ErrCommitIndeterminate) {
+		t.Fatalf("RunTx() error = %v, want ErrCommitIndeterminate", err)
+	}
+	if callCount != 1 || provider.newUOWCalls != 1 {
+		t.Fatalf("indeterminate publication was replayed: work calls = %d, UOW calls = %d", callCount, provider.newUOWCalls)
 	}
 }
 

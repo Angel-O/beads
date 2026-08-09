@@ -1,0 +1,273 @@
+{
+  "schema": "memory_beads_c_run_evidence/v1",
+  "run": {
+    "id": "memory-beads-c-20260808-222312-pdt",
+    "started_at": "2026-08-09T05:23:12.748545Z",
+    "last_agent_action_at": "2026-08-09T05:24:28.761649Z",
+    "evaluator_history_check_at": "2026-08-09T05:25:23.318484Z",
+    "timezone": "America/Los_Angeles",
+    "workspace": "/tmp/memory-beads-succession.XVDpbN",
+    "agent_context": "Fresh collaboration subagent started with fork_turns=none and restricted to the isolated workspace.",
+    "model_identifier": "not retained",
+    "verbatim_agent_assignment_retained": false,
+    "verbatim_agent_replies_retained": false,
+    "evidence_note": "The evaluator's task sequence and shell commands below are reconstructions from the event log and final state, not a verbatim agent transcript. No missing dialogue is presented as raw evidence."
+  },
+  "source": {
+    "vcs_revision": "742a6ab92dcce4b6522d389d77cb030c3165a767",
+    "vcs_modified": true,
+    "go_version": "go1.26.5",
+    "go_module_version": "v1.1.1-0.20260809050659-742a6ab92dcc+dirty",
+    "build_command": "go build -o /tmp/memory-beads-succession.XVDpbN/bd ./cmd/memory-beads-spike-bd",
+    "binary_sha256": "c47505740f2b7195dd3f5f6370116790d5c14ac54663b41dfb09ac3106686187",
+    "files": [
+      {
+        "path": "cmd/memory-beads-spike-bd/main.go",
+        "sha256": "4e2e7e27814d9c104300d8951ce025cfcbf83645c1a24a88824ee7f94c1c267c"
+      },
+      {
+        "path": "internal/memorybeads/spikec/testdata/succession.json",
+        "sha256": "7dedabfadfd685886dcc6269b45e10f4a4da8c4bb5a27063db618991e365261e"
+      }
+    ],
+    "audit": "On 2026-08-08 PDT, a fresh build from the recorded source produced the same binary SHA-256."
+  },
+  "evaluator_instructions_reconstructed": [
+    {
+      "step": 1,
+      "instruction": "Use task-1's linked repository test policy to propose validation and identify the exact Memory Bead revision used."
+    },
+    {
+      "step": 2,
+      "instruction": "Find the project's unlinked storage-boundary guidance and identify the exact Memory Bead revision used."
+    },
+    {
+      "step": 3,
+      "instruction": "Look for the requested catering policy; report a truthful absence rather than inventing or writing one when the corpus does not answer."
+    },
+    {
+      "step": 4,
+      "instruction": "Make sure the storage-boundary fact is remembered without creating a duplicate bead or an unnecessary revision."
+    },
+    {
+      "step": 5,
+      "instruction": "Correct the preview deployment region from us-west-1 to us-west-2 on the existing bead, preserve history, and record the configured author and change message."
+    }
+  ],
+  "commands_reconstructed": [
+    "BEADS_MEMORY_SPIKE_FIXTURE=<fixture> BEADS_MEMORY_SPIKE_AUTHOR='Fresh Agent <fresh-agent@example.test>' ./bd init --quiet --prefix test --skip-hooks --skip-agents",
+    "./bd prime",
+    "./bd show task-1 --json",
+    "./bd recall mem-policy --revision rev-policy-1 --json",
+    "./bd memories 'storage boundary' --json --details",
+    "./bd recall mem-storage --revision rev-storage-1 --json",
+    "./bd memories catering --json --details",
+    "./bd memories 'catering vendor' --json --details",
+    "./bd memories 'project events' --json --details",
+    "./bd remember '<existing storage body>' --id mem-storage --expected-revision rev-storage-1 --json",
+    "./bd memories 'preview deployment region' --json --details",
+    "./bd memories preview --json --details",
+    "./bd recall mem-deploy --revision rev-deploy-1 --json",
+    "./bd remember 'The preview service is deployed in us-west-2.' --id mem-deploy --expected-revision rev-deploy-1 --message 'Correct preview deployment region from us-west-1 to us-west-2.' --json",
+    "./bd recall mem-deploy --revision rev-0031 --json",
+    "./bd history mem-deploy --json"
+  ],
+  "observed_agent_results": [
+    {
+      "step": 1,
+      "result": "Returned the fixture's repository test policy after one task display and one exact recall.",
+      "address": "mem-policy@rev-policy-1"
+    },
+    {
+      "step": 2,
+      "result": "Returned the fixture's storage-boundary guidance after compact search and exact recall.",
+      "address": "mem-storage@rev-storage-1"
+    },
+    {
+      "step": 3,
+      "result": "Reported that the corpus did not answer after three complete zero-result searches and created no memory."
+    },
+    {
+      "step": 4,
+      "result": "Targeted the existing bead and received an unchanged result; no duplicate or revision was created.",
+      "address": "mem-storage@rev-storage-1"
+    },
+    {
+      "step": 5,
+      "result": "Revised the existing deployment bead, then recalled the corrected revision; evaluator history retained its parent.",
+      "address": "mem-deploy@rev-0031"
+    }
+  ],
+  "pre_evaluator_events": [
+    {
+      "at": "2026-08-09T05:23:12.748545Z",
+      "command": "show",
+      "bead_id": "task-1",
+      "outcome": "found"
+    },
+    {
+      "at": "2026-08-09T05:23:16.011761Z",
+      "command": "recall",
+      "bead_id": "mem-policy",
+      "revision": "rev-policy-1",
+      "outcome": "found"
+    },
+    {
+      "at": "2026-08-09T05:23:26.517466Z",
+      "command": "memories",
+      "query": "storage boundary",
+      "outcome": "1_matches"
+    },
+    {
+      "at": "2026-08-09T05:23:29.717602Z",
+      "command": "recall",
+      "bead_id": "mem-storage",
+      "revision": "rev-storage-1",
+      "outcome": "found"
+    },
+    {
+      "at": "2026-08-09T05:23:36.669319Z",
+      "command": "memories",
+      "query": "catering",
+      "outcome": "0_matches"
+    },
+    {
+      "at": "2026-08-09T05:23:39.565365Z",
+      "command": "memories",
+      "query": "catering vendor",
+      "outcome": "0_matches"
+    },
+    {
+      "at": "2026-08-09T05:23:44.891885Z",
+      "command": "memories",
+      "query": "project events",
+      "outcome": "0_matches"
+    },
+    {
+      "at": "2026-08-09T05:24:05.536495Z",
+      "command": "remember",
+      "bead_id": "mem-storage",
+      "revision": "rev-storage-1",
+      "outcome": "unchanged"
+    },
+    {
+      "at": "2026-08-09T05:24:08.806891Z",
+      "command": "memories",
+      "query": "preview deployment region",
+      "outcome": "0_matches"
+    },
+    {
+      "at": "2026-08-09T05:24:12.112123Z",
+      "command": "memories",
+      "query": "preview",
+      "outcome": "1_matches"
+    },
+    {
+      "at": "2026-08-09T05:24:18.154144Z",
+      "command": "recall",
+      "bead_id": "mem-deploy",
+      "revision": "rev-deploy-1",
+      "outcome": "found"
+    },
+    {
+      "at": "2026-08-09T05:24:23.330092Z",
+      "command": "remember",
+      "bead_id": "mem-deploy",
+      "revision": "rev-0031",
+      "outcome": "applied"
+    },
+    {
+      "at": "2026-08-09T05:24:28.761649Z",
+      "command": "recall",
+      "bead_id": "mem-deploy",
+      "revision": "rev-0031",
+      "outcome": "found"
+    }
+  ],
+  "evaluator_events": [
+    {
+      "at": "2026-08-09T05:25:23.318484Z",
+      "command": "history",
+      "bead_id": "mem-deploy",
+      "outcome": "found"
+    }
+  ],
+  "final_state": {
+    "project_id": "project-succession",
+    "sequence": 31,
+    "memories": {
+      "mem-deploy": {
+        "id": "mem-deploy",
+        "key": "deployment-region",
+        "title": "Deployment region",
+        "lifecycle": "active",
+        "current_revision": "rev-0031",
+        "revisions": [
+          {
+            "id": "rev-deploy-1",
+            "body": "The preview service is deployed in us-west-1.",
+            "author": "Lin Operator <lin@example.test>",
+            "message": "Record preview deployment region",
+            "at": "2026-08-03T12:00:00Z"
+          },
+          {
+            "id": "rev-0031",
+            "parent": "rev-deploy-1",
+            "body": "The preview service is deployed in us-west-2.",
+            "author": "Fresh Agent <fresh-agent@example.test>",
+            "message": "Correct preview deployment region from us-west-1 to us-west-2.",
+            "at": "2026-08-09T05:24:23.330089Z"
+          }
+        ]
+      },
+      "mem-policy": {
+        "id": "mem-policy",
+        "key": "go-test-policy",
+        "title": "Go test policy",
+        "lifecycle": "active",
+        "current_revision": "rev-policy-1",
+        "revisions": [
+          {
+            "id": "rev-policy-1",
+            "body": "Run Go tests through ./scripts/test.sh so repository build tags and isolation are applied. Start with the narrow package and run make test once before handoff.",
+            "author": "Ada Maintainer <ada@example.test>",
+            "message": "Record the repository test policy",
+            "at": "2026-08-01T12:00:00Z"
+          }
+        ]
+      },
+      "mem-storage": {
+        "id": "mem-storage",
+        "key": "storage-boundary",
+        "title": "Storage boundary",
+        "lifecycle": "active",
+        "current_revision": "rev-storage-1",
+        "revisions": [
+          {
+            "id": "rev-storage-1",
+            "body": "Beads talks to storage through the provider interface. Storage-engine details stay behind that seam; widen the provider interface instead of importing engine internals into commands.",
+            "author": "Grace Maintainer <grace@example.test>",
+            "message": "Document the storage boundary",
+            "at": "2026-08-02T12:00:00Z"
+          }
+        ]
+      }
+    },
+    "tasks": {
+      "task-1": {
+        "id": "task-1",
+        "title": "Validate the change",
+        "body": "Use the linked repository test policy when proposing the validation sequence. Do not assume the policy body is in this task.",
+        "references": [
+          {
+            "project_id": "project-succession",
+            "bead_id": "mem-policy",
+            "revision": "rev-policy-1",
+            "kind": "memory",
+            "type": "related"
+          }
+        ]
+      }
+    }
+  }
+}

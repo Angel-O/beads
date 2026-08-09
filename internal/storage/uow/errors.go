@@ -33,6 +33,22 @@ func isSerializationError(err error) bool {
 	return false
 }
 
+// isIndeterminateCommitResponse reports whether a commit statement failed
+// without a decoded server response proving rejection or rollback. Transport
+// and protocol errors are therefore unknown publication outcomes, not ordinary
+// failures that a caller may safely replay.
+func isIndeterminateCommitResponse(err error) bool {
+	if err == nil {
+		return false
+	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		return false
+	}
+	var stateErr interface{ SQLState() string }
+	return !errors.As(err, &stateErr)
+}
+
 // isDatabaseExistsError reports whether err is the server refusing a bare
 // CREATE DATABASE because the database already exists (MySQL 1007,
 // ER_DB_CREATE_EXISTS). The message fallback matches how the rest of the
