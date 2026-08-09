@@ -73,6 +73,15 @@ type EdgeCountRequest struct {
 	// REPEATS COLLAPSE onto the first mention, for EdgeReadRequest.IDs's reason:
 	// a second entry for the same anchor carries no second fact and would only
 	// invite a caller summing the result to count the same edges twice.
+	//
+	// THERE IS NO SIZE CAP HERE, exactly as there is none on EdgeReadRequest.IDs.
+	// The reads are batched internally, and an in-process caller that holds the
+	// role has already paid for the slice it is passing; a cap on the role would
+	// be a limit invented for a caller that is not the one that needs it. The
+	// bound belongs to the WIRE operation, where the request arrives from
+	// somewhere else and the cost of an unbounded one is a stranger's — the
+	// split ApplyBatchRequest.Items makes explicitly by bounding at 100. The
+	// graph-counts wire slice sets it.
 	IDs []string
 
 	// Direction is which edges the count is over, and it is REQUIRED. An empty
@@ -146,6 +155,16 @@ type AnchorEdgeCount struct {
 	// contract (CountDependentRecords) and this count never has. Nothing in this
 	// contract's reach can produce one — a seeded edge is routed to exactly one
 	// plane by its source — so the distinction is stated rather than pinned.
+	//
+	// UNREACHABLE HERE IS NOT UNREACHABLE IN PRODUCTION, and the difference is
+	// worth the extra sentence because "the contract cannot build it" reads too
+	// easily as "it cannot happen". A collision is real: dependency row ids are
+	// derived from (issue_id, target) and omit the table, so a wisp PROMOTED to
+	// durable, or two Dolt clones MERGED, leave one logical edge in both tables.
+	// TestDependentRecordsCrossTableCollision constructs exactly that state and
+	// names those two paths. What this role promises against it is the sum, the
+	// same answer the raw counts give, and a caller that needs the distinct
+	// total is asking CountDependentRecords' question rather than this one.
 	//
 	// A missing anchor counts 0.
 	Count int64
