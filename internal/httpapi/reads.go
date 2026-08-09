@@ -89,35 +89,53 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// readyFilters decodes the ready-work filter vocabulary the two ready
-// operations share — everything except the PAGE, which only the listing has,
-// and the ORDER, which only the listing needs.
+// readyFilterInput is the named-accessor surface readyFilters reads the ready
+// vocabulary through, so the SAME decode serves two front doors: the URL query
+// (*query) that listReadyWork and countReadyWork parse, and the JSON object
+// (readyFilterObject) that batchCloseIssues decodes claim_next from. Each
+// accessor validates its own value and records a first refusal; readyFilters
+// itself only names members. Factoring the reader rather than copying it is what
+// keeps the query and the body admitting the same filters and refusing the same
+// malformed ones.
+type readyFilterInput interface {
+	str(name string) string
+	boolean(name string) bool
+	list(name string) []string
+	integer(name string) *int
+	metadataFields(name string) map[string]string
+}
+
+// readyFilters decodes the ready-work filter vocabulary the ready operations
+// share — everything except the PAGE, which only the listing has, the ORDER,
+// which only the listing needs, and MolType, which no front door on this surface
+// exposes.
 //
-// It is one function because the two operations must admit exactly the same
-// filters: countReadyWork answers with the size of the set listReadyWork
-// returns, and a parameter one of them decoded and the other did not would
-// make that identity false for any client that sent it.
-func readyFilters(q *query) issueops.ReadyRequest {
+// It is one function because the operations that use it must admit exactly the
+// same filters: countReadyWork answers with the size of the set listReadyWork
+// returns, and claim_next chooses from the same ready set, so a member one of
+// them decoded and another did not would make those identities false for any
+// client that sent it.
+func readyFilters(in readyFilterInput) issueops.ReadyRequest {
 	return issueops.ReadyRequest{
-		Assignee:     q.str("assignee"),
-		Unassigned:   q.boolean("unassigned"),
-		IssueType:    q.str("type"),
-		ExcludeTypes: q.list("exclude_type"),
+		Assignee:     in.str("assignee"),
+		Unassigned:   in.boolean("unassigned"),
+		IssueType:    in.str("type"),
+		ExcludeTypes: in.list("exclude_type"),
 
-		Labels:        q.list("label"),
-		LabelsAny:     q.list("label_any"),
-		ExcludeLabels: q.list("exclude_label"),
-		LabelPattern:  q.str("label_pattern"),
-		LabelRegex:    q.str("label_regex"),
+		Labels:        in.list("label"),
+		LabelsAny:     in.list("label_any"),
+		ExcludeLabels: in.list("exclude_label"),
+		LabelPattern:  in.str("label_pattern"),
+		LabelRegex:    in.str("label_regex"),
 
-		Priority: q.integer("priority"),
-		ParentID: q.str("parent"),
+		Priority: in.integer("priority"),
+		ParentID: in.str("parent"),
 
-		MetadataFields: q.metadataFields("metadata_field"),
-		HasMetadataKey: q.str("has_metadata_key"),
+		MetadataFields: in.metadataFields("metadata_field"),
+		HasMetadataKey: in.str("has_metadata_key"),
 
-		IncludeEphemeral: q.boolean("include_ephemeral"),
-		IncludeDeferred:  q.boolean("include_deferred"),
+		IncludeEphemeral: in.boolean("include_ephemeral"),
+		IncludeDeferred:  in.boolean("include_deferred"),
 	}
 }
 

@@ -73,6 +73,15 @@ var (
 	_ []types.Issue            = apigen.BatchCreateResponse{}.Items
 
 	_ []eventsjournal.Record = apigen.EventsPage{}.Records
+
+	// The batch close resolves its per-item snapshot and its claimed row to the
+	// canonical structs through the pointer members the outcome carries: wrapping
+	// each in an allOf to make it optional must not have detached it from the pin
+	// (Issue and IssueWithCounts keep their x-go-type; the property is a
+	// single-branch allOf, not a composed component). BatchCloseOutcome.Issue and
+	// BatchCloseResponse.ClaimedNext are the two dereferences the handler makes.
+	_ *types.Issue           = apigen.BatchCloseOutcome{}.Issue
+	_ *types.IssueWithCounts = apigen.BatchCloseResponse{}.ClaimedNext
 )
 
 // SettingsPage.Items and BatchCreateRequest.Items are deliberately absent:

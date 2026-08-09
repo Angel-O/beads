@@ -323,6 +323,7 @@ var (
 	_ uow.SweeperSource             = timedProvider{}
 	_ uow.DeleterSource             = timedProvider{}
 	_ uow.BatchCreatorSource        = timedProvider{}
+	_ uow.BatchCloserSource         = timedProvider{}
 	_ uow.DependencyEditorSource    = timedProvider{}
 	_ uow.MetadataCASSource         = timedProvider{}
 	_ uow.BatchApplierSource        = timedProvider{}
@@ -440,6 +441,13 @@ func (p timedProvider) Deleter() (issueops.Deleter, error) {
 // per call.
 func (p timedProvider) BatchCreator() (issueops.BatchCreator, error) {
 	return uow.NewBatchCreator(p)
+}
+
+// BatchCloser builds the batch closer OVER THIS WRAPPER, for the same reason as
+// the roles above. Like BatchCreator it opens a WRITE unit of work per call — the
+// close-many transaction, plus the optional claim_next that lands inside it.
+func (p timedProvider) BatchCloser() (issueops.BatchCloser, error) {
+	return uow.NewBatchCloser(p)
 }
 
 // DependencyEditor builds the graph's write role OVER THIS WRAPPER, for the

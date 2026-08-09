@@ -253,6 +253,47 @@ func (c *roleBatchCreator) createRequests() []issueops.CreateBatchRequest {
 	return append([]issueops.CreateBatchRequest(nil), c.requests...)
 }
 
+// roleBatchCloser is the store-shaped source's batch-close role. By default it
+// answers with one LANDED outcome per requested item — the exactly-one-of
+// {Issue, Err} shape the role promises and the checked wrapper insists on — and
+// a case overrides outcomes, the claimed row, or the whole-batch error to drive
+// the handler's mapping.
+type roleBatchCloser struct {
+	outcomes    []issueops.CloseOutcome
+	claimedNext *types.IssueWithCounts
+	err         error
+
+	mu       sync.Mutex
+	requests []issueops.CloseBatchRequest
+}
+
+func (c *roleBatchCloser) CloseBatch(_ context.Context, req issueops.CloseBatchRequest) (issueops.CloseBatchResult, error) {
+	c.mu.Lock()
+	c.requests = append(c.requests, req)
+	c.mu.Unlock()
+	if c.err != nil {
+		return issueops.CloseBatchResult{}, c.err
+	}
+	if c.outcomes != nil {
+		return issueops.CloseBatchResult{Outcomes: c.outcomes, ClaimedNext: c.claimedNext}, nil
+	}
+	outcomes := make([]issueops.CloseOutcome, len(req.Items))
+	for i, item := range req.Items {
+		outcomes[i] = issueops.CloseOutcome{
+			IssueID: item.IssueID,
+			Issue:   &types.Issue{ID: item.IssueID, Status: types.StatusClosed},
+			Changed: true,
+		}
+	}
+	return issueops.CloseBatchResult{Outcomes: outcomes, ClaimedNext: c.claimedNext}, nil
+}
+
+func (c *roleBatchCloser) closeRequests() []issueops.CloseBatchRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]issueops.CloseBatchRequest(nil), c.requests...)
+}
+
 // roleDependencyEditor is the store-shaped source's graph-write role.
 //
 // It records the request each method was handed, because what is worth
@@ -674,6 +715,9 @@ func rolesConfig(cfg Config) Config {
 	if cfg.BatchCreator == nil {
 		cfg.BatchCreator = &roleBatchCreator{}
 	}
+	if cfg.BatchCloser == nil {
+		cfg.BatchCloser = &roleBatchCloser{}
+	}
 	if cfg.DependencyEditor == nil {
 		cfg.DependencyEditor = &roleDependencyEditor{}
 	}
@@ -1016,6 +1060,21 @@ func TestListenRequiresExactlyOneDatabaseSource(t *testing.T) {
 		{
 			name:    "a provider and a batch applier",
 			cfg:     Config{Provider: &fakeProvider{}, BatchApplier: &roleBatchApplier{}},
+			wantErr: "exactly one database source",
+		},
+		{
+			name:    "no batch closer",
+			cfg:     rolesConfigWithout(func(c *Config) { c.BatchCloser = nil }),
+			wantErr: "no database source",
+		},
+		{
+			name:    "a batch closer alone",
+			cfg:     Config{BatchCloser: &roleBatchCloser{}},
+			wantErr: "no database source",
+		},
+		{
+			name:    "a provider and a batch closer",
+			cfg:     Config{Provider: &fakeProvider{}, BatchCloser: &roleBatchCloser{}},
 			wantErr: "exactly one database source",
 		},
 		{

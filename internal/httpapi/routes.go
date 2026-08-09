@@ -334,6 +334,21 @@ var routeTable = []route{
 		handler:     (*Server).handleApplyBatch,
 	},
 	{
+		op:     OpBatchCloseIssues,
+		method: http.MethodPost,
+		// A literal collection-level custom method, spelled the way :batchCreate,
+		// :sweep and :delete are. It is registered AFTER the claim's wildcard
+		// `/v0/beads/issues/{idop}` and ServeMux prefers the literal by
+		// specificity, so `:batchClose` is never parsed as a claim of an issue
+		// called ":batchClose"; the separating slash the wildcard requires is
+		// absent here, so the two never match the same request either.
+		// TestBatchClosePathReachesItsHandler drives the documented path.
+		pattern:     "/v0/beads/issues:batchClose",
+		capability:  "issues.batchClose",
+		implemented: true,
+		handler:     (*Server).handleBatchClose,
+	},
+	{
 		op:      OpClaimIssue,
 		method:  http.MethodPost,
 		pattern: customMethodPattern,

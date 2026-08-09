@@ -355,6 +355,12 @@ const (
 	// close-policy conflict, the claim's assignee fence and both of the graph's
 	// conflicts, because it performs all three families of write.
 	OpApplyBatch = "applyBatch"
+	// OpBatchCloseIssues closes many issues the request NAMES as one act, and is
+	// the write side of `bd close a b c`. Unlike the create it is NOT
+	// all-or-nothing: a refused id is a per-item outcome inside a 200, so the top
+	// level carries batchCreate's status set exactly and the not_found /
+	// not_closable vocabulary lives on BatchCloseItemError instead.
+	OpBatchCloseIssues = "batchCloseIssues"
 	// OpRememberMemory stores one memory, behind memoryops.Memories. It is the
 	// first operation on this surface that reaches a role outside issueops: the
 	// memory plane is user data riding in the config table, not settings, and
@@ -590,6 +596,13 @@ var operationCodes = map[string][]Code{
 		CodeDependencyCycle, CodeDependencyExists,
 		CodeBusy, CodeDBUnavailable, CodeInternal,
 	},
+	// batchCreate's status set EXACTLY, and the reason is the operation's shape:
+	// this batch is not all-or-nothing, so a per-item refusal (not_found,
+	// not_closable) is an outcome carried inside the 200 on BatchCloseItemError,
+	// never a top-level status. No 404 and no 409 here — the only thing above the
+	// per-item outcomes is request validation (400) plus the shared 500/503. The
+	// role's ErrValidation reaches the wire as the 400 through failBatchClose.
+	OpBatchCloseIssues: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
 	// No 404 and no conflict code: this is an UPSERT with a server-derivable
 	// key, so there is no resource it can fail to address and no row it can
 	// collide with. Its 400 is the body vocabulary plus the ROLE's two

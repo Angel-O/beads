@@ -195,6 +195,11 @@ type Config struct {
 	// Deleter is the OTHER destructive one, required for the same reason.
 	Deleter      issueops.Deleter
 	BatchCreator issueops.BatchCreator
+	// BatchCloser is the close-many write side, behind batchCloseIssues. Required
+	// on the same terms as BatchCreator: whether this build serves the batch
+	// close is a decision for the operator who ran bd serve, not a consequence of
+	// whether a caller remembered a field.
+	BatchCloser issueops.BatchCloser
 	// DependencyEditor is the graph's write side. Required on the same terms as
 	// the two destructive roles above: whether this build can rewire the
 	// dependency graph is a decision for the operator who chose to run bd serve,
@@ -296,6 +301,7 @@ type Server struct {
 	issueSweeper      issueops.Sweeper
 	issueDeleter      issueops.Deleter
 	issueBatchCreator issueops.BatchCreator
+	issueBatchCloser  issueops.BatchCloser
 	issueDependencies issueops.DependencyEditor
 	issueMetadataCAS  issueops.MetadataCAS
 	issueBatchApplier issueops.BatchApplier
@@ -428,6 +434,7 @@ func Listen(cfg Config) (*Server, error) {
 		issueSweeper:      cfg.Sweeper,
 		issueDeleter:      cfg.Deleter,
 		issueBatchCreator: cfg.BatchCreator,
+		issueBatchCloser:  cfg.BatchCloser,
 		issueDependencies: cfg.DependencyEditor,
 		issueMetadataCAS:  cfg.MetadataCAS,
 		issueBatchApplier: cfg.BatchApplier,
@@ -536,12 +543,12 @@ func Listen(cfg Config) (*Server, error) {
 // "all or nothing" would turn an honest condition into a special case inside
 // three functions. It is checked once, on its own, below.
 func sourceRoles(cfg Config) []any {
-	return []any{cfg.Reader, cfg.Claimer, cfg.Lifecycle, cfg.Settings, cfg.Stats, cfg.CycleDetector, cfg.EdgeReader, cfg.BlockingAnnotator, cfg.TreeWalker, cfg.ReadyCounter, cfg.Querier, cfg.Sweeper, cfg.Deleter, cfg.BatchCreator, cfg.DependencyEditor, cfg.BatchApplier, cfg.Memories, cfg.MetadataCAS}
+	return []any{cfg.Reader, cfg.Claimer, cfg.Lifecycle, cfg.Settings, cfg.Stats, cfg.CycleDetector, cfg.EdgeReader, cfg.BlockingAnnotator, cfg.TreeWalker, cfg.ReadyCounter, cfg.Querier, cfg.Sweeper, cfg.Deleter, cfg.BatchCreator, cfg.BatchCloser, cfg.DependencyEditor, cfg.BatchApplier, cfg.Memories, cfg.MetadataCAS}
 }
 
 // roleSourceNames spells sourceRoles for the refusal message, in the same
 // order, so a caller reading the error learns the whole set it must pass.
-const roleSourceNames = "Reader, Claimer, Lifecycle, Settings, Stats, CycleDetector, EdgeReader, BlockingAnnotator, TreeWalker, ReadyCounter, Querier, Sweeper, Deleter, BatchCreator, DependencyEditor, BatchApplier, Memories and MetadataCAS"
+const roleSourceNames = "Reader, Claimer, Lifecycle, Settings, Stats, CycleDetector, EdgeReader, BlockingAnnotator, TreeWalker, ReadyCounter, Querier, Sweeper, Deleter, BatchCreator, BatchCloser, DependencyEditor, BatchApplier, Memories and MetadataCAS"
 
 func anyRoleSet(cfg Config) bool {
 	return slices.ContainsFunc(sourceRoles(cfg), func(r any) bool { return r != nil })
@@ -889,6 +896,27 @@ func (s *Server) batchCreator(r *http.Request) (issueops.BatchCreator, error) {
 		return nil, err
 	}
 	return checkedBatchCreator{inner: creator}, nil
+}
+
+// batchCloser returns the close-many surface for one request, on the same terms
+// as batchCreator and held by INTERFACE so uow.BatchCloserSource is load-bearing
+// rather than decorative.
+//
+// It goes out CHECKED, like the batch creator. The role's contract is exactly-
+// one-of {issue, error} per outcome, and the response body dereferences the
+// issue snapshot for every landed item; a role that answered an outcome with
+// neither is folded per item rather than allowed to reach the wire as a broken
+// entry or a nil dereference. See checkedBatchCloser.
+func (s *Server) batchCloser(r *http.Request) (issueops.BatchCloser, error) {
+	if s.provider == nil {
+		return checkedBatchCloser{inner: s.issueBatchCloser}, nil
+	}
+	var src uow.BatchCloserSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	closer, err := src.BatchCloser()
+	if err != nil {
+		return nil, err
+	}
+	return checkedBatchCloser{inner: closer}, nil
 }
 
 // dependencyEditor returns the guarded dependency-graph write surface for one

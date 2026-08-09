@@ -188,16 +188,31 @@ func (q *query) timestamp(name string) *time.Time {
 
 // metadataFields reads the repeatable `key=value` equality filter, split on the
 // FIRST `=` so a value may contain one.
+//
+// The split itself is splitMetadataFields, shared with the batch-close
+// claim_next decode so the query string and the JSON object refuse a malformed
+// entry the same way — the filter vocabulary readyFilters reads is one decode
+// with two front doors, and this is one of the validators both call.
 func (q *query) metadataFields(name string) map[string]string {
-	raw := q.list(name)
-	if len(raw) == 0 {
+	return splitMetadataFields(q.list(name), func(bad string) {
+		q.invalid(name, fmt.Sprintf("%q is not key=value", bad))
+	})
+}
+
+// splitMetadataFields parses the `key=value` metadata equality entries, split on
+// the FIRST `=` so a value may contain one. An entry with no `=` or an empty key
+// is reported through onBad and collapses the whole filter to nil, so a
+// malformed entry never reaches storage as a half-parsed map. An empty input is
+// nil, not an empty map — the caller asked for no metadata filter.
+func splitMetadataFields(entries []string, onBad func(bad string)) map[string]string {
+	if len(entries) == 0 {
 		return nil
 	}
-	out := make(map[string]string, len(raw))
-	for _, entry := range raw {
+	out := make(map[string]string, len(entries))
+	for _, entry := range entries {
 		k, v, ok := strings.Cut(entry, "=")
 		if !ok || k == "" {
-			q.invalid(name, fmt.Sprintf("%q is not key=value", entry))
+			onBad(entry)
 			return nil
 		}
 		out[k] = v

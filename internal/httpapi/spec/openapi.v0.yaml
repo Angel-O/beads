@@ -2390,6 +2390,14 @@ paths:
         create has no outcome that could be reported.
 
 
+        CONTRAST `POST /v0/beads/issues:batchClose`, the OTHER batch write on
+        this surface. That operation only closes, and it is skip-and-continue: a
+        refused id is a per-item outcome inside a `200` and the survivors still
+        commit, with an in-transaction `claim_next`. Reach for it to close a set
+        where one bad id should be skipped rather than roll the batch back; reach
+        for THIS one when the work is an ordered plan that must land whole.
+
+
         THAT IS WHY A PRECONDITION MISS IS A `409` HERE and not an answer.
         `POST /v0/beads/issues/{id}:casMetadata` reports a lost compare-and-set
         as a 200, because a retry loop is its designed caller and a miss is the
@@ -2599,6 +2607,126 @@ paths:
           x-bd-codes:
             [already_claimed, already_exists, dependency_cycle,
              dependency_exists, not_closable, precondition_failed]
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v0/beads/issues:batchClose:
+    post:
+      operationId: batchCloseIssues
+      summary: Close many issues as one act
+      description: >-
+        Closes every item in the request that it can, and commits the ones that
+        landed together. It is the write side of `bd close a b c`, and it
+        completes the batch write surface `issues:batchCreate` and
+        `issues:delete` opened: the collection-level operation for closing a set
+        the request NAMES.
+
+
+        IT IS NOT ALL-OR-NOTHING, and that is the OPPOSITE of
+        `issues:batchCreate` on purpose. A create that half-succeeded could not
+        be re-sent without duplicating the half that landed; a close that
+        half-succeeded can, because closing is idempotent. So an id this request
+        refuses is SKIPPED and reported in its own `items` entry, and the
+        survivors still commit — the same skip-and-continue `bd close a b c` has
+        always done when one argument is a typo. The whole request is still ONE
+        transaction with at most one history entry, and none at all when nothing
+        landed.
+
+
+        THAT IS THE OTHER AXIS FROM `POST /v0/beads/issues:batchApply`, which is
+        the atomic sibling: it applies an ORDERED plan of creates, updates,
+        closes and edges as one transaction or none of it, and a refused item is
+        a top-level `409` that rolls the whole plan back. Use THIS operation to
+        close a set and skip the ids that will not close; use that one when the
+        work is a plan that must land whole.
+
+
+        ## Per-item outcomes
+
+
+        The response is a `200` whether every item closed, some did, or none
+        did: the batch RAN. Each `items` entry carries EXACTLY ONE of `issue`
+        (the post-close snapshot) or `error` (why that id was refused), in
+        request order, so a caller walks the outcomes against its own argument
+        list without matching ids back up. A successful entry also carries
+        `already_closed` — the idempotent re-close, mirroring
+        `CloseIssueResponse.already_closed` — and `open_children`, the count a
+        forced close observed. A refused entry's `error.code` is `not_found`
+        (the id names no issue or wisp) or `not_closable` (close policy refused
+        an unforced close), and the open-children refusal carries
+        `error.open_children` while the live-blocker refusal carries none — the
+        SAME member-presence discriminator `POST /v0/beads/issues/{id}:close`
+        uses on its 409. `force` bypasses close policy for every item, and
+        nothing else; the refusals are the ROLE's, so this endpoint cannot skip
+        a guard by forgetting one exists.
+
+
+        ## Reason and session
+
+
+        Each item carries its own `reason`, recorded against that issue alone,
+        because `bd close a b c -r x -r y -r z` has always mapped reasons
+        positionally. `session` is request-wide. Both follow
+        `CloseIssueRequest`'s first-close-wins rule: an idempotent re-close
+        writes neither.
+
+
+        ## claim_next
+
+
+        `claim_next`, when present, claims the next ready issue AFTER the closes
+        land, in the same transaction, and only when at least one item actually
+        closed — a claim handed out by a request that closed nothing would be a
+        claim the caller never earned. It carries the same filter vocabulary as
+        `GET /v0/beads/ready` (see `ClaimNextRequest`); the claimed row comes
+        back in `claimed_next`, hydrated with its counts. This is what lets an
+        agent close its finished work and pick up its next task in one atomic
+        round trip.
+
+
+        ## Planes, hooks and auto-commit
+
+
+        An id resolves across BOTH planes, exactly as
+        `POST /v0/beads/issues/{id}:close` does; a wisp close lands on the
+        unversioned plane and records no durable history entry. Hooks do not
+        fire and the per-command auto-commit machinery does not run, exactly as
+        for `POST /v0/beads/issues/{id}:claim`. The only durable effect is the
+        single storage commit the role makes in its own transaction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchCloseRequest'
+      responses:
+        '200':
+          description: >-
+            The batch ran. `items` carries one per-item outcome in request
+            order, each either `issue` or `error`. This status is returned even
+            when every item was refused — the batch committed nothing, but it
+            ran.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchCloseResponse'
+        '400':
+          description: >-
+            Invalid request: an unknown query parameter, an unparseable or
+            oversized body, an unknown body member at any level, an `actor` that
+            is empty after trimming, longer than 256 bytes or carrying control
+            characters, an empty or over-long `items` array, a blank or
+            over-long item `id`, a `reason` or `session` longer than the column
+            holds or carrying control characters, or a `claim_next` filter this
+            server cannot decode. Nothing is closed in any of these cases. A
+            per-item refusal is NOT one of these — it is an outcome inside a 200.
+          x-bd-codes: [invalid_argument]
           content:
             application/problem+json:
               schema:
@@ -4900,6 +5028,7 @@ components:
             `issues.close`, `issues.reopen`, `issues.update`,
             `issues.sweep`, `issues.delete`, `issues.batchCreate`,
             `issues.batchApply`,
+            `issues.batchClose`,
             `stats.get`, `config.list`, `config.get`, `dependencies.cycles`,
             `dependencies.list`, `dependencies.blocking`, `dependencies.tree`,
             `dependencies.add`, `dependencies.remove`,
@@ -5894,6 +6023,262 @@ components:
             look for a second page that can never exist.
           items:
             $ref: '#/components/schemas/Issue'
+
+    BatchCloseRequest:
+      type: object
+      additionalProperties: false
+      required: [actor, items]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F-\u009F\u2028\u2029]+$'
+          description: >-
+            Who is closing the issues, under `ClaimRequest.actor`'s rules and
+            for the same reasons: the server trims it, refuses an empty result,
+            anything longer than 256 BYTES, and any control character including
+            newline. It is attributed to every item and interpolated into the
+            storage commit message.
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: >-
+            The issues to close, in order. An empty array is a `400` rather
+            than a successful no-op, `BatchCreateRequest.items`' rule: a write
+            request that writes nothing is a client bug. Each entry appears in
+            the response's `items` at the same index.
+
+
+            The 100-item cap is a bound on how long one request may hold a write
+            transaction, not a statement about batch semantics. Split a larger
+            list; each request is atomic on its own.
+          items:
+            $ref: '#/components/schemas/BatchCloseItem'
+        session:
+          type: string
+          maxLength: 255
+          description: >-
+            The working session that closed the issues, recorded against every
+            item, stored and read back as `closed_by_session`. Request-wide,
+            unlike `reason`. Under `CloseIssueRequest`'s first-close-wins rule
+            and the same bounds: refused for control characters, and bounded by
+            what the column holds rather than by the number above.
+        force:
+          type: boolean
+          default: false
+          description: >-
+            Bypass close policy — the open-children refusal and the
+            live-blocker refusal — for every item, and nothing else. The
+            refusals are the ROLE's, so this endpoint cannot skip a guard by
+            forgetting one exists. Request-wide because the flag that spells it
+            is. A forced item still reports `open_children`.
+        claim_next:
+          allOf:
+            - $ref: '#/components/schemas/ClaimNextRequest'
+          description: >-
+            When present, claim the next ready issue after the closes land, in
+            the same transaction, and ONLY when at least one item actually
+            closed — a batch whose items were all already closed mutated
+            nothing and earns no claim. The claimed row is returned in
+            `claimed_next`. Absent skips it entirely.
+
+    BatchCloseItem:
+      type: object
+      additionalProperties: false
+      required: [id]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >-
+            The issue to close. An EXACT canonical id, resolved across both
+            planes exactly as `POST /v0/beads/issues/{id}:close` resolves one.
+            An id that names nothing is not a request error: it is reported as a
+            `not_found` outcome in this item's response entry, and the rest of
+            the batch still commits.
+        reason:
+          type: string
+          maxLength: 255
+          description: >-
+            Why this issue is closed, recorded against this item ALONE — reasons
+            are per item, not per request, because `bd close a b c -r x -r y
+            -r z` maps them positionally. Stored on the issue and read back as
+            `close_reason`, under `CloseIssueRequest.reason`'s first-close-wins
+            rule and the same bounds: refused for control characters, and
+            bounded by what the column holds rather than by the number above.
+
+    ClaimNextRequest:
+      type: object
+      additionalProperties: false
+      description: >-
+        The filter that chooses `BatchCloseRequest.claim_next`'s issue. Its
+        members are `GET /v0/beads/ready`'s filter vocabulary BY REFERENCE —
+        every member here has the meaning the `listReadyWork` parameter of the
+        same name documents, and a value this server cannot decode is refused
+        the same way that operation refuses it. It excludes only what a claim
+        has no use for: `limit`, the page bound, and `sort`, an ordering a
+        single claim does not need. An unknown member is a `400`.
+      properties:
+        assignee:
+          type: string
+          description: As `listReadyWork`'s `assignee` parameter.
+        unassigned:
+          type: boolean
+          description: As `listReadyWork`'s `unassigned` parameter.
+        type:
+          type: string
+          description: As `listReadyWork`'s `type` parameter.
+        exclude_type:
+          type: array
+          items:
+            type: string
+          description: As `listReadyWork`'s `exclude_type` parameter.
+        label:
+          type: array
+          items:
+            type: string
+          description: As `listReadyWork`'s `label` parameter.
+        label_any:
+          type: array
+          items:
+            type: string
+          description: As `listReadyWork`'s `label_any` parameter.
+        exclude_label:
+          type: array
+          items:
+            type: string
+          description: As `listReadyWork`'s `exclude_label` parameter.
+        label_pattern:
+          type: string
+          description: As `listReadyWork`'s `label_pattern` parameter.
+        label_regex:
+          type: string
+          description: As `listReadyWork`'s `label_regex` parameter.
+        priority:
+          type: integer
+          description: As `listReadyWork`'s `priority` parameter.
+        parent:
+          type: string
+          description: As `listReadyWork`'s `parent` parameter.
+        metadata_field:
+          type: array
+          items:
+            type: string
+          description: >-
+            As `listReadyWork`'s `metadata_field` parameter: `key=value`
+            equality, split on the first `=`. An invalid key is a `400`.
+        has_metadata_key:
+          type: string
+          description: As `listReadyWork`'s `has_metadata_key` parameter.
+        include_ephemeral:
+          type: boolean
+          default: false
+          description: As `listReadyWork`'s `include_ephemeral` parameter.
+        include_deferred:
+          type: boolean
+          default: false
+          description: As `listReadyWork`'s `include_deferred` parameter.
+
+    BatchCloseItemError:
+      type: object
+      required: [code]
+      description: >-
+        Why one item in a batch close was refused. It is NOT the `Problem`
+        envelope: it rides inside a `200` as one outcome of a batch that ran, so
+        it carries only the members a per-item refusal needs.
+      properties:
+        code:
+          type: string
+          enum: [not_found, not_closable]
+          description: >-
+            The machine-readable reason, from the same frozen vocabulary the
+            `Problem` envelope draws on. `not_found`: the id names no issue or
+            wisp. `not_closable`: close policy refused an unforced close —
+            open children or a live blocker, both bypassable with request-wide
+            `force`. The set grows additively exactly as `Problem.code` does, so
+            a client MUST default-branch on an unknown value.
+        detail:
+          type: string
+          description: >-
+            Optional prose, never load-bearing. It reflects the caller's own id
+            back and names no server internals.
+        open_children:
+          type: integer
+          description: >-
+            With `not_closable`: how many open children the transaction that
+            refused the close observed, read inside that transaction rather than
+            parsed out of `detail`. PRESENT ONLY for the open-children refusal;
+            the live-blocker refusal carries none, so member presence — not
+            prose — is how a client tells the two apart. This is
+            `Problem.open_children`'s rule, per item.
+
+    BatchCloseOutcome:
+      type: object
+      required: [id]
+      description: >-
+        What happened to ONE requested item. It carries EXACTLY ONE of `issue`
+        or `error`: `issue` with `already_closed` and `open_children` when the
+        close landed or was an idempotent re-close, `error` when the id was
+        refused. Member presence is the discriminator — a client reads `error`
+        first and falls through to `issue`.
+      properties:
+        id:
+          type: string
+          description: >-
+            The id the caller asked for, echoed so an outcome can be read
+            without indexing back into the request.
+        issue:
+          allOf:
+            - $ref: '#/components/schemas/Issue'
+          description: >-
+            The post-close snapshot, present when this item was NOT refused.
+            Mutually exclusive with `error`.
+        already_closed:
+          type: boolean
+          description: >-
+            Present with `issue`: true when the issue was already closed and
+            this call changed nothing — the idempotent re-close, mirroring
+            `CloseIssueResponse.already_closed`. `reason`/`session` were not
+            rewritten.
+        open_children:
+          type: integer
+          description: >-
+            Present with `issue`: how many open children the close observed,
+            `CloseIssueResponse.open_children`'s rule per item. A FORCED close
+            reports it; an unforced close that got this far had none, so it
+            reports 0.
+        error:
+          allOf:
+            - $ref: '#/components/schemas/BatchCloseItemError'
+          description: >-
+            Why this item was refused, present when this item was NOT closed.
+            Mutually exclusive with `issue`.
+
+    BatchCloseResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: >-
+            One outcome per requested item, in REQUEST ORDER — including the
+            items that refused, so a caller reporting per-id status walks it
+            against its own argument list. Never null and never shorter than the
+            request. There is no `has_more` and no `next_cursor`: this is not a
+            page, and a partial-length answer does not exist on this operation.
+          items:
+            $ref: '#/components/schemas/BatchCloseOutcome'
+        claimed_next:
+          allOf:
+            - $ref: '#/components/schemas/IssueWithCounts'
+          description: >-
+            The row a requested `claim_next` won, hydrated with its counts in
+            the same transaction. Present only when `claim_next` was sent, at
+            least one item closed, and a ready issue was eligible; absent
+            otherwise.
 
     ApplyBatchRequest:
       type: object

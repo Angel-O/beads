@@ -196,6 +196,7 @@ func runServe() error {
 			Sweeper:           roles.sweeper,
 			Deleter:           roles.deleter,
 			BatchCreator:      roles.batchCreator,
+			BatchCloser:       roles.batchCloser,
 			DependencyEditor:  roles.dependencyEditor,
 			MetadataCAS:       roles.metadataCAS,
 			BatchApplier:      roles.batchApplier,
@@ -512,6 +513,7 @@ func serveIssueRoles(src storage.DoltStorage, journalEnabled bool) (serveRoles, 
 		{"sweeper", func() (err error) { roles.sweeper, err = src.Sweeper(); return }},
 		{"deleter", func() (err error) { roles.deleter, err = src.Deleter(); return }},
 		{"batch creator", func() (err error) { roles.batchCreator, err = src.BatchCreator(); return }},
+		{"batch closer", func() (err error) { roles.batchCloser, err = src.BatchCloser(); return }},
 		{"dependency editor", func() (err error) { roles.dependencyEditor, err = src.DependencyEditor(); return }},
 		{"metadata cas", func() (err error) { roles.metadataCAS, err = src.MetadataCAS(); return }},
 		{"batch applier", func() (err error) { roles.batchApplier, err = src.BatchApplier(); return }},
@@ -567,6 +569,7 @@ type serveRoles struct {
 	sweeper      issueops.Sweeper
 	deleter      issueops.Deleter
 	batchCreator issueops.BatchCreator
+	batchCloser  issueops.BatchCloser
 	// dependencyEditor is the second role here whose accessor recurses through
 	// the hook decorator, so taking it off the peeled store is not optional:
 	// HookFiringStore.DependencyEditor fires the workspace's update hook per

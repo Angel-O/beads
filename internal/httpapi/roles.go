@@ -91,6 +91,46 @@ func (c checkedBatchCreator) CreateBatch(ctx context.Context, req issueops.Creat
 	return result, nil
 }
 
+// checkedBatchCloser is the closer the batch-close handler is handed.
+//
+// The role's contract is exactly-one-of {Issue, Err} per outcome, and the
+// response body dereferences the issue snapshot for every landed item — the
+// checkedClaimer hazard, once per item. Two broken shapes are folded here so
+// neither reaches the wire:
+//
+//   - A result whose outcome count does not match the request cannot be walked
+//     against the caller's items at all, so it is the generic 500 with the fault
+//     in the log. This is checkedBatchCreator's whole-batch refusal exactly,
+//     because a miscounted result says nothing trustworthy about any item.
+//
+//   - An outcome reporting NEITHER a snapshot NOR a refusal is a post-commit
+//     fault: the batch is not all-or-nothing and its survivors already
+//     committed, so failing the whole request would hide a durable close. It is
+//     folded into THAT item's Err instead — a per-item error the handler maps
+//     through its default branch — and the rest of the outcomes are untouched.
+type checkedBatchCloser struct{ inner issueops.BatchCloser }
+
+// CloseBatch refuses a miscounted result and folds a neither-issue-nor-error
+// outcome into its own item's Err.
+func (c checkedBatchCloser) CloseBatch(ctx context.Context, req issueops.CloseBatchRequest) (issueops.CloseBatchResult, error) {
+	result, err := c.inner.CloseBatch(ctx, req)
+	if err != nil {
+		return result, err
+	}
+	if len(result.Outcomes) != len(req.Items) {
+		return issueops.CloseBatchResult{}, fmt.Errorf(
+			"close batch: the closer reported %d outcomes for %d items", len(result.Outcomes), len(req.Items))
+	}
+	for i := range result.Outcomes {
+		outcome := &result.Outcomes[i]
+		if outcome.Err == nil && outcome.Issue == nil {
+			outcome.Err = fmt.Errorf(
+				"close batch: the closer reported outcome %d (%q) with neither an issue nor an error", i, outcome.IssueID)
+		}
+	}
+	return result, nil
+}
+
 // checkedLifecycle is the lifecycle role every mutation handler is handed.
 //
 // All four methods are why it exists: every handler over this role writes
