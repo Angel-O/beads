@@ -3,6 +3,7 @@ package conformance
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	storageops "github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/types"
 	publicops "github.com/steveyegge/beads/issueops"
 )
@@ -1671,6 +1673,309 @@ func RunReaderListStatusAcceptsACommaSeparatedORSet(t *testing.T, ctx context.Co
 	}
 }
 
+// RunReaderReadyPageIsThePrefixOfTheUnboundedAnswerCountsIncluded pins what a
+// bounded ready page IS (reader.go:85-100): the front of the answer the same
+// request returns unlimited — row for row AND COUNT FOR COUNT.
+//
+// The counts are the half nothing pinned. Every row of a ready page is an
+// IssueWithCounts (reader.go:11-12), and each cardinality is a function of the
+// whole dependency graph rather than of the page, so bounding the page must not
+// be able to move one. That is not free on either seam. The store-backed body
+// answers a BOUNDED request with a different query from an unbounded one: it
+// resolves the page of ids with the cheap indexed query and then hydrates the
+// cardinalities constrained to exactly those ids, where an unbounded request
+// runs the predicate-form mega-query (issueops.runReadyCountsInTx). The
+// unit-of-work body resolves ids first either way — its own UNION across the
+// two planes — and hydrates them by id (domain/db.fetchCountsByIDs). Three
+// wirings, three routes to one promise, and `bd ready`'s "showing N of M" rides
+// on all of them.
+//
+// WHAT THIS FIXTURE MAKES OBSERVABLE that RunReaderReadyLimitBoundary's does
+// not. That case seeds three interchangeable rows and reads only how many came
+// back, so a seam that hydrated a row's counts from the page rather than the
+// graph, or that paired a row with its neighbor's cardinalities, answers it
+// correctly. Here every row carries its OWN count signature and the comparison
+// is per row, so a mis-keyed hydration join has nowhere to land.
+//
+// THE EDGE TYPES ARE THE OTHER HALF. A ready page's cardinalities are
+// BLOCKS-ONLY, where the detail view's count every edge — the split
+// RunReaderListCountsAreBlocksOnlyWhereGetCountsEveryEdge owns — and every
+// count fixture in this file seeded blocks edges alone, so an implementation
+// that also counted parent-child and relates-to edges passed all of them. The
+// `family` row below has two outgoing edges of neither type and must still
+// report zero dependencies while carrying its Parent.
+//
+// WHAT IT DEPENDS ON FROM OUTSIDE ITSELF: the label that scopes it, and nothing
+// else. The sort policy is NAMED — `oldest` is created_at ASC, id ASC — and the
+// rows are seeded whole seconds apart, because created_at is a DATETIME with no
+// fractional part and same-second rows would leave the word "prefix" resting on
+// the id tiebreak alone.
+func RunReaderReadyPageIsThePrefixOfTheUnboundedAnswerCountsIncluded(t *testing.T, ctx context.Context, fixture ReaderFixture) {
+	t.Helper()
+	scope := readerLabel(fixture, "rdycnt")
+	id := func(name string) string { return readerID(fixture, "rdycnt", name) }
+	plain, onedep, twodeps := id("plain"), id("onedep"), id("twodeps")
+	depended, commented, family := id("depended"), id("commented"), id("family")
+	closedA, closedB, closedC := id("closed-a"), id("closed-b"), id("closed-c")
+	dependentA, dependentB := id("dependent-a"), id("dependent-b")
+	parent, related := id("parent"), id("related")
+
+	// The ready rows, in the order `oldest` will answer with. Whole seconds
+	// apart; the helpers below are unlabeled, so they are outside the scope
+	// this case queries no matter what state they are in.
+	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
+	order := []string{plain, onedep, twodeps, depended, commented, family}
+	for i, member := range order {
+		issue := readerIssue(member, types.TypeTask, scope)
+		at := base.Add(time.Duration(i) * time.Second)
+		issue.CreatedAt = at
+		issue.UpdatedAt = at
+		seedReaderIssue(t, ctx, fixture, issue)
+	}
+	// A CLOSED blocker is a blocks dependency that does not block, which is the
+	// only way a row can be ready and carry a nonzero DependencyCount at once.
+	for _, blocker := range []string{closedA, closedB, closedC} {
+		closedIssue := readerIssue(blocker, types.TypeTask, "")
+		closedIssue.Status = types.StatusClosed
+		seedReaderIssue(t, ctx, fixture, closedIssue)
+	}
+	for _, helper := range []string{dependentA, dependentB, parent, related} {
+		seedReaderIssue(t, ctx, fixture, readerIssue(helper, types.TypeTask, ""))
+	}
+	for _, edge := range []*types.Dependency{
+		{IssueID: onedep, DependsOnID: closedA, Type: types.DepBlocks},
+		{IssueID: twodeps, DependsOnID: closedB, Type: types.DepBlocks},
+		{IssueID: twodeps, DependsOnID: closedC, Type: types.DepBlocks},
+		{IssueID: dependentA, DependsOnID: depended, Type: types.DepBlocks},
+		{IssueID: dependentB, DependsOnID: depended, Type: types.DepBlocks},
+		{IssueID: family, DependsOnID: parent, Type: types.DepParentChild},
+		{IssueID: family, DependsOnID: related, Type: types.DepRelatesTo},
+	} {
+		if err := fixture.AddDependency(ctx, edge, "seed"); err != nil {
+			t.Fatalf("seed edge %s -> %s: %v", edge.IssueID, edge.DependsOnID, err)
+		}
+	}
+	for _, text := range []string{"first", "second"} {
+		if err := fixture.AddComment(ctx, commented, "seed", text); err != nil {
+			t.Fatalf("seed comment %q: %v", text, err)
+		}
+	}
+
+	request := func(limit int) publicops.ReadyRequest {
+		return publicops.ReadyRequest{Labels: []string{scope}, Sort: "oldest", Limit: readerLimit(limit)}
+	}
+	unbounded, err := fixture.Reader.Ready(ctx, request(0))
+	if err != nil {
+		t.Fatalf("Ready unlimited: %v", err)
+	}
+	assertReaderPageIDs(t, "Ready unlimited", unbounded, order)
+	if unbounded.HasMore {
+		t.Error("Ready unlimited reported HasMore")
+	}
+
+	// The exact cardinalities, on the unbounded answer, before any page is
+	// compared against it. A prefix identity over two answers that were both
+	// wrong the same way is the shape of assertion this program keeps
+	// finding, so the reference is pinned to the seeds first.
+	for _, want := range []readerCounts{
+		{id: plain},
+		{id: onedep, dependencies: 1},
+		{id: twodeps, dependencies: 2},
+		{id: depended, dependents: 2},
+		{id: commented, comments: 2},
+		{id: family, parent: &parent},
+	} {
+		assertReaderRowCounts(t, "Ready unlimited", unbounded, want)
+	}
+
+	for _, limit := range []int{1, 3, len(order), len(order) + 3} {
+		page, pageErr := fixture.Reader.Ready(ctx, request(limit))
+		if pageErr != nil {
+			t.Errorf("Ready --limit %d: %v", limit, pageErr)
+			continue
+		}
+		assertReaderPageIsPrefixWithItsCounts(t, fmt.Sprintf("Ready --limit %d", limit), page, unbounded, min(limit, len(order)))
+		if want := limit < len(order); page.HasMore != want {
+			t.Errorf("Ready --limit %d reported HasMore = %v, want %v", limit, page.HasMore, want)
+		}
+	}
+}
+
+// RunReaderReadyEphemeralPageKeepsBothPlanesCountsAtItsBoundary is the same
+// promise across the plane union (reader.go:62-65 with reader.go:85-100), and
+// the union is where the two seams stop resembling each other. The store-backed
+// body runs the ready-counts query ONCE PER TABLE FAMILY and merges the two
+// results wisp-wins in Go (issueops.GetReadyWorkWithCountsInTx); the
+// unit-of-work body renders one UNION ALL over both planes, orders it in SQL,
+// and then hydrates each plane's ids separately
+// (domain/db.getReadyWorkWithCountsUnion). A page bound that falls INSIDE the
+// interleaved order is what makes those two arrangements answer differently:
+// one of them can trim a plane before the merge, the other after it.
+//
+// WHAT THIS FIXTURE MAKES OBSERVABLE that RunReaderReadyDeferredAndEphemeralGates
+// does not. That case asks only WHICH rows the gate admits, with one wisp and
+// no counts, and reads the answer as a set. Here the two planes ALTERNATE in
+// the answer's order and both a durable row and a WISP row carry a nonzero
+// cardinality, so a merge that ordered one plane after the other, or hydrated
+// the wisp ids against the durable tables, changes the page rather than passing
+// quietly. The wisp's own count is the load-bearing one: the reverse-blocker
+// subquery reads both edge tables, and a wisp hydrated against the wrong family
+// comes back with the zeros a caller cannot tell from a wisp that has none.
+//
+// WHAT IT DEPENDS ON FROM OUTSIDE ITSELF: the scoping label and the named sort,
+// as above. The two planes' rows are seeded on alternating seconds so their
+// interleaving is a property of the fixture rather than of whichever plane the
+// implementation happens to read first.
+func RunReaderReadyEphemeralPageKeepsBothPlanesCountsAtItsBoundary(t *testing.T, ctx context.Context, fixture ReaderFixture) {
+	t.Helper()
+	scope := readerLabel(fixture, "rdyeph")
+	id := func(name string) string { return readerID(fixture, "rdyeph", name) }
+	durableOne, durableTwo, durableThree := id("i1"), id("i2"), id("i3")
+	wispOne, wispTwo, wispThree := id("w1"), id("w2"), id("w3")
+	closedBlocker, wispDependent := id("closed"), id("w-dependent")
+
+	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
+	seeds := []struct {
+		id        string
+		ephemeral bool
+	}{
+		{durableOne, false}, {wispOne, true}, {durableTwo, false},
+		{wispTwo, true}, {durableThree, false}, {wispThree, true},
+	}
+	order := make([]string, 0, len(seeds))
+	for i, seed := range seeds {
+		order = append(order, seed.id)
+		issue := readerIssue(seed.id, types.TypeTask, scope)
+		at := base.Add(time.Duration(i) * time.Second)
+		issue.CreatedAt = at
+		issue.UpdatedAt = at
+		if seed.ephemeral {
+			issue.Ephemeral = true
+			seedReaderWisp(t, ctx, fixture, issue)
+			continue
+		}
+		seedReaderIssue(t, ctx, fixture, issue)
+	}
+	closedIssue := readerIssue(closedBlocker, types.TypeTask, "")
+	closedIssue.Status = types.StatusClosed
+	seedReaderIssue(t, ctx, fixture, closedIssue)
+	seedReaderIssue(t, ctx, fixture, readerIssue(wispDependent, types.TypeTask, ""))
+	for _, edge := range []*types.Dependency{
+		{IssueID: durableTwo, DependsOnID: closedBlocker, Type: types.DepBlocks},
+		{IssueID: wispDependent, DependsOnID: wispTwo, Type: types.DepBlocks},
+	} {
+		if err := fixture.AddDependency(ctx, edge, "seed"); err != nil {
+			t.Fatalf("seed edge %s -> %s: %v", edge.IssueID, edge.DependsOnID, err)
+		}
+	}
+
+	request := func(limit int) publicops.ReadyRequest {
+		return publicops.ReadyRequest{
+			Labels: []string{scope}, Sort: "oldest", IncludeEphemeral: true, Limit: readerLimit(limit),
+		}
+	}
+	unbounded, err := fixture.Reader.Ready(ctx, request(0))
+	if err != nil {
+		t.Fatalf("Ready --include-ephemeral unlimited: %v", err)
+	}
+	assertReaderPageIDs(t, "Ready --include-ephemeral unlimited", unbounded, order)
+	assertReaderRowCounts(t, "Ready --include-ephemeral unlimited", unbounded, readerCounts{id: durableTwo, dependencies: 1})
+	assertReaderRowCounts(t, "Ready --include-ephemeral unlimited", unbounded, readerCounts{id: wispTwo, dependents: 1})
+
+	// Every bound from inside the first plane's run to past the end. The
+	// interesting ones are 3 and 4, where the cut lands between a wisp and the
+	// durable row that follows it.
+	for limit := 1; limit <= len(order)+1; limit++ {
+		page, pageErr := fixture.Reader.Ready(ctx, request(limit))
+		if pageErr != nil {
+			t.Errorf("Ready --include-ephemeral --limit %d: %v", limit, pageErr)
+			continue
+		}
+		assertReaderPageIsPrefixWithItsCounts(t, fmt.Sprintf("Ready --include-ephemeral --limit %d", limit), page, unbounded, min(limit, len(order)))
+		if want := limit < len(order); page.HasMore != want {
+			t.Errorf("Ready --include-ephemeral --limit %d reported HasMore = %v, want %v", limit, page.HasMore, want)
+		}
+	}
+}
+
+// RunReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix drives the same
+// promise past the point where both seams stop asking one question.
+//
+// Neither implementation binds an unbounded id list into one statement: each
+// hydrates a page's cardinalities in batches of two hundred ids and merges the
+// batches in Go — issueops.runReadyCountsInTx against sqlbuild.QueryBatchSize,
+// domain/db.fetchCountsByIDs against its own constant of the same value, two
+// loops written separately. A page that fits in one batch cannot tell a working
+// merge from a body that returns only the batch it happened to keep, and no
+// fixture in this contract or in any other seeds past the boundary.
+//
+// WHAT THIS FIXTURE MAKES OBSERVABLE: rows on BOTH SIDES of the boundary carry
+// distinct nonzero counts, so a second batch that was dropped, overwritten by
+// the first, or merged back in the wrong order fails on a row rather than on a
+// length. The page is also driven at a bound that lands one row into the second
+// batch, which is the off-by-one a loop's terminating condition gets wrong.
+//
+// WHAT IT DEPENDS ON FROM OUTSIDE ITSELF: the scoping label, the named sort and
+// the batch constant itself, which is imported rather than transcribed — a
+// backend that raised its own batching would otherwise leave this case seeding
+// under the boundary it means to cross.
+func RunReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix(t *testing.T, ctx context.Context, fixture ReaderFixture) {
+	t.Helper()
+	scope := readerLabel(fixture, "rdybatch")
+	total := sqlbuild.QueryBatchSize + 5
+	// The two rows that straddle the boundary: the last of the first batch and
+	// the first of the second.
+	lastOfFirst, firstOfSecond := sqlbuild.QueryBatchSize-1, sqlbuild.QueryBatchSize
+	closedBlocker := readerID(fixture, "rdybatch", "closed")
+	commentAnchor := readerID(fixture, "rdybatch", "anchor")
+
+	base := time.Now().UTC().Truncate(time.Second).Add(-24 * time.Hour)
+	order := make([]string, 0, total)
+	for i := range total {
+		// Zero-padded so the id tiebreak agrees with the seeded order rather
+		// than sorting 10 before 2 if two rows ever share a second.
+		member := readerID(fixture, "rdybatch", fmt.Sprintf("%04d", i))
+		order = append(order, member)
+		issue := readerIssue(member, types.TypeTask, scope)
+		at := base.Add(time.Duration(i) * time.Second)
+		issue.CreatedAt = at
+		issue.UpdatedAt = at
+		seedReaderIssue(t, ctx, fixture, issue)
+	}
+	closedIssue := readerIssue(closedBlocker, types.TypeTask, "")
+	closedIssue.Status = types.StatusClosed
+	seedReaderIssue(t, ctx, fixture, closedIssue)
+	seedReaderIssue(t, ctx, fixture, readerIssue(commentAnchor, types.TypeTask, ""))
+	if err := fixture.AddDependency(ctx, &types.Dependency{
+		IssueID: order[firstOfSecond], DependsOnID: closedBlocker, Type: types.DepBlocks,
+	}, "seed"); err != nil {
+		t.Fatalf("seed the edge on the first row past the batch boundary: %v", err)
+	}
+	if err := fixture.AddComment(ctx, order[lastOfFirst], "seed", "the last row of the first batch"); err != nil {
+		t.Fatalf("seed the comment on the last row of the first batch: %v", err)
+	}
+
+	request := func(limit int) publicops.ReadyRequest {
+		return publicops.ReadyRequest{Labels: []string{scope}, Sort: "oldest", Limit: readerLimit(limit)}
+	}
+	unbounded, err := fixture.Reader.Ready(ctx, request(0))
+	if err != nil {
+		t.Fatalf("Ready unlimited over %d rows: %v", total, err)
+	}
+	assertReaderPageIDs(t, "Ready unlimited", unbounded, order)
+	assertReaderRowCounts(t, "Ready unlimited", unbounded, readerCounts{id: order[lastOfFirst], comments: 1})
+	assertReaderRowCounts(t, "Ready unlimited", unbounded, readerCounts{id: order[firstOfSecond], dependencies: 1})
+
+	for _, limit := range []int{firstOfSecond + 1, total} {
+		page, pageErr := fixture.Reader.Ready(ctx, request(limit))
+		if pageErr != nil {
+			t.Errorf("Ready --limit %d: %v", limit, pageErr)
+			continue
+		}
+		assertReaderPageIsPrefixWithItsCounts(t, fmt.Sprintf("Ready --limit %d", limit), page, unbounded, min(limit, total))
+	}
+}
+
 // readerIssue builds the seed every case starts from: an open, unassigned,
 // unblocked task that qualifies for ready work. A case that needs it to fail one
 // of those tests changes the field it means to test and nothing else.
@@ -1857,6 +2162,92 @@ func assertReaderItemsCarryLabel(t *testing.T, what string, page publicops.Issue
 		}
 		if !slices.Contains(item.Labels, label) {
 			t.Errorf("%s returned %s with labels %v, want it to carry %q: labels are hydrated on this arm either way", what, item.ID, item.Labels, label)
+		}
+	}
+}
+
+// readerCounts is one row's expected cardinalities on a PAGE — the blocks-only
+// vocabulary, which is not the detail view's. The zero value is the row that
+// has none of them, so a case names only what it seeded.
+type readerCounts struct {
+	id           string
+	dependencies int
+	dependents   int
+	comments     int
+	parent       *string
+}
+
+func readerCountsOf(row *types.IssueWithCounts) readerCounts {
+	return readerCounts{
+		id:           row.ID,
+		dependencies: row.DependencyCount,
+		dependents:   row.DependentCount,
+		comments:     row.CommentCount,
+		parent:       row.Parent,
+	}
+}
+
+func (c readerCounts) String() string {
+	return fmt.Sprintf("%s{dependencies:%d dependents:%d comments:%d parent:%s}",
+		c.id, c.dependencies, c.dependents, c.comments, readerParentText(c.parent))
+}
+
+func (c readerCounts) equal(other readerCounts) bool {
+	return c.id == other.id &&
+		c.dependencies == other.dependencies &&
+		c.dependents == other.dependents &&
+		c.comments == other.comments &&
+		readerSameParent(c.parent, other.parent)
+}
+
+// assertReaderRowCounts pins one row's cardinalities EXACTLY. Nonzero is not
+// enough: the three aggregates hang off separate joins over the same edge
+// table, and a body that answered every one of them with the row's total edge
+// count would satisfy "nonzero" everywhere it matters.
+func assertReaderRowCounts(t *testing.T, what string, page publicops.IssuePage, want readerCounts) {
+	t.Helper()
+	row := readerRowByID(t, what, page, want.id)
+	if row == nil {
+		return
+	}
+	if got := readerCountsOf(row); !got.equal(want) {
+		t.Errorf("%s returned %s, want %s", what, got, want)
+	}
+}
+
+// assertReaderPageIsPrefixWithItsCounts compares a bounded page against the
+// answer the same request gives unbounded, CARDINALITIES INCLUDED. It is the
+// stronger sibling of assertReaderPageIsPrefixOf, which compares ids alone:
+// each count is a function of the whole graph, so the page a bound produces
+// carries the same numbers the unbounded answer did for those rows.
+//
+// wantN is the length the bound calls for, and it is a SEPARATE argument
+// because a row-for-row comparison over whatever came back agrees with itself:
+// a body that delivered only the first of the batches it hydrates answers a
+// short page every one of whose rows is correct.
+func assertReaderPageIsPrefixWithItsCounts(t *testing.T, what string, page, unbounded publicops.IssuePage, wantN int) {
+	t.Helper()
+	assertReaderPageNotNil(t, what, page)
+	if len(page.Items) != wantN {
+		t.Errorf("%s returned %d rows, want %d: %v against the unbounded answer %v",
+			what, len(page.Items), wantN, readerPageIDs(page), readerPageIDs(unbounded))
+		return
+	}
+	if len(page.Items) > len(unbounded.Items) {
+		t.Errorf("%s returned %v, which is longer than the unbounded answer %v",
+			what, readerPageIDs(page), readerPageIDs(unbounded))
+		return
+	}
+	for i, item := range page.Items {
+		reference := unbounded.Items[i]
+		if item == nil || item.Issue == nil || reference == nil || reference.Issue == nil {
+			t.Errorf("%s returned a nil row at position %d", what, i)
+			continue
+		}
+		got, want := readerCountsOf(item), readerCountsOf(reference)
+		if !got.equal(want) {
+			t.Errorf("%s at position %d returned %s, want %s — a bound chooses how many rows a caller receives, never what any of them says",
+				what, i, got, want)
 		}
 	}
 }

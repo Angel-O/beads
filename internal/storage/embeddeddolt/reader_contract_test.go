@@ -163,6 +163,28 @@ func TestEmbeddedReaderDoesNotMutateTheCallerRequest(t *testing.T) {
 	conformance.RunReaderDoesNotMutateTheCallerRequest(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
 }
 
+// One body, the other engine. The counts mega-query's reverse-blocker join is
+// the one the pure-Go planner cannot index, which is why the by-ids page-down
+// path these cases drive exists at all — so an engine-level disagreement about
+// it shows here rather than at the server-backed wiring.
+func TestEmbeddedReaderReadyPageIsThePrefixOfTheUnboundedAnswerCountsIncluded(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderReadyPageIsThePrefixOfTheUnboundedAnswerCountsIncluded(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderReadyEphemeralPageKeepsBothPlanesCountsAtItsBoundary(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderReadyEphemeralPageKeepsBothPlanesCountsAtItsBoundary(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
 // newEmbeddedReaderFixture composes the shared role kit with the reader
 // accessor. One environment per case: newTestEnv clones a pristine template
 // into the test's own temp dir, which costs a fraction of a second once the

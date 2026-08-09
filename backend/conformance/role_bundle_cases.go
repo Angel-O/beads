@@ -389,6 +389,9 @@ var roleContractCases = []roleContract{
 		RunReaderReadySetOwnsItsStatusPinnedAndTemplateDecisions,
 		RunReaderListReadyFlagCarriesTheAssigneeAndPriorityFilters,
 		RunReaderListStatusAcceptsACommaSeparatedORSet,
+		RunReaderReadyPageIsThePrefixOfTheUnboundedAnswerCountsIncluded,
+		RunReaderReadyEphemeralPageKeepsBothPlanesCountsAtItsBoundary,
+		RunReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix,
 	),
 
 	roleCases("ReadyClaimer", "ReadyClaimer() and IssueReader()", oncePerRole,

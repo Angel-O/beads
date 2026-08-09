@@ -164,6 +164,30 @@ func TestReaderDoesNotMutateTheCallerRequest(t *testing.T) {
 	conformance.RunReaderDoesNotMutateTheCallerRequest(t, ctx, fixture)
 }
 
+// The bounded ready page and the unbounded one are two different queries on
+// this body — an id page plus a by-ids hydration against the predicate-form
+// mega-query (internal/storage/issueops/ready_work_counts.go) — so the identity
+// the case asserts is a claim about this wiring specifically, not a tautology.
+func TestReaderReadyPageIsThePrefixOfTheUnboundedAnswerCountsIncluded(t *testing.T) {
+	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
+	defer cleanup()
+	conformance.RunReaderReadyPageIsThePrefixOfTheUnboundedAnswerCountsIncluded(t, ctx, fixture)
+}
+
+// The plane union is a Go-side merge of two per-family query results here,
+// where the unit-of-work wiring orders one UNION ALL in SQL.
+func TestReaderReadyEphemeralPageKeepsBothPlanesCountsAtItsBoundary(t *testing.T) {
+	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
+	defer cleanup()
+	conformance.RunReaderReadyEphemeralPageKeepsBothPlanesCountsAtItsBoundary(t, ctx, fixture)
+}
+
+func TestReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix(t *testing.T) {
+	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
+	defer cleanup()
+	conformance.RunReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix(t, ctx, fixture)
+}
+
 // newDoltReaderFixture composes the shared role kit with the reader accessor.
 // One store per case here rather than one per suite: setupTestStore gives each
 // test its own copy-on-write branch and costs a fraction of a second, so the

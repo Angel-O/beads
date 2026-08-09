@@ -104,6 +104,21 @@ func TestReaderContract(t *testing.T) {
 	t.Run("DoesNotMutateTheCallerRequest", func(t *testing.T) {
 		conformance.RunReaderDoesNotMutateTheCallerRequest(t, ctx, fixture)
 	})
+	// The ready-counts family. This body resolves an id page from its own
+	// UNION over both planes and hydrates the cardinalities by id in every
+	// case, where the store-backed one switches between a by-ids hydration and
+	// a predicate-form mega-query at the bound — so "the page is the prefix" is
+	// a claim about two differently shaped mechanisms agreeing, and this is the
+	// leg that has never voted on it.
+	t.Run("ReadyPageIsThePrefixOfTheUnboundedAnswerCountsIncluded", func(t *testing.T) {
+		conformance.RunReaderReadyPageIsThePrefixOfTheUnboundedAnswerCountsIncluded(t, ctx, fixture)
+	})
+	t.Run("ReadyEphemeralPageKeepsBothPlanesCountsAtItsBoundary", func(t *testing.T) {
+		conformance.RunReaderReadyEphemeralPageKeepsBothPlanesCountsAtItsBoundary(t, ctx, fixture)
+	})
+	t.Run("ReadyPageWiderThanTheHydrationBatchIsStillThatPrefix", func(t *testing.T) {
+		conformance.RunReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix(t, ctx, fixture)
+	})
 	// Last on purpose: the backend-failure half runs a request on a dead
 	// context, and this backend's provider is shared by every case above it.
 	t.Run("GetMissIsNotFoundAndBackendFailureDoesNotDecay", func(t *testing.T) {
