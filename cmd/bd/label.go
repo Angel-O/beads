@@ -80,6 +80,16 @@ func applyLabelEdit(ctx context.Context, issueIDs []string, labels []string, ope
 	if err != nil {
 		return HandleErrorRespectJSON("%v", err)
 	}
+	// The role creates its Dolt version commit inside the storage layer, so
+	// `--dolt-auto-commit batch` cannot be honored by blanking a commit message
+	// the way transactHonoringAutoCommit did on the old direct route: it has to
+	// be said on the CONTEXT. This is the one thing a command loses by moving
+	// off the raw transaction, and issueOpsContext is where every other
+	// role-routed write says it.
+	ctx, err = issueOpsContext(ctx)
+	if err != nil {
+		return HandleErrorRespectJSON("%v", err)
+	}
 	patch := issueops.IssuePatch{}
 	if operation == labelOperationRemoved {
 		patch.Labels.Remove = labels
