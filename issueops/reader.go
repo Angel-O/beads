@@ -207,12 +207,55 @@ type ListRequest struct {
 	IncludeTemplates bool
 	IncludeGates     bool
 	IncludeInfra     bool
+	// IncludeEphemeral admits the EPHEMERAL PLANE — the wisp-table rows a
+	// default listing never sees — and admits nothing else.
+	//
+	// False, the zero value, is the listing every caller has today: the durable
+	// issues table alone. True merges the wisp plane IN ADDITION, so under the
+	// same filters the answer is a SUPERSET of the false answer. It never
+	// narrows, and it never becomes ephemeral-only. Those are exactly
+	// ReadyRequest.IncludeEphemeral's semantics on the ready query; the two
+	// fields mean the same thing and are spelled the same way on purpose.
+	//
+	// IT IS A PLANE KNOB, NOT A TYPE KNOB — the difference from the three
+	// fields above it. Each of those takes a TYPE exclusion back off; this
+	// takes none off, so an ephemeral row that is also a template, a gate or an
+	// infra type stays hidden by its own predicate. IncludeInfra is the field
+	// that does BOTH — it drops the infra-type exclusions AND admits the plane
+	// — so it is strictly wider and is not a substitute: a caller who wants the
+	// ephemeral rows of ORDINARY types, and not the infra vocabulary along with
+	// them, has only this field.
+	//
+	// THE MERGED ANSWER IS ONE ORDER. Both planes are ordered together by
+	// SortBy as if they were a single table — not the durable rows followed by
+	// the ephemeral ones — so a Limit truncates the merged order rather than
+	// one plane's. Both implementations produce it (one merge-sorts two ordered
+	// legs, the other ORDERs a SQL union), and the keyset position
+	// (AfterCreatedAt/AfterID) is applied to BOTH legs, so a paged walk over
+	// the merged order drops no row and repeats none.
+	//
+	// The caveat that walk inherits is the one every multi-page walk already
+	// has, and this does not deepen it: a page is not a snapshot. A row written
+	// — or, for a wisp, compacted away — between two pages is seen or missed
+	// according to where it falls relative to the position, and the ephemeral
+	// plane merely turns over faster than the durable one.
+	//
+	// On the ReadyFlag arm it is CARRIED rather than dropped; see that field.
+	IncludeEphemeral bool
 	// ExcludeTypes entries may be comma-separated; splitting happens inside.
 	ExcludeTypes []string
 
 	ParentID string
 	NoParent bool
 	MolType  *MolType
+	// WispType matches the wisp_type COLUMN, which both tables carry. It is
+	// therefore a predicate and not a plane selector: it does not admit the
+	// ephemeral plane, and on a default listing — where that plane is
+	// suppressed — it narrows the durable rows to those whose wisp_type
+	// matches, which no ordinary durable row has. The combination that answers
+	// with rows is IncludeEphemeral (or IncludeInfra) plus this, and it is
+	// lawful rather than refused: the two compose as an ordinary AND, admitting
+	// the plane and then narrowing it to one classification.
 	WispType *WispType
 
 	DeferredFlag bool
@@ -234,8 +277,10 @@ type ListRequest struct {
 	// WHAT IT CARRIES: IssueType, all five label forms, Assignee, NoAssignee,
 	// the exact Priority, ParentID, MolType, WispType, MetadataFields,
 	// HasMetadataKey, the type exclusions (ExcludeTypes, and with them
-	// IncludeGates and IncludeInfra), Limit, Offset and the MaxRows cap with
-	// its attribution. SortBy and Reverse
+	// IncludeGates and IncludeInfra), IncludeEphemeral — the ready query has an
+	// ephemeral gate of its own, so the plane bit crosses intact and
+	// IncludeInfra's plane half crosses with it — Limit, Offset and the MaxRows
+	// cap with its attribution. SortBy and Reverse
 	// still apply, because the display order is applied to the page after the
 	// query rather than inside it. Status and AllFlag are resolved to "open"
 	// and have no further effect: ready work is open work.

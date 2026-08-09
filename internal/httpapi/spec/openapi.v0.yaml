@@ -879,12 +879,18 @@ paths:
         only the order differs.
 
 
-        EPHEMERAL (WISP) ROWS ARE NOT IN SCOPE for this operation in v0: there
-        is no `include_ephemeral` parameter here, unlike on `ready`. `bd list`
-        cannot emit those rows either, so there is no CLI behavior to diverge
-        from — but it does mean a client whose workload spans the ephemeral
-        tier still needs the CLI for that half. Adding the parameter later is
-        additive.
+        EPHEMERAL (WISP) ROWS ARE OUT OF SCOPE BY DEFAULT and are admitted by
+        `include_ephemeral`, which merges that plane IN ADDITION to the durable
+        one. The merged page is ordered by the same `(created_at DESC, id ASC)`
+        key across both planes as if they were one table, and `cursor` pages
+        across the merge without skipping or repeating a row.
+
+
+        The CLI has no `--include-ephemeral` flag for `bd list` yet, so this is
+        the one filter on this operation with no `bd list` spelling. The
+        nearest CLI equivalent is `--include-infra`, which is strictly wider:
+        it admits the plane AND takes the infra-type exclusions off.
+        `include_infra` here does the same, and the two compose.
       parameters:
         - name: status
           in: query
@@ -975,7 +981,22 @@ paths:
             default: false
         - name: include_infra
           in: query
-          description: Include the workspace's configured infrastructure issue types.
+          description: >-
+            Include the workspace's configured infrastructure issue types. This
+            also admits the ephemeral plane those types live in, so it is
+            strictly wider than `include_ephemeral`.
+          schema:
+            type: boolean
+            default: false
+        - name: include_ephemeral
+          in: query
+          description: >-
+            Include ephemeral (non-synced) rows, merged into the same
+            `(created_at DESC, id ASC)` order as the durable ones. It admits a
+            PLANE and takes no type exclusion off: an ephemeral row that is
+            also a template, a gate or an infra type stays hidden by its own
+            predicate, and `include_infra` is the parameter that takes the
+            infra one off.
           schema:
             type: boolean
             default: false

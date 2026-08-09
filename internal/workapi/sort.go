@@ -77,7 +77,14 @@ func ReadyFilterFromIssueFilter(filter types.IssueFilter) types.WorkFilter {
 	if filter.NoAssignee {
 		wf.Unassigned = true
 	}
-	if filter.Ephemeral != nil && *filter.Ephemeral {
+	// The ephemeral PLANE, which the two filters spell differently: a list
+	// filter admits it by leaving SkipWisps off (or, for an infra type, by
+	// routing to it outright), and a work filter by setting IncludeEphemeral.
+	// Reading both spellings is what carries ListRequest.IncludeEphemeral —
+	// and IncludeInfra's plane half with it — onto the --ready arm instead of
+	// dropping it there, which would answer a request that named the plane
+	// with the durable set and no error.
+	if (filter.Ephemeral != nil && *filter.Ephemeral) || !filter.SkipWisps {
 		wf.IncludeEphemeral = true
 	}
 	return wf

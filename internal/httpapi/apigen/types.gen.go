@@ -1015,8 +1015,11 @@ type ListIssuesParams struct {
 	// IncludeGates Include gate issues.
 	IncludeGates *bool `form:"include_gates,omitempty" json:"include_gates,omitempty"`
 
-	// IncludeInfra Include the workspace's configured infrastructure issue types.
+	// IncludeInfra Include the workspace's configured infrastructure issue types. This also admits the ephemeral plane those types live in, so it is strictly wider than `include_ephemeral`.
 	IncludeInfra *bool `form:"include_infra,omitempty" json:"include_infra,omitempty"`
+
+	// IncludeEphemeral Include ephemeral (non-synced) rows, merged into the same `(created_at DESC, id ASC)` order as the durable ones. It admits a PLANE and takes no type exclusion off: an ephemeral row that is also a template, a gate or an infra type stays hidden by its own predicate, and `include_infra` is the parameter that takes the infra one off.
+	IncludeEphemeral *bool `form:"include_ephemeral,omitempty" json:"include_ephemeral,omitempty"`
 
 	// CreatedBefore Only issues created strictly before this instant (RFC 3339).
 	CreatedBefore *time.Time `form:"created_before,omitempty" json:"created_before,omitempty"`
