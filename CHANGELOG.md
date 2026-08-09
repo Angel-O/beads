@@ -196,6 +196,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps the escape hatch for a wedged memory. What is gone is reading memory
   contents through `bd config get`, `bd config list` and `bd config show`.
 
+  **This is plane hygiene, not a confidentiality boundary.** `bd serve` has no
+  authentication, and it serves every memory in full through
+  `/v0/beads/memories` by design — anyone who can reach the server can still
+  read them. What this closes is the settings plane's habit of handing user
+  data to callers that asked for configuration: the routes that get republished
+  into agent transcripts and pasted into issues. Do not read it as a fix that
+  makes memories secret from someone who can already reach the port.
+
 - **`bd search` now includes closed issues by default** (bd-t5yex). The
   dominant real-world search query is "was this already found/filed/fixed?" —
   exactly the query where silently excluding closed issues produced a false
