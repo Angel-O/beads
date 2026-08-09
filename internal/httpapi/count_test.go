@@ -496,6 +496,14 @@ func specParams(t *testing.T, doc map[string]any, id string) []string {
 // the server as `unknown_parameter`; a parameter read and not documented is
 // undisclosed filtering surface, and on THIS operation an undisclosed filter
 // silently changes which set a number describes.
+//
+// THE DERIVATION IS BY EXECUTION, WHICH BOUNDS WHAT IT CAN SEE. It observes the
+// names read on the path this call actually takes, and that is the whole
+// vocabulary only because countFilters is straight-line: every accessor runs on
+// every request, so an empty query exercises all of them. A conditional there —
+// a parameter read only when another is present — would leave its name out of
+// this set and out of this check. If one is ever added, drive this over the
+// query that reaches it too, or the gate quietly narrows to the default path.
 func TestCountParametersMatchTheHandler(t *testing.T) {
 	q := newQuery(url.Values{})
 	_ = countFilters(q)
@@ -551,5 +559,78 @@ func TestCountGroupEnumMatchesTheRolesVocabulary(t *testing.T) {
 	}
 	if !slices.Equal(documented, countGroupNames()) {
 		t.Errorf("the document's group_by enum is %v, the server accepts %v", documented, countGroupNames())
+	}
+}
+
+// countFieldForParameter maps every documented parameter to the
+// issueops.CountRequest field it fills, and it is the third leg of this
+// operation's parity triangle.
+//
+// The other two are already mechanical: TestCountParametersMatchTheHandler ties
+// the parameter names to the DOCUMENT, and TestCountForwardsEveryDocumentedParameter
+// ties each parameter's VALUE to the field it lands in. Neither can see a role
+// field that no parameter reaches — a 24th filter added to CountRequest and left
+// unpublished turns nothing red, and the wire silently stops being able to ask
+// a question the role can answer. That is the failure this map closes, and it is
+// the one that matters for an HTTP-backed store: it is how the wire becomes
+// narrower than the role without anyone deciding to narrow it.
+//
+// `group_by` is absent because it is not a filter: it selects the role's other
+// METHOD and lives on CountByGroupRequest.
+var countFieldForParameter = map[string]string{
+	"status":            "Status",
+	"type":              "IssueType",
+	"assignee":          "Assignee",
+	"priority":          "Priority",
+	"priority_min":      "PriorityMin",
+	"priority_max":      "PriorityMax",
+	"label":             "Labels",
+	"label_any":         "LabelsAny",
+	"title":             "TitleSearch",
+	"id":                "IDFilter",
+	"title_contains":    "TitleContains",
+	"desc_contains":     "DescContains",
+	"notes_contains":    "NotesContains",
+	"created_after":     "CreatedAfter",
+	"created_before":    "CreatedBefore",
+	"updated_after":     "UpdatedAfter",
+	"updated_before":    "UpdatedBefore",
+	"closed_after":      "ClosedAfter",
+	"closed_before":     "ClosedBefore",
+	"empty_description": "EmptyDesc",
+	"no_assignee":       "NoAssignee",
+	"no_labels":         "NoLabels",
+	"include_infra":     "IncludeInfra",
+}
+
+// TestEveryCountRequestFieldIsPublished: the role publishes 23 filters and the
+// wire publishes all 23. A field added to issueops.CountRequest fails here and
+// NAMES itself, so the choice is made deliberately — publish it, or record why
+// it is withheld — rather than by nobody noticing.
+//
+// The map above is pinned at both ends and is not a third hand-rolled list: its
+// KEYS are checked against the document by TestCountParametersMatchTheHandler,
+// and its VALUES are checked against the struct here.
+func TestEveryCountRequestFieldIsPublished(t *testing.T) {
+	published := map[string]bool{}
+	for param, field := range countFieldForParameter {
+		if published[field] {
+			t.Errorf("two parameters claim to fill %s; the map is meant to be one parameter per field", field)
+		}
+		published[field] = true
+		if _, ok := reflect.TypeOf(issueops.CountRequest{}).FieldByName(field); !ok {
+			t.Errorf("parameter %q names field %s, which issueops.CountRequest does not declare", param, field)
+		}
+	}
+
+	declared := map[string]bool{}
+	typ := reflect.TypeOf(issueops.CountRequest{})
+	for i := range typ.NumField() {
+		declared[typ.Field(i).Name] = true
+	}
+	if missing := diff(declared, published); len(missing) > 0 {
+		t.Errorf("issueops.CountRequest declares filters this operation publishes no parameter for: %v\n"+
+			"add a parameter and a line to countFilters, or record here why the wire withholds it — "+
+			"a role filter with no way to reach it makes an HTTP-backed store narrower than the native one", missing)
 	}
 }
