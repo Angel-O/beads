@@ -82,7 +82,7 @@ func (o *batchApplier) ApplyBatch(ctx context.Context, request publicops.ApplyBa
 		if err := run.apply(ctx); err != nil {
 			return publicops.ApplyBatchResult{}, "", err
 		}
-		return run.result, storageissueops.ApplyBatchCommitMessage(plan, run.result), nil
+		return run.result, storageissueops.ApplyBatchCommitMessage(plan, run.result, run.write), nil
 	})
 }
 
@@ -97,6 +97,12 @@ type uowApplyRun struct {
 	planes map[string]bool
 	edges  []uowAppliedEdge
 	result publicops.ApplyBatchResult
+	// write records whether this unit of work has anything to commit, on the
+	// same terms the store bodies record it: a create and an edge always write,
+	// an update and a close write when they changed something. It carries no
+	// tables — this backend stages nothing, its whole unit of work commits — so
+	// the commit message is composed from Changed alone.
+	write storageissueops.BatchApplyWrite
 	// createContext is the workspace's prefix, statuses, types and infra-type
 	// set, loaded ONCE for the whole request. Nothing an item writes changes
 	// it, and a request may carry a hundred creates: loading it per item would
@@ -187,6 +193,7 @@ func (r *uowApplyRun) applyCreate(ctx context.Context, index int, item *publicop
 		r.result.Keys[item.Key] = issue.ID
 	}
 	r.planes[issue.ID] = useWisp
+	r.write.Changed = true
 	r.result.Items[index] = publicops.ItemResult{
 		Kind:       publicops.ItemCreate,
 		IssueID:    issue.ID,
@@ -237,6 +244,7 @@ func (r *uowApplyRun) applyUpdate(ctx context.Context, index int, item *publicop
 	if err != nil {
 		return itemErr(err)
 	}
+	r.write.Changed = r.write.Changed || updated.Changed
 	r.result.Items[index] = publicops.ItemResult{
 		Kind:       publicops.ItemUpdate,
 		IssueID:    id,
@@ -320,10 +328,12 @@ func (r *uowApplyRun) applyClose(ctx context.Context, index int, item *publicops
 	if err != nil {
 		return err
 	}
+	closeChanged := !semanticIssueEqual(before, hydrated)
+	r.write.Changed = r.write.Changed || closeChanged
 	r.result.Items[index] = publicops.ItemResult{
 		Kind:       publicops.ItemClose,
 		IssueID:    id,
-		Changed:    !semanticIssueEqual(before, hydrated),
+		Changed:    closeChanged,
 		RowVersion: hydrated.RowVersion,
 		Issue:      hydrated,
 	}
@@ -373,6 +383,11 @@ func (r *uowApplyRun) applyDepAdd(ctx context.Context, index int, item *publicop
 	}); err != nil {
 		return itemErr(err)
 	}
+	// The edge row was written EITHER WAY — a new edge is an insert, a same-type
+	// re-add rewrites that row's metadata — so the unit of work has something to
+	// commit even when the caller sees no change. The store bodies say the same
+	// thing by staging the dependency table unconditionally.
+	r.write.Changed = true
 	r.edges = append(r.edges, uowAppliedEdge{index: index, dep: dep})
 	r.result.Items[index] = publicops.ItemResult{
 		Kind:        publicops.ItemDepAdd,

@@ -49,7 +49,7 @@ func (o *batchApplier) ApplyBatch(ctx context.Context, request issueops.ApplyBat
 			return nil, "", err
 		}
 		result = attempt
-		return write.Tables, storageissueops.ApplyBatchCommitMessage(plan, attempt), nil
+		return write.Tables, storageissueops.ApplyBatchCommitMessage(plan, attempt, write), nil
 	})
 	if err != nil {
 		return issueops.ApplyBatchResult{}, err

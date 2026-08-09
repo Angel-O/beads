@@ -71,10 +71,15 @@ func ApplyBatchInTx(ctx context.Context, tx *sql.Tx, plan storage.ApplyBatchPlan
 // when handed an empty commit message, since that message is what commits the
 // SQL transaction as well as what versions it.
 type BatchApplyWrite struct {
-	// Changed is true when at least one item persisted a semantic mutation, on
-	// EITHER plane. It is false for a batch whose every item was a no-op — an
-	// idempotent re-close, an update that matched, an edge that was already
-	// there.
+	// Changed is true when this request WROTE something, on either plane.
+	//
+	// IT IS NOT ItemResult.Changed SUMMED, and the difference is deliberate.
+	// ItemResult.Changed answers what a CALLER can observe — a new edge, a
+	// status that moved — and is false for an idempotent re-add of an edge that
+	// already existed. This one answers whether the transaction has anything to
+	// commit, and that re-add still rewrote the edge row's metadata
+	// (AddDependencyInTx's same-type branch). Conflating them would leave a
+	// staged table with no commit message behind it.
 	Changed bool
 	// Tables are the DURABLE tables the request changed, for a caller that
 	// stages them. It is empty when nothing was written AND when everything
@@ -98,7 +103,15 @@ type BatchApplyWrite struct {
 // so a wisp-only batch must still be handed a message or the wisps it wrote are
 // discarded. Counting the DURABLE landings only would silently delete an
 // ephemeral batch's work on one backend out of three.
-func ApplyBatchCommitMessage(plan storage.ApplyBatchPlan, result publicops.ApplyBatchResult) string {
+//
+// SO IT READS THE WRITE, not just the result, and that is the second half of
+// the same trap. The counts below are ItemResult.Changed, which is what a
+// caller can OBSERVE; a request can write a durable row without any item
+// reporting a landing — an idempotent same-type re-add rewrites the edge's
+// metadata, and a re-close can still settle blocked state. Composing "" for one
+// of those would hand the store legs a staged table with an empty Dolt commit
+// message, and hand the unit-of-work leg a rollback of a write it had made.
+func ApplyBatchCommitMessage(plan storage.ApplyBatchPlan, result publicops.ApplyBatchResult, write BatchApplyWrite) string {
 	counts := map[publicops.ItemKind]int{}
 	for _, item := range result.Items {
 		if item.Changed {
@@ -120,7 +133,13 @@ func ApplyBatchCommitMessage(plan storage.ApplyBatchPlan, result publicops.Apply
 		}
 	}
 	if len(parts) == 0 {
-		return ""
+		if !write.Changed && len(write.Tables) == 0 {
+			return ""
+		}
+		// The request wrote, but nothing it wrote is a landing a caller asked
+		// about. Naming the act plainly is the honest entry; naming a count of
+		// zero would not be.
+		return HistoryEntry(plan.Provenance, "bd: apply batch")
 	}
 	return HistoryEntry(plan.Provenance, "bd: apply "+strings.Join(parts, ", "))
 }
@@ -252,7 +271,7 @@ func (r *applyBatchRun) applyUpdate(ctx context.Context, tx *sql.Tx, index int, 
 		return &publicops.ItemError{Index: index, Kind: publicops.ItemUpdate, Key: item.Target.Key, IssueID: id, Err: err}
 	}
 	r.write.Tables.Merge(tables)
-	r.write.Changed = r.write.Changed || updated.Changed
+	r.write.Changed = r.write.Changed || updated.Changed || len(tables) > 0
 	r.result.Items[index] = publicops.ItemResult{
 		Kind:       publicops.ItemUpdate,
 		IssueID:    id,
@@ -283,7 +302,7 @@ func (r *applyBatchRun) applyClose(ctx context.Context, tx *sql.Tx, index int, i
 		return &publicops.ItemError{Index: index, Kind: publicops.ItemClose, Key: item.Target.Key, IssueID: id, Err: err}
 	}
 	r.write.Tables.Merge(tables)
-	r.write.Changed = r.write.Changed || closed.Changed
+	r.write.Changed = r.write.Changed || closed.Changed || len(tables) > 0
 	r.result.Items[index] = publicops.ItemResult{
 		Kind:       publicops.ItemClose,
 		IssueID:    id,
@@ -358,9 +377,12 @@ func (r *applyBatchRun) applyDepAdd(ctx context.Context, tx *sql.Tx, index int, 
 	// documents, so an idempotent re-add cannot sweep unrelated pending event
 	// rows into this commit (GH#2455).
 	r.write.Tables.Add(depTable)
+	// The edge row was written EITHER WAY: a new edge is an insert, and a
+	// same-type re-add rewrites that row's metadata. So the transaction has
+	// something to commit even when the caller sees no change.
+	r.write.Changed = true
 	if eventWritten {
 		r.write.Tables.Add(eventTable)
-		r.write.Changed = true
 	}
 	r.edges = append(r.edges, appliedEdge{
 		index: index,
