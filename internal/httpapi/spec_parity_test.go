@@ -756,6 +756,88 @@ func TestCloseRequestMembersMatchTheHandler(t *testing.T) {
 	}
 }
 
+// TestBatchCloseRequestMembersMatchTheHandler is the batch create's gate for
+// the batch close body, at BOTH of its levels. Same reason as there: the
+// handler decodes raw members so it can name the offending one by index, which
+// costs a hand-rolled copy of two member lists with nothing tying them to the
+// document.
+func TestBatchCloseRequestMembersMatchTheHandler(t *testing.T) {
+	doc := loadSpec(t)
+	schemas := mapAt(t, mapAt(t, doc, "components"), "schemas")
+
+	for _, tc := range []struct {
+		schema   string
+		accepted []string
+		goType   any
+	}{
+		{schema: "BatchCloseRequest", accepted: batchCloseRequestMembers, goType: apigen.BatchCloseRequest{}},
+		{schema: "BatchCloseItem", accepted: batchCloseItemMembers, goType: apigen.BatchCloseItem{}},
+	} {
+		t.Run(tc.schema, func(t *testing.T) {
+			accepted := map[string]bool{}
+			for _, name := range tc.accepted {
+				accepted[name] = true
+			}
+			goFields := jsonTagNames(t, reflect.TypeOf(tc.goType))
+			if extra := diff(goFields, accepted); len(extra) > 0 {
+				t.Errorf("generated %s declares members the batchClose handler refuses as unknown: %v", tc.schema, extra)
+			}
+			if missing := diff(accepted, goFields); len(missing) > 0 {
+				t.Errorf("the batchClose handler accepts members %s does not declare: %v", tc.schema, missing)
+			}
+			specProps := schemaProperties(t, doc, mapAt(t, schemas, tc.schema))
+			if extra := diff(specProps, accepted); len(extra) > 0 {
+				t.Errorf("the %s schema documents members the batchClose handler refuses: %v", tc.schema, extra)
+			}
+			if missing := diff(accepted, specProps); len(missing) > 0 {
+				t.Errorf("the batchClose handler accepts members the %s schema does not document: %v", tc.schema, missing)
+			}
+		})
+	}
+}
+
+// TestCloseOutcomeCodesAreExactlyWhatTheProjectionEmits holds the per-item
+// vocabulary to the document, which no other gate covers: `code` on an outcome
+// lives inside a 200 BODY, so TestSpecStatusCodesMatchHandlerTable — which
+// compares problem documents — cannot see it at all.
+//
+// An item code the projection emits and the document does not name is
+// undisclosed wire surface on the one operation whose refusals do not travel as
+// problems.
+func TestCloseOutcomeCodesAreExactlyWhatTheProjectionEmits(t *testing.T) {
+	// The codes closeOutcome can produce, read off the function's own arms.
+	emitted := map[string]bool{
+		string(CodeNotFound):    true,
+		string(CodeNotClosable): true,
+		string(CodeInternal):    true,
+	}
+	for code := range emitted {
+		if Code(code).Status() == 0 {
+			t.Errorf("outcome code %q is not in the frozen vocabulary", code)
+		}
+	}
+
+	doc := loadSpec(t)
+	schema := mapAt(t, mapAt(t, mapAt(t, doc, "components"), "schemas"), "CloseOutcome")
+	described := mapAt(t, mapAt(t, schema, "properties"), "code")["description"]
+	prose, _ := described.(string)
+	if prose == "" {
+		t.Fatal("CloseOutcome.code carries no description; the item vocabulary is documented nowhere else")
+	}
+	for code := range emitted {
+		// `internal` is the fail-closed arm for a refusal no vocabulary here
+		// names, and the document does not enumerate it for the same reason no
+		// operation enumerates the generic 500: it means the server is broken,
+		// not that the client sent something.
+		if code == string(CodeInternal) {
+			continue
+		}
+		if !strings.Contains(prose, "`"+code+"`") {
+			t.Errorf("closeOutcome emits %q and CloseOutcome.code does not name it", code)
+		}
+	}
+}
+
 // TestClaimNextRequestMembersMatchTheHandler is the claim's gate for the
 // claimNext body. The body is one member, and the point of the test is the
 // NEGATIVE half: this operation's filter lives in the query string, so a

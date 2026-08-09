@@ -311,6 +311,7 @@ type timedProvider struct {
 var (
 	_ uow.IssueReaderSource         = timedProvider{}
 	_ uow.IssueClaimerSource        = timedProvider{}
+	_ uow.BatchCloserSource         = timedProvider{}
 	_ uow.ReadyClaimerSource        = timedProvider{}
 	_ uow.ReleaserSource            = timedProvider{}
 	_ uow.IssueLifecycleSource      = timedProvider{}
@@ -367,6 +368,15 @@ func (p timedProvider) IssueReader() (issueops.Reader, error) {
 // instead of the recursion looking correct.
 func (p timedProvider) IssueClaimer() (issueops.Claimer, error) {
 	return uow.NewIssueClaimer(p)
+}
+
+// BatchCloser builds the many-issue close role OVER THIS WRAPPER, for the same
+// reason as the roles above. Like BatchApplier it opens one of the longest
+// write units of work on this surface — up to a hundred closes plus their
+// blocked-state maintenance in one transaction — so a recursion here would
+// report uow_ms=0.000 for exactly the requests whose timing matters most.
+func (p timedProvider) BatchCloser() (issueops.BatchCloser, error) {
+	return uow.NewBatchCloser(p)
 }
 
 // ReadyClaimer builds the take-ready-work role OVER THIS WRAPPER, for the same

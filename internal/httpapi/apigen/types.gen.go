@@ -600,6 +600,40 @@ type ApplyUpdateItem struct {
 	Target Ref `json:"target"`
 }
 
+// BatchCloseItem defines model for BatchCloseItem.
+type BatchCloseItem struct {
+	// Id Exact canonical issue id, resolved across BOTH planes. No fuzzy, prefix or substring resolution — `IssueID`'s rule.
+	//
+	// A DUPLICATE is admissible; see the operation description.
+	Id string `json:"id"`
+
+	// Reason Why THIS issue is closed. It is per item rather than per request because `bd close a b c --reason x --reason y --reason z` has always mapped them positionally, and one request-wide reason could not express it. `CloseIssueRequest.reason`'s rules and first-close-wins.
+	Reason *string `json:"reason,omitempty"`
+}
+
+// BatchCloseRequest defines model for BatchCloseRequest.
+type BatchCloseRequest struct {
+	// Actor Who is closing. `ClaimRequest.actor`'s rules exactly, and the value is recorded against every item.
+	Actor string `json:"actor"`
+
+	// Force Bypass close policy — the open-children refusal and the live-blocker refusal — for EVERY item, and nothing else. It never bypasses validation and it never bypasses existence: an id that names nothing refuses whether or not this is set. It is request-wide because the flag that spells it is.
+	Force *bool `json:"force,omitempty"`
+
+	// Items The issues to close, in the order the caller asked for them. Every item appears in `outcomes` at the same index.
+	//
+	// An EMPTY array is a `400` rather than an empty answer, and the cap is `batchCreateIssues`' cap for its reason: it bounds how long one request may hold a write transaction.
+	Items []BatchCloseItem `json:"items"`
+
+	// Session The working session, recorded against every item that closes, under `CloseIssueRequest.session`'s first-close-wins rule and bounds.
+	Session *string `json:"session,omitempty"`
+}
+
+// BatchCloseResponse defines model for BatchCloseResponse.
+type BatchCloseResponse struct {
+	// Outcomes Exactly one entry per requested item, in REQUEST ORDER — including for items that refused, so a client walks this against its own argument list without matching ids back up.
+	Outcomes []CloseOutcome `json:"outcomes"`
+}
+
 // BatchCreateDependency defines model for BatchCreateDependency.
 type BatchCreateDependency struct {
 	// TargetId The far end of the edge: an issue this workspace holds, an `external:` reference, or an id whose prefix belongs to another repository. Anything else is a `400` and nothing is created.
@@ -724,6 +758,35 @@ type CloseIssueResponse struct {
 	OpenChildren int `json:"open_children"`
 }
 
+// CloseOutcome What happened to ONE requested item.
+//
+// `code` IS THE DISCRIMINATOR. Present means the item REFUSED and nothing was written for it; absent means it succeeded, and `issue`, `already_closed` and `open_children` are all present. A client branches on `code` first and reads nothing else until it has.
+type CloseOutcome struct {
+	// AlreadyClosed True when the issue was already closed and this item changed nothing — the idempotent re-close, spelled the way `CloseIssueResponse.already_closed` spells it. Present only on a successful item.
+	//
+	// A BATCH WHOSE ITEMS ARE ALL `true` LANDED NOTHING, and records no history entry: a per-item success that changed nothing is not work the caller did.
+	AlreadyClosed *bool `json:"already_closed,omitempty"`
+
+	// Code This item's refusal, from `Problem.code`'s vocabulary and restricted to `not_found` (the id names no row in either plane) and `not_closable` (close policy refused it: open children, or a live blocker — see `open_children`). ABSENT means the item succeeded.
+	//
+	// It is the problem vocabulary rather than a second one because an item refusal and a request refusal are the same question asked at two scopes, and a client that had to learn two vocabularies to classify one condition would be classifying the SCOPE rather than the condition.
+	Code *string `json:"code,omitempty"`
+
+	// Detail Prose for a refusal, never load-bearing and present only with `code`. It reflects the request and this server's own words rather than the role's message, for the reason `Problem.detail` gives.
+	Detail *string `json:"detail,omitempty"`
+
+	// Issue A tracked work item. Property semantics documented here apply to every schema that repeats them below.
+	Issue *Issue `json:"issue,omitempty"`
+
+	// IssueId The id the caller asked for, echoed verbatim so an outcome can be read without indexing back into the request.
+	IssueId string `json:"issue_id"`
+
+	// OpenChildren How many open children the transaction observed for this item.
+	//
+	// ITS MEANING FOLLOWS `code`, and both readings are the ones the single close already publishes. On a SUCCESSFUL item it is always present and is `CloseIssueResponse.open_children` — the number a forced close bypassed, reported even for an idempotent re-close, and `0` for an unforced close that got that far. On a REFUSED item its PRESENCE is the discriminator between the two `not_closable` refusals, exactly as it is on a problem document: present means open children, absent means a live blocker.
+	OpenChildren *int `json:"open_children,omitempty"`
+}
+
 // Comment defines model for Comment.
 type Comment = types.Comment
 
@@ -775,7 +838,7 @@ type ContextResponse struct {
 	// BeadsDir Absolute path of the served workspace's `.beads` directory. A host path, kept because it is the single-workspace server's only workspace-identity handshake; disclosing it to network peers is part of what an operator accepts when binding beyond loopback.
 	BeadsDir string `json:"beads_dir"`
 
-	// Capabilities The operations this server actually implements, derived from its route table. v0's vocabulary is `ready.list`, `ready.count`, `issues.list`, `issues.query`, `issues.get`, `issues.create`, `issues.claim`, `issues.claimNext`, `issues.release`, `issues.close`, `issues.reopen`, `issues.update`, `issues.sweep`, `issues.delete`, `issues.batchCreate`, `issues.batchApply`, `stats.get`, `config.list`, `config.get`, `dependencies.cycles`, `dependencies.list`, `dependencies.blocking`, `dependencies.tree`, `dependencies.add`, `dependencies.remove`, `memories.list`, `memories.get`, `memories.remember`, `memories.forget`, `events.list`, `events.watch`, `issues.casMetadata`; it grows additively, and an operation never appears here unless it is fully implemented. This is how a client checks for an operation — never the version string.
+	// Capabilities The operations this server actually implements, derived from its route table. v0's vocabulary is `ready.list`, `ready.count`, `issues.list`, `issues.query`, `issues.get`, `issues.create`, `issues.batchClose`, `issues.claim`, `issues.claimNext`, `issues.release`, `issues.close`, `issues.reopen`, `issues.update`, `issues.sweep`, `issues.delete`, `issues.batchCreate`, `issues.batchApply`, `stats.get`, `config.list`, `config.get`, `dependencies.cycles`, `dependencies.list`, `dependencies.blocking`, `dependencies.tree`, `dependencies.add`, `dependencies.remove`, `memories.list`, `memories.get`, `memories.remember`, `memories.forget`, `events.list`, `events.watch`, `issues.casMetadata`; it grows additively, and an operation never appears here unless it is fully implemented. This is how a client checks for an operation — never the version string.
 	//
 	// THIS LIST IS BUILD-LEVEL, NOT WORKSPACE-LEVEL. It says which operations this binary serves, and for every entry but two that is the whole answer. `events.list` and `events.watch` are the exceptions: the durable events journal is a per-workspace setting that is OFF by default, so a server that advertises them may still refuse every request to both with 409 `events_journal_disabled` — correctly, because the operations exist and the workspace has no journal. A consumer of either MUST treat the capability as "this server speaks it" and the 409 as "not on this workspace", and must not read the capability as a promise that records will arrive.
 	Capabilities []string `json:"capabilities"`
@@ -2078,6 +2141,9 @@ type ReopenIssueJSONRequestBody = ReopenIssueRequest
 
 // ApplyBatchJSONRequestBody defines body for ApplyBatch for application/json ContentType.
 type ApplyBatchJSONRequestBody = ApplyBatchRequest
+
+// BatchCloseIssuesJSONRequestBody defines body for BatchCloseIssues for application/json ContentType.
+type BatchCloseIssuesJSONRequestBody = BatchCloseRequest
 
 // BatchCreateIssuesJSONRequestBody defines body for BatchCreateIssues for application/json ContentType.
 type BatchCreateIssuesJSONRequestBody = BatchCreateRequest

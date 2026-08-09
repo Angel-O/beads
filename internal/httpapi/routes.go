@@ -410,6 +410,17 @@ var routeTable = []route{
 		handler:      (*Server).handleReopen,
 	},
 	{
+		op:     OpBatchCloseIssues,
+		method: http.MethodPost,
+		// A collection-level custom method, spelled the way issues:batchCreate
+		// is — and this operation is that one's deliberate opposite: it is not
+		// all-or-nothing, so its 200 carries per-item refusals.
+		pattern:     "/v0/beads/issues:batchClose",
+		capability:  "issues.batchClose",
+		implemented: true,
+		handler:     (*Server).handleBatchClose,
+	},
+	{
 		op:     OpClaimNextIssue,
 		method: http.MethodPost,
 		// A collection-level custom method, spelled the way issues:sweep is,

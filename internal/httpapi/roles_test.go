@@ -449,6 +449,34 @@ func (c *roleClaimer) claimRequests() []issueops.ClaimRequest {
 	return append([]issueops.ClaimRequest(nil), c.claims...)
 }
 
+// roleBatchCloser is the store-shaped source's many-issue close role. The
+// batchClose tests drive it directly, and it is the fake that matters most on
+// this surface: the per-item outcome projection is the one place where a role
+// result and a 200 body can disagree without any status saying so.
+type roleBatchCloser struct {
+	result issueops.CloseBatchResult
+	err    error
+
+	mu       sync.Mutex
+	requests []issueops.CloseBatchRequest
+}
+
+func (c *roleBatchCloser) CloseBatch(_ context.Context, req issueops.CloseBatchRequest) (issueops.CloseBatchResult, error) {
+	c.mu.Lock()
+	c.requests = append(c.requests, req)
+	c.mu.Unlock()
+	if c.err != nil {
+		return issueops.CloseBatchResult{}, c.err
+	}
+	return c.result, nil
+}
+
+func (c *roleBatchCloser) closeBatchRequests() []issueops.CloseBatchRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]issueops.CloseBatchRequest(nil), c.requests...)
+}
+
 // roleReadyClaimer is the store-shaped source's take-ready-work role. The
 // claimNext tests drive it directly: the wire edge — the filter decode, the
 // `limit` refusal, the body vocabulary and the absent-row answer — is provable
@@ -694,6 +722,9 @@ func rolesConfig(cfg Config) Config {
 	}
 	if cfg.Claimer == nil {
 		cfg.Claimer = &roleClaimer{}
+	}
+	if cfg.BatchCloser == nil {
+		cfg.BatchCloser = &roleBatchCloser{}
 	}
 	if cfg.ReadyClaimer == nil {
 		cfg.ReadyClaimer = &roleReadyClaimer{}

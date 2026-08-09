@@ -311,6 +311,15 @@ const (
 	OpListIssues    = "listIssues"
 	OpGetIssue      = "getIssue"
 	OpClaimIssue    = "claimIssue"
+	// OpBatchCloseIssues closes many issues as one transaction, behind
+	// issueops.BatchCloser. It is the surface's ONLY operation whose 200 body
+	// carries refusals: the role is deliberately not all-or-nothing, so an id
+	// it turns down is skipped and the survivors commit.
+	//
+	// Its problem vocabulary is therefore narrow rather than wide — everything
+	// an ITEM can earn lives in that item's outcome, and a problem document
+	// from this operation means the batch NEVER RAN.
+	OpBatchCloseIssues = "batchCloseIssues"
 	// OpClaimNextIssue takes ONE ready issue and hands it back claimed, behind
 	// issueops.ReadyClaimer. It is the surface's first operation that names no
 	// row at all: the caller sends a QUESTION — the ready listing's own filter
@@ -549,6 +558,14 @@ var operationCodes = map[string][]Code{
 		CodeInvalidArgument, CodeNotFound, CodeAlreadyClaimed, CodeNotClaimable,
 		CodeBusy, CodeDBUnavailable, CodeInternal,
 	},
+	// The NARROWEST write vocabulary on this surface, and the narrowness is the
+	// contract rather than an oversight. A problem document from this operation
+	// means the batch never ran; every refusal an ITEM can earn — not_found for
+	// an id naming no row, not_closable for close policy — travels in that
+	// item's outcome inside a 200. A 404 here would say the operation went to
+	// the wrong place, and a 409 would say the whole batch was refused, and
+	// neither is ever true of a per-item refusal.
+	OpBatchCloseIssues: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
 	// NO 409 AND NO 404, and both absences are this operation's contract rather
 	// than an omission. There is no id to have missed, and a row a racing agent
 	// took is simply not in the set this claim scanned — the role walks past it
