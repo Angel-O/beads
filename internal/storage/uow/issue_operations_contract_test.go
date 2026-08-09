@@ -137,6 +137,16 @@ func TestIssueOperationsUpdateWritesEveryScalarPatchField(t *testing.T) {
 	conformance.RunIssueOperationsUpdateWritesEveryScalarPatchField(t, ctx, newUOWIssueOperationsFixture(t, ctx))
 }
 
+func TestIssueOperationsUpdateStampsStartedAtOnceOnTheFirstInProgress(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsUpdateStampsStartedAtOnceOnTheFirstInProgress(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsUpdateRawMetadataTakesTheFunnelsValueShapes(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsUpdateRawMetadataTakesTheFunnelsValueShapes(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
 func TestIssueOperationsUpdateRefusesATypeOutsideTheWorkspaceVocabulary(t *testing.T) {
 	ctx := context.Background()
 	conformance.RunIssueOperationsUpdateRefusesATypeOutsideTheWorkspaceVocabulary(t, ctx, newUOWIssueOperationsFixture(t, ctx))

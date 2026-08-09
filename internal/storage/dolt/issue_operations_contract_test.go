@@ -157,6 +157,18 @@ func TestIssueOperationsUpdateWritesEveryScalarPatchField(t *testing.T) {
 	conformance.RunIssueOperationsUpdateWritesEveryScalarPatchField(t, ctx, fixture)
 }
 
+func TestIssueOperationsUpdateStampsStartedAtOnceOnTheFirstInProgress(t *testing.T) {
+	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
+	defer cleanup()
+	conformance.RunIssueOperationsUpdateStampsStartedAtOnceOnTheFirstInProgress(t, ctx, fixture)
+}
+
+func TestIssueOperationsUpdateRawMetadataTakesTheFunnelsValueShapes(t *testing.T) {
+	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
+	defer cleanup()
+	conformance.RunIssueOperationsUpdateRawMetadataTakesTheFunnelsValueShapes(t, ctx, fixture)
+}
+
 func TestIssueOperationsUpdateRefusesATypeOutsideTheWorkspaceVocabulary(t *testing.T) {
 	fixture, ctx, cleanup := newDoltIssueOperationsFixture(t)
 	defer cleanup()

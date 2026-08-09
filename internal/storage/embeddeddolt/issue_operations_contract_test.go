@@ -185,6 +185,20 @@ func TestEmbeddedIssueOperationsUpdateWritesEveryScalarPatchField(t *testing.T) 
 	conformance.RunIssueOperationsUpdateWritesEveryScalarPatchField(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "scalarsurface"))
 }
 
+func TestEmbeddedIssueOperationsUpdateStampsStartedAtOnceOnTheFirstInProgress(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	te := newTestEnv(t, "startstamp")
+	ctx := t.Context()
+	conformance.RunIssueOperationsUpdateStampsStartedAtOnceOnTheFirstInProgress(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "startstamp"))
+}
+
+func TestEmbeddedIssueOperationsUpdateRawMetadataTakesTheFunnelsValueShapes(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	te := newTestEnv(t, "rawmeta")
+	ctx := t.Context()
+	conformance.RunIssueOperationsUpdateRawMetadataTakesTheFunnelsValueShapes(t, ctx, newEmbeddedIssueOperationsFixture(t, ctx, te, "rawmeta"))
+}
+
 func TestEmbeddedIssueOperationsUpdateRefusesATypeOutsideTheWorkspaceVocabulary(t *testing.T) {
 	skipUnlessEmbeddedDolt(t)
 	te := newTestEnv(t, "typevocab")

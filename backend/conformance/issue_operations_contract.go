@@ -2414,6 +2414,153 @@ func RunIssueOperationsUpdateWritesEveryScalarPatchField(t *testing.T, ctx conte
 	events.assert(t, "restated scalar patch", 0, nil)
 }
 
+// RunIssueOperationsUpdateStampsStartedAtOnceOnTheFirstInProgress pins the
+// started_at lifecycle a plain status update carries with it
+// (internal/storage/issueops/update.go ManageStartedAt: "auto-sets started_at
+// when transitioning to in_progress. If the issue already has a started_at, it
+// is preserved"). It drives the UNTYPED FUNNEL, because IssuePatch has no
+// started_at member and the funnel is what every `bd update -s` and every
+// external-sync caller reaches.
+//
+// STAMPING AND PRESERVING FAIL IN OPPOSITE DIRECTIONS, so both are here. A body
+// that never stamps leaves an in_progress row that has never started, and
+// nothing downstream can say how long the work has been running — the lease
+// reclaim reads exactly this column. A body that RE-stamps resets that clock
+// every time an agent bounces a bead through open and back, which is the shape
+// a retry loop produces, and the row then looks freshly started forever.
+//
+// The closest existing case is
+// RunIssueOperationsUpdateClaimIsAMutationWhenThePatchRestoresTheRow, which
+// pins preservation of a seeded started_at under CLAIM. Neither the stamp on an
+// empty column nor preservation across a plain status patch is pinned anywhere.
+//
+// THE PRESERVING ROW'S STAMP IS SEEDED YEARS IN THE PAST, and that is the
+// fixture doing the work rather than the assertion. started_at is DATETIME(0):
+// a row stamped by the first transition and re-stamped by the second, both
+// inside one second, holds the same bytes either way, so a case that stamped
+// its own precondition could not tell preservation from a rewrite. The stamping
+// row therefore proves only that a stamp lands, in a measured window, and the
+// preserving row — seeded, never stamped by this case — carries the whole
+// preservation claim across a full open/in_progress/open/in_progress cycle.
+func RunIssueOperationsUpdateStampsStartedAtOnceOnTheFirstInProgress(t *testing.T, ctx context.Context, fixture IssueOperationsStagingFixture) {
+	t.Helper()
+	if fixture.UpdateRaw == nil {
+		t.Skip("fixture has no UpdateRaw: this backend's untyped update funnel is unreachable, so ManageStartedAt is UNPINNED here")
+	}
+
+	stamping := fixture.IssuePrefix + "-startstamp"
+	if err := fixture.CreateIssue(ctx, &types.Issue{
+		ID: stamping, Title: stamping, Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask,
+	}, "seed"); err != nil {
+		t.Fatalf("seed %s: %v", stamping, err)
+	}
+	assertIssueOperationsStartedAt(t, ctx, fixture, stamping, "before any transition", "")
+
+	lower := time.Now().UTC().Add(-issueOperationsClockSlack).Format(issueOperationsStoredTimeLayout)
+	issueOperationsUpdateStatus(t, ctx, fixture, stamping, types.StatusInProgress)
+	upper := time.Now().UTC().Add(issueOperationsClockSlack).Format(issueOperationsStoredTimeLayout)
+	stamped := issueOperationsStartedAt(t, ctx, fixture, stamping, "after the first in_progress")
+	// The stored layout sorts lexicographically, so string bounds are time
+	// bounds. A bare "not empty" check would accept the zero time, which is
+	// what a body writing an unset *time.Time lands.
+	if stamped < lower || stamped > upper {
+		t.Errorf("%s started_at = %q after its first in_progress, want a stamp between %q and %q", stamping, stamped, lower, upper)
+	}
+
+	preserving := fixture.IssuePrefix + "-startkeep"
+	seededStart := time.Date(2019, 3, 4, 5, 6, 7, 0, time.UTC)
+	if err := fixture.CreateIssue(ctx, &types.Issue{
+		ID: preserving, Title: preserving, Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask,
+		StartedAt: &seededStart,
+	}, "seed"); err != nil {
+		t.Fatalf("seed %s: %v", preserving, err)
+	}
+	want := seededStart.Format(issueOperationsStoredTimeLayout)
+	// The precondition, not an assumption: a seed hook that dropped the preset
+	// stamp would leave every check below comparing a rewrite with a rewrite.
+	assertIssueOperationsStartedAt(t, ctx, fixture, preserving, "as seeded", want)
+
+	for _, step := range []types.Status{types.StatusInProgress, types.StatusOpen, types.StatusInProgress} {
+		issueOperationsUpdateStatus(t, ctx, fixture, preserving, step)
+		assertIssueOperationsStartedAt(t, ctx, fixture, preserving, "after a status update to "+string(step), want)
+	}
+}
+
+// issueOperationsUpdateStatus drives one status change through the untyped
+// funnel, which is the only route to it that carries no patch of its own.
+func issueOperationsUpdateStatus(t *testing.T, ctx context.Context, fixture IssueOperationsStagingFixture, id string, status types.Status) {
+	t.Helper()
+	if err := fixture.UpdateRaw(ctx, id, map[string]any{"status": string(status)}, "writer"); err != nil {
+		t.Fatalf("raw status update of %s to %q: %v", id, status, err)
+	}
+}
+
+func issueOperationsStartedAt(t *testing.T, ctx context.Context, fixture IssueOperationsStagingFixture, id, label string) string {
+	t.Helper()
+	return readIssueOperationsStoredColumns(t, ctx, fixture, id, label, []string{"started_at"})[0].value
+}
+
+func assertIssueOperationsStartedAt(t *testing.T, ctx context.Context, fixture IssueOperationsStagingFixture, id, label, want string) {
+	t.Helper()
+	if got := issueOperationsStartedAt(t, ctx, fixture, id, label); got != want {
+		t.Errorf("%s started_at %s = %q, want %q", id, label, got, want)
+	}
+}
+
+// RunIssueOperationsUpdateRawMetadataTakesTheFunnelsValueShapes pins what the
+// UNTYPED update funnel accepts in its metadata slot. The typed
+// IssuePatch.Metadata surface is an ordered merge/set/unset document with its
+// own owning cases; this is the OTHER entry, the one every `bd update
+// --metadata` and every backfill script reaches, where the value arrives as
+// whatever the caller's JSON decoder produced.
+//
+// The shapes are the contract. The two stores funnel through
+// storage.NormalizeMetadataValue, which names string, []byte and
+// json.RawMessage; the unit-of-work backend funnels through its own
+// normalizeUpdateValue in internal/storage/domain/db. Two maps, and nothing
+// held them to the same accepted set — a backend that took only one of the
+// three would refuse a caller the others serve, or worse, store the Go
+// rendering of a []byte as the document.
+//
+// audit_issue-lifecycle.go's testAuditMetadataJSONRoundTrip drives []byte alone
+// and only at the storage seam. The document is compared parsed rather than
+// byte-for-byte because a JSON column may reformat and reorder, and the NOT
+// NULL probe is the half a value comparison cannot make: a NULL column reads
+// back as the literal "null" and compares equal to an empty document.
+func RunIssueOperationsUpdateRawMetadataTakesTheFunnelsValueShapes(t *testing.T, ctx context.Context, fixture IssueOperationsStagingFixture) {
+	t.Helper()
+	if fixture.UpdateRaw == nil {
+		t.Skip("fixture has no UpdateRaw: this backend's untyped update funnel is unreachable, so its metadata slot is UNPINNED here")
+	}
+
+	id := fixture.IssuePrefix + "-rawmeta"
+	if err := fixture.CreateIssue(ctx, &types.Issue{
+		ID: id, Title: id, Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask,
+		Metadata: json.RawMessage(`{"team":"seeded"}`),
+	}, "seed"); err != nil {
+		t.Fatalf("seed %s: %v", id, err)
+	}
+	assertIssueOperationsStoredMetadata(t, ctx, fixture, id, "as seeded", `{"team":"seeded"}`)
+
+	for _, shape := range []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{"a []byte", []byte(`{"team":"ops"}`), `{"team":"ops"}`},
+		{"a string", `{"team":"sre"}`, `{"team":"sre"}`},
+		{"a json.RawMessage", json.RawMessage(`{"team":"platform"}`), `{"team":"platform"}`},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			if err := fixture.UpdateRaw(ctx, id, map[string]any{"metadata": shape.value}, "writer"); err != nil {
+				t.Fatalf("raw metadata update of %s with %s: %v", id, shape.name, err)
+			}
+			assertIssueOperationsStoredMetadata(t, ctx, fixture, id, "after a raw update with "+shape.name, shape.want)
+			assertIssueOperationsMetadataIsNotNull(t, ctx, fixture, id, "after a raw update with "+shape.name)
+		})
+	}
+}
+
 // RunIssueOperationsUpdateRefusesATypeOutsideTheWorkspaceVocabulary pins the
 // WRITE side of the issue-type vocabulary. The read side is pinned by
 // RunReaderListRejectsATypeOutsideTheWorkspaceVocabulary; on the write side each
