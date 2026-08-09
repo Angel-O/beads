@@ -40,8 +40,8 @@ func ValidateDeleteRequest(in issueops.DeleteRequest) error {
 		}
 	}
 	// DISTINCT ids, not mentions: DeleteRequest.IDs promises duplicates
-	// collapse, so `bd delete a a --expect-version` names one row and is legal.
-	// Counting the raw slice here would refuse the request the role's own
+	// collapse, so an IDs of {"a", "a"} carrying a version names ONE row and is
+	// legal. Counting the raw slice here would refuse the request the role's own
 	// normalization rule says is fine.
 	if in.ExpectedVersion != nil {
 		if distinct := len(NormalizeDeleteIDs(in.IDs)); distinct > 1 {

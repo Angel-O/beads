@@ -128,6 +128,21 @@ func RunDeleterRefusesAMalformedRequest(t *testing.T, ctx context.Context, fixtu
 // arrangement that can fail: an implementation that deleted as it resolved
 // would pass a single-absent-id case perfectly. And under DryRun too, because a
 // preview that succeeded here would tell a caller to go ahead.
+//
+// THE SECOND BLOCK PINS THE ORDER AGAINST ExpectedVersion, which is the one
+// boundary the leaf promises and nothing else here watches: "it ranks BELOW the
+// existence probe ... a request that named no row has nothing to be stale
+// about" (Deleter.Delete). It is a SINGLE absent id, because a version request
+// may not name two.
+//
+// IT ASSERTS THE TYPE, NOT THE SENTINEL, and that is the whole point of the
+// block. errors.Is(err, ErrNotFound) is satisfied by the WRONG order too: the
+// store legs run the version guard through CheckVersionInTx, which answers a
+// bare wrapped ErrNotFound of its own for a row that is not there. Only
+// *NotFoundError — which nothing but the existence probe mints, and which
+// carries the id — tells the two apart. The uow leg cannot even answer: its
+// version comparison reads the row the probe loaded, so a flipped order is a
+// nil dereference rather than a wrong error.
 func RunDeleterRefusesAnAbsentID(t *testing.T, ctx context.Context, fixture DeleterFixture) {
 	t.Helper()
 	stored := deleterSeedIssue(t, ctx, fixture, "gone", "real")
@@ -153,6 +168,34 @@ func RunDeleterRefusesAnAbsentID(t *testing.T, ctx context.Context, fixture Dele
 			t.Errorf("refused delete reported Deleted = %d, want 0", result.Deleted)
 		}
 		deleterAssertIssueRows(t, ctx, fixture, 1, stored)
+	}
+
+	// The version the request carries is deliberately a plausible one rather
+	// than a sentinel: the subject is WHICH refusal comes back, so a token that
+	// looked obviously wrong would leave a reader unsure whether the existence
+	// probe won or the guard simply had nothing to compare.
+	version := int64(0)
+	for _, dryRun := range []bool{false, true} {
+		result, err := fixture.Deleter.Delete(ctx, publicops.DeleteRequest{
+			IDs:             []string{absent},
+			Force:           true,
+			ExpectedVersion: &version,
+			DryRun:          dryRun,
+		})
+		var notFound *publicops.NotFoundError
+		if !errors.As(err, &notFound) {
+			t.Fatalf("Delete(dryRun=%v) of an absent id with a version error = %v, want *NotFoundError — the existence probe outranks the version guard",
+				dryRun, err)
+		}
+		if errors.Is(err, publicops.ErrVersionMismatch) {
+			t.Errorf("Delete(dryRun=%v) answered the version guard over an id that names no row", dryRun)
+		}
+		if !reflect.DeepEqual(notFound.IDs, []string{absent}) {
+			t.Errorf("NotFoundError.IDs = %v, want [%s]", notFound.IDs, absent)
+		}
+		if result.Deleted != 0 {
+			t.Errorf("refused delete reported Deleted = %d, want 0", result.Deleted)
+		}
 	}
 }
 
