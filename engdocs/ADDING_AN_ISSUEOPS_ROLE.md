@@ -111,6 +111,27 @@ in; 13 is the HTTP surface, which lands with the command rather than after it.
    — the shared function takes a transaction, so no front door can call it at
    all.
 
+   **CHECK WHETHER THE UNIT OF WORK CAN REACH THE BODY BEFORE PROMISING THAT IT
+   WILL.** `MetadataCAS` and `TreeWalker` collapse all three legs onto one
+   `…InTx` function, and it is tempting to read that as the rule for tx-level
+   bodies. It is not. Those two take a `DBTX`, which is exactly the method set
+   `domain/db.Runner` publishes, so the unit-of-work leg reaches them through
+   the domain repository. `issueops.BatchApplier` cannot: its body COMPOSES
+   `ExecuteCreate`, `ExecuteUpdate` and `ExecuteClose`, every one of which takes
+   a `*sql.Tx`, and a unit of work's runner is a `*sql.Conn` with a transaction
+   open on it. No interface between the two publishes the other, and widening
+   three of the oldest write paths in the tree to take an interface is not a
+   role slice's change.
+
+   So that role has TWO bodies, and its contract says so at the top rather than
+   claiming three legs and one reading. **The test is mechanical: does every
+   function your body calls take an interface `Runner` satisfies?** Ask it
+   before you write the contract header, because the header's vote count is
+   what tells the next reader how much a three-leg run is worth — and a role
+   that shares its request VALIDATION, its commit-message rule and its end gate
+   while forking the body is still one definition of what the role MEANS, which
+   is what the sharing is for.
+
 4. **The unit-of-work body and its source interface.**
    `internal/storage/uow/<role>.go`, declaring `type <Role>Source interface {
    <Role>() (publicops.<Role>, error) }` and implementing the accessor on
@@ -344,6 +365,13 @@ no front door holds (`internal/storage/memoryops/memories.go:15-18`). Step 3's
 address is what decides the entry, so a namespace of tx-level bodies has no
 entries at all, and the absence has to be readable as a decision rather than as
 a step someone skipped.
+
+`issueops.BatchApplier` is the second role with no entry, for the same reason
+and one more: its step-3 body is an `…InTx` function AND it has no `cmd/bd`
+front door at all in the slice that introduced it — it landed with the HTTP
+half only. An absent CLI is a decision too, and the place to write it down is
+the leaf doc beside the promises, exactly as `VersionReconciler` writes down
+its absent HTTP half.
 
 The test: **does step 3 have an exported constructor returning the role
 interface, in a package a `cmd/bd` file can import?**

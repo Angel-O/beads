@@ -103,6 +103,11 @@ func RoleFiresHooks(role any) bool {
 	// handed an unpeeled one runs the workspace's script once per contended
 	// retry round.
 	case *hookMetadataCAS:
+	// The batch applier is the widest of them all: one call fires on_create,
+	// on_update AND the close hooks, once per landed item plus once per
+	// distinct edge source (hook_batch_applier.go). A hundred-item plan served
+	// unpeeled is a hundred user subprocesses inside one request.
+	case *hookBatchApplier:
 		return true
 	}
 	return false
