@@ -498,6 +498,21 @@ had already happened one layer down. Two consequences worth generalizing:
   extra SELECT — and say in the leaf that the caller composes its next
   expectation from that value and not from its own spelling.
 
+**And the step with no number: every surface that EMBEDS the store or a use
+case.** A new accessor arrives on each of them PROMOTED rather than declared, so
+the build stays green and the first symptom is a nil dereference in somebody
+else's stub. `issueops.MetadataCAS` was caught by CI in four such places after
+passing every package test its own slice ran: `storage.RoleFiresHooks` (a role
+whose hook decorator WRAPS must gain a case, or `checkDatabaseSource` cannot
+refuse a hook-firing one — missing it is a `bd serve` that runs a user
+subprocess per call); `uow`'s notifying wrapper, in BOTH halves — the recording
+use case, which silently records nothing for an inherited method, and the
+notifying provider, whose missing accessor makes a caller's type assertion stop
+matching; and two `cmd/bd` stub stores that embed `storage.DoltStorage`. Grep
+for the embed, not for the interface. And note that `internal/storage/uow`'s own
+package run is nine minutes — the parity guards live there, so a role slice that
+runs only its contract on the three legs has not run them.
+
 ## Retiring a test against a contract
 
 Once a role has a contract, the ad-hoc tests that predate it start to look
