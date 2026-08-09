@@ -24,16 +24,22 @@ import (
 // accessors validate BEFORE opening a transaction, so a malformed request costs
 // no database work.
 //
-// THE CLASSIFYING READ IS THIS BODY'S OWN WORK, not the raw seam's. The two raw
-// entry points below refuse the same requests, but two of their refusals are
-// untyped strings — "issue %s is not assigned" and, for a status the release
-// transition is not defined over, "no matching row" — which no caller can
-// classify and the second of which explains nothing. Reading the row first lets
-// every refusal carry a sentinel, and the row is needed anyway.
+// IT CLASSIFIES EXACTLY THE TWO REFUSALS THE RAW SEAM LEAVES UNTYPED, and no
+// others. The raw entry points below refuse the same requests this role does,
+// but two of those refusals are bare strings — "issue %s is not assigned" and,
+// for a status the release transition is not defined over, "no matching row",
+// which no caller can classify and the second of which explains nothing. The
+// row is read here anyway for the post-state snapshot, so naming them costs a
+// comparison each.
 //
-// WHICH REQUESTS ARE REFUSED IS UNCHANGED BY THAT. The checks below are the raw
-// seam's own, in the raw seam's order, and the raw calls still run their own
-// afterwards — this body narrows nothing and widens nothing.
+// THE ONES THE RAW SEAM ALREADY TYPES ARE NOT REPEATED. ErrNotOwner and
+// ErrAssigneeMismatch come back from the calls below already wrapped and in
+// this same order, so a pre-check for either is a branch nothing can make fail.
+// See the note beside the ownership call.
+//
+// WHICH REQUESTS ARE REFUSED IS UNCHANGED BY EITHER DECISION. The checks here
+// are the raw seam's own, in the raw seam's order, and the raw calls still run
+// them — this body narrows nothing and widens nothing.
 func ReleaseIssueInTx(ctx context.Context, tx DBTX, req publicops.ReleaseRequest) (publicops.ReleaseResult, ReleaseWrite, error) {
 	before, err := GetIssueInTx(ctx, tx, req.IssueID)
 	if err != nil {
@@ -52,29 +58,27 @@ func ReleaseIssueInTx(ctx context.Context, tx DBTX, req publicops.ReleaseRequest
 			publicops.ErrNotReleasable, req.IssueID, before.Status, types.StatusOpen, types.StatusInProgress)
 	}
 
-	if req.ExpectedAssignee != nil {
-		// A row that holds no claim is a MISMATCH on this path rather than
-		// ErrNotClaimed: the caller asked about a named holder, and the answer
-		// is that it is not the holder. That is also what the raw conditional
-		// release answers, so the two agree.
-		if before.Assignee != *req.ExpectedAssignee {
-			return publicops.ReleaseResult{}, ReleaseWrite{}, fmt.Errorf(
-				"%w: %s is held by %q, expected %q",
-				publicops.ErrAssigneeMismatch, req.IssueID, before.Assignee, *req.ExpectedAssignee)
-		}
-	} else {
-		if before.Assignee == "" {
-			return publicops.ReleaseResult{}, ReleaseWrite{}, fmt.Errorf(
-				"%w: %s has no assignee to release", publicops.ErrNotClaimed, req.IssueID)
-		}
-		// Force bypasses the fence and only the fence.
-		if !req.Force && before.Assignee != req.Actor {
-			return publicops.ReleaseResult{}, ReleaseWrite{}, fmt.Errorf(
-				"%w: %s is held by %s; coordinate with the holder — force only if their claim is abandoned (crashed agent, expired lease)",
-				publicops.ErrNotOwner, req.IssueID, before.Assignee)
-		}
+	// AN UNHELD ROW ON THE UNCONDITIONAL PATH is the second refusal this body
+	// owns, and for the same reason as the first: the raw release answers it
+	// with a bare string. It is only asked when the request named no expected
+	// holder — a caller that DID name one gets ErrAssigneeMismatch from the raw
+	// conditional release below, because it asked about a specific holder and
+	// the answer is that it is not the holder.
+	//
+	// Force does not reach it. Force bypasses the ownership fence, and "is
+	// there a claim here at all" is not a question about ownership.
+	if req.ExpectedAssignee == nil && before.Assignee == "" {
+		return publicops.ReleaseResult{}, ReleaseWrite{}, fmt.Errorf(
+			"%w: %s has no assignee to release", publicops.ErrNotClaimed, req.IssueID)
 	}
 
+	// EVERY OTHER REFUSAL IS THE RAW SEAM'S, and is deliberately not repeated
+	// here. The ownership fence and the assignee compare-and-set already answer
+	// with ErrNotOwner and ErrAssigneeMismatch — typed, wrapped, and in this
+	// same order — so a copy above would be a branch nothing could make fail:
+	// the call below refuses the identical requests whether or not it is there.
+	// Both copies WERE written, and both were deleted after a mutation removing
+	// them left the whole contract green.
 	if req.ExpectedAssignee != nil {
 		err = UnclaimIssueIfAssigneeInTx(ctx, tx, req.IssueID, req.Actor, *req.ExpectedAssignee)
 	} else {
