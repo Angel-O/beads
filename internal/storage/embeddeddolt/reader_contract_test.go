@@ -205,6 +205,18 @@ func TestEmbeddedReaderListParentReachesEveryDescendantAndOnlyItsOwn(t *testing.
 	conformance.RunReaderListParentReachesEveryDescendantAndOnlyItsOwn(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
 }
 
+func TestEmbeddedReaderListKeysetWalkOverAnOversizedGroupLosesNothingAndRepeatsNothing(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderListKeysetWalkOverAnOversizedGroupLosesNothingAndRepeatsNothing(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderListKeysetPositionNarrowsWithoutReplacingTheOtherPredicates(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderListKeysetPositionNarrowsWithoutReplacingTheOtherPredicates(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
 // newEmbeddedReaderFixture composes the shared role kit with the reader
 // accessor. One environment per case: newTestEnv clones a pristine template
 // into the test's own temp dir, which costs a fraction of a second once the

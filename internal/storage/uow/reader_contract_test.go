@@ -134,6 +134,16 @@ func TestReaderContract(t *testing.T) {
 	t.Run("ListParentReachesEveryDescendantAndOnlyItsOwn", func(t *testing.T) {
 		conformance.RunReaderListParentReachesEveryDescendantAndOnlyItsOwn(t, ctx, fixture)
 	})
+	// The keyset predicate is one shared builder, but the page around it is
+	// not: this seam trims a natively bounded window where the store-backed one
+	// drops an over-fetched probe row, and a walk is where those two
+	// arrangements can start handing out different next positions.
+	t.Run("ListKeysetWalkOverAnOversizedGroupLosesNothingAndRepeatsNothing", func(t *testing.T) {
+		conformance.RunReaderListKeysetWalkOverAnOversizedGroupLosesNothingAndRepeatsNothing(t, ctx, fixture)
+	})
+	t.Run("ListKeysetPositionNarrowsWithoutReplacingTheOtherPredicates", func(t *testing.T) {
+		conformance.RunReaderListKeysetPositionNarrowsWithoutReplacingTheOtherPredicates(t, ctx, fixture)
+	})
 	// Last on purpose: the backend-failure half runs a request on a dead
 	// context, and this backend's provider is shared by every case above it.
 	t.Run("GetMissIsNotFoundAndBackendFailureDoesNotDecay", func(t *testing.T) {

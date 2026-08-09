@@ -209,6 +209,21 @@ func TestReaderListParentReachesEveryDescendantAndOnlyItsOwn(t *testing.T) {
 	conformance.RunReaderListParentReachesEveryDescendantAndOnlyItsOwn(t, ctx, fixture)
 }
 
+// The walk is where this body's probe-row over-fetch has to stay out of the
+// caller's way: the next position comes from the last DELIVERED row, and the
+// probe row is not one.
+func TestReaderListKeysetWalkOverAnOversizedGroupLosesNothingAndRepeatsNothing(t *testing.T) {
+	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
+	defer cleanup()
+	conformance.RunReaderListKeysetWalkOverAnOversizedGroupLosesNothingAndRepeatsNothing(t, ctx, fixture)
+}
+
+func TestReaderListKeysetPositionNarrowsWithoutReplacingTheOtherPredicates(t *testing.T) {
+	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
+	defer cleanup()
+	conformance.RunReaderListKeysetPositionNarrowsWithoutReplacingTheOtherPredicates(t, ctx, fixture)
+}
+
 // newDoltReaderFixture composes the shared role kit with the reader accessor.
 // One store per case here rather than one per suite: setupTestStore gives each
 // test its own copy-on-write branch and costs a fraction of a second, so the

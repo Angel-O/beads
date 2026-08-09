@@ -2181,6 +2181,209 @@ func RunReaderListParentReachesEveryDescendantAndOnlyItsOwn(t *testing.T, ctx co
 	}
 }
 
+// RunReaderListKeysetWalkOverAnOversizedGroupLosesNothingAndRepeatsNothing
+// drives the keyset position the way its doc says a caller should
+// (reader.go:292-296, "it does not skip or repeat rows when the result set
+// changes underneath a walk") — page after page, to the end.
+//
+// WHAT THIS FIXTURE MAKES OBSERVABLE that
+// RunReaderListKeysetPositionResumesTheCreatedDescIDAscOrder's does not. That
+// case reads ONE page from one hand-written position, over a group of two rows
+// sharing a second. Both of its properties survive a body that walks correctly
+// once and then stalls, and neither can see the shape that actually loses
+// records: a same-second group LARGER THAN THE PAGE, where the position has to
+// resume in the middle of a tie the timestamp alone cannot break. Five rows
+// share one second here against a page of two, so the walk crosses that group
+// twice.
+//
+// The walk is also where the two seams stop agreeing by construction. The
+// keyset PREDICATE is one shared builder, but the page around it is not: one
+// body over-fetches a probe row and the other reports has-more natively, and
+// the trim runs in the shared epilogue after that. A body that fed the next
+// position from the probe row rather than from the last DELIVERED row skips one
+// record per page, which no single-page read can see.
+//
+// THE ONE-SHOT ORDER IS READ FIRST, so a backend that agrees with itself but
+// orders differently from the reference fails on the sequence rather than on
+// the walk — two different defects that would otherwise report the same way.
+//
+// THE EMPTY AfterID is the documented group-start form (types.go: an empty id
+// starts the same-second group from its first id) and is driven on the same
+// fixture, because it is the position a decoded cursor carries when it points
+// at a second rather than at a row.
+//
+// WHAT IT DEPENDS ON FROM OUTSIDE ITSELF: the id set it scopes on, and nothing
+// about the workspace. Every timestamp is a whole second, deliberately: the
+// column has no fractional part, so a fixture written in milliseconds would
+// have the engine, not the case, decide which rows tie.
+func RunReaderListKeysetWalkOverAnOversizedGroupLosesNothingAndRepeatsNothing(t *testing.T, ctx context.Context, fixture ReaderFixture) {
+	t.Helper()
+	newer := readerID(fixture, "kswalk", "newer")
+	older := readerID(fixture, "kswalk", "older")
+	group := []string{
+		readerID(fixture, "kswalk", "a1"), readerID(fixture, "kswalk", "a2"),
+		readerID(fixture, "kswalk", "a3"), readerID(fixture, "kswalk", "a4"),
+		readerID(fixture, "kswalk", "a5"),
+	}
+	groupSecond := time.Now().UTC().Truncate(time.Second).Add(-1 * time.Hour)
+
+	seed := func(memberID string, at time.Time) {
+		issue := readerIssue(memberID, types.TypeTask, "")
+		issue.CreatedAt = at
+		issue.UpdatedAt = at
+		seedReaderIssue(t, ctx, fixture, issue)
+	}
+	seed(newer, groupSecond.Add(time.Second))
+	for _, member := range group {
+		seed(member, groupSecond)
+	}
+	seed(older, groupSecond.Add(-time.Second))
+
+	want := append([]string{newer}, group...)
+	want = append(want, older)
+	idScope := readerIDFilter(want...)
+
+	oneShot, err := fixture.Reader.List(ctx, publicops.ListRequest{IDFilter: idScope, SortBy: "created"})
+	if err != nil {
+		t.Fatalf("List unpaged: %v", err)
+	}
+	assertReaderPageIDs(t, "List unpaged", oneShot, want)
+
+	const pageSize = 2
+	var walked []string
+	seen := make(map[string]bool, len(want))
+	var afterCreatedAt *time.Time
+	afterID := ""
+	for page := 0; page <= len(want); page++ {
+		got, pageErr := fixture.Reader.List(ctx, publicops.ListRequest{
+			IDFilter: idScope, SortBy: "created", Limit: readerLimit(pageSize),
+			AfterCreatedAt: afterCreatedAt, AfterID: afterID,
+		})
+		if pageErr != nil {
+			t.Fatalf("List page %d: %v", page, pageErr)
+		}
+		if len(got.Items) == 0 {
+			if got.HasMore {
+				t.Errorf("List page %d came back empty with HasMore set", page)
+			}
+			break
+		}
+		if len(got.Items) > pageSize {
+			t.Fatalf("List page %d answered %d rows over a Limit of %d", page, len(got.Items), pageSize)
+		}
+		for _, item := range got.Items {
+			if item == nil || item.Issue == nil {
+				t.Fatalf("List page %d returned a nil row", page)
+			}
+			if seen[item.ID] {
+				t.Fatalf("List page %d repeated %s: the same-second group is larger than the page, and the position re-delivered a row it had already handed out",
+					page, item.ID)
+			}
+			seen[item.ID] = true
+			walked = append(walked, item.ID)
+		}
+		last := got.Items[len(got.Items)-1]
+		at := last.CreatedAt.UTC()
+		afterCreatedAt = &at
+		afterID = last.ID
+	}
+	if !slices.Equal(walked, want) {
+		t.Errorf("the keyset walk delivered %v, want the one-shot sequence %v with nothing dropped and nothing repeated", walked, want)
+	}
+
+	// The group-start form: a position naming the second with no id starts that
+	// second from its first row rather than skipping the group.
+	fromGroupStart, err := fixture.Reader.List(ctx, publicops.ListRequest{
+		IDFilter: idScope, SortBy: "created", AfterCreatedAt: &groupSecond, AfterID: "",
+	})
+	if err != nil {
+		t.Fatalf(`List from (the group's second, ""): %v`, err)
+	}
+	assertReaderPageIDs(t, `List from (the group's second, "")`, fromGroupStart, append(slices.Clone(group), older))
+}
+
+// RunReaderListKeysetPositionNarrowsWithoutReplacingTheOtherPredicates pins the
+// keyset position as a CONJUNCT. It narrows what the rest of the request
+// matched; it does not become the request.
+//
+// The three legs are cumulative on one fixture, so each predicate is shown to
+// be load-bearing by the row only it excludes: the unpositioned read fixes what
+// the id set and the status matched, adding the position drops the cursor row
+// and everything newer, and adding CreatedBefore drops the same-second survivor
+// the position had admitted. That last leg is the one worth having. The keyset
+// renders its own upper bound on created_at, and that bound is INCLUSIVE —
+// same-second rows are exactly what it exists to admit — where CreatedBefore's
+// is strict. A body that let one displace the other answers this request with a
+// row that is not before the time the caller named.
+//
+// WHAT THIS FIXTURE MAKES OBSERVABLE that the existing keyset case's does not:
+// that case sends a position and NOTHING ELSE, so composition is unpinned in
+// both directions — a body that dropped the other predicates when a position
+// arrived, and a body that dropped the position when other predicates did,
+// both pass it.
+//
+// WHAT IT DEPENDS ON FROM OUTSIDE ITSELF: nothing. The shadow rows share every
+// timestamp with the scoped ones and are excluded by the id set alone, so a
+// position that widened its own scope collects them.
+func RunReaderListKeysetPositionNarrowsWithoutReplacingTheOtherPredicates(t *testing.T, ctx context.Context, fixture ReaderFixture) {
+	t.Helper()
+	id := func(name string) string { return readerID(fixture, "kscompose", name) }
+	newest, cursor := id("a1"), id("b1")
+	closedSibling, sameSecond := id("b2"), id("b3")
+	older, closedOlder, oldest := id("c1"), id("c2"), id("d1")
+
+	second := func(offset int) time.Time {
+		return time.Now().UTC().Truncate(time.Second).Add(-1 * time.Hour).Add(time.Duration(offset) * time.Minute)
+	}
+	oldestAt, olderAt, cursorAt, newestAt := second(0), second(1), second(2), second(3)
+	seed := func(memberID string, at time.Time, status types.Status) {
+		issue := readerIssue(memberID, types.TypeTask, "")
+		issue.Status = status
+		issue.CreatedAt = at
+		issue.UpdatedAt = at
+		seedReaderIssue(t, ctx, fixture, issue)
+	}
+	seed(newest, newestAt, types.StatusOpen)
+	seed(cursor, cursorAt, types.StatusOpen)
+	seed(closedSibling, cursorAt, types.StatusClosed)
+	seed(sameSecond, cursorAt, types.StatusOpen)
+	seed(older, olderAt, types.StatusOpen)
+	seed(closedOlder, olderAt, types.StatusClosed)
+	seed(oldest, oldestAt, types.StatusOpen)
+	// A second population sharing every timestamp, kept out by the id set alone.
+	for i, at := range []time.Time{newestAt, cursorAt, olderAt, oldestAt} {
+		seed(id(fmt.Sprintf("shadow%d", i)), at, types.StatusOpen)
+	}
+
+	base := publicops.ListRequest{
+		IDFilter: readerIDFilter(newest, cursor, closedSibling, sameSecond, older, closedOlder, oldest),
+		Status:   string(types.StatusOpen),
+		SortBy:   "created",
+	}
+	matched, err := fixture.Reader.List(ctx, base)
+	if err != nil {
+		t.Fatalf("List over the id set: %v", err)
+	}
+	assertReaderPageIDs(t, "List over the id set", matched, []string{newest, cursor, sameSecond, older, oldest})
+
+	positioned := base
+	positioned.AfterCreatedAt = &cursorAt
+	positioned.AfterID = cursor
+	resumed, err := fixture.Reader.List(ctx, positioned)
+	if err != nil {
+		t.Fatalf("List resumed from the cursor: %v", err)
+	}
+	assertReaderPageIDs(t, "List resumed from the cursor", resumed, []string{sameSecond, older, oldest})
+
+	bounded := positioned
+	bounded.CreatedBefore = &cursorAt
+	narrowed, err := fixture.Reader.List(ctx, bounded)
+	if err != nil {
+		t.Fatalf("List resumed from the cursor under CreatedBefore: %v", err)
+	}
+	assertReaderPageIDs(t, "List resumed from the cursor under CreatedBefore", narrowed, []string{older, oldest})
+}
+
 // readerIssue builds the seed every case starts from: an open, unassigned,
 // unblocked task that qualifies for ready work. A case that needs it to fail one
 // of those tests changes the field it means to test and nothing else.

@@ -395,6 +395,8 @@ var roleContractCases = []roleContract{
 		RunReaderListCountsAreBlocksOnlyWhereGetCountsEveryEdge,
 		RunReaderReadyParentScopesToItsTransitiveDescendants,
 		RunReaderListParentReachesEveryDescendantAndOnlyItsOwn,
+		RunReaderListKeysetWalkOverAnOversizedGroupLosesNothingAndRepeatsNothing,
+		RunReaderListKeysetPositionNarrowsWithoutReplacingTheOtherPredicates,
 	),
 
 	roleCases("ReadyClaimer", "ReadyClaimer() and IssueReader()", oncePerRole,
