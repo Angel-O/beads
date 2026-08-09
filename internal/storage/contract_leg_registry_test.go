@@ -29,18 +29,20 @@ import (
 //
 // Registering is the deliberate act, and it is not free: a registered leg is
 // held to every role contract entrypoint the conformance package exports, so it
-// either wires the whole tier or carries a reasoned waiver per contract it
-// cannot run (see unwiredContractEntrypoints). That cost is the point. It is
-// paid by the change that decides the leg is a leg, not by the change that
-// happens to add a directory.
+// either wires the whole tier, carries a reasoned waiver per contract it cannot
+// run (see unwiredContractEntrypoints), or declares an adoption ceiling that
+// ratchets down as its wiring lands. That cost is the point. It is paid by the
+// change that decides the leg is a leg, not by the change that happens to add a
+// directory.
 //
 // A wiringRoot may point anywhere in the repository, so a leg does not have to
 // live under internal/storage to be locked.
 //
 // A distribution built on top of this repository registers its own legs from a
-// file of its own — an init() calling registerContractLeg in a new _test.go
-// file in this package — rather than editing this table, so its registration is
-// its own commit and merges without conflict.
+// file of its own — an init() in a new _test.go file in this package, calling
+// registerContractLeg and registerContractLegWaivers together — rather than
+// editing this table or the waiver map, so its whole registration is its own
+// commit and merges without conflict.
 var contractLegRegistry []contractLeg
 
 func init() {
@@ -49,8 +51,8 @@ func init() {
 	registerContractLeg(contractLeg{name: "uow", wiringRoot: "internal/storage/uow"})
 }
 
-// contractLeg is one registered backend leg: what the lock calls it, and where
-// its contract wiring lives.
+// contractLeg is one registered backend leg: what the lock calls it, where its
+// contract wiring lives, and how much of the tier it has adopted so far.
 type contractLeg struct {
 	// name is the leg's identity in every message the lock prints and the key
 	// unwiredContractEntrypoints waives against.
@@ -58,11 +60,89 @@ type contractLeg struct {
 	// wiringRoot is the directory holding the leg's *_test.go wiring,
 	// slash-separated and relative to the repository root.
 	wiringRoot string
+	// adopting is why the leg has not finished adopting the contract tier, and
+	// is required of any leg with a ceiling above zero. It is a sentence about
+	// the adoption, not about a contract: the per-entrypoint reasons in
+	// unwiredContractEntrypoints stay the place to say why one named contract
+	// cannot run.
+	adopting string
+	// adoptionCeiling is how many contract entrypoints the leg may still skip
+	// without naming each one. It exists because a leg part-way through
+	// adopting the tier has one true reason covering hundreds of contracts, and
+	// writing that reason out hundreds of times buys nothing a single reviewed
+	// integer does not.
+	//
+	// It is asserted EXACTLY: skipping more fails, and so does skipping FEWER.
+	// That makes it a RATCHET, not an exemption. Every tranche of wiring that
+	// lands has to lower this number in the same change, so the ceiling is
+	// always a measurement of how far adoption actually got rather than a
+	// budget somebody once asked for. And when a contract is added upstream,
+	// the leg's skipped count rises past the ceiling and the branch goes red —
+	// which is the notification a leg carrying a ceiling most needs, since
+	// nothing else would tell it the tier grew. The fix is one reviewed
+	// integer, in a change that says why the leg still cannot wire it.
+	//
+	// Zero — the three legs here — means the leg has adopted the whole tier and
+	// every remaining gap has to be a named, reasoned waiver.
+	adoptionCeiling int
 }
 
 // registerContractLeg adds a leg to the registry.
 func registerContractLeg(leg contractLeg) {
 	contractLegRegistry = append(contractLegRegistry, leg)
+}
+
+// unwiredContractEntrypoints waives, per leg, the role contracts that leg
+// cannot run, with the reason it cannot. It answers the same rules the
+// conformance package's own waiver list does: an entry has to name a real
+// entrypoint and a real leg, carry a reason, and stop being waived the moment
+// the leg wires it.
+//
+// It ACCUMULATES rather than being written out in one place, for the same
+// reason the leg table does: a leg registered by a distribution built on top of
+// this repository has to be able to bring its waivers with it, in its own file,
+// without editing a literal this repository owns.
+var unwiredContractEntrypoints = map[string]map[string]string{}
+
+// duplicateContractLegWaivers records every waiver registered twice for one
+// leg. A second registration is refused rather than merged: silently taking one
+// of two reasons is how a waiver outlives the reason that justified it, which
+// is the exact failure the shrink-only rule exists to prevent.
+var duplicateContractLegWaivers []string
+
+// registerContractLegWaivers adds a leg's waivers to unwiredContractEntrypoints.
+func registerContractLegWaivers(leg string, waivers map[string]string) {
+	duplicateContractLegWaivers = append(duplicateContractLegWaivers,
+		mergeContractLegWaivers(unwiredContractEntrypoints, leg, waivers)...)
+}
+
+// mergeContractLegWaivers adds a leg's waivers to into, reporting every
+// entrypoint that leg had already been waived for. It is separate from the
+// registration so the accumulation can be proved without writing to the map the
+// real lock reads.
+func mergeContractLegWaivers(into map[string]map[string]string, leg string, waivers map[string]string) []string {
+	if into[leg] == nil {
+		into[leg] = map[string]string{}
+	}
+	var duplicates []string
+	for _, name := range sortedNames(waivers) {
+		if _, already := into[leg][name]; already {
+			duplicates = append(duplicates, leg+"/"+name)
+			continue
+		}
+		into[leg][name] = waivers[name]
+	}
+	return duplicates
+}
+
+// legWiringDir resolves a leg's wiring root against a repository root.
+//
+// Both the lock and the fabricated-repository tests go through here, so the
+// resolution that lets a wiring root point outside internal/storage is the same
+// line of code in the test that proves it works and in the check that relies on
+// it.
+func legWiringDir(root string, leg contractLeg) string {
+	return filepath.Join(root, filepath.FromSlash(leg.wiringRoot))
 }
 
 // storageTree is the subtree the tripwire watches: the one place an in-tree leg
@@ -85,15 +165,16 @@ func registeredContractLegs(t *testing.T) []contractLeg {
 
 // validateContractLegRegistry sorts a registry by leg name and rejects the ways
 // an entry can be unusable: a nameless leg, a leg with nowhere to look, a
-// wiring root given as an absolute or escaping path, and two entries claiming
-// one name — which would let one leg's waivers answer for the other.
+// wiring root given as an absolute or escaping path, two entries claiming one
+// name — which would let one leg's waivers answer for the other — and an
+// adoption ceiling that does not come with the reason it exists.
 //
 // A wiring root that names nothing needs no check here. The lock resolves it,
-// finds no test source, and reports the leg as naming none of the contract
-// entrypoints, which is as loud as a failure gets.
+// finds no test source, and reports the leg as naming no contract entrypoint at
+// all, which is as loud as a failure gets.
 func validateContractLegRegistry(registry []contractLeg) ([]contractLeg, error) {
 	legs := slices.Clone(registry)
-	slices.SortFunc(legs, func(a, b contractLeg) int { return strings.Compare(a.name, b.name) })
+	slices.SortStableFunc(legs, func(a, b contractLeg) int { return strings.Compare(a.name, b.name) })
 	seen := map[string]bool{}
 	for _, leg := range legs {
 		if strings.TrimSpace(leg.name) == "" {
@@ -106,8 +187,29 @@ func validateContractLegRegistry(registry []contractLeg) ([]contractLeg, error) 
 		if err := checkWiringRoot(leg.wiringRoot); err != nil {
 			return nil, fmt.Errorf("leg %q: %w", leg.name, err)
 		}
+		if err := checkAdoptionCeiling(leg); err != nil {
+			return nil, fmt.Errorf("leg %q: %w", leg.name, err)
+		}
 	}
 	return legs, nil
+}
+
+// checkAdoptionCeiling holds a ceiling and its reason to each other. A ceiling
+// with no reason is a number nobody can review, and a reason with no ceiling is
+// a reason that has outlived the gap it explained.
+func checkAdoptionCeiling(leg contractLeg) error {
+	adopting := strings.TrimSpace(leg.adopting)
+	switch {
+	case leg.adoptionCeiling < 0:
+		return fmt.Errorf("adoption ceiling %d is negative", leg.adoptionCeiling)
+	case leg.adoptionCeiling > 0 && adopting == "":
+		return fmt.Errorf("adoption ceiling %d comes with no adopting reason; the ceiling is reviewed, "+
+			"so it has to say what is being adopted and why it is not finished", leg.adoptionCeiling)
+	case leg.adoptionCeiling == 0 && adopting != "":
+		return fmt.Errorf("adopting reason %q with a zero ceiling; the leg has adopted the whole tier, "+
+			"so drop the reason", leg.adopting)
+	}
+	return nil
 }
 
 // checkWiringRoot rejects a wiring root that is not a clean path inside the
@@ -265,7 +367,7 @@ func TestARegisteredLegOutsideTheStorageTreeIsLockedToo(t *testing.T) {
 	if !slices.Equal(entrypoints, []string{"RunFabricatedContract", "RunSecondFabricatedContract"}) {
 		t.Fatalf("fabricated contract tier = %v, want the two entrypoints that take a fixture", entrypoints)
 	}
-	dir := filepath.Join(root, filepath.FromSlash(leg.wiringRoot))
+	dir := legWiringDir(root, leg)
 
 	wiring := inspectLegWiring(t, dir, entrypoints, nil)
 	if wiring.named != 1 || !slices.Equal(wiring.missing, []string{"RunSecondFabricatedContract"}) {
@@ -282,6 +384,109 @@ func TestARegisteredLegOutsideTheStorageTreeIsLockedToo(t *testing.T) {
 	if wiredWiring := inspectLegWiring(t, dir, entrypoints, spent); !slices.Equal(wiredWiring.falselyWaived, []string{"RunFabricatedContract"}) {
 		t.Errorf("falselyWaived = %v, want the contract the leg actually runs; shrink-only is what keeps "+
 			"a waiver list from outliving its reason", wiredWiring.falselyWaived)
+	}
+}
+
+// TestAFullyCoveredLegWithNoWiringIsNotSilentlyGreen pins the one way this lock
+// can pass while checking nothing.
+//
+// A leg whose wiring root resolves to nothing names no contract, so there is no
+// missing contract for the ceiling arm to count and no waiver for the
+// false-waiver arm to catch. Cover the tier — with a ceiling, or with waivers —
+// and every arm falls silent at once. The risk is highest for a leg outside
+// internal/storage, where not even the tripwire cross-checks the path, so the
+// count of what the leg actually names has to be asked about on its own.
+func TestAFullyCoveredLegWithNoWiringIsNotSilentlyGreen(t *testing.T) {
+	root := fabricateRepository(t, map[string]string{
+		"backend/conformance/fabricated_contract.go":       fabricatedContractPackage,
+		"internal/storage/placeholder/placeholder_test.go": "package placeholder\n",
+	})
+	leg := contractLeg{
+		name:            "misrouted",
+		wiringRoot:      "internal/httpstore/cleint",
+		adopting:        "fabricated: a leg part-way through adopting the tier",
+		adoptionCeiling: 2,
+	}
+	if _, err := validateContractLegRegistry([]contractLeg{leg}); err != nil {
+		t.Fatalf("the misrouted leg was refused before the lock could run: %v", err)
+	}
+
+	entrypoints := roleContractEntrypoints(t, filepath.Join(root, "backend", "conformance"))
+	wiring := inspectLegWiring(t, legWiringDir(root, leg), entrypoints, nil)
+
+	if fault := adoptionFault(leg, wiring, len(entrypoints)); fault != "" {
+		t.Errorf("adoptionFault = %q, want silence; a ceiling covering the tier leaves this arm nothing "+
+			"to say, which is the whole reason the wiring count is asked about separately", fault)
+	}
+	if len(wiring.falselyWaived) != 0 {
+		t.Errorf("falselyWaived = %v, want none; a leg that names nothing can contradict no waiver", wiring.falselyWaived)
+	}
+	if wiring.named != 0 {
+		t.Errorf("named = %d, want 0: the wiring root is a typo that resolves to no directory, and named "+
+			"is the only signal that says so", wiring.named)
+	}
+}
+
+// TestTheAdoptionCeilingRatchetsBothWays proves the ceiling is a ratchet rather
+// than a budget: skipping more than it allows fails, and skipping FEWER fails
+// too, so wiring cannot land without lowering the number in the same change.
+//
+// Both arms are unreachable against this repository — every leg here is at zero
+// — so they are proved against a fabricated repository with two contracts, a
+// leg that wires one of them, and a leg that wires neither.
+func TestTheAdoptionCeilingRatchetsBothWays(t *testing.T) {
+	root := fabricateRepository(t, map[string]string{
+		"backend/conformance/fabricated_contract.go":       fabricatedContractPackage,
+		"internal/storage/placeholder/placeholder_test.go": "package placeholder\n",
+		"internal/httpstore/partial/leg_contract_test.go":  fabricatedWiring("partial", "RunFabricatedContract"),
+		"internal/httpstore/silent/leg_contract_test.go":   fabricatedWiring("silent"),
+	})
+	entrypoints := roleContractEntrypoints(t, filepath.Join(root, "backend", "conformance"))
+	if len(entrypoints) != 2 {
+		t.Fatalf("fabricated contract tier = %v, want two entrypoints", entrypoints)
+	}
+	const adopting = "fabricated: a leg part-way through adopting the tier"
+
+	tests := []struct {
+		name string
+		leg  contractLeg
+		want string
+	}{
+		{
+			name: "at the ceiling",
+			leg:  contractLeg{name: "partial", wiringRoot: "internal/httpstore/partial", adopting: adopting, adoptionCeiling: 1},
+			want: "",
+		},
+		{
+			name: "past the ceiling",
+			leg:  contractLeg{name: "silent", wiringRoot: "internal/httpstore/silent", adopting: adopting, adoptionCeiling: 1},
+			want: "1 past its adoption ceiling of 1",
+		},
+		{
+			name: "under the ceiling, so the ceiling is stale",
+			leg:  contractLeg{name: "partial", wiringRoot: "internal/httpstore/partial", adopting: adopting, adoptionCeiling: 2},
+			want: "lower the ceiling to 1",
+		},
+		{
+			name: "no ceiling at all, so every gap has to be a waiver",
+			leg:  contractLeg{name: "partial", wiringRoot: "internal/httpstore/partial"},
+			want: "it never names: RunSecondFabricatedContract",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := validateContractLegRegistry([]contractLeg{test.leg}); err != nil {
+				t.Fatalf("the leg was refused before the lock could run: %v", err)
+			}
+			wiring := inspectLegWiring(t, legWiringDir(root, test.leg), entrypoints, nil)
+			fault := adoptionFault(test.leg, wiring, len(entrypoints))
+			switch {
+			case test.want == "" && fault != "":
+				t.Errorf("adoptionFault = %q, want silence: the leg skips exactly its ceiling", fault)
+			case test.want != "" && !strings.Contains(fault, test.want):
+				t.Errorf("adoptionFault = %q, want it to say %q", fault, test.want)
+			}
+		})
 	}
 }
 
@@ -323,6 +528,21 @@ func TestTheRegistryRefusesAnEntryTheLockCannotActOn(t *testing.T) {
 			},
 			want: "registered twice",
 		},
+		{
+			name:     "ceiling with no reason",
+			registry: []contractLeg{{name: "dolt", wiringRoot: "internal/storage/dolt", adoptionCeiling: 400}},
+			want:     "comes with no adopting reason",
+		},
+		{
+			name:     "reason with no ceiling",
+			registry: []contractLeg{{name: "dolt", wiringRoot: "internal/storage/dolt", adopting: "still adopting"}},
+			want:     "with a zero ceiling",
+		},
+		{
+			name:     "negative ceiling",
+			registry: []contractLeg{{name: "dolt", wiringRoot: "internal/storage/dolt", adopting: "x", adoptionCeiling: -1}},
+			want:     "is negative",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -334,6 +554,37 @@ func TestTheRegistryRefusesAnEntryTheLockCannotActOn(t *testing.T) {
 				t.Errorf("error = %v, want it to say %q", err, test.want)
 			}
 		})
+	}
+}
+
+// TestWaiverRegistrationAccumulatesAndRefusesASecondReason covers the half of a
+// downstream registration the leg table does not: its waivers.
+//
+// They accumulate from separate calls so a leg registered in another file
+// brings its own, and a second reason for a waiver a leg already has is
+// REFUSED rather than merged — taking one of two silently is how a waiver
+// outlives the reason that justified it.
+func TestWaiverRegistrationAccumulatesAndRefusesASecondReason(t *testing.T) {
+	waivers := map[string]map[string]string{}
+	if duplicates := mergeContractLegWaivers(waivers, "first", map[string]string{"RunOne": "because"}); len(duplicates) != 0 {
+		t.Fatalf("registering into an empty map reported %v", duplicates)
+	}
+	if duplicates := mergeContractLegWaivers(waivers, "second", map[string]string{"RunOne": "different leg"}); len(duplicates) != 0 {
+		t.Fatalf("registering a second leg reported %v; legs do not collide with each other", duplicates)
+	}
+	if duplicates := mergeContractLegWaivers(waivers, "first", map[string]string{"RunTwo": "also because"}); len(duplicates) != 0 {
+		t.Fatalf("a second call for one leg reported %v; that is how a leg registers from more than one place", duplicates)
+	}
+	if got := waivers["first"]; len(got) != 2 || got["RunOne"] != "because" || got["RunTwo"] != "also because" {
+		t.Errorf("accumulated waivers for the first leg = %v, want both reasons kept", got)
+	}
+
+	duplicates := mergeContractLegWaivers(waivers, "first", map[string]string{"RunOne": "a second reason"})
+	if !slices.Equal(duplicates, []string{"first/RunOne"}) {
+		t.Errorf("duplicates = %v, want first/RunOne", duplicates)
+	}
+	if got := waivers["first"]["RunOne"]; got != "because" {
+		t.Errorf("RunOne now reads %q; the second reason overwrote the first instead of being refused", got)
 	}
 }
 
