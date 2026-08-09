@@ -8250,8 +8250,9 @@ components:
 
 
             Repetition is free: a label named twice is applied once, and adding
-            one the issue already carries is a no-op that reports
-            `changed: false`. An EMPTY-STRING entry is DROPPED rather than
+            one the issue already carries changes no labels. (Whether the
+            RESPONSE reports `changed: false` is a fact about the whole patch —
+            see `remove_labels`.) An EMPTY-STRING entry is DROPPED rather than
             refused — a label row carrying `""` renders as nothing and matches
             nothing, so writing one would only store junk, and refusing the
             whole update would let one stray entry fail an otherwise-good edit.
@@ -8265,8 +8266,10 @@ components:
             REMOVAL WINS over both.
 
 
-            Removing a label the issue does not carry is a no-op that reports
-            `changed: false`; it is not a `404` and not a conflict. The same
+            Removing a label the issue does not carry CHANGES NO LABELS; it is
+            not a `404` and not a conflict. Whether the RESPONSE reports
+            `changed: false` is a fact about the whole patch, not about this
+            member — a request that also moved a title changed the row. The same
             repetition and empty-string rules as `add_labels` apply, and a value
             longer than the column is refused here as it is there — the length
             rule is about what a label may BE, not about whether this particular

@@ -1142,7 +1142,7 @@ type IssuePatchBody struct {
 	//
 	// IT IS WHY THIS PAIR EXISTS. A caller that reads a row, adds one label and writes the whole set back silently drops any label another writer added in between — and `bd label add` and every agent that tags work concurrently are exactly that caller. A replacement can only be composed safely by a writer that knows it is alone.
 	//
-	// Repetition is free: a label named twice is applied once, and adding one the issue already carries is a no-op that reports `changed: false`. An EMPTY-STRING entry is DROPPED rather than refused — a label row carrying `""` renders as nothing and matches nothing, so writing one would only store junk, and refusing the whole update would let one stray entry fail an otherwise-good edit.
+	// Repetition is free: a label named twice is applied once, and adding one the issue already carries changes no labels. (Whether the RESPONSE reports `changed: false` is a fact about the whole patch — see `remove_labels`.) An EMPTY-STRING entry is DROPPED rather than refused — a label row carrying `""` renders as nothing and matches nothing, so writing one would only store junk, and refusing the whole update would let one stray entry fail an otherwise-good edit.
 	AddLabels *[]string `json:"add_labels,omitempty"`
 
 	// AppendNotes Appends to the notes rather than replacing them. Mutually exclusive with `notes`.
@@ -1193,7 +1193,7 @@ type IssuePatchBody struct {
 
 	// RemoveLabels Labels to remove, applied AFTER `labels` and `add_labels`, so REMOVAL WINS over both.
 	//
-	// Removing a label the issue does not carry is a no-op that reports `changed: false`; it is not a `404` and not a conflict. The same repetition and empty-string rules as `add_labels` apply, and a value longer than the column is refused here as it is there — the length rule is about what a label may BE, not about whether this particular row happens to carry one.
+	// Removing a label the issue does not carry CHANGES NO LABELS; it is not a `404` and not a conflict. Whether the RESPONSE reports `changed: false` is a fact about the whole patch, not about this member — a request that also moved a title changed the row. The same repetition and empty-string rules as `add_labels` apply, and a value longer than the column is refused here as it is there — the length rule is about what a label may BE, not about whether this particular row happens to carry one.
 	RemoveLabels *[]string `json:"remove_labels,omitempty"`
 
 	// Status The issue's status, from this workspace's own configured vocabulary.
