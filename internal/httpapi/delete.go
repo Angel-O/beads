@@ -247,11 +247,11 @@ func deleteMemberList() string {
 //
 // THE PRECONDITION ARM IS FIRST, ABOVE THE ErrValidation LINE, and the order is
 // load-bearing rather than cosmetic. ErrVersionMismatch wraps neither
-// ErrValidation nor ErrNotFound and ClassifyError has no row for it, so below
-// this arm it falls straight through failErr's default into a GENERIC 500 — for
-// the one refusal on this operation that says an irreversible act was stopped
-// because the caller's view had moved. Verified by mutation: dropping the arm
-// turns TestDeleteRefusesAStaleGuard into a 500, not a 400.
+// ErrValidation nor ErrNotFound, so under ClassifyError's rule it falls straight
+// through failErr's default into a GENERIC 500 — for the one refusal on this
+// operation that reports an irreversible act being stopped because the caller's
+// view had moved. Verified by mutation: dropping the arm turns
+// TestDeleteRefusesAStaleGuard into a 500, not a 400.
 //
 // THE ABSENT-ID REFUSAL NEEDS NO BRANCH AT ALL, and does not get one: the
 // role's *NotFoundError wraps issueops.ErrNotFound, which ClassifyError already

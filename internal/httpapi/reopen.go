@@ -89,9 +89,9 @@ func (s *Server) handleReopen(w http.ResponseWriter, r *http.Request) {
 // extension member out of, and it is the row-version guard rather than a
 // policy. Everything else is still the shared mapping.
 //
-// THE ARM IS FIRST, and it must be: ClassifyError has no row for
-// ErrVersionMismatch and neither leg wraps it, so without this the guard's miss
-// is a generic 500 — failClose's finding, on the mirror operation.
+// THE ARM IS FIRST, under the rule ClassifyError states, and the cost of
+// forgetting it is a generic 500 for every guard miss here rather than a worse
+// 4xx — failClose's finding, on the mirror operation.
 func (s *Server) failReopen(w http.ResponseWriter, r *http.Request, request issueops.ReopenRequest, err error) {
 	if errors.Is(err, issueops.ErrVersionMismatch) {
 		s.fail(w, r, versionPreconditionResult(request.ExpectedVersion))

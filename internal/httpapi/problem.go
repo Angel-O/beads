@@ -1103,6 +1103,27 @@ func MemoryNotFound() Result {
 // ClassifyError maps an error from the storage seam onto the wire. The caller
 // is responsible for logging err: everything mapped to a 5xx deliberately
 // drops the error text on the floor (see staticDetail).
+//
+// ErrVersionMismatch — AND EVERY OTHER COMPARE-AND-SET SENTINEL — IS
+// DELIBERATELY ABSENT FROM THIS FUNCTION, because the 409 it earns cannot be
+// built from the error alone: `precondition_failed` echoes the value the
+// REQUEST guarded on, and this function is handed an error and nothing else.
+// So an operation that publishes `expected_version` (or `expected_status`, or
+// `expected_assignee`) MUST match the sentinel TYPED in its own failure path,
+// before anything reaches failErr — updateIssue, closeIssue, reopenIssue,
+// deleteIssues, releaseIssue and applyBatch each do. A handler that forgets is
+// not answering a worse 4xx: neither storage leg wraps these in ErrValidation,
+// so the miss falls through the default arm below and every guard failure on
+// that operation is a GENERIC 500. Mutation-verified on the single-issue
+// handlers.
+//
+// THE RULE IS WRITTEN HERE BECAUSE SIX HANDLERS FOUND IT SEPARATELY. failUpdate
+// worked it out, failRelease worked it out again and called it "failUpdate's
+// hazard, in a sharper form", and the guard slice worked it out three more
+// times. Six independent discoveries of one fact are a fact nobody recorded
+// where the seventh author would look — which is here, since a handler author
+// asking "does the shared mapping cover my sentinel?" reads this function and
+// finds no row.
 func ClassifyError(err error) Result {
 	// The one row that carries data out of the error rather than only a code.
 	// It lives HERE, in the shared mapping, rather than in the events handler:

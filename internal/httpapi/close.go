@@ -217,16 +217,17 @@ func (s *Server) booleanMember(w http.ResponseWriter, r *http.Request, members m
 // failClose answers a failed close: the precondition's 409, then the shared
 // classification with the extension member the open-children 409 carries.
 //
-// THE PRECONDITION ARM IS MATCHED TYPED AND FIRST, and that placement is the
-// whole correctness of this function rather than a stylistic preference.
-// ClassifyError has no row for ErrVersionMismatch — deliberately, since it is a
-// per-operation guard rather than a shared refusal — so below this arm a
-// version mismatch falls through failErr's default into a GENERIC 500, on both
-// legs, for a condition this document names by code. Neither leg wraps it in
-// ErrValidation either: the store legs return CheckVersionInTx's error through
-// runIssueOperationTx unchanged and the unit of work returns its own, so it
-// arrives as a bare sentinel with nothing else to catch it. Verified by
-// mutation, not asserted: removing the arm turns
+// THE PRECONDITION ARM IS MATCHED TYPED AND FIRST, obeying the rule
+// ClassifyError states rather than restating it: that function cannot build
+// this 409, because the refusal echoes the value the REQUEST guarded on and it
+// is handed an error alone.
+//
+// The cost of forgetting the arm is not a worse 4xx. Neither leg wraps
+// ErrVersionMismatch in ErrValidation — the store legs return CheckVersionInTx's
+// error through runIssueOperationTx unchanged and the unit of work returns its
+// own — so it arrives as a bare sentinel, falls through failErr's default, and
+// every guard miss on this operation becomes a GENERIC 500. Verified by
+// mutation rather than asserted: removing the arm turns
 // TestCloseRefusesAStaleGuard into a 500.
 //
 // The open-children count comes from *issueops.CloseOpenChildrenError's own
