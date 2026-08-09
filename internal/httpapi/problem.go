@@ -352,8 +352,11 @@ const (
 	// normalization, and the close policy vocabulary.
 	OpCloseIssue = "closeIssue"
 	// OpReopenIssue is the close's mirror, and it completes the lifecycle pair
-	// so a recovery flow works end to end over this surface. It is the one
-	// write here with no conflict code: reopen has no policy guard.
+	// so a recovery flow works end to end over this surface. It is the one write
+	// here with no POLICY conflict code: reopen takes an issue OUT of the done
+	// category, so there is no state of the graph that can refuse it. Its one
+	// 409 is the caller's own compare-and-set, which is a fact about the
+	// request's premise rather than about the graph.
 	OpReopenIssue = "reopenIssue"
 	// OpUpdateIssue edits the FIELDS of one issue, including the three that
 	// carry policy: `status`, `assignee` and `parent_id`.
@@ -553,7 +556,20 @@ var operationCodes = map[string][]Code{
 	// CodeNotFound is the one this operation has and the sweep does not: a
 	// sweep describes a set that can legitimately be empty, while a delete
 	// names beads and an id that resolves to nothing is a caller mistake.
-	OpDeleteIssues: {CodeInvalidArgument, CodeNotFound, CodeBusy, CodeDBUnavailable, CodeInternal},
+	//
+	// precondition_failed is `expected_version`'s, and it is the 409 form for
+	// the reason that code documents: a miss refuses the whole request and
+	// leaves nothing to report but the refusal. It ranks BELOW the 404 — a
+	// request that named no row has nothing to be stale about — and ABOVE the
+	// dependents refusal, which is the role's own order and is what makes the
+	// wire's answer the same one `bd delete` gives.
+	//
+	// The ARITY refusal is a 400 rather than a second conflict: a token beside
+	// two distinct ids is a malformed request, not a statement about state.
+	OpDeleteIssues: {
+		CodeInvalidArgument, CodeNotFound, CodePreconditionFailed,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
 	OpClaimIssue: {
 		CodeInvalidArgument, CodeNotFound, CodeAlreadyClaimed, CodeNotClaimable,
 		CodeBusy, CodeDBUnavailable, CodeInternal,
@@ -594,22 +610,33 @@ var operationCodes = map[string][]Code{
 		CodeAlreadyClaimed, CodeNotReleasable, CodePreconditionFailed,
 		CodeBusy, CodeDBUnavailable, CodeInternal,
 	},
-	// The 409 is close POLICY, and it is the only conflict this operation has:
-	// an unforced close refused for open children or for a live blocker. There
-	// is no already_claimed here — closing work somebody else holds is not a
-	// refusal on this surface — and the idempotent re-close is a 200 carrying
-	// `already_closed`, the claim's answer to the same question.
+	// TWO 409s, and they answer different questions with `code` as the only
+	// discriminator a client needs.
+	//
+	// not_closable is close POLICY: an unforced close refused for open children
+	// or for a live blocker. There is no already_claimed here — closing work
+	// somebody else holds is not a refusal on this surface — and the idempotent
+	// re-close is a 200 carrying `already_closed`, the claim's answer to the
+	// same question.
+	//
+	// precondition_failed is `expected_version`'s, in the 409 form for the
+	// reason that code documents, and it is CHECKED FIRST — before policy and
+	// before the idempotent re-close, which is the role's own order
+	// (issueops.Lifecycle.Close). `force` bypasses policy and never it: the two
+	// members make unrelated claims.
 	OpCloseIssue: {
-		CodeInvalidArgument, CodeNotFound, CodeNotClosable,
+		CodeInvalidArgument, CodeNotFound, CodeNotClosable, CodePreconditionFailed,
 		CodeBusy, CodeDBUnavailable, CodeInternal,
 	},
-	// NO 409, and the absence is the point. Close has a policy guard — open
-	// children, a live blocker — and reopen is the direction that takes an issue
-	// OUT of the done category rather than putting it in, so there is no state
-	// of the graph that can refuse it and nothing to name. The idempotent case
-	// is a 200 carrying `already_open`, not a conflict.
+	// ONE 409, and it is a PRECONDITION rather than a policy. Close has a policy
+	// guard — open children, a live blocker — and reopen is the direction that
+	// takes an issue OUT of the done category rather than putting it in, so
+	// there is no state of the graph that can refuse it: not_closable is absent
+	// here and always will be. What `expected_version` refuses is the request's
+	// own premise, which every write can have wrong. The idempotent case is
+	// still a 200 carrying `already_open`, unless a guard came with it.
 	OpReopenIssue: {
-		CodeInvalidArgument, CodeNotFound,
+		CodeInvalidArgument, CodeNotFound, CodePreconditionFailed,
 		CodeBusy, CodeDBUnavailable, CodeInternal,
 	},
 	// FOUR conflict codes, and the three members that publish them are exactly
