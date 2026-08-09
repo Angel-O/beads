@@ -222,6 +222,10 @@ var roleContractCases = []roleContract{
 		RunDependencyEditorRemoveUnmarksItsSourceAndDescendants,
 		RunDependencyEditorMaintainsBlockedStateAcrossPlanes,
 		RunDependencyEditorClosedChildAddSatisfiesAnAnyChildrenGate,
+		RunDependencyEditorRelatesToAddLeavesItsSourceUnblocked,
+		RunDependencyEditorAcceptsADiamond,
+		RunDependencyEditorGateScopeFollowsTheEdgeType,
+		RunDependencyEditorAcceptsBlockingAcrossIssueTypes,
 	),
 
 	roleCases("EdgeReader", "EdgeReader()", oncePerRole,
