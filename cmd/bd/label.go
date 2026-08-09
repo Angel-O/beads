@@ -13,6 +13,7 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
+	"github.com/steveyegge/beads/issueops"
 )
 
 var labelCmd = &cobra.Command{
@@ -21,25 +22,100 @@ var labelCmd = &cobra.Command{
 	Short:   "Manage issue labels",
 }
 
-func processBatchLabelOperation(issueIDs []string, labels []string, operation string, jsonOut bool,
-	txFunc func(context.Context, storage.Transaction, string, string, string) error) error {
-	ctx := rootCtx
-	labelDesc := strings.Join(labels, "', '")
-	commitMsg := fmt.Sprintf("bd: label %s '%s' on %d issue(s)", operation, labelDesc, len(issueIDs))
-	err := transactHonoringAutoCommit(ctx, store, commitMsg, func(tx storage.Transaction) error {
-		for _, issueID := range issueIDs {
-			for _, label := range labels {
-				if err := txFunc(ctx, tx, issueID, label, actor); err != nil {
-					return fmt.Errorf("%s label '%s' on %s: %w", operation, label, issueID, err)
-				}
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return HandleErrorRespectJSON("label %s: %v", operation, err)
+// openIssueLifecycle hands back the guarded write role for whichever route this
+// invocation is on, each through its own capability accessor. Neither branch
+// opens a unit of work, names a use case or composes a transaction: the label
+// edit is a patch, and the role is what applies it.
+func openIssueLifecycle() (issueops.Lifecycle, error) {
+	if usesProxiedServer() {
+		return proxiedIssueLifecycle()
 	}
-	commandDidWrite.Store(true)
+	return store.IssueLifecycle()
+}
+
+// openIssueReader hands back the read role the same way. `bd label list` is a
+// detail read whose answer is already hydrated — issueops.Reader.Get returns
+// IssueDetails with Labels on it — so there is nothing here for a label-shaped
+// read surface to add.
+func openIssueReader() (issueops.Reader, error) {
+	if usesProxiedServer() {
+		return proxiedIssueReader()
+	}
+	return store.IssueReader()
+}
+
+// resolveLabelTarget turns one positional argument into the EXACT id the roles
+// take, on whichever route this invocation is on.
+//
+// This is the ONE fork left in this command, and it is a fork over how a route
+// REACHES the store rather than over what it does once it has an answer. The
+// proxied arm is not a second policy: it is the same exact-then-wisp lookup
+// internal/workapi already defines for every proxied front door, and its
+// not-found is normalized to the same message shape.
+func resolveLabelTarget(ctx context.Context, id string) (string, error) {
+	if usesProxiedServer() {
+		return resolveLabelTargetProxied(ctx, id)
+	}
+	return utils.ResolvePartialID(ctx, store, id)
+}
+
+// applyLabelEdit applies ONE label patch to each named issue through
+// issueops.Lifecycle, and is the whole of what `bd label add` and
+// `bd label remove` do differently.
+//
+// ONE CALL PER ISSUE, AND ONE PATCH PER CALL. Every label of the request goes
+// into a single LabelPatch, so an N-issue, M-label edit is N calls rather than
+// the N*M raw writes both routes used to make. The role is what makes that
+// safe to say: LabelPatch applies Replace, then Add, then Remove, de-duplicates
+// within an edit, drops an empty entry rather than storing it, and refuses an
+// over-length label with ErrFieldTooLong before anything is written.
+//
+// The wisp plane needs no branch here. UpdateRequest.IssuePlaneOnly stays
+// false, so the role resolves the plane INSIDE its own transaction and an
+// ephemeral row's labels land in the ephemeral table — which is the four-way
+// switch the proxied route used to hand-roll, and the one place a front door
+// could put a wisp's label in the durable table by getting a boolean backwards.
+func applyLabelEdit(ctx context.Context, issueIDs []string, labels []string, operation string) error {
+	lifecycle, err := openIssueLifecycle()
+	if err != nil {
+		return HandleErrorRespectJSON("%v", err)
+	}
+	patch := issueops.IssuePatch{}
+	if operation == labelOperationRemoved {
+		patch.Labels.Remove = labels
+	} else {
+		patch.Labels.Add = labels
+	}
+	for _, issueID := range issueIDs {
+		_, uerr := lifecycle.Update(ctx, issueops.UpdateRequest{
+			Actor:   actor,
+			IssueID: issueID,
+			Patch:   patch,
+		})
+		// Marked per issue rather than once at the end: the edits land one
+		// call at a time, so a request that failed on its third id has still
+		// written its first two and the deferred commit has to know.
+		commandDidWrite.Store(true)
+		if uerr != nil {
+			return HandleErrorRespectJSON("label %s: %s label '%s' on %s: %v",
+				operation, operation, strings.Join(labels, "', '"), issueID, uerr)
+		}
+	}
+	return reportLabelEdit(issueIDs, labels, operation, jsonOutput)
+}
+
+// The two label edits this command performs, spelled once. They are the words
+// the JSON "status" member and the human line both carry, so they are constants
+// rather than two string literals that have to agree.
+const (
+	labelOperationAdded   = "added"
+	labelOperationRemoved = "removed"
+)
+
+// reportLabelEdit prints what landed, in the shape both routes have always
+// printed it: one JSON row per (issue, label) pair, or one human line per issue
+// naming every label at once.
+func reportLabelEdit(issueIDs []string, labels []string, operation string, jsonOut bool) error {
 	if jsonOut {
 		results := make([]map[string]interface{}, 0, len(issueIDs)*len(labels))
 		for _, issueID := range issueIDs {
@@ -53,16 +129,15 @@ func processBatchLabelOperation(issueIDs []string, labels []string, operation st
 		}
 		return outputJSON(results)
 	}
-	verb := "Added"
-	prep := "to"
-	if operation == "removed" {
-		verb = "Removed"
-		prep = "from"
+	verb, prep := "Added", "to"
+	if operation == labelOperationRemoved {
+		verb, prep = "Removed", "from"
 	}
 	noun := "label"
 	if len(labels) > 1 {
 		noun = "labels"
 	}
+	labelDesc := strings.Join(labels, "', '")
 	for _, issueID := range issueIDs {
 		fmt.Printf("%s %s %s '%s' %s %s\n", ui.RenderPass("✓"), verb, noun, labelDesc, prep, issueID)
 	}
@@ -91,15 +166,24 @@ func splitLabelArg(arg string) []string {
 	return labels
 }
 
-// resolveLabelIssueIDs resolves every issue-ID positional arg, failing hard on
-// the first arg that doesn't resolve. Labels come last on the command line, so
-// when several ID-position args fail the caller almost certainly passed labels
-// space-separated ("bd label add bd-123 a b c"); the error hints at the
-// comma-separated form instead of silently skipping the bad args (bd-vu5kv).
+// resolveLabelIssueIDs resolves every issue-ID positional arg to the EXACT id
+// the role takes, failing hard on the first arg that doesn't resolve.
+//
+// Resolution stays a front-door job and does not move behind the role:
+// GetRequest.ID and UpdateRequest.IssueID are both exact by contract, for the
+// reason those docs give — an affordance that can resolve to a different issue
+// than the caller named has no place on a contract two front doors share. This
+// is therefore the ONE thing that still forks by route, and it forks on how a
+// route reaches the store rather than on what it then does with the answer.
+//
+// Labels come last on the command line, so when several ID-position args fail
+// the caller almost certainly passed labels space-separated ("bd label add
+// bd-123 a b c"); the error hints at the comma-separated form instead of
+// silently skipping the bad args (bd-vu5kv).
 func resolveLabelIssueIDs(ctx context.Context, subcommand string, issueIDs []string) ([]string, error) {
 	resolved := make([]string, 0, len(issueIDs))
 	for _, id := range issueIDs {
-		fullID, err := utils.ResolvePartialID(ctx, store, id)
+		fullID, err := resolveLabelTarget(ctx, id)
 		if err != nil {
 			if len(issueIDs) > 1 {
 				return nil, fmt.Errorf("resolving issue ID %q: %w (to %s multiple labels, pass one comma-separated argument: bd label %s <issue-id> label1,label2)",
@@ -130,30 +214,7 @@ var labelAddCmd = &cobra.Command{
 			}
 		}()
 
-		if usesProxiedServer() {
-			return runLabelAddProxiedServer(rootCtx, args)
-		}
-
-		issueIDs, labels := parseLabelArgs(args)
-		if len(labels) == 0 {
-			return HandleErrorRespectJSON("label cannot be empty")
-		}
-		ctx := rootCtx
-		issueIDs, err := resolveLabelIssueIDs(ctx, "add", issueIDs)
-		if err != nil {
-			return HandleErrorRespectJSON("%v", err)
-		}
-
-		for _, label := range labels {
-			if strings.HasPrefix(label, "provides:") {
-				return HandleErrorRespectJSON("'provides:' labels are reserved for cross-project capabilities. Hint: use 'bd ship %s' instead", strings.TrimPrefix(label, "provides:"))
-			}
-		}
-
-		return processBatchLabelOperation(issueIDs, labels, "added", jsonOutput,
-			func(ctx context.Context, tx storage.Transaction, issueID, lbl, act string) error {
-				return tx.AddLabel(ctx, issueID, lbl, act)
-			})
+		return runLabelAdd(rootCtx, args)
 	},
 }
 
@@ -175,23 +236,7 @@ var labelRemoveCmd = &cobra.Command{
 			}
 		}()
 
-		if usesProxiedServer() {
-			return runLabelRemoveProxiedServer(rootCtx, args)
-		}
-
-		issueIDs, labels := parseLabelArgs(args)
-		if len(labels) == 0 {
-			return HandleErrorRespectJSON("label cannot be empty")
-		}
-		ctx := rootCtx
-		issueIDs, err := resolveLabelIssueIDs(ctx, "remove", issueIDs)
-		if err != nil {
-			return HandleErrorRespectJSON("%v", err)
-		}
-		return processBatchLabelOperation(issueIDs, labels, "removed", jsonOutput,
-			func(ctx context.Context, tx storage.Transaction, issueID, lbl, act string) error {
-				return tx.RemoveLabel(ctx, issueID, lbl, act)
-			})
+		return runLabelRemove(rootCtx, args)
 	},
 }
 var labelListCmd = &cobra.Command{
@@ -208,38 +253,7 @@ var labelListCmd = &cobra.Command{
 			}
 		}()
 
-		if usesProxiedServer() {
-			return runLabelListProxiedServer(rootCtx, args)
-		}
-
-		ctx := rootCtx
-		var issueID string
-		var err error
-		issueID, err = utils.ResolvePartialID(ctx, store, args[0])
-		if err != nil {
-			return HandleErrorRespectJSON("resolving %s: %v", args[0], err)
-		}
-		var labels []string
-		labels, err = store.GetLabels(ctx, issueID)
-		if err != nil {
-			return HandleErrorRespectJSON("%v", err)
-		}
-		if jsonOutput {
-			if labels == nil {
-				labels = []string{}
-			}
-			return outputJSON(labels)
-		}
-		if len(labels) == 0 {
-			fmt.Printf("\n%s has no labels\n", issueID)
-			return nil
-		}
-		fmt.Printf("\n%s Labels for %s:\n", ui.RenderAccent("🏷"), issueID)
-		for _, label := range labels {
-			fmt.Printf("  - %s\n", label)
-		}
-		fmt.Println()
-		return nil
+		return runLabelList(rootCtx, args)
 	},
 }
 var labelListAllCmd = &cobra.Command{
@@ -411,4 +425,77 @@ func init() {
 	labelCmd.AddCommand(labelListAllCmd)
 	labelCmd.AddCommand(labelPropagateCmd)
 	rootCmd.AddCommand(labelCmd)
+}
+
+// runLabelAdd, runLabelRemove and runLabelList are ONE body each, for both
+// routes. The route fork is gone from these three commands: what used to be an
+// `if usesProxiedServer() { return run…ProxiedServer(...) }` in the middle of a
+// RunE — with a second, separately-maintained implementation on the other side
+// of it — is now a fork inside resolveLabelTarget and inside the accessor, and
+// both arms end at the same role.
+func runLabelAdd(ctx context.Context, args []string) error {
+	issueIDs, labels := parseLabelArgs(args)
+	if len(labels) == 0 {
+		return HandleErrorRespectJSON("label cannot be empty")
+	}
+	// The reserved-prefix refusal is checked BEFORE anything is resolved, so a
+	// caller that both typo'd an id and reached for a reserved label is told
+	// about the label — the one of the two this command will never accept.
+	for _, label := range labels {
+		if strings.HasPrefix(label, "provides:") {
+			return HandleErrorRespectJSON("'provides:' labels are reserved for cross-project capabilities. Hint: use 'bd ship %s' instead", strings.TrimPrefix(label, "provides:"))
+		}
+	}
+	issueIDs, err := resolveLabelIssueIDs(ctx, "add", issueIDs)
+	if err != nil {
+		return HandleErrorRespectJSON("%v", err)
+	}
+	return applyLabelEdit(ctx, issueIDs, labels, labelOperationAdded)
+}
+
+func runLabelRemove(ctx context.Context, args []string) error {
+	issueIDs, labels := parseLabelArgs(args)
+	if len(labels) == 0 {
+		return HandleErrorRespectJSON("label cannot be empty")
+	}
+	issueIDs, err := resolveLabelIssueIDs(ctx, "remove", issueIDs)
+	if err != nil {
+		return HandleErrorRespectJSON("%v", err)
+	}
+	return applyLabelEdit(ctx, issueIDs, labels, labelOperationRemoved)
+}
+
+func runLabelList(ctx context.Context, args []string) error {
+	issueID, err := resolveLabelTarget(ctx, args[0])
+	if err != nil {
+		return HandleErrorRespectJSON("resolving %s: %v", args[0], err)
+	}
+	reader, err := openIssueReader()
+	if err != nil {
+		return HandleErrorRespectJSON("%v", err)
+	}
+	// The detail read already carries the labels, sorted, for whichever
+	// plane holds the row — so there is no label-shaped read here, and no
+	// wisp branch either.
+	details, err := reader.Get(ctx, issueops.GetRequest{ID: issueID})
+	if err != nil {
+		return HandleErrorRespectJSON("%v", err)
+	}
+	labels := details.Labels
+	if jsonOutput {
+		if labels == nil {
+			labels = []string{}
+		}
+		return outputJSON(labels)
+	}
+	if len(labels) == 0 {
+		fmt.Printf("\n%s has no labels\n", issueID)
+		return nil
+	}
+	fmt.Printf("\n%s Labels for %s:\n", ui.RenderAccent("🏷"), issueID)
+	for _, label := range labels {
+		fmt.Printf("  - %s\n", label)
+	}
+	fmt.Println()
+	return nil
 }

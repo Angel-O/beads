@@ -134,6 +134,42 @@ linters:
           deny:
             - pkg: github.com/steveyegge/beads/internal/storage/domain
               desc: "internal/httpapi is transport only: a handler reaches storage through an issueops role accessor on the provider, never through the domain use cases - see internal/httpapi/claim.go"
+        # The same boundary, transposed onto the front door that was last past
+        # it. cmd/bd cannot be closed to the domain wholesale — thirty of its
+        # non-test files import internal/storage/domain today and unpicking
+        # them is a program, not a rule — so this closes it ONE COMMAND AT A
+        # TIME, and `bd label` is the first entry.
+        #
+        # It denies internal/storage/uow as well as internal/storage/domain,
+        # and the second package is the one that does the work here. depguard
+        # matches IMPORTS, and a file can call uw.LabelUseCase().AddLabel(...)
+        # without importing domain at all — the method call needs no import for
+        # the inferred type. That is exactly what cmd/bd/label_proxied_server.go
+        # did, so a domain-only deny would have been a rule that could not see
+        # the bypass it was written for. Reaching a use case requires a unit of
+        # work, opening one requires uow.RunTx, and THAT is an import.
+        #
+        # cmd/bd/label.go holds every label decision now — the arg split, the
+        # reserved-prefix refusal, the patch, the report — and reaches storage
+        # only through issueops.Lifecycle and issueops.Reader.
+        # cmd/bd/label_proxied_server.go is NOT on this list and legitimately
+        # imports uow: it is where the route's capability accessors live, and
+        # it still holds `list-all` and `propagate`, whose questions no role
+        # answers yet. It joins the list when they move.
+        #
+        # The list grows by one file per command whose front doors reach the
+        # roles, the way cmd-bd-role-constructors grows by one package per
+        # shared body.
+        cmd-bd-domain-boundary:
+          list-mode: lax
+          files:
+            - "**/cmd/bd/label.go"
+            - "!$test"
+          deny:
+            - pkg: github.com/steveyegge/beads/internal/storage/domain
+              desc: "bd label reaches storage through an issueops role accessor, never through the domain use cases - see openIssueLifecycle in cmd/bd/label.go"
+            - pkg: github.com/steveyegge/beads/internal/storage/uow
+              desc: "bd label does not open a unit of work: the route fork is the accessor (openIssueLifecycle/openIssueReader), and a unit of work here is how a use-case call gets back in - see cmd/bd/label.go"
         # store.IssueReader() is the door to the reader role, and a store wears
         # decorators (telemetry spans, hook firing) that each add their layer in
         # their OWN accessor. A command holding the storage.DoltStorage
