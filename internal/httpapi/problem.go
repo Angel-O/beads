@@ -82,7 +82,7 @@ const (
 	//
 	// THE TWO CONDITIONS ARE FULLY DISTINGUISHABLE HERE. ErrNotClaimed and
 	// ErrNotReleasable are two distinct typed sentinels, and failRelease holds
-	// both in one case arm — so a future split needs no excavation and no
+	// both in one case arm — so a future split needs no archeology and no
 	// prose-scraping: it is a mapping change in that arm plus a code in this
 	// block and a line in the document. What IS unavailable typed is the
 	// OBSERVATION either refusal made — the status it saw, the emptiness of the
