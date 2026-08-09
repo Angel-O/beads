@@ -9,10 +9,16 @@ import (
 )
 
 // uncoveredRoleMethods waives the role methods this package knowingly has no
-// contract case for. It is SHRINK-ONLY: the gate fails on an entry that names
-// no real method and on an entry the package has since covered, so the PR that
-// writes the first case for a waived method deletes its entry in the same
-// change. Nothing may be added here to land a role method without a contract.
+// contract case for. It is SHRINK-ONLY in the sense that matters: the gate
+// fails on an entry that names no real method and on an entry the package has
+// since covered, so the PR that writes the first case for a waived method
+// deletes its entry in the same change.
+//
+// Adding an entry stays possible, and deliberately so — a role that genuinely
+// cannot be reached from the contract tier has to be recordable somewhere. What
+// the gate takes away is doing it quietly: an addition must name a real method,
+// carry a reason, and land in a diff a reviewer reads. It converts silence into
+// an argument someone has to make.
 var uncoveredRoleMethods = map[string]string{
 	"issueops.Importer.ImportBatch": "Importer is the one role no storage accessor hands out: " +
 		"internal/storage/uow reaches it through its own provider and the other two " +
@@ -62,7 +68,10 @@ func TestRoleFacadeCensusAgreesWithReflection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the role facade: %v", err)
 	}
-	accessors := reflectRoleAccessors()
+	accessors, err := reflectRoleAccessors()
+	if err != nil {
+		t.Fatalf("censusing the storage accessors: %v", err)
+	}
 	if len(accessors) == 0 {
 		t.Fatal("no storage accessor returns a facade role; the cross-check would pass vacuously")
 	}
