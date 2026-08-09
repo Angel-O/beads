@@ -164,10 +164,10 @@ func RunBatchApplyAppliesEveryItemInDeclarationOrder(t *testing.T, ctx context.C
 	assertBatchApplyRowCount(t, ctx, fixture, "issues", blocked, 1)
 	assertBatchApplyRowCount(t, ctx, fixture, "issues", blocker, 1)
 	assertBatchApplyEdgeCount(t, ctx, fixture, blocked, blocker, 1)
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "status", blocker); got != string(types.StatusClosed) {
+	if got := batchApplyColumn(t, ctx, fixture, "status", blocker); got != string(types.StatusClosed) {
 		t.Errorf("%s status = %q after a close item, want %q", blocker, got, types.StatusClosed)
 	}
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "status", blocked); got == string(types.StatusClosed) {
+	if got := batchApplyColumn(t, ctx, fixture, "status", blocked); got == string(types.StatusClosed) {
 		t.Errorf("%s was closed by a request that only asked to close %s", blocked, blocker)
 	}
 }
@@ -233,7 +233,7 @@ func RunBatchApplyResolvesABackwardKeyRef(t *testing.T, ctx context.Context, fix
 		},
 	})
 
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "title", id); got != "patched through the key" {
+	if got := batchApplyColumn(t, ctx, fixture, "title", id); got != "patched through the key" {
 		t.Errorf("%s title = %q, want the patch the keyed update carried; a backward Ref.Key resolves to the row the earlier create minted", id, got)
 	}
 }
@@ -357,7 +357,7 @@ func RunBatchApplyRefusesARefNamingNeitherOrBoth(t *testing.T, ctx context.Conte
 			batchApplyUpdate(publicops.Ref{ID: seeded}, patch),
 		},
 	})
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "title", seeded); got != "refshape" {
+	if got := batchApplyColumn(t, ctx, fixture, "title", seeded); got != "refshape" {
 		t.Errorf("%s title = %q after a well-formed id ref, want %q", seeded, got, "refshape")
 	}
 }
@@ -416,7 +416,7 @@ func RunBatchApplyRollsBackEverythingWhenTheLastItemRefuses(t *testing.T, ctx co
 	}
 	// The seeded row is untouched: an upsert would report the same error having
 	// rewritten every column of it.
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "title", occupied); got != occupied {
+	if got := batchApplyColumn(t, ctx, fixture, "title", occupied); got != occupied {
 		t.Errorf("the occupied row's title = %q, want %q: the refusal must not have written through it", got, occupied)
 	}
 
@@ -456,10 +456,10 @@ func RunBatchApplyNeverReordersItsItems(t *testing.T, ctx context.Context, fixtu
 		},
 	})
 
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "status", parent); got != string(types.StatusClosed) {
+	if got := batchApplyColumn(t, ctx, fixture, "status", parent); got != string(types.StatusClosed) {
 		t.Errorf("%s status = %q, want %q: the close ran at ITS OWN position, before the edge that would have refused it", parent, got, types.StatusClosed)
 	}
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "status", child); got == string(types.StatusClosed) {
+	if got := batchApplyColumn(t, ctx, fixture, "status", child); got == string(types.StatusClosed) {
 		t.Errorf("%s was closed; only the parent was asked to close", child)
 	}
 	assertBatchApplyTypedEdgeCount(t, ctx, fixture, child, parent, string(publicops.DepParentChild), 1)
@@ -605,7 +605,7 @@ func RunBatchApplyExpectedVersionThatMatchesLetsTheItemThrough(t *testing.T, ctx
 		},
 	})
 
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "title", guarded); got != "guard held" {
+	if got := batchApplyColumn(t, ctx, fixture, "title", guarded); got != "guard held" {
 		t.Errorf("%s title = %q, want %q: a matching ExpectedVersion lets the item through", guarded, got, "guard held")
 	}
 	assertBatchApplyRowCount(t, ctx, fixture, "issues", sibling, 1)
@@ -647,7 +647,7 @@ func RunBatchApplyStaleExpectedVersionRefusesTheWholeRequest(t *testing.T, ctx c
 		t.Errorf("ItemError = %#v, want Index 1 acting on %s", itemErr, guarded)
 	}
 	assertBatchApplyRowCount(t, ctx, fixture, "issues", sibling, 0)
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "title", guarded); got != guarded {
+	if got := batchApplyColumn(t, ctx, fixture, "title", guarded); got != guarded {
 		t.Errorf("%s title = %q, want the seeded %q: a refused guard writes nothing", guarded, got, guarded)
 	}
 }
@@ -715,10 +715,10 @@ func RunBatchApplyRefusesExpectedVersionOnARowAnEarlierItemTouched(t *testing.T,
 			}
 			// Nothing was written, which is what "checked before anything is
 			// written" means: the FIRST item's patch must not have landed.
-			if got := batchApplyColumn(t, ctx, fixture, "issues", "title", id); got != id {
+			if got := batchApplyColumn(t, ctx, fixture, "title", id); got != id {
 				t.Errorf("%s title = %q, want the seeded %q: the static check runs before the transaction opens", id, got, id)
 			}
-			if got := batchApplyColumn(t, ctx, fixture, "issues", "status", id); got != string(types.StatusOpen) {
+			if got := batchApplyColumn(t, ctx, fixture, "status", id); got != string(types.StatusOpen) {
 				t.Errorf("%s status = %q, want %q", id, got, types.StatusOpen)
 			}
 		})
@@ -789,10 +789,10 @@ func RunBatchApplyEvaluatesExpectedStatusAsModified(t *testing.T, ctx context.Co
 			}, nil, &inProgress, nil),
 		},
 	})
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "title", held); got != "guarded on what this request set" {
+	if got := batchApplyColumn(t, ctx, fixture, "title", held); got != "guarded on what this request set" {
 		t.Errorf("%s title = %q, want the second item's patch: an item guarding on what an earlier item wrote is asking a coherent question", held, got)
 	}
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "status", held); got != string(inProgress) {
+	if got := batchApplyColumn(t, ctx, fixture, "status", held); got != string(inProgress) {
 		t.Errorf("%s status = %q, want %q", held, got, inProgress)
 	}
 
@@ -812,10 +812,10 @@ func RunBatchApplyEvaluatesExpectedStatusAsModified(t *testing.T, ctx context.Co
 	if !errors.Is(err, publicops.ErrStatusMismatch) {
 		t.Fatalf("guarding on the PRE-request status: error = %v, want ErrStatusMismatch", err)
 	}
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "status", stale); got != string(types.StatusOpen) {
+	if got := batchApplyColumn(t, ctx, fixture, "status", stale); got != string(types.StatusOpen) {
 		t.Errorf("%s status = %q, want the seeded %q: a guard miss refuses the WHOLE request, so the first item rolled back too", stale, got, types.StatusOpen)
 	}
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "title", stale); got != stale {
+	if got := batchApplyColumn(t, ctx, fixture, "title", stale); got != stale {
 		t.Errorf("%s title = %q, want the seeded %q", stale, got, stale)
 	}
 }
@@ -843,10 +843,10 @@ func RunBatchApplyEvaluatesExpectedAssigneeAsModified(t *testing.T, ctx context.
 			}, nil, nil, &holder),
 		},
 	})
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "title", held); got != "guarded on the holder this request set" {
+	if got := batchApplyColumn(t, ctx, fixture, "title", held); got != "guarded on the holder this request set" {
 		t.Errorf("%s title = %q, want the second item's patch", held, got)
 	}
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "assignee", held); got != holder {
+	if got := batchApplyColumn(t, ctx, fixture, "assignee", held); got != holder {
 		t.Errorf("%s assignee = %q, want %q", held, got, holder)
 	}
 
@@ -866,7 +866,7 @@ func RunBatchApplyEvaluatesExpectedAssigneeAsModified(t *testing.T, ctx context.
 	if !errors.Is(err, publicops.ErrAssigneeMismatch) {
 		t.Fatalf("guarding on the PRE-request assignee: error = %v, want ErrAssigneeMismatch", err)
 	}
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "assignee", stale); got != "" {
+	if got := batchApplyColumn(t, ctx, fixture, "assignee", stale); got != "" {
 		t.Errorf("%s assignee = %q, want the seeded empty holder: a guard miss refuses the whole request", stale, got)
 	}
 }
@@ -919,10 +919,10 @@ func RunBatchApplyClosePolicyEvaluatesAtTheCloseItem(t *testing.T, ctx context.C
 	assertBatchApplyRowCount(t, ctx, fixture, "issues", child, 0)
 
 	batchApplyMust(t, ctx, fixture, batch(true))
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "status", parent); got != string(types.StatusClosed) {
+	if got := batchApplyColumn(t, ctx, fixture, "status", parent); got != string(types.StatusClosed) {
 		t.Errorf("%s status = %q under Force, want %q", parent, got, types.StatusClosed)
 	}
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "status", child); got != string(types.StatusOpen) {
+	if got := batchApplyColumn(t, ctx, fixture, "status", child); got != string(types.StatusOpen) {
 		t.Errorf("%s status = %q, want %q: Force bypasses the close policy and nothing else", child, got, types.StatusOpen)
 	}
 	assertBatchApplyTypedEdgeCount(t, ctx, fixture, child, parent, string(publicops.DepParentChild), 1)
@@ -954,10 +954,10 @@ func RunBatchApplyAllowsAClosedParentToGainAnOpenChild(t *testing.T, ctx context
 	})
 
 	assertBatchApplyTypedEdgeCount(t, ctx, fixture, child, parent, string(publicops.DepParentChild), 1)
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "status", parent); got != string(types.StatusClosed) {
+	if got := batchApplyColumn(t, ctx, fixture, "status", parent); got != string(types.StatusClosed) {
 		t.Errorf("%s status = %q after gaining an open child, want %q: the close policy is a gate on the closing ACT", parent, got, types.StatusClosed)
 	}
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "status", child); got != string(types.StatusOpen) {
+	if got := batchApplyColumn(t, ctx, fixture, "status", child); got != string(types.StatusOpen) {
 		t.Errorf("%s status = %q, want %q", child, got, types.StatusOpen)
 	}
 }
@@ -991,10 +991,10 @@ func RunBatchApplyUpdateAfterCloseInOneRequest(t *testing.T, ctx context.Context
 		t.Errorf("the update after the close reported Changed false; it moved the title")
 	}
 
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "title", id); got != "edited after the close" {
+	if got := batchApplyColumn(t, ctx, fixture, "title", id); got != "edited after the close" {
 		t.Errorf("%s title = %q, want the update's patch: the update saw the row the close had already written", id, got)
 	}
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "status", id); got != string(types.StatusClosed) {
+	if got := batchApplyColumn(t, ctx, fixture, "status", id); got != string(types.StatusClosed) {
 		t.Errorf("%s status = %q, want %q: an ordinary field patch does not reopen a row the same request closed", id, got, types.StatusClosed)
 	}
 }
@@ -1046,10 +1046,10 @@ func RunBatchApplyReportsChangedPerItem(t *testing.T, ctx context.Context, fixtu
 
 	assertBatchApplyEdgeCount(t, ctx, fixture, edited, target, 1)
 	assertBatchApplyRowCount(t, ctx, fixture, "issues", edited, 1)
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "title", edited); got != "moved once" {
+	if got := batchApplyColumn(t, ctx, fixture, "title", edited); got != "moved once" {
 		t.Errorf("%s title = %q, want %q", edited, got, "moved once")
 	}
-	if got := batchApplyColumn(t, ctx, fixture, "issues", "status", closing); got != string(types.StatusClosed) {
+	if got := batchApplyColumn(t, ctx, fixture, "status", closing); got != string(types.StatusClosed) {
 		t.Errorf("%s status = %q, want %q", closing, got, types.StatusClosed)
 	}
 }
@@ -1549,7 +1549,7 @@ func RunBatchApplySplicesAForwardMetadataRef(t *testing.T, ctx context.Context, 
 		},
 	})
 
-	stored, ok := batchApplyMetadataKey(t, ctx, fixture, "issues", stamped, "gc.retry_of")
+	stored, ok := batchApplyMetadataKey(t, ctx, fixture, stamped, "gc.retry_of")
 	if !ok {
 		t.Fatalf("%s carries no gc.retry_of key; the forward metadata_ref was never spliced", stamped)
 	}
@@ -1582,7 +1582,7 @@ func RunBatchApplySplicesASelfMetadataRef(t *testing.T, ctx context.Context, fix
 		Items:         []publicops.ApplyItem{item},
 	})
 
-	stored, ok := batchApplyMetadataKey(t, ctx, fixture, "issues", id, "gc.self")
+	stored, ok := batchApplyMetadataKey(t, ctx, fixture, id, "gc.self")
 	if !ok {
 		t.Fatalf("%s carries no gc.self key; a metadata_ref naming this item's own key was not spliced", id)
 	}
@@ -1704,7 +1704,7 @@ func RunBatchApplyKeepsAStoredNullApartFromAnEmptyString(t *testing.T, ctx conte
 		{"patched.null", `null`},
 		{"patched.empty", `""`},
 	} {
-		stored, ok := batchApplyMetadataKey(t, ctx, fixture, "issues", id, test.key)
+		stored, ok := batchApplyMetadataKey(t, ctx, fixture, id, test.key)
 		if !ok {
 			t.Errorf("%s carries no metadata key %q; a key stored holding null is PRESENT", id, test.key)
 			continue
@@ -1747,7 +1747,7 @@ func RunBatchApplyLandsAnIdempotencyRecordWithItsWork(t *testing.T, ctx context.
 	})
 	assertBatchApplyRowCount(t, ctx, fixture, "issues", record, 1)
 	assertBatchApplyRowCount(t, ctx, fixture, "issues", work, 1)
-	stored, ok := batchApplyMetadataKey(t, ctx, fixture, "issues", record, "gc.idempotency_key")
+	stored, ok := batchApplyMetadataKey(t, ctx, fixture, record, "gc.idempotency_key")
 	if !ok || string(stored) != `"apply-once"` {
 		t.Errorf("the record's gc.idempotency_key = %s (present %v), want %q", stored, ok, `"apply-once"`)
 	}
@@ -1818,7 +1818,7 @@ func RunBatchApplyBoundsTheItemCount(t *testing.T, ctx context.Context, fixture 
 //
 // It is deliberate rather than accidental, so it is pinned rather than left to
 // be discovered: a body that grew request-level deduplication would be a
-// SILENT behaviour change, invisible to every case above, and the composition
+// SILENT behavior change, invisible to every case above, and the composition
 // case beside this one is the mechanism this property is the reason for.
 func RunBatchApplyReplayMintsANewSetOfRows(t *testing.T, ctx context.Context, fixture BatchApplyFixture) {
 	t.Helper()
@@ -2054,13 +2054,16 @@ func batchApplyCount(t *testing.T, ctx context.Context, fixture BatchApplyFixtur
 // batchApplyColumn reads one text column off one row. It is how every case that
 // says "the row holds X" says it: reading the value back through the role is
 // exactly the check that passes on a body that never wrote.
-func batchApplyColumn(t *testing.T, ctx context.Context, fixture BatchApplyFixture, table, column, id string) string {
+func batchApplyColumn(t *testing.T, ctx context.Context, fixture BatchApplyFixture, column, id string) string {
 	t.Helper()
 	var value string
-	//nolint:gosec // G201: table and column are this contract's own hardcoded names.
-	query := fmt.Sprintf("SELECT COALESCE(%s, '') FROM %s WHERE id = ?", column, table)
+	// The durable plane only: every case that reads a column reads a durable
+	// row, and the two that care about a wisp read its presence rather than its
+	// fields.
+	//nolint:gosec // G201: column is one of this contract's own hardcoded names.
+	query := fmt.Sprintf("SELECT COALESCE(%s, '') FROM issues WHERE id = ?", column)
 	if err := fixture.QueryScalar(ctx, query, []any{id}, &value); err != nil {
-		t.Fatalf("reading %s.%s for %s: %v", table, column, id, err)
+		t.Fatalf("reading issues.%s for %s: %v", column, id, err)
 	}
 	return value
 }
@@ -2150,22 +2153,21 @@ func batchApplyEdgeMetadata(t *testing.T, ctx context.Context, fixture BatchAppl
 // key's raw bytes. The whole blob is read rather than a JSON path extract,
 // because that is what lets a case see an absent key and a null one as the
 // different things they are — a path extract answers NULL for both.
-func batchApplyMetadataKey(t *testing.T, ctx context.Context, fixture BatchApplyFixture, table, id, key string) (json.RawMessage, bool) {
+func batchApplyMetadataKey(t *testing.T, ctx context.Context, fixture BatchApplyFixture, id, key string) (json.RawMessage, bool) {
 	t.Helper()
 	// Scanned as a STRING, which is the destination the three kits' scalar
 	// readers agree on; a []byte destination is one of them only.
 	var blob string
-	//nolint:gosec // G201: table is one of this contract's hardcoded plane names.
-	query := fmt.Sprintf("SELECT COALESCE(metadata, '{}') FROM %s WHERE id = ?", table)
+	const query = "SELECT COALESCE(metadata, '{}') FROM issues WHERE id = ?"
 	if err := fixture.QueryScalar(ctx, query, []any{id}, &blob); err != nil {
-		t.Fatalf("reading %s.metadata for %s: %v", table, id, err)
+		t.Fatalf("reading issues.metadata for %s: %v", id, err)
 	}
 	if blob == "" || blob == "null" {
 		return nil, false
 	}
 	object := map[string]json.RawMessage{}
 	if err := json.Unmarshal([]byte(blob), &object); err != nil {
-		t.Fatalf("parsing %s.metadata for %s (%s): %v", table, id, blob, err)
+		t.Fatalf("parsing issues.metadata for %s (%s): %v", id, blob, err)
 	}
 	stored, ok := object[key]
 	return stored, ok

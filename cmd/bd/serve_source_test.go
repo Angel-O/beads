@@ -98,6 +98,7 @@ func TestServeIssueRolesComeFromBeneathTheHookDecorator(t *testing.T) {
 			claimer:      &serveStubClaimer{},
 			lifecycle:    &serveStubLifecycle{},
 			dependencies: &serveStubDependencyEditor{},
+			batchApplier: &serveStubBatchApplier{},
 			inner:        inner,
 		}
 	}
@@ -136,6 +137,17 @@ func TestServeIssueRolesComeFromBeneathTheHookDecorator(t *testing.T) {
 	if !storage.RoleFiresHooks(editorFromTheStore) {
 		t.Fatal("the store's own accessor no longer returns a hook-firing dependency editor; this test proves nothing")
 	}
+	// And for the batch applier, the FOURTH and widest role the decorator wraps:
+	// one call fires on_create, on_update and the close hooks, once per landed
+	// item plus once per distinct edge source. Without this precondition its case
+	// in the RoleFiresHooks switch is held only by a comment.
+	applierFromTheStore, err := chained.BatchApplier()
+	if err != nil {
+		t.Fatalf("BatchApplier: %v", err)
+	}
+	if !storage.RoleFiresHooks(applierFromTheStore) {
+		t.Fatal("the store's own accessor no longer returns a hook-firing batch applier; this test proves nothing")
+	}
 
 	roles, err := serveIssueRoles(chained, false)
 	if err != nil {
@@ -173,6 +185,19 @@ func TestServeIssueRolesComeFromBeneathTheHookDecorator(t *testing.T) {
 	if roles.dependencyEditor != issueops.DependencyEditor(middle.dependencies) {
 		t.Errorf("dependency editor came from %p, want the layer directly beneath the hooks (%p)",
 			roles.dependencyEditor, middle.dependencies)
+	}
+
+	// The batch applier is the FOURTH, and the one where the peel is worth the
+	// most: its wrapper fires four hook vocabularies from one call — per landed
+	// item, plus once per distinct edge source — so an unpeeled applier serving
+	// one hundred-item plan is up to a hundred of this workspace's own
+	// subprocesses spawned inside a single HTTP request.
+	if storage.RoleFiresHooks(roles.batchApplier) {
+		t.Error("bd serve would run this workspace's hooks once per item of every HTTP plan")
+	}
+	if roles.batchApplier != issueops.BatchApplier(middle.batchApplier) {
+		t.Errorf("batch applier came from %p, want the layer directly beneath the hooks (%p)",
+			roles.batchApplier, middle.batchApplier)
 	}
 
 	t.Run("a workspace with hooks disabled has no layer to peel", func(t *testing.T) {
@@ -270,6 +295,7 @@ type serveRolesStore struct {
 	claimer      *serveStubClaimer
 	lifecycle    *serveStubLifecycle
 	dependencies *serveStubDependencyEditor
+	batchApplier *serveStubBatchApplier
 	inner        storage.DoltStorage
 }
 
@@ -289,6 +315,14 @@ func (s *serveRolesStore) IssueLifecycle() (issueops.Lifecycle, error) { return 
 // writes.
 func (s *serveRolesStore) DependencyEditor() (issueops.DependencyEditor, error) {
 	return s.dependencies, nil
+}
+
+// BatchApplier carries an identifiable value for the same reason, and it is the
+// FOURTH the decorator wraps: a peel of the wrong depth would hand bd serve an
+// applier that runs the workspace's hooks once per item of every plan it
+// applies.
+func (s *serveRolesStore) BatchApplier() (issueops.BatchApplier, error) {
+	return s.batchApplier, nil
 }
 
 func (*serveRolesStore) WorkspaceConfig() (issueops.WorkspaceConfig, error)     { return nil, nil }
@@ -351,4 +385,10 @@ func (*serveStubDependencyEditor) AddDependencies(context.Context, issueops.AddD
 
 func (*serveStubDependencyEditor) RemoveDependency(context.Context, issueops.RemoveDependencyRequest) (issueops.RemoveDependencyResult, error) {
 	return issueops.RemoveDependencyResult{}, errors.ErrUnsupported
+}
+
+type serveStubBatchApplier struct{}
+
+func (*serveStubBatchApplier) ApplyBatch(context.Context, issueops.ApplyBatchRequest) (issueops.ApplyBatchResult, error) {
+	return issueops.ApplyBatchResult{}, errors.ErrUnsupported
 }
