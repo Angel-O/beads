@@ -7,7 +7,6 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -119,62 +118,89 @@ func TestEveryLegWiresEveryRoleContract(t *testing.T) {
 	if len(entrypoints) == 0 {
 		t.Fatal("the conformance package exports no role contract entrypoints; this test would pass vacuously")
 	}
-	legs := contractLegs(t, filepath.Join(root, "internal", "storage"))
-	if len(legs) == 0 {
-		t.Fatal("no package under internal/storage imports the conformance package; this test would pass vacuously")
-	}
+	legs := registeredContractLegs(t)
 	known := map[string]bool{}
 	for _, name := range entrypoints {
 		known[name] = true
 	}
+	registered := map[string]bool{}
 
 	for _, leg := range legs {
-		t.Run(leg, func(t *testing.T) {
-			wired, excluded := conformanceEntrypointsWiredBy(t, filepath.Join(root, "internal", "storage", leg))
-			waived := unwiredContractEntrypoints[leg]
+		registered[leg.name] = true
+		t.Run(leg.name, func(t *testing.T) {
+			waived := unwiredContractEntrypoints[leg.name]
+			wiring := inspectLegWiring(t, filepath.Join(root, filepath.FromSlash(leg.wiringRoot)), entrypoints, waived)
 
-			var missing []string
-			names := 0
-			for _, name := range entrypoints {
-				_, isWaived := waived[name]
-				if wired[name] {
-					names++
-				}
-				switch {
-				case wired[name] && isWaived:
-					t.Errorf("%s is waived as unwired for %s but the leg runs it: "+
-						"delete its entry from unwiredContractEntrypoints", name, leg)
-				case !wired[name] && !isWaived:
-					missing = append(missing, name)
-				}
+			for _, name := range wiring.falselyWaived {
+				t.Errorf("%s is waived as unwired for %s but the leg runs it: "+
+					"delete its entry from unwiredContractEntrypoints", name, leg.name)
 			}
-			if len(missing) > 0 {
+			if len(wiring.missing) > 0 {
 				detail := fmt.Sprintf(" (%d waived)", len(waived))
-				if len(excluded) > 0 {
+				if len(wiring.excluded) > 0 {
 					detail += fmt.Sprintf(" (ignoring %d file(s) no build includes: %s)",
-						len(excluded), strings.Join(excluded, ", "))
+						len(wiring.excluded), strings.Join(wiring.excluded, ", "))
 				}
 				t.Errorf("%s names %d of the %d role contract entrypoints%s; it never names: %s",
-					leg, names, len(entrypoints), detail, strings.Join(missing, ", "))
+					leg.name, wiring.named, len(entrypoints), detail, strings.Join(wiring.missing, ", "))
 			}
 
 			for _, name := range sortedNames(waived) {
 				if !known[name] {
-					t.Errorf("unwiredContractEntrypoints waives %q for %s, which is no contract entrypoint", name, leg)
+					t.Errorf("unwiredContractEntrypoints waives %q for %s, which is no contract entrypoint", name, leg.name)
 					continue
 				}
 				if strings.TrimSpace(waived[name]) == "" {
-					t.Errorf("unwiredContractEntrypoints waives %s for %s with no reason", name, leg)
+					t.Errorf("unwiredContractEntrypoints waives %s for %s with no reason", name, leg.name)
 				}
 			}
 		})
 	}
 
 	for _, leg := range sortedNames(unwiredContractEntrypoints) {
-		if !sortedContains(legs, leg) {
-			t.Errorf("unwiredContractEntrypoints waives entrypoints for %q, which is no backend leg", leg)
+		if !registered[leg] {
+			t.Errorf("unwiredContractEntrypoints waives entrypoints for %q, which is no registered leg", leg)
 		}
 	}
+}
+
+// legWiring is what one leg's test sources say about the role contract tier,
+// with that leg's waivers already spent.
+type legWiring struct {
+	// named is how many contract entrypoints the leg's sources name.
+	named int
+	// missing are the entrypoints the leg neither names nor is waived for.
+	missing []string
+	// falselyWaived are entrypoints waived as unwired that the leg does run.
+	falselyWaived []string
+	// excluded are the files no build includes, which were not read.
+	excluded []string
+}
+
+// inspectLegWiring diffs what the leg rooted at dir names against the contract
+// tier.
+//
+// It reports rather than fails so the mechanism can be proved against a
+// fabricated leg — see TestARegisteredLegOutsideTheStorageTreeIsLockedToo,
+// which is the only place a leg's wiring root outside internal/storage is
+// exercised until a distribution registers one.
+func inspectLegWiring(t *testing.T, dir string, entrypoints []string, waived map[string]string) legWiring {
+	t.Helper()
+	wired, excluded := conformanceEntrypointsWiredBy(t, dir)
+	wiring := legWiring{excluded: excluded}
+	for _, name := range entrypoints {
+		_, isWaived := waived[name]
+		if wired[name] {
+			wiring.named++
+		}
+		switch {
+		case wired[name] && isWaived:
+			wiring.falselyWaived = append(wiring.falselyWaived, name)
+		case !wired[name] && !isWaived:
+			wiring.missing = append(wiring.missing, name)
+		}
+	}
+	return wiring
 }
 
 // repositoryRoot locates the module root from this file's own path.
@@ -185,44 +211,6 @@ func repositoryRoot(t *testing.T) string {
 		t.Fatal("runtime.Caller failed")
 	}
 	return filepath.Join(filepath.Dir(thisFile), "..", "..")
-}
-
-// contractLegs reports the packages under dir whose tests import the
-// conformance package, which is what makes a package a backend leg.
-//
-// It is derived rather than listed because a fourth leg arriving beside a
-// hand-written list stays outside every check here, which is the drift this
-// file exists to catch. A package that only mentions the conformance package in
-// a comment is not a leg and does not appear: the test is the import, not the
-// word.
-func contractLegs(t *testing.T, dir string) []string {
-	t.Helper()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("reading %s: %v", dir, err)
-	}
-	var legs []string
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		files, err := filepath.Glob(filepath.Join(dir, entry.Name(), "*_test.go"))
-		if err != nil {
-			t.Fatalf("globbing %s: %v", entry.Name(), err)
-		}
-		for _, file := range files {
-			parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.ImportsOnly)
-			if err != nil {
-				t.Fatalf("parsing %s: %v", file, err)
-			}
-			if conformanceImportName(parsed) != "" {
-				legs = append(legs, entry.Name())
-				break
-			}
-		}
-	}
-	sort.Strings(legs)
-	return legs
 }
 
 // roleContractEntrypoints reports the role tier: every exported Run function
@@ -433,10 +421,4 @@ func sortedNames[V any](m map[string]V) []string {
 	}
 	sort.Strings(names)
 	return names
-}
-
-// sortedContains reports whether a sorted slice holds want.
-func sortedContains(names []string, want string) bool {
-	index := sort.SearchStrings(names, want)
-	return index < len(names) && names[index] == want
 }
