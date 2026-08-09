@@ -2843,6 +2843,269 @@ paths:
         '503':
           $ref: '#/components/responses/Unavailable'
 
+  /v0/beads/issues:claimNext:
+    post:
+      operationId: claimNextIssue
+      summary: Claim the next ready issue
+      description: >-
+        Takes ONE ready issue and hands it back claimed, in a single
+        transaction. It is `bd ready --claim`, and it is the operation this
+        surface's polling clients have been composing by hand out of
+        `GET /v0/beads/ready` and `POST /v0/beads/issues/{id}:claim`.
+
+
+        THAT COMPOSITION IS A RACE, and retiring it is why this exists. Between
+        the listing that offered a row and the claim that asked for it, another
+        agent claims it — so the second agent gets `409 already_claimed` for a
+        row it was correctly offered, and a fleet polling one queue spends its
+        requests losing races rather than doing work. Here the ready predicate,
+        the compare-and-set that wins the row, and the hydration of the row that
+        was won are ONE transaction, so the row cannot move between being chosen
+        and being reported.
+
+
+        THE CALLER NAMES A QUESTION, NOT A ROW, which is what makes this a
+        different operation rather than a mode of the claim. There is no id in
+        the path and none in the body: selection is part of the contract.
+
+
+        ## Nothing eligible is a 200
+
+
+        An empty ready front is the steady state of a drained queue, not a
+        failure, so a request that finds nothing answers `200` with `claimed`
+        ABSENT. Its absence is the whole signal and there is no second member
+        beside it: a polling agent branches on presence and sleeps. Nothing is
+        written and no history entry is recorded.
+
+
+        This is the one place this operation deliberately differs from
+        `POST /v0/beads/issues/{id}:claim`, which 404s an id that names nothing
+        — that operation was asked about a ROW, and this one was asked a
+        question whose honest answer can be "none".
+
+
+        ## The filters are the listing's, exactly
+
+
+        Every parameter below is `GET /v0/beads/ready`'s, means what it means
+        there, and is decoded by the same function — including the default type
+        exclusions and the way `type` drops them. That is not tidiness: a claim
+        that answered a different question than the listing shows would hand an
+        agent work the listing never offered it, and two predicates that are
+        allowed to differ eventually do.
+
+
+        THERE IS NO `limit`, and sending one is a 400 rather than a silently
+        dropped parameter. A claim delivers exactly the one row it wins no
+        matter how large the pool it scanned, and the scan itself must stay
+        UNBOUNDED: the implementation walks the ready order and continues past
+        rows a racing agent already took, so a bounded window would report
+        "nothing to claim" whenever that window happened to be unclaimable while
+        plenty of other ready work remained.
+
+
+        `sort` IS published, unlike on `GET /v0/beads/ready:count`, because
+        order decides WHICH row a claim wins where it cannot change a
+        cardinality.
+
+
+        ## Leases, and the one case that has none
+
+
+        A DURABLE win grants exactly one lease on the row it won — the handle
+        heartbeats extend, and the row lease-expiry recovery walks once nothing
+        extends it.
+
+
+        An EPHEMERAL win carries NO LEASE, and that is the sharper consequence
+        because it has no expiry to wait out. Ephemeral rows are outside the
+        ready set by default; `include_ephemeral` pulls them in for the claim
+        exactly as it does for the listing, and such a row IS claimable —
+        claiming it moves the ephemeral row itself rather than promoting it.
+        But heartbeats refuse an ephemeral row and lease-expiry recovery only
+        walks leased durable ones, so nothing reclaims it if its claimant dies:
+        it stays in progress under a gone actor until something releases or
+        finishes it. A caller handing ephemeral work to agents it does not
+        supervise owns that recovery itself. An ephemeral win records no durable
+        history entry either, so a caller reconstructing who took what from
+        history alone will not see it — read the row.
+
+
+        ## Hooks and auto-commit
+
+
+        Hooks do not fire and the per-command auto-commit machinery does not
+        run, exactly as for `POST /v0/beads/issues/{id}:claim`.
+      parameters:
+        - name: assignee
+          in: query
+          description: Only issues assigned to this actor.
+          schema:
+            type: string
+        - name: unassigned
+          in: query
+          description: Only issues with no assignee.
+          schema:
+            type: boolean
+        - name: type
+          in: query
+          description: >-
+            Issue type. The only normalization is shorthand ALIAS expansion,
+            exactly what `bd ready --type` does: `mr` → `merge-request`,
+            `feat` → `feature`, `mol` → `molecule`, `enhancement` → `feature`,
+            `dec`/`adr` → `decision`. Every other value is used as written —
+            there is NO plural folding, so `bugs` is not `bug`.
+
+
+            An unrecognized type is not an error here: the type vocabulary is
+            workspace-configurable, and `bd ready` does not validate it either,
+            so it simply matches nothing and `items` comes back empty. (The
+            list operation differs — `bd list` DOES validate the type, so
+            `GET /v0/beads/issues?type=bugs` is a 400.)
+
+
+            When set, `exclude_type` is ignored, and so are the default type
+            exclusions described above.
+          schema:
+            type: string
+        - name: exclude_type
+          in: query
+          description: >-
+            Issue types to exclude. Repeat the parameter, or pass a
+            comma-separated list. Ignored when `type` is set.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+        - name: label
+          in: query
+          description: Labels that must ALL be present (AND).
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+        - name: label_any
+          in: query
+          description: Labels of which at least one must be present (OR).
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+        - name: exclude_label
+          in: query
+          description: Labels that must not be present.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+        - name: label_pattern
+          in: query
+          description: Glob matched against labels.
+          schema:
+            type: string
+        - name: label_regex
+          in: query
+          description: Regular expression matched against labels.
+          schema:
+            type: string
+        - name: priority
+          in: query
+          description: Exact priority (0 is a real value, not "unset").
+          schema:
+            type: integer
+        - name: parent
+          in: query
+          description: Restrict to recursive descendants of this issue.
+          schema:
+            type: string
+        - name: metadata_field
+          in: query
+          description: >-
+            Top-level metadata equality filter as `key=value`, split on the
+            first `=`. Repeatable. An invalid key is a 400.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+        - name: has_metadata_key
+          in: query
+          description: Only issues carrying this top-level metadata key.
+          schema:
+            type: string
+        - name: include_ephemeral
+          in: query
+          description: Include ephemeral (non-synced) rows.
+          schema:
+            type: boolean
+            default: false
+        - name: include_deferred
+          in: query
+          description: Include issues whose `defer_until` is still in the future.
+          schema:
+            type: boolean
+            default: false
+        - name: sort
+          in: query
+          description: >-
+            Ready-work ordering. `priority` is priority-first; `hybrid` orders
+            recent issues by priority and older ones by age; `oldest` is
+            creation order. An unrecognized value is a 400.
+
+
+            The default is the one `bd ready --sort` registers, so a client
+            swapping `bd ready --json` for this operation gets the same items in
+            the same order. The storage layer treats an EMPTY policy as
+            `hybrid`, but that fallback is unreachable from the CLI and is NOT
+            this parameter's default: `hybrid` demotes older high-priority work,
+            so defaulting to it would change the item SET as soon as `limit`
+            truncates — silently, and only for the clients this API exists to
+            migrate.
+          schema:
+            type: string
+            enum: [hybrid, priority, oldest]
+            default: priority
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimNextRequest'
+      responses:
+        '200':
+          description: >-
+            The claim ran. `claimed` carries the row it won, or is ABSENT
+            because nothing was eligible.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimNextResponse'
+        '400':
+          description: >-
+            Invalid request: an unknown query parameter, a malformed filter
+            value, a `limit` (which this operation refuses rather than drops),
+            an unparseable or oversized body, an unknown body member, or an
+            `actor` refused by the rules `ClaimRequest.actor` states.
+          x-bd-codes: [invalid_argument]
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
   /v0/beads/config:
     get:
       operationId: listSettings
@@ -5131,7 +5394,7 @@ components:
             The operations this server actually implements, derived from its
             route table. v0's vocabulary is `ready.list`, `ready.count`,
             `issues.list`, `issues.query`, `issues.get`, `issues.create`,
-            `issues.claim`, `issues.release`,
+            `issues.claim`, `issues.claimNext`, `issues.release`,
             `issues.close`, `issues.reopen`, `issues.update`,
             `issues.sweep`, `issues.delete`, `issues.batchCreate`,
             `issues.batchApply`,
@@ -7216,6 +7479,63 @@ components:
             `UpdateIssueRequest.expected_version` spells out: an IEEE-754-double
             parser corrupts it silently, and the corruption only shows up as a
             `precondition_failed` on the NEXT request.
+
+    ClaimNextRequest:
+      type: object
+      additionalProperties: false
+      required: [actor]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F-\u009F\u2028\u2029]+$'
+          description: >-
+            Who is claiming. `ClaimRequest.actor`'s rules exactly: the server
+            trims it, then refuses an empty result, anything longer than 256
+            BYTES (the `maxLength` above counts characters — the byte limit is
+            the binding one), and any control character including newline. The
+            value is persisted as the assignee and interpolated into the storage
+            commit message, so an unvalidated newline would forge audit-trail
+            lines.
+
+
+            IT IS THE ONLY BODY MEMBER, and the FILTER travels in the query
+            string instead. That split is deliberate: the filter vocabulary is
+            `GET /v0/beads/ready`'s and is decoded by the same function, so
+            re-spelling it as a body object would create a second expression of
+            one predicate — and two spellings of one predicate eventually
+            disagree. The actor cannot go the same way: it is provenance that
+            lands in a column, and this surface has always carried that in a
+            body.
+
+    ClaimNextResponse:
+      type: object
+      properties:
+        claimed:
+          $ref: '#/components/schemas/IssueWithCounts'
+      description: >-
+        The outcome of one atomic take of ready work.
+
+
+        `claimed` IS ABSENT WHEN NOTHING WAS ELIGIBLE, and its absence is the
+        whole signal — there is no boolean beside it, because a second member
+        carrying the same fact is a second member that can disagree with the
+        first. A polling client branches on presence.
+
+
+        IT IS ALSO THE ONLY MEMBER, deliberately. A count of what was scanned,
+        or how many rows a racing agent had already taken, would describe a
+        moment inside a transaction that has committed and is not a fact about
+        the claim.
+
+
+        The row is `IssueWithCounts` — the element type `GET /v0/beads/ready`
+        returns and `bd ready --json` emits — hydrated INSIDE the transaction
+        that committed the claim, so its counts describe the state the claim
+        produced rather than a later one. It is not an `Issue` because the
+        listing this replaces answers with counts, and a client swapping the
+        composed pair for this operation should not lose a field doing it.
 
     CloseIssueRequest:
       type: object

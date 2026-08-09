@@ -114,6 +114,27 @@ func (e GetDependencyTreeParamsDirection) Valid() bool {
 	}
 }
 
+// Defines values for ClaimNextIssueParamsSort.
+const (
+	ClaimNextIssueParamsSortHybrid   ClaimNextIssueParamsSort = "hybrid"
+	ClaimNextIssueParamsSortOldest   ClaimNextIssueParamsSort = "oldest"
+	ClaimNextIssueParamsSortPriority ClaimNextIssueParamsSort = "priority"
+)
+
+// Valid indicates whether the value is a known member of the ClaimNextIssueParamsSort enum.
+func (e ClaimNextIssueParamsSort) Valid() bool {
+	switch e {
+	case ClaimNextIssueParamsSortHybrid:
+		return true
+	case ClaimNextIssueParamsSortOldest:
+		return true
+	case ClaimNextIssueParamsSortPriority:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for QueryIssuesParamsSort.
 const (
 	QueryIssuesParamsSortAssignee QueryIssuesParamsSort = "assignee"
@@ -155,19 +176,19 @@ func (e QueryIssuesParamsSort) Valid() bool {
 
 // Defines values for ListReadyWorkParamsSort.
 const (
-	ListReadyWorkParamsSortHybrid   ListReadyWorkParamsSort = "hybrid"
-	ListReadyWorkParamsSortOldest   ListReadyWorkParamsSort = "oldest"
-	ListReadyWorkParamsSortPriority ListReadyWorkParamsSort = "priority"
+	Hybrid   ListReadyWorkParamsSort = "hybrid"
+	Oldest   ListReadyWorkParamsSort = "oldest"
+	Priority ListReadyWorkParamsSort = "priority"
 )
 
 // Valid indicates whether the value is a known member of the ListReadyWorkParamsSort enum.
 func (e ListReadyWorkParamsSort) Valid() bool {
 	switch e {
-	case ListReadyWorkParamsSortHybrid:
+	case Hybrid:
 		return true
-	case ListReadyWorkParamsSortOldest:
+	case Oldest:
 		return true
-	case ListReadyWorkParamsSortPriority:
+	case Priority:
 		return true
 	default:
 		return false
@@ -639,6 +660,26 @@ type BlockingAnnotations struct {
 // BondRef A constituent of a compound molecule.
 type BondRef = types.BondRef
 
+// ClaimNextRequest defines model for ClaimNextRequest.
+type ClaimNextRequest struct {
+	// Actor Who is claiming. `ClaimRequest.actor`'s rules exactly: the server trims it, then refuses an empty result, anything longer than 256 BYTES (the `maxLength` above counts characters — the byte limit is the binding one), and any control character including newline. The value is persisted as the assignee and interpolated into the storage commit message, so an unvalidated newline would forge audit-trail lines.
+	//
+	// IT IS THE ONLY BODY MEMBER, and the FILTER travels in the query string instead. That split is deliberate: the filter vocabulary is `GET /v0/beads/ready`'s and is decoded by the same function, so re-spelling it as a body object would create a second expression of one predicate — and two spellings of one predicate eventually disagree. The actor cannot go the same way: it is provenance that lands in a column, and this surface has always carried that in a body.
+	Actor string `json:"actor"`
+}
+
+// ClaimNextResponse The outcome of one atomic take of ready work.
+//
+// `claimed` IS ABSENT WHEN NOTHING WAS ELIGIBLE, and its absence is the whole signal — there is no boolean beside it, because a second member carrying the same fact is a second member that can disagree with the first. A polling client branches on presence.
+//
+// IT IS ALSO THE ONLY MEMBER, deliberately. A count of what was scanned, or how many rows a racing agent had already taken, would describe a moment inside a transaction that has committed and is not a fact about the claim.
+//
+// The row is `IssueWithCounts` — the element type `GET /v0/beads/ready` returns and `bd ready --json` emits — hydrated INSIDE the transaction that committed the claim, so its counts describe the state the claim produced rather than a later one. It is not an `Issue` because the listing this replaces answers with counts, and a client swapping the composed pair for this operation should not lose a field doing it.
+type ClaimNextResponse struct {
+	// Claimed An `Issue` plus relationship cardinalities. This is the element type of both `/v0/beads/ready` and `/v0/beads/issues`, matching what `bd ready --json` and `bd list --json` emit. Property semantics are documented on `Issue`.
+	Claimed *IssueWithCounts `json:"claimed,omitempty"`
+}
+
 // ClaimRequest defines model for ClaimRequest.
 type ClaimRequest struct {
 	// Actor Who is claiming the issue. The server trims it, then refuses an empty result, anything longer than 256 BYTES (the `maxLength` above counts characters — the byte limit is the binding one), and any control character including newline: Unicode category Cc — C0, DEL and the C1 block — plus the U+2028/U+2029 line separators, which is the set the `pattern` above spells.
@@ -734,7 +775,7 @@ type ContextResponse struct {
 	// BeadsDir Absolute path of the served workspace's `.beads` directory. A host path, kept because it is the single-workspace server's only workspace-identity handshake; disclosing it to network peers is part of what an operator accepts when binding beyond loopback.
 	BeadsDir string `json:"beads_dir"`
 
-	// Capabilities The operations this server actually implements, derived from its route table. v0's vocabulary is `ready.list`, `ready.count`, `issues.list`, `issues.query`, `issues.get`, `issues.create`, `issues.claim`, `issues.release`, `issues.close`, `issues.reopen`, `issues.update`, `issues.sweep`, `issues.delete`, `issues.batchCreate`, `issues.batchApply`, `stats.get`, `config.list`, `config.get`, `dependencies.cycles`, `dependencies.list`, `dependencies.blocking`, `dependencies.tree`, `dependencies.add`, `dependencies.remove`, `memories.list`, `memories.get`, `memories.remember`, `memories.forget`, `events.list`, `events.watch`, `issues.casMetadata`; it grows additively, and an operation never appears here unless it is fully implemented. This is how a client checks for an operation — never the version string.
+	// Capabilities The operations this server actually implements, derived from its route table. v0's vocabulary is `ready.list`, `ready.count`, `issues.list`, `issues.query`, `issues.get`, `issues.create`, `issues.claim`, `issues.claimNext`, `issues.release`, `issues.close`, `issues.reopen`, `issues.update`, `issues.sweep`, `issues.delete`, `issues.batchCreate`, `issues.batchApply`, `stats.get`, `config.list`, `config.get`, `dependencies.cycles`, `dependencies.list`, `dependencies.blocking`, `dependencies.tree`, `dependencies.add`, `dependencies.remove`, `memories.list`, `memories.get`, `memories.remember`, `memories.forget`, `events.list`, `events.watch`, `issues.casMetadata`; it grows additively, and an operation never appears here unless it is fully implemented. This is how a client checks for an operation — never the version string.
 	//
 	// THIS LIST IS BUILD-LEVEL, NOT WORKSPACE-LEVEL. It says which operations this binary serves, and for every entry but two that is the whole answer. `events.list` and `events.watch` are the exceptions: the durable events journal is a per-workspace setting that is OFF by default, so a server that advertises them may still refuse every request to both with 409 `events_journal_disabled` — correctly, because the operations exist and the workspace has no journal. A consumer of either MUST treat the capability as "this server speaks it" and the 409 as "not on this workspace", and must not read the capability as a promise that records will arrive.
 	Capabilities []string `json:"capabilities"`
@@ -1765,6 +1806,66 @@ type GetIssueParams struct {
 	IncludeDependents *bool `form:"include_dependents,omitempty" json:"include_dependents,omitempty"`
 }
 
+// ClaimNextIssueParams defines parameters for ClaimNextIssue.
+type ClaimNextIssueParams struct {
+	// Assignee Only issues assigned to this actor.
+	Assignee *string `form:"assignee,omitempty" json:"assignee,omitempty"`
+
+	// Unassigned Only issues with no assignee.
+	Unassigned *bool `form:"unassigned,omitempty" json:"unassigned,omitempty"`
+
+	// Type Issue type. The only normalization is shorthand ALIAS expansion, exactly what `bd ready --type` does: `mr` → `merge-request`, `feat` → `feature`, `mol` → `molecule`, `enhancement` → `feature`, `dec`/`adr` → `decision`. Every other value is used as written — there is NO plural folding, so `bugs` is not `bug`.
+	//
+	// An unrecognized type is not an error here: the type vocabulary is workspace-configurable, and `bd ready` does not validate it either, so it simply matches nothing and `items` comes back empty. (The list operation differs — `bd list` DOES validate the type, so `GET /v0/beads/issues?type=bugs` is a 400.)
+	//
+	// When set, `exclude_type` is ignored, and so are the default type exclusions described above.
+	Type *string `form:"type,omitempty" json:"type,omitempty"`
+
+	// ExcludeType Issue types to exclude. Repeat the parameter, or pass a comma-separated list. Ignored when `type` is set.
+	ExcludeType *[]string `form:"exclude_type,omitempty" json:"exclude_type,omitempty"`
+
+	// Label Labels that must ALL be present (AND).
+	Label *[]string `form:"label,omitempty" json:"label,omitempty"`
+
+	// LabelAny Labels of which at least one must be present (OR).
+	LabelAny *[]string `form:"label_any,omitempty" json:"label_any,omitempty"`
+
+	// ExcludeLabel Labels that must not be present.
+	ExcludeLabel *[]string `form:"exclude_label,omitempty" json:"exclude_label,omitempty"`
+
+	// LabelPattern Glob matched against labels.
+	LabelPattern *string `form:"label_pattern,omitempty" json:"label_pattern,omitempty"`
+
+	// LabelRegex Regular expression matched against labels.
+	LabelRegex *string `form:"label_regex,omitempty" json:"label_regex,omitempty"`
+
+	// Priority Exact priority (0 is a real value, not "unset").
+	Priority *int `form:"priority,omitempty" json:"priority,omitempty"`
+
+	// Parent Restrict to recursive descendants of this issue.
+	Parent *string `form:"parent,omitempty" json:"parent,omitempty"`
+
+	// MetadataField Top-level metadata equality filter as `key=value`, split on the first `=`. Repeatable. An invalid key is a 400.
+	MetadataField *[]string `form:"metadata_field,omitempty" json:"metadata_field,omitempty"`
+
+	// HasMetadataKey Only issues carrying this top-level metadata key.
+	HasMetadataKey *string `form:"has_metadata_key,omitempty" json:"has_metadata_key,omitempty"`
+
+	// IncludeEphemeral Include ephemeral (non-synced) rows.
+	IncludeEphemeral *bool `form:"include_ephemeral,omitempty" json:"include_ephemeral,omitempty"`
+
+	// IncludeDeferred Include issues whose `defer_until` is still in the future.
+	IncludeDeferred *bool `form:"include_deferred,omitempty" json:"include_deferred,omitempty"`
+
+	// Sort Ready-work ordering. `priority` is priority-first; `hybrid` orders recent issues by priority and older ones by age; `oldest` is creation order. An unrecognized value is a 400.
+	//
+	// The default is the one `bd ready --sort` registers, so a client swapping `bd ready --json` for this operation gets the same items in the same order. The storage layer treats an EMPTY policy as `hybrid`, but that fallback is unreachable from the CLI and is NOT this parameter's default: `hybrid` demotes older high-priority work, so defaulting to it would change the item SET as soon as `limit` truncates — silently, and only for the clients this API exists to migrate.
+	Sort *ClaimNextIssueParamsSort `form:"sort,omitempty" json:"sort,omitempty"`
+}
+
+// ClaimNextIssueParamsSort defines parameters for ClaimNextIssue.
+type ClaimNextIssueParamsSort string
+
 // QueryIssuesParams defines parameters for QueryIssues.
 type QueryIssuesParams struct {
 	// Q The query expression, e.g. `status=open AND priority>1` or `type=bug OR label=urgent`. Blank, unparseable, or naming a field or operator the language does not have is a 400 `invalid_argument` with `param: "q"` and `reason: "invalid_value"`.
@@ -1964,6 +2065,9 @@ type ApplyBatchJSONRequestBody = ApplyBatchRequest
 
 // BatchCreateIssuesJSONRequestBody defines body for BatchCreateIssues for application/json ContentType.
 type BatchCreateIssuesJSONRequestBody = BatchCreateRequest
+
+// ClaimNextIssueJSONRequestBody defines body for ClaimNextIssue for application/json ContentType.
+type ClaimNextIssueJSONRequestBody = ClaimNextRequest
 
 // DeleteIssuesJSONRequestBody defines body for DeleteIssues for application/json ContentType.
 type DeleteIssuesJSONRequestBody = DeleteIssuesRequest

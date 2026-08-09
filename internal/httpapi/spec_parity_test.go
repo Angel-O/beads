@@ -756,6 +756,84 @@ func TestCloseRequestMembersMatchTheHandler(t *testing.T) {
 	}
 }
 
+// TestClaimNextRequestMembersMatchTheHandler is the claim's gate for the
+// claimNext body. The body is one member, and the point of the test is the
+// NEGATIVE half: this operation's filter lives in the query string, so a
+// documented body member the handler refuses — or, worse, a filter member added
+// to the schema that would have to be a second spelling of the ready
+// vocabulary — fails here rather than shipping.
+func TestClaimNextRequestMembersMatchTheHandler(t *testing.T) {
+	accepted := map[string]bool{}
+	for _, name := range claimNextRequestMembers {
+		accepted[name] = true
+	}
+
+	goFields := jsonTagNames(t, reflect.TypeOf(apigen.ClaimNextRequest{}))
+	if extra := diff(goFields, accepted); len(extra) > 0 {
+		t.Errorf("generated ClaimNextRequest declares members the claimNext handler refuses as unknown: %v", extra)
+	}
+	if missing := diff(accepted, goFields); len(missing) > 0 {
+		t.Errorf("the claimNext handler accepts members ClaimNextRequest does not declare: %v", missing)
+	}
+
+	doc := loadSpec(t)
+	schema := mapAt(t, mapAt(t, mapAt(t, doc, "components"), "schemas"), "ClaimNextRequest")
+	specProps := schemaProperties(t, doc, schema)
+	if extra := diff(specProps, accepted); len(extra) > 0 {
+		t.Errorf("the ClaimNextRequest schema documents members the claimNext handler refuses: %v", extra)
+	}
+	if missing := diff(accepted, specProps); len(missing) > 0 {
+		t.Errorf("the claimNext handler accepts members the ClaimNextRequest schema does not document: %v", missing)
+	}
+}
+
+// TestClaimNextAdmitsExactlyTheListingsFilters is the guarantee readyFilters
+// exists for, asserted at the DOCUMENT level rather than trusted to the shared
+// function.
+//
+// The handler cannot drift — it calls readyFilters itself — but the SPEC can,
+// and a document that published a filter the handler never decodes would tell a
+// client its request was narrowed when it was not. The two operations must
+// admit one set: a claim answering a different question than the listing shows
+// would hand an agent work the listing never offered it.
+//
+// `limit` is the one deliberate difference, and it is asserted as an absence
+// rather than merely not listed, because it is the parameter this operation
+// refuses BY VALUE.
+func TestClaimNextAdmitsExactlyTheListingsFilters(t *testing.T) {
+	doc := loadSpec(t)
+	names := func(path, method string) map[string]bool {
+		op := mapAt(t, mapAt(t, mapAt(t, doc, "paths"), path), method)
+		params, _ := op["parameters"].([]any)
+		out := map[string]bool{}
+		for _, raw := range params {
+			p, _ := raw.(map[string]any)
+			name, _ := p["name"].(string)
+			out[name] = true
+		}
+		return out
+	}
+	listing := names("/v0/beads/ready", "get")
+	claimNext := names("/v0/beads/issues:claimNext", "post")
+
+	if !listing["limit"] {
+		t.Fatal("the listing no longer publishes `limit`; this test's one exception is stale")
+	}
+	delete(listing, "limit")
+
+	if extra := diff(claimNext, listing); len(extra) > 0 {
+		t.Errorf("claimNext publishes parameters the ready listing does not: %v\n"+
+			"the two must admit one filter vocabulary, or a claim answers a different question than the listing shows", extra)
+	}
+	if missing := diff(listing, claimNext); len(missing) > 0 {
+		t.Errorf("the ready listing publishes parameters claimNext does not: %v\n"+
+			"the handler decodes them through readyFilters either way, so the document is understating what it accepts", missing)
+	}
+	if claimNext["limit"] {
+		t.Error("claimNext publishes `limit`; it refuses one, and a documented parameter that is always a 400 is a trap")
+	}
+}
+
 // TestReleaseRequestMembersMatchTheHandler is the close's gate for the release
 // body, and it exists for the same reason. It matters a little more here than
 // there because two of the three members are GUARDS: a documented guard the

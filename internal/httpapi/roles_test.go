@@ -449,6 +449,35 @@ func (c *roleClaimer) claimRequests() []issueops.ClaimRequest {
 	return append([]issueops.ClaimRequest(nil), c.claims...)
 }
 
+// roleReadyClaimer is the store-shaped source's take-ready-work role. The
+// claimNext tests drive it directly: the wire edge — the filter decode, the
+// `limit` refusal, the body vocabulary and the absent-row answer — is provable
+// against a fake, and the atomicity that makes the operation worth having
+// belongs to the role's own contract.
+type roleReadyClaimer struct {
+	result issueops.ClaimNextResult
+	err    error
+
+	mu     sync.Mutex
+	claims []issueops.ClaimNextRequest
+}
+
+func (c *roleReadyClaimer) ClaimNext(_ context.Context, req issueops.ClaimNextRequest) (issueops.ClaimNextResult, error) {
+	c.mu.Lock()
+	c.claims = append(c.claims, req)
+	c.mu.Unlock()
+	if c.err != nil {
+		return issueops.ClaimNextResult{}, c.err
+	}
+	return c.result, nil
+}
+
+func (c *roleReadyClaimer) claimNextRequests() []issueops.ClaimNextRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]issueops.ClaimNextRequest(nil), c.claims...)
+}
+
 // roleReleaser is the store-shaped source's claim-release role. The release
 // tests drive it directly, for the reason roleLifecycle exists: the wire edge —
 // the body vocabulary, the guard pair, the refusal mapping — is provable
@@ -665,6 +694,9 @@ func rolesConfig(cfg Config) Config {
 	}
 	if cfg.Claimer == nil {
 		cfg.Claimer = &roleClaimer{}
+	}
+	if cfg.ReadyClaimer == nil {
+		cfg.ReadyClaimer = &roleReadyClaimer{}
 	}
 	if cfg.Releaser == nil {
 		cfg.Releaser = &roleReleaser{}

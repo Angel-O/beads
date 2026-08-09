@@ -173,6 +173,12 @@ type Config struct {
 	// server, so a rebuild would buy nothing.
 	Reader  issueops.Reader
 	Claimer issueops.Claimer
+	// ReadyClaimer is the atomic take of ready work, behind
+	// POST /v0/beads/issues:claimNext. It is its own field rather than a second
+	// verb on Claimer for the reason the role is its own interface: the caller
+	// names a QUESTION and the implementation picks the answer, so selection is
+	// part of the operation and not a patch.
+	ReadyClaimer issueops.ReadyClaimer
 	// Releaser is the claim's inverse, behind
 	// POST /v0/beads/issues/{id}:release. It is its own field rather than a
 	// method on Claimer for the reason the role is its own interface: a caller
@@ -291,6 +297,7 @@ type Server struct {
 	// names because a struct cannot carry both.
 	issueReader       issueops.Reader
 	issueClaimer      issueops.Claimer
+	issueReadyClaimer issueops.ReadyClaimer
 	issueReleaser     issueops.Releaser
 	issueLifecycle    issueops.Lifecycle
 	settings          issueops.WorkspaceConfig
@@ -424,6 +431,7 @@ func Listen(cfg Config) (*Server, error) {
 		provider:          cfg.Provider,
 		issueReader:       cfg.Reader,
 		issueClaimer:      cfg.Claimer,
+		issueReadyClaimer: cfg.ReadyClaimer,
 		issueReleaser:     cfg.Releaser,
 		issueLifecycle:    cfg.Lifecycle,
 		settings:          cfg.Settings,
@@ -545,12 +553,12 @@ func Listen(cfg Config) (*Server, error) {
 // "all or nothing" would turn an honest condition into a special case inside
 // three functions. It is checked once, on its own, below.
 func sourceRoles(cfg Config) []any {
-	return []any{cfg.Reader, cfg.Claimer, cfg.Releaser, cfg.Lifecycle, cfg.Settings, cfg.Stats, cfg.CycleDetector, cfg.EdgeReader, cfg.BlockingAnnotator, cfg.TreeWalker, cfg.ReadyCounter, cfg.Querier, cfg.Sweeper, cfg.Deleter, cfg.BatchCreator, cfg.DependencyEditor, cfg.BatchApplier, cfg.Memories, cfg.MetadataCAS}
+	return []any{cfg.Reader, cfg.Claimer, cfg.ReadyClaimer, cfg.Releaser, cfg.Lifecycle, cfg.Settings, cfg.Stats, cfg.CycleDetector, cfg.EdgeReader, cfg.BlockingAnnotator, cfg.TreeWalker, cfg.ReadyCounter, cfg.Querier, cfg.Sweeper, cfg.Deleter, cfg.BatchCreator, cfg.DependencyEditor, cfg.BatchApplier, cfg.Memories, cfg.MetadataCAS}
 }
 
 // roleSourceNames spells sourceRoles for the refusal message, in the same
 // order, so a caller reading the error learns the whole set it must pass.
-const roleSourceNames = "Reader, Claimer, Releaser, Lifecycle, Settings, Stats, CycleDetector, EdgeReader, BlockingAnnotator, TreeWalker, ReadyCounter, Querier, Sweeper, Deleter, BatchCreator, DependencyEditor, BatchApplier, Memories and MetadataCAS"
+const roleSourceNames = "Reader, Claimer, ReadyClaimer, Releaser, Lifecycle, Settings, Stats, CycleDetector, EdgeReader, BlockingAnnotator, TreeWalker, ReadyCounter, Querier, Sweeper, Deleter, BatchCreator, DependencyEditor, BatchApplier, Memories and MetadataCAS"
 
 func anyRoleSet(cfg Config) bool {
 	return slices.ContainsFunc(sourceRoles(cfg), func(r any) bool { return r != nil })
@@ -740,6 +748,25 @@ func (s *Server) claimer(r *http.Request) (issueops.Claimer, error) {
 		return nil, err
 	}
 	return checkedClaimer{inner: cl}, nil
+}
+
+// readyClaimer returns the take-ready-work surface for one request.
+//
+// Built the same two ways as claimer above and for the same reasons, and held
+// by INTERFACE so uow.ReadyClaimerSource is load-bearing rather than
+// decorative.
+//
+// IT GOES OUT UNWRAPPED, and the difference from checkedClaimer is the whole
+// reason that wrapper exists. That one folds a nil issue because handleClaim
+// DEREFERENCES the pointer the role returned; this handler forwards it, and a
+// nil is not even a fault here — it is the documented answer for an empty ready
+// front. A wrapper would be ceremony that reads like a guarantee.
+func (s *Server) readyClaimer(r *http.Request) (issueops.ReadyClaimer, error) {
+	if s.provider == nil {
+		return s.issueReadyClaimer, nil
+	}
+	var src uow.ReadyClaimerSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	return src.ReadyClaimer()
 }
 
 // releaser returns the claim-release surface for one request.
