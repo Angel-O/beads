@@ -600,7 +600,7 @@ func TestCapabilitiesAdvertiseEveryImplementedOperation(t *testing.T) {
 		"dependencies.cycles", "dependencies.list", "dependencies.remove",
 		"dependencies.tree", "events.list", "events.watch", "issues.batchApply",
 		"issues.batchClose", "issues.batchCreate", "issues.casMetadata",
-		"issues.claim", "issues.claimNext", "issues.close", "issues.create", "issues.delete", "issues.get", "issues.list",
+		"issues.claim", "issues.claimNext", "issues.close", "issues.count", "issues.create", "issues.delete", "issues.get", "issues.list",
 		"issues.query", "issues.release", "issues.reopen", "issues.sweep", "issues.update",
 		"memories.forget", "memories.get",
 		"memories.list", "memories.remember", "ready.count", "ready.list",
