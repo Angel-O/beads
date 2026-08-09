@@ -1837,6 +1837,15 @@ func RunDependencyEditorRelatesToAddLeavesItsSourceUnblocked(t *testing.T, ctx c
 // diamond back onto its own root and requires ErrDependencyCycle with nothing
 // written. Acceptance and refusal over one fixture is what makes either one
 // mean anything.
+//
+// THE LAST ARM IS THE ONE THAT WALKS THE CONVERGENCE. Both gates search FROM
+// the new edge's target, so while the target is the diamond's foot the walk
+// finds a sink and never meets a node twice — the acceptance above would
+// survive a gate that mistook a second visit for a loop. An edge pointing INTO
+// the diamond's head makes the search start at the root and reach the foot down
+// both shoulders, so the second visit happens on a graph with no cycle in it,
+// and the gate's visited-set (issueops.CycleThroughEdgesInGraph's BFS) is what
+// has to tell those apart.
 func RunDependencyEditorAcceptsADiamond(t *testing.T, ctx context.Context, fixture DependencyEditorFixture) {
 	t.Helper()
 	root := fixture.IssuePrefix + "-diamond-root"
@@ -1884,6 +1893,19 @@ func RunDependencyEditorAcceptsADiamond(t *testing.T, ctx context.Context, fixtu
 		t.Fatalf("closing the diamond back onto its root: error = %v, want ErrDependencyCycle — the accepting half above is only meaningful beside a gate that still fires", err)
 	}
 	assertDependencyEditorNoEdgesFrom(t, ctx, fixture, foot)
+
+	// An edge into the HEAD of the diamond, from an issue the diamond cannot
+	// reach. The gate searches from the target, so this is the arm whose search
+	// runs down both shoulders and arrives at the foot twice.
+	outsider := fixture.IssuePrefix + "-diamond-outsider"
+	seedDependencyEditorIssue(t, ctx, fixture, outsider)
+	if _, err := fixture.Editor.AddDependencies(ctx, publicops.AddDependenciesRequest{
+		Actor: "writer",
+		Edges: []publicops.DependencyEdge{{IssueID: outsider, DependsOnID: root, Type: publicops.DepBlocks}},
+	}); err != nil {
+		t.Fatalf("gating an outside issue on the head of a diamond: %v — reaching one node by two paths is convergence, not a loop", err)
+	}
+	assertDependencyEdgeTypedCount(t, ctx, fixture, "dependencies", outsider, root, string(publicops.DepBlocks), 1)
 }
 
 // RunDependencyEditorGateScopeFollowsTheEdgeType pins which edges the ADD-TIME
