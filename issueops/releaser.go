@@ -124,7 +124,7 @@ type ReleaseResult struct {
 //
 // It lives beside the role rather than in errors.go because it is meaningless
 // without ReleaseRequest to explain it, and errors.go is the file every
-// parallel role slice touches. Its neighbour ErrNotOwner is in errors.go
+// parallel role slice touches. Its neighbor ErrNotOwner is in errors.go
 // instead, because that one is the shared ownership vocabulary the claim family
 // already speaks.
 //

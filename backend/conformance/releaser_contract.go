@@ -119,15 +119,14 @@ type ReleaserFixture struct {
 // that makes the documented compose-and-continue loop diverge.
 func RunReleaserReleasesItsOwnClaim(t *testing.T, ctx context.Context, fixture ReleaserFixture) {
 	t.Helper()
-	const actor = "releaser-holder"
-	id := releaserSeedClaimed(t, ctx, fixture, "own", "target", actor, false)
-	before := releaserRowVersion(t, ctx, fixture, "issues", id)
+	id := releaserSeedClaimed(t, ctx, fixture, "own", "target", false)
+	before := releaserRowVersion(t, ctx, fixture, id)
 	if started := releaserScalar[int](t, ctx, fixture,
 		"SELECT COUNT(*) FROM issues WHERE id = ? AND started_at IS NOT NULL", id); started != 1 {
 		t.Fatalf("seed left started_at NULL; the cleared-started_at clause below could not fail")
 	}
 
-	result, err := fixture.Releaser.Release(ctx, publicops.ReleaseRequest{Actor: actor, IssueID: id})
+	result, err := fixture.Releaser.Release(ctx, publicops.ReleaseRequest{Actor: releaserHolder, IssueID: id})
 	if err != nil {
 		t.Fatalf("Release() error = %v", err)
 	}
@@ -148,7 +147,7 @@ func RunReleaserReleasesItsOwnClaim(t *testing.T, ctx context.Context, fixture R
 		t.Errorf("lease rows for %s = %d, want 0 — a released row holding a lease is the state a reaper cannot fix", id, leases)
 	}
 
-	after := releaserRowVersion(t, ctx, fixture, "issues", id)
+	after := releaserRowVersion(t, ctx, fixture, id)
 	if after == before {
 		t.Errorf("row version did not move across the release; a concurrent reclaim would silently merge with it")
 	}
@@ -171,16 +170,15 @@ func RunReleaserReleasesItsOwnClaim(t *testing.T, ctx context.Context, fixture R
 // perfectly — and refusal-only coverage of a guarded write is half a test.
 func RunReleaserRefusesAForeignClaimUntilForced(t *testing.T, ctx context.Context, fixture ReleaserFixture) {
 	t.Helper()
-	const holder = "releaser-holder"
-	id := releaserSeedClaimed(t, ctx, fixture, "foreign", "target", holder, false)
-	version := releaserRowVersion(t, ctx, fixture, "issues", id)
+	id := releaserSeedClaimed(t, ctx, fixture, "foreign", "target", false)
+	version := releaserRowVersion(t, ctx, fixture, id)
 
 	_, err := fixture.Releaser.Release(ctx, publicops.ReleaseRequest{Actor: "releaser-stranger", IssueID: id})
 	if !errors.Is(err, publicops.ErrNotOwner) {
 		t.Fatalf("Release() by a stranger error = %v, want ErrNotOwner", err)
 	}
-	releaserAssertRow(t, ctx, fixture, "issues", id, holder, types.StatusInProgress)
-	if got := releaserRowVersion(t, ctx, fixture, "issues", id); got != version {
+	releaserAssertRow(t, ctx, fixture, "issues", id, releaserHolder, types.StatusInProgress)
+	if got := releaserRowVersion(t, ctx, fixture, id); got != version {
 		t.Errorf("a refused release moved the row version; the holder's next compare-and-set would lose for a reason it cannot see")
 	}
 
@@ -211,24 +209,23 @@ func RunReleaserRefusesAForeignClaimUntilForced(t *testing.T, ctx context.Contex
 // would answer ErrNotOwner here and pass every other case in this file.
 func RunReleaserReleasesOnlyTheExpectedHolder(t *testing.T, ctx context.Context, fixture ReleaserFixture) {
 	t.Helper()
-	const holder = "releaser-holder"
 	stale := "releaser-previous-holder"
 
-	moved := releaserSeedClaimed(t, ctx, fixture, "expect", "moved", holder, false)
-	version := releaserRowVersion(t, ctx, fixture, "issues", moved)
+	moved := releaserSeedClaimed(t, ctx, fixture, "expect", "moved", false)
+	version := releaserRowVersion(t, ctx, fixture, moved)
 	_, err := fixture.Releaser.Release(ctx, publicops.ReleaseRequest{
 		Actor: "releaser-supervisor", IssueID: moved, ExpectedAssignee: &stale,
 	})
 	if !errors.Is(err, publicops.ErrAssigneeMismatch) {
 		t.Fatalf("Release() naming a stale holder error = %v, want ErrAssigneeMismatch", err)
 	}
-	releaserAssertRow(t, ctx, fixture, "issues", moved, holder, types.StatusInProgress)
-	if got := releaserRowVersion(t, ctx, fixture, "issues", moved); got != version {
+	releaserAssertRow(t, ctx, fixture, "issues", moved, releaserHolder, types.StatusInProgress)
+	if got := releaserRowVersion(t, ctx, fixture, moved); got != version {
 		t.Errorf("a refused conditional release moved the row version")
 	}
 
-	current := holder
-	matched := releaserSeedClaimed(t, ctx, fixture, "expect", "matched", holder, false)
+	current := releaserHolder
+	matched := releaserSeedClaimed(t, ctx, fixture, "expect", "matched", false)
 	result, err := fixture.Releaser.Release(ctx, publicops.ReleaseRequest{
 		Actor: "releaser-supervisor", IssueID: matched, ExpectedAssignee: &current,
 	})
@@ -258,18 +255,18 @@ func RunReleaserReleasesOnlyTheExpectedHolder(t *testing.T, ctx context.Context,
 func RunReleaserRefusesAnUnheldIssue(t *testing.T, ctx context.Context, fixture ReleaserFixture) {
 	t.Helper()
 	id := releaserSeed(t, ctx, fixture, releaserIssue(fixture, "unheld", "target", false))
-	version := releaserRowVersion(t, ctx, fixture, "issues", id)
-	holder := "releaser-holder"
+	version := releaserRowVersion(t, ctx, fixture, id)
+	expectedHolder := releaserHolder
 
 	for _, test := range []struct {
 		name    string
 		request publicops.ReleaseRequest
 		want    error
 	}{
-		{"unconditional", publicops.ReleaseRequest{Actor: "releaser-holder", IssueID: id}, publicops.ErrNotClaimed},
+		{"unconditional", publicops.ReleaseRequest{Actor: releaserHolder, IssueID: id}, publicops.ErrNotClaimed},
 		{"forced", publicops.ReleaseRequest{Actor: "releaser-reaper", IssueID: id, Force: true}, publicops.ErrNotClaimed},
 		{"conditional", publicops.ReleaseRequest{
-			Actor: "releaser-supervisor", IssueID: id, ExpectedAssignee: &holder,
+			Actor: "releaser-supervisor", IssueID: id, ExpectedAssignee: &expectedHolder,
 		}, publicops.ErrAssigneeMismatch},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -278,7 +275,7 @@ func RunReleaserRefusesAnUnheldIssue(t *testing.T, ctx context.Context, fixture 
 				t.Fatalf("Release(%s) error = %v, want %v", test.name, err, test.want)
 			}
 			releaserAssertRow(t, ctx, fixture, "issues", id, "", types.StatusOpen)
-			if got := releaserRowVersion(t, ctx, fixture, "issues", id); got != version {
+			if got := releaserRowVersion(t, ctx, fixture, id); got != version {
 				t.Errorf("a refused release moved the row version")
 			}
 		})
@@ -298,7 +295,6 @@ func RunReleaserRefusesAnUnheldIssue(t *testing.T, ctx context.Context, fixture 
 // asserting the CLAIM SURVIVES is what says the refusal did not half-apply.
 func RunReleaserRefusesAStatusThatCannotBeReleased(t *testing.T, ctx context.Context, fixture ReleaserFixture) {
 	t.Helper()
-	const holder = "releaser-holder"
 
 	for _, test := range []struct {
 		name   string
@@ -310,14 +306,14 @@ func RunReleaserRefusesAStatusThatCannotBeReleased(t *testing.T, ctx context.Con
 		t.Run(test.name, func(t *testing.T) {
 			issue := releaserIssue(fixture, "status", test.name, false)
 			issue.Status = test.status
-			issue.Assignee = holder
+			issue.Assignee = releaserHolder
 			id := releaserSeed(t, ctx, fixture, issue)
 
-			_, err := fixture.Releaser.Release(ctx, publicops.ReleaseRequest{Actor: holder, IssueID: id})
+			_, err := fixture.Releaser.Release(ctx, publicops.ReleaseRequest{Actor: releaserHolder, IssueID: id})
 			if !errors.Is(err, publicops.ErrNotReleasable) {
 				t.Fatalf("Release() of a %s issue error = %v, want ErrNotReleasable", test.name, err)
 			}
-			releaserAssertRow(t, ctx, fixture, "issues", id, holder, test.status)
+			releaserAssertRow(t, ctx, fixture, "issues", id, releaserHolder, test.status)
 		})
 	}
 }
@@ -332,21 +328,21 @@ func RunReleaserRefusesAStatusThatCannotBeReleased(t *testing.T, ctx context.Con
 // answers to one question.
 func RunReleaserRefusesAMalformedRequest(t *testing.T, ctx context.Context, fixture ReleaserFixture) {
 	t.Helper()
-	id := releaserSeedClaimed(t, ctx, fixture, "malformed", "target", "releaser-holder", false)
+	id := releaserSeedClaimed(t, ctx, fixture, "malformed", "target", false)
 	empty := ""
-	holder := "releaser-holder"
+	expectedHolder := releaserHolder
 
 	for _, test := range []struct {
 		name    string
 		request publicops.ReleaseRequest
 	}{
 		{"no actor", publicops.ReleaseRequest{IssueID: id}},
-		{"no issue id", publicops.ReleaseRequest{Actor: "releaser-holder"}},
+		{"no issue id", publicops.ReleaseRequest{Actor: releaserHolder}},
 		{"empty expected assignee", publicops.ReleaseRequest{
-			Actor: "releaser-holder", IssueID: id, ExpectedAssignee: &empty,
+			Actor: releaserHolder, IssueID: id, ExpectedAssignee: &empty,
 		}},
 		{"force beside an expected assignee", publicops.ReleaseRequest{
-			Actor: "releaser-holder", IssueID: id, ExpectedAssignee: &holder, Force: true,
+			Actor: releaserHolder, IssueID: id, ExpectedAssignee: &expectedHolder, Force: true,
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -357,7 +353,7 @@ func RunReleaserRefusesAMalformedRequest(t *testing.T, ctx context.Context, fixt
 	}
 	// The claim is still there: a refused request reads nothing and writes
 	// nothing, and the last two rows above name a real, claimed id.
-	releaserAssertRow(t, ctx, fixture, "issues", id, "releaser-holder", types.StatusInProgress)
+	releaserAssertRow(t, ctx, fixture, "issues", id, releaserHolder, types.StatusInProgress)
 }
 
 // RunReleaserRefusesAnAbsentID pins the existence refusal
@@ -372,7 +368,7 @@ func RunReleaserRefusesAnAbsentID(t *testing.T, ctx context.Context, fixture Rel
 	absent := fixture.IssuePrefix + "-absent-nosuchrow"
 	for _, force := range []bool{false, true} {
 		_, err := fixture.Releaser.Release(ctx, publicops.ReleaseRequest{
-			Actor: "releaser-holder", IssueID: absent, Force: force,
+			Actor: releaserHolder, IssueID: absent, Force: force,
 		})
 		if !errors.Is(err, publicops.ErrNotFound) {
 			t.Fatalf("Release(force=%v) of an absent id error = %v, want ErrNotFound", force, err)
@@ -395,9 +391,8 @@ func RunReleaserRefusesAnAbsentID(t *testing.T, ctx context.Context, fixture Rel
 // metadata compare-and-set contract hit and documented.
 func RunReleaserAttributesTheReleaseToTheActor(t *testing.T, ctx context.Context, fixture ReleaserFixture) {
 	t.Helper()
-	const holder = "releaser-holder"
 	const actor = "releaser-reaper"
-	id := releaserSeedClaimed(t, ctx, fixture, "attribution", "target", holder, false)
+	id := releaserSeedClaimed(t, ctx, fixture, "attribution", "target", false)
 
 	if _, err := fixture.Releaser.Release(ctx, publicops.ReleaseRequest{
 		Actor: actor, IssueID: id, Force: true,
@@ -408,8 +403,8 @@ func RunReleaserAttributesTheReleaseToTheActor(t *testing.T, ctx context.Context
 	if got := releaserUnclaimEvents(t, ctx, fixture, id, actor); got != 1 {
 		t.Errorf("unclaimed events attributed to %q = %d, want 1", actor, got)
 	}
-	if got := releaserUnclaimEvents(t, ctx, fixture, id, holder); got != 0 {
-		t.Errorf("unclaimed events attributed to the HOLDER %q = %d, want 0 — the actor released it, not the holder", holder, got)
+	if got := releaserUnclaimEvents(t, ctx, fixture, id, releaserHolder); got != 0 {
+		t.Errorf("unclaimed events attributed to the HOLDER %q = %d, want 0 — the actor released it, not the holder", releaserHolder, got)
 	}
 }
 
@@ -426,14 +421,13 @@ func RunReleaserRecordsExactlyOneHistoryEntry(t *testing.T, ctx context.Context,
 	if fixture.CountHistory == nil || fixture.CommitPending == nil {
 		t.Skip("this backend cannot observe or settle its version history")
 	}
-	const holder = "releaser-holder"
-	id := releaserSeedClaimed(t, ctx, fixture, "history", "target", holder, false)
+	id := releaserSeedClaimed(t, ctx, fixture, "history", "target", false)
 	if err := fixture.CommitPending(ctx); err != nil {
 		t.Fatalf("CommitPending(): %v", err)
 	}
 
 	before := releaserHistory(t, ctx, fixture)
-	if _, err := fixture.Releaser.Release(ctx, publicops.ReleaseRequest{Actor: holder, IssueID: id}); err != nil {
+	if _, err := fixture.Releaser.Release(ctx, publicops.ReleaseRequest{Actor: releaserHolder, IssueID: id}); err != nil {
 		t.Fatalf("Release() error = %v", err)
 	}
 	if got := releaserHistory(t, ctx, fixture) - before; got != 1 {
@@ -458,8 +452,7 @@ func RunReleaserRecordsExactlyOneHistoryEntry(t *testing.T, ctx context.Context,
 // no verb could free.
 func RunReleaserReleasesAWispClaimWithoutVersioning(t *testing.T, ctx context.Context, fixture ReleaserFixture) {
 	t.Helper()
-	const holder = "releaser-holder"
-	id := releaserSeedClaimed(t, ctx, fixture, "wisp", "target", holder, true)
+	id := releaserSeedClaimed(t, ctx, fixture, "wisp", "target", true)
 
 	var before int
 	settled := fixture.CountHistory != nil && fixture.CommitPending != nil
@@ -470,7 +463,7 @@ func RunReleaserReleasesAWispClaimWithoutVersioning(t *testing.T, ctx context.Co
 		before = releaserHistory(t, ctx, fixture)
 	}
 
-	result, err := fixture.Releaser.Release(ctx, publicops.ReleaseRequest{Actor: holder, IssueID: id})
+	result, err := fixture.Releaser.Release(ctx, publicops.ReleaseRequest{Actor: releaserHolder, IssueID: id})
 	if err != nil {
 		t.Fatalf("Release() of a claimed wisp error = %v", err)
 	}
@@ -498,7 +491,7 @@ func RunReleaserReleasesAWispClaimWithoutVersioning(t *testing.T, ctx context.Co
 // mutation would survive unnoticed.
 func RunReleaserDoesNotMutateTheCallerRequest(t *testing.T, ctx context.Context, fixture ReleaserFixture) {
 	t.Helper()
-	id := releaserSeedClaimed(t, ctx, fixture, "immutable", "target", "releaser-holder", false)
+	id := releaserSeedClaimed(t, ctx, fixture, "immutable", "target", false)
 	expected := "releaser-previous-holder"
 	request := publicops.ReleaseRequest{
 		Actor: "releaser-supervisor", IssueID: id, ExpectedAssignee: &expected,
@@ -544,18 +537,24 @@ func releaserSeed(t *testing.T, ctx context.Context, fixture ReleaserFixture, is
 	return issue.ID
 }
 
-// releaserSeedClaimed seeds a row in the state a release acts on: held, in
-// progress and started.
+// releaserHolder is the actor every case here seeds a claim to. It is one
+// constant rather than a per-case string because half these cases are ABOUT the
+// difference between the holder and the caller, and two spellings of "the
+// holder" is how such a case comes to assert the wrong one.
+const releaserHolder = "releaser-holder"
+
+// releaserSeedClaimed seeds a row in the state a release acts on: held by
+// releaserHolder, in progress and started.
 //
 // The claim is seeded on the ROW rather than taken through Claimer, which the
 // fixture does not carry — and which would make every case here depend on a
-// second role's behaviour to establish its own precondition.
-func releaserSeedClaimed(t *testing.T, ctx context.Context, fixture ReleaserFixture, tag, name, holder string, ephemeral bool) string {
+// second role's behavior to establish its own precondition.
+func releaserSeedClaimed(t *testing.T, ctx context.Context, fixture ReleaserFixture, tag, name string, ephemeral bool) string {
 	t.Helper()
 	started := time.Now().UTC().Add(-time.Hour)
 	issue := releaserIssue(fixture, tag, name, ephemeral)
 	issue.Status = types.StatusInProgress
-	issue.Assignee = holder
+	issue.Assignee = releaserHolder
 	issue.StartedAt = &started
 	return releaserSeed(t, ctx, fixture, issue)
 }
@@ -578,16 +577,18 @@ func releaserAssertRow(t *testing.T, ctx context.Context, fixture ReleaserFixtur
 	}
 }
 
-// releaserRowVersion reads the RowVersion token straight off the row. COALESCE
-// mirrors the defensive scan the shared guard does, so a NULL in a
+// releaserRowVersion reads the RowVersion token straight off the DURABLE row.
+// COALESCE mirrors the defensive scan the shared guard does, so a NULL in a
 // NOT NULL DEFAULT 0 column reads as 0 rather than failing a case for a reason
 // that is not its subject.
 //
-//nolint:gosec // G201: table is chosen by the caller from the two plane tables.
-func releaserRowVersion(t *testing.T, ctx context.Context, fixture ReleaserFixture, table, id string) int64 {
+// It takes no plane argument because every case that asks is about a durable
+// row: the wisp case's subject is what the release did to the VERSION HISTORY,
+// not to the token.
+func releaserRowVersion(t *testing.T, ctx context.Context, fixture ReleaserFixture, id string) int64 {
 	t.Helper()
 	return releaserScalar[int64](t, ctx, fixture,
-		fmt.Sprintf("SELECT COALESCE(row_lock, 0) FROM %s WHERE id = ?", table), id)
+		"SELECT COALESCE(row_lock, 0) FROM issues WHERE id = ?", id)
 }
 
 // releaserUnclaimEvents counts the release entries on one row attributed to one
