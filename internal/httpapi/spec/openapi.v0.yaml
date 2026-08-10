@@ -62,19 +62,28 @@ info:
     * **Unknown query parameter.** Every operation rejects any query parameter
       outside its own parameter table with `400` / `code: invalid_argument` /
       `reason: "unknown_parameter"` and `param` naming the offending key.
-      Operations with no parameters at all (`GET /healthz`,
-      `GET /v0/beads/context`, `GET /v0/beads/dependencies/cycles`,
+      Operations that declare no QUERY parameter at all reject every query key
+      the same way. Today that is twenty-two of the thirty-eight operations
+      here — `GET /healthz`, `GET /v0/beads/context`,
+      `GET /v0/beads/dependencies/cycles`, `POST /v0/beads/issues`,
+      `PATCH /v0/beads/issues/{id}`,
       `POST /v0/beads/issues/{id}:claim`,
       `POST /v0/beads/issues/{id}:release`,
       `POST /v0/beads/issues/{id}:close`,
       `POST /v0/beads/issues/{id}:reopen`,
       `POST /v0/beads/issues/{id}:casMetadata`, `POST /v0/beads/issues:sweep`,
       `POST /v0/beads/issues:delete`,
+      `POST /v0/beads/issues:batchCreate`,
       `POST /v0/beads/issues:batchApply`,
       `POST /v0/beads/issues:batchClose`, `GET /v0/beads/config`,
       `GET /v0/beads/config/{key}`, `POST /v0/beads/dependencies:add`,
-      `POST /v0/beads/dependencies:remove`) reject every query key the same
-      way.
+      `POST /v0/beads/dependencies:remove`, `POST /v0/beads/memories`,
+      `GET /v0/beads/memories/{key}` and `DELETE /v0/beads/memories/{key}`.
+      A path parameter is not a query parameter: several of those carry
+      `{id}` or `{key}` and still take no query key. The authority is each
+      operation's own `parameters` table, which is what a generated client
+      reads; this list is a convenience and, being prose, is the half that can
+      go stale — six entries were missing from it before this revision.
 
     * **Request media type.** Every operation that carries a request body
       requires `Content-Type: application/json` and refuses anything else with
@@ -184,6 +193,28 @@ info:
     * Clients MUST default-branch on unknown `code` and `reason` values within
       a status class: both vocabularies grow additively, so an exhaustive
       switch breaks on the first addition.
+
+
+    ## An `operationId` is not derivable from its path
+
+
+    A custom method usually reads the same in both — `:claim` is `claimIssue`,
+    `:sweep` is `sweepIssues` — and TWO OPERATIONS INVERT IT. Neither is a
+    typo and neither will be renamed, because an `operationId` is a generated
+    client's method name and a path is wire surface, so both are one-way doors:
+
+
+    | Path | `operationId` | Capability token |
+    |---|---|---|
+    | `POST /v0/beads/issues:batchApply` | `applyBatch` | `issues.batchApply` |
+    | `POST /v0/beads/issues/{id}:casMetadata` | `compareAndSetMetadata` | `issues.casMetadata` |
+
+
+    The capability token follows the PATH in both cases, not the
+    `operationId`, so a client probing `capabilities` before calling a
+    generated method reads two different spellings of one operation. A spec
+    author adding an operation should spell them alike; a spec author touching
+    these two should leave both spellings exactly as they are.
 
 
     ## Schema evolution while `/v0` is the newest path version
@@ -2113,8 +2144,10 @@ paths:
         '409':
           description: >-
             The request is well-formed and the STATE refuses it, and NOTHING WAS
-            WRITTEN. Four codes, each inherited from the operation that already
-            publishes it rather than minted here.
+            WRITTEN. Five codes, each inherited from the operation that already
+            publishes it rather than minted here, and described in the four
+            paragraphs below — `dependency_cycle` and `dependency_exists` share
+            one, because they are one member reaching the graph.
 
 
             `precondition_failed` is `expected_version`, `expected_status` or
@@ -3575,8 +3608,10 @@ paths:
         '409':
           description: >-
             The request is well-formed and the STATE refuses it, and NOTHING WAS
-            WRITTEN. Five codes, and every one of them is a statement a caller
-            could not have made without reading state it does not hold.
+            WRITTEN. Six codes, and every one of them is a statement a caller
+            could not have made without reading state it does not hold. Five
+            paragraphs cover them: `dependency_cycle` and `dependency_exists`
+            share one, because they are the graph's own pair.
 
 
             `precondition_failed` is a guard that missed:
@@ -5637,7 +5672,7 @@ components:
     # ---------------------------------------------------------------------
     # Pinned schemas.
     #
-    # Each of the twelve below is `x-go-type`-pinned to the canonical Go struct,
+    # Each of the thirteen below is `x-go-type`-pinned to the canonical Go struct,
     # so the generator emits a type ALIAS and no mirror struct exists anywhere.
     # `types.Issue`'s JSON encoding IS this contract; the CLI's `--json`, the
     # JSONL interchange and these bodies all marshal the same struct.
@@ -5649,10 +5684,13 @@ components:
     # added to the Go struct without an entry here fails CI, and an entry here
     # with no Go field fails CI.
     #
-    # Nine of the twelve are pinned to `internal/types`; `Cycle`, `CycleMember`
-    # and `IssueBlocking`, which appear after `BondRef`, are pinned to the role
-    # package `issueops` instead, because that is where those canonical structs
-    # live.
+    # Nine of the thirteen are pinned to `internal/types`. The other four are
+    # pinned where their canonical struct actually lives: `CycleMember`,
+    # `Cycle` and `IssueBlocking`, which appear after `Statistics`, to the role
+    # package `issueops`; `EventRecord`, last of the group, to
+    # `internal/eventsjournal`. TestWireTagBijection's `pinnedSchemas` table is
+    # the enumeration that is machine-checked; the counts here are prose and go
+    # stale in silence, so a schema added to that table updates them too.
     # ---------------------------------------------------------------------
 
     Issue:
@@ -7345,11 +7383,12 @@ components:
         One entry of the workspace's stored settings plane.
 
 
-        THIS SCHEMA IS DELIBERATELY NOT `x-go-type`-PINNED, and it is the only
-        response component on this surface that is not. The seven pinned
-        schemas above are pinned because a canonical Go struct already IS the
-        contract — `types.Issue`'s JSON encoding is what `bd show --json`
-        emits. A setting has no such struct: the CLI marshals an ad-hoc
+        THIS SCHEMA IS DELIBERATELY NOT `x-go-type`-PINNED, and with `Memory`
+        it is one of the two response components on this surface that is not.
+        The thirteen pinned schemas above are pinned because a canonical Go
+        struct already IS the contract — `types.Issue`'s JSON encoding is what
+        `bd show --json` emits. A setting has no such struct: the CLI marshals
+        an ad-hoc
         `map[string]string` per verb, so there is nothing to pin TO, and
         minting a type to pin to would mean changing what `bd config get
         --json` prints in order to satisfy a rule about not changing it.
@@ -10160,7 +10199,19 @@ components:
         assignee:
           type: string
           description: >-
-            With `already_claimed`: the actor currently holding the issue.
+            With `already_claimed`: the actor currently holding the issue, read
+            inside the transaction that refused.
+
+
+            IT IS OPTIONAL ON EVERY OPERATION BUT THE CLAIM. `POST
+            /v0/beads/issues/{id}:claim` always carries it, because its
+            conflict path reads the row it lost to. `PATCH
+            /v0/beads/issues/{id}` and `POST /v0/beads/issues:batchApply` carry
+            it only when the refusing transaction reported a holder, and `POST
+            /v0/beads/issues/{id}:release` never does — the ownership fence
+            refuses without naming anyone. An absent member means "this refusal
+            could not name the holder", never "nobody holds it"; re-read the
+            row.
         issue_status:
           type: string
           description: >-
@@ -10244,6 +10295,16 @@ components:
             member is omitted rather than reconstructed. Its absence therefore
             means "this server cannot tell you what it found", never "it found
             zero".
+
+
+            NO v0 OPERATION EMITS IT TODAY, nor `actual_status` or
+            `actual_assignee`. Every operation that publishes a guard refuses
+            all-or-nothing, and none of the roles behind them carries the
+            observed value out of the rolled-back transaction. The three
+            members are declared so that an operation whose role CAN report
+            what it found is an addition rather than a wire change — a client
+            must not wait for them, and must never read their absence as a
+            value.
         expected_status:
           type: string
           description: >-

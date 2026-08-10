@@ -1422,9 +1422,13 @@ type Problem struct {
 	// ActualVersion With `precondition_failed`: the `revision` the row was found holding, read inside the transaction that refused the guard.
 	//
 	// PRESENT ONLY WHERE THE REFUSING OPERATION CAN REPORT IT. An all-or-nothing operation rolls its transaction back, so a value read after the fact would describe a row the refusal never saw; where the role behind an operation does not carry the observed value, this member is omitted rather than reconstructed. Its absence therefore means "this server cannot tell you what it found", never "it found zero".
+	//
+	// NO v0 OPERATION EMITS IT TODAY, nor `actual_status` or `actual_assignee`. Every operation that publishes a guard refuses all-or-nothing, and none of the roles behind them carries the observed value out of the rolled-back transaction. The three members are declared so that an operation whose role CAN report what it found is an addition rather than a wire change — a client must not wait for them, and must never read their absence as a value.
 	ActualVersion *int64 `json:"actual_version,omitempty"`
 
-	// Assignee With `already_claimed`: the actor currently holding the issue.
+	// Assignee With `already_claimed`: the actor currently holding the issue, read inside the transaction that refused.
+	//
+	// IT IS OPTIONAL ON EVERY OPERATION BUT THE CLAIM. `POST /v0/beads/issues/{id}:claim` always carries it, because its conflict path reads the row it lost to. `PATCH /v0/beads/issues/{id}` and `POST /v0/beads/issues:batchApply` carry it only when the refusing transaction reported a holder, and `POST /v0/beads/issues/{id}:release` never does — the ownership fence refuses without naming anyone. An absent member means "this refusal could not name the holder", never "nobody holds it"; re-read the row.
 	Assignee *string `json:"assignee,omitempty"`
 
 	// BlockerId With `dependency_cycle`, hierarchy refusal only: the ancestor or descendant the edge named as blocker. See `issue_id`.
@@ -1697,7 +1701,7 @@ type ReopenIssueResponse struct {
 
 // Setting One entry of the workspace's stored settings plane.
 //
-// THIS SCHEMA IS DELIBERATELY NOT `x-go-type`-PINNED, and it is the only response component on this surface that is not. The seven pinned schemas above are pinned because a canonical Go struct already IS the contract — `types.Issue`'s JSON encoding is what `bd show --json` emits. A setting has no such struct: the CLI marshals an ad-hoc `map[string]string` per verb, so there is nothing to pin TO, and minting a type to pin to would mean changing what `bd config get --json` prints in order to satisfy a rule about not changing it.
+// THIS SCHEMA IS DELIBERATELY NOT `x-go-type`-PINNED, and with `Memory` it is one of the two response components on this surface that is not. The thirteen pinned schemas above are pinned because a canonical Go struct already IS the contract — `types.Issue`'s JSON encoding is what `bd show --json` emits. A setting has no such struct: the CLI marshals an ad-hoc `map[string]string` per verb, so there is nothing to pin TO, and minting a type to pin to would mean changing what `bd config get --json` prints in order to satisfy a rule about not changing it.
 //
 // The two surfaces are still one shape where they overlap — `key` and `value` are spelled as the CLI spells them — and they diverge in exactly one deliberate place, `redacted`, which exists because a bearer on this surface is optional, shared and surface-wide — it cannot decide that one caller may read a credential and another may not — while the CLI requires access to the database anyway.
 type Setting struct {
