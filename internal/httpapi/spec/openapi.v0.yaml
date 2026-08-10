@@ -2408,10 +2408,13 @@ paths:
         `POST /v0/beads/issues/{id}:claim`'s reason. HERE IT IS ALSO THE
         OWNERSHIP FENCE'S SUBJECT: a release carrying neither
         `expected_assignee` nor `force` succeeds only while `actor` is the
-        current holder. That is not authentication — this surface has none, and
-        `actor` is caller-asserted provenance exactly as it is on the claim —
-        it is the same anti-yank guard the claim gets from refusing a foreign
-        holder, pointed the other way.
+        current holder. That is not authentication — `actor` is caller-asserted
+        provenance exactly as it is on the claim, and it is NOT the
+        authenticated principal even where a bearer is required: the token a
+        deployment configures admits a client to the whole surface and names
+        nobody, so it can neither confirm nor contradict the name in `actor`.
+        The fence is the same anti-yank guard the claim gets from refusing a
+        foreign holder, pointed the other way.
 
 
         ## NOT IDEMPOTENT, which is the one thing to read before adopting it
@@ -4728,13 +4731,16 @@ paths:
         answer.
 
 
-        MEMORY CONTENT IS SERVED IN FULL and this API has no authentication.
-        Every entry carries its value verbatim; there is no `redacted` member
-        and nothing is withheld. See `POST /v0/beads/memories` for why a
-        key-name heuristic would be worse here than no promise at all. This is
-        the operation that makes stored memories DISCOVERABLE rather than merely
-        readable by a caller who already knows a key — an operator binding
-        beyond loopback is accepting exactly that.
+        MEMORY CONTENT IS SERVED IN FULL, and authentication does not narrow
+        that. Every entry carries its value verbatim; there is no `redacted`
+        member and nothing is withheld. A bearer decides WHO may call, not what
+        a caller who is let in may read, so a token-protected server serves
+        every memory to every holder of the token. See
+        `POST /v0/beads/memories` for why a key-name heuristic would be worse
+        here than no promise at all. This is the operation that makes stored
+        memories DISCOVERABLE rather than merely readable by a caller who
+        already knows a key — an operator binding beyond loopback is accepting
+        exactly that for everyone the token admits.
 
 
         A memory stored as the EMPTY STRING is enumerated here, because its key
@@ -4821,7 +4827,8 @@ paths:
 
 
         MEMORY CONTENT IS SERVED IN FULL, here and on every other operation of
-        this plane, and this API has no authentication. There is no `redacted`
+        this plane, and a bearer does not change that — it gates WHO may call,
+        never what a caller who is let in may read. There is no `redacted`
         member and no value withholding: the settings surface's redaction is a
         heuristic over the KEY NAME, and memory keys are derived from the
         content, so the same rule would withhold a memory ABOUT tokens while
@@ -4905,10 +4912,10 @@ paths:
         one way a client can tell the two apart.
 
 
-        MEMORY CONTENT IS SERVED IN FULL and this API has no authentication:
-        `Memory` carries no `redacted` member and withholds nothing. See
-        `POST /v0/beads/memories` for why a key-name heuristic would be worse
-        than no promise at all.
+        MEMORY CONTENT IS SERVED IN FULL, and a configured bearer does not
+        narrow it: `Memory` carries no `redacted` member and withholds nothing
+        from any caller the token admits. See `POST /v0/beads/memories` for why
+        a key-name heuristic would be worse than no promise at all.
 
 
         KEYS THIS OPERATION CANNOT REACH. `bd remember --key` accepts any
@@ -6803,9 +6810,12 @@ components:
 
 
             It defaults FALSE, which is the guarded mode, and the default is
-            the protection: this surface has no authentication, so an omitted
-            member must not silently choose the answer that changes another
-            bead's graph.
+            the protection. Authentication here is a deployment posture, and
+            where it is configured it is a single shared bearer that admits a
+            client to the WHOLE surface — it names no principal this operation
+            could weigh and grants no narrower right — so an omitted member
+            must not silently choose the answer that changes another bead's
+            graph.
         dry_run:
           type: boolean
           default: false
@@ -6988,12 +6998,15 @@ components:
 
 
             It DEFAULTS ON here, unlike the library default, and that is
-            deliberate. This surface has no authentication and this is its only
-            destructive operation, so a caller that omits the member must not
-            get weaker protection than the operator typing `bd prune`, which
-            protects unless `--ignore-references`. The inverse — opt OUT
-            locally, opt IN remotely — is the shape that lets a stray request
-            delete a decision trail nothing brings back.
+            deliberate. This is the only destructive operation on the surface,
+            and the bearer a deployment may configure is not a per-caller
+            right: one shared token admits a client to everything published
+            here, so being authenticated says nothing about whether this
+            particular deletion was meant. A caller that omits the member must
+            therefore not get weaker protection than the operator typing `bd
+            prune`, which protects unless `--ignore-references`. The inverse —
+            opt OUT locally, opt IN remotely — is the shape that lets a stray
+            request delete a decision trail nothing brings back.
 
 
             It costs a full scan of the not-done set and its comments. Sending
@@ -7344,9 +7357,10 @@ components:
 
         The two surfaces are still one shape where they overlap — `key` and
         `value` are spelled as the CLI spells them — and they diverge in
-        exactly one deliberate place, `redacted`, which exists because this
-        surface has no authentication and the CLI requires access to the
-        database anyway.
+        exactly one deliberate place, `redacted`, which exists because a bearer
+        on this surface is optional, shared and surface-wide — it cannot decide
+        that one caller may read a credential and another may not — while the
+        CLI requires access to the database anyway.
       required: [key, redacted]
       properties:
         key:
@@ -7400,9 +7414,10 @@ components:
         `Setting`. Redaction there is a decision about the KEY NAME, which works
         because settings keys are configured names; memory keys are derived from
         the content, so the same rule would withhold a memory about credentials
-        and serve one containing a credential under an innocuous slug. This
-        surface has no authentication and states the exposure rather than
-        implying a protection it does not have.
+        and serve one containing a credential under an innocuous slug. A
+        configured bearer would not close that either — it admits a client to
+        the whole surface rather than to particular keys — so this schema
+        states the exposure rather than implying a protection it does not have.
       properties:
         key:
           type: string
