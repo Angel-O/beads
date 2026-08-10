@@ -54,9 +54,15 @@ import (
 //   - THE COMMIT-ORDER PROPERTY OF SEQ. That seqs are gapless and ordered by
 //     COMMIT rather than by insert is a claim about concurrent writers
 //     (issueops.nextEventSeq), and the leg that can actually violate it is the
-//     shared SQL server. It is pinned where the concurrency lives —
-//     embeddeddolt/journal_concurrency_test.go and the dolt package's own
-//     journal tests — not here, where every case is one writer.
+//     shared SQL server. It is pinned where the concurrency actually lives:
+//     internal/storage/domain/db/journal_seq_test.go, whose
+//     TestEventsJournal_CommitOrderedGaplessSeq drives two OVERLAPPING
+//     transactions on independent connections and whose
+//     TestEventsJournal_ConcurrentWritersGaplessNoDup drives a racing batch,
+//     plus embeddeddolt/journal_concurrency_test.go for the embedded engine.
+//     Not the dolt package's own journal tests, which exercise the same
+//     server-mode plumbing but are single-threaded, and not here, where every
+//     case is one writer.
 //   - RETENTION POLICY. The retain-days and retain-rows floors are the
 //     operator's surface (storage.EventsJournalAccessor), deliberately not on
 //     this role. The fixture's Prune hook exists to CREATE the truncation the
@@ -438,6 +444,13 @@ func RunJournalHeadSurvivesAFullPrune(t *testing.T, ctx context.Context, fixture
 // It runs LAST, after both pruning cases, which is deliberate: a journal that
 // was emptied and then written to again is the state a long-lived workspace
 // actually spends its life in, and the mutations here have to land in it.
+//
+// MOVING IT EARLIER IS A SILENT WEAKENING, so this is stated here as well as in
+// the dispatch table and the three leg wirings — at the site somebody editing a
+// leg file would actually be looking. Every case rebaselines off the live head,
+// so a reorder still COMPILES AND STILL PASSES; what it quietly gives up is the
+// only coverage anywhere that a journal keeps recording after a full prune,
+// with nothing going red to say so. If you reorder these, say why.
 func RunJournalEveryMutationKindLandsARow(t *testing.T, ctx context.Context, fixture JournalFixture) {
 	journalBaseline(t, ctx, fixture)
 	subject := fixture.IssuePrefix + "-kind-subject"
