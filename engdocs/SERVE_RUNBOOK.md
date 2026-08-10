@@ -1,10 +1,14 @@
 # `bd serve` operator runbook
 
-Last reviewed: 2026-08-10 (freshness sources: the operating-envelope constants
-in `internal/httpapi/server.go` and `internal/httpapi/events_watch.go`, the
-fields their `event` emitters write, and the flag, posture and token-file rules
-in `cmd/bd/serve.go` and `internal/httpapi/auth.go` — every flag, error string
-and event name quoted below was checked against a build of those files)
+Last reviewed: 2026-08-10
+
+Freshness source: `internal/httpapi/server.go`,
+`internal/httpapi/events_watch.go`, `cmd/bd/serve.go` and
+`internal/httpapi/auth.go` — the operating-envelope constants, the fields their
+`event` emitters write, and the flag, posture and token-file rules.
+
+Every flag, error string, event name and reason value quoted below was checked
+against a build of those files, not read off the source.
 
 Running the v0 HTTP surface. For the contract it serves — the operations, the
 error vocabulary, the cursor, the loopback posture — see
@@ -422,7 +426,10 @@ gives the shape, the `request_error` line gives the cause.
 | `address already in use` | The fixed-port mutual exclusion working as intended: a second server is already on that port. |
 
 The five auth and bind refusals above are raised by `resolveServeConfig` before
-any database is opened, so they read the same in every workspace mode — and
+serve opens its database source or listener, independent of the workspace, so
+they read the same in every workspace mode. (The root command's
+`PersistentPreRunE` still resolves the workspace first, so a directory with no
+beads database answers `no beads database found` ahead of any of them.) And
 `httpapi.Listen` re-checks the same rules, so a second caller of the package
 cannot assemble a `Config` that serves the whole surface to a network with no
 credential.

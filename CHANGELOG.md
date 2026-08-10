@@ -340,9 +340,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   settings. Listing them was already excluded, but a caller naming an exact key
   still got the value — and since `bd remember` derives its key from the content
   it stores, the keys are guessable, so `bd config get kv.memory.<slug>` and
-  `GET /v0/beads/config/kv.memory.<slug>` (a surface with no authentication,
-  whose redaction decides on the key NAME while a memory's secret is in the
-  VALUE) walked around the exclusion.
+  `GET /v0/beads/config/kv.memory.<slug>` (a surface whose only credential is
+  an optional shared bearer, and whose redaction decides on the key NAME while
+  a memory's secret is in the VALUE) walked around the exclusion.
 
   A point read of a `kv.` key now answers exactly as a key nothing ever stored
   does — the echoed key, an empty value, a nil error — so a caller cannot tell a
@@ -650,8 +650,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routes now call. `capabilities` gains `issues.sweep`.
 
   **This is the first DESTRUCTIVE operation on the surface, and nothing it
-  deletes comes back.** `bd serve` binds loopback and has no authentication, so
-  anyone who can reach the port can now clear closed beads: `--help` gained a
+  deletes comes back.** `bd serve` binds loopback, and its bearer — optional,
+  and where configured a single shared token admitting a client to the whole
+  surface — grants no narrower right, so anyone who can reach the port with a
+  credential it accepts can now clear closed beads: `--help` gained a
   DESTRUCTIVE OPERATIONS section and the `--allow-non-loopback` warning says so.
   A `durable` sweep with neither a cutoff nor a pattern is refused by the role
   itself rather than by the handler, and `dry_run: true` costs the same request
@@ -659,10 +661,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **`protect_referenced` defaults to `true` here**, where the CLI's equivalent
   (`--ignore-references`) is opt-out. The local flag and the remote member
-  therefore disagree on purpose: this surface has no authentication, and a
-  remote caller who omits a member should not get a weaker guard than the
-  operator typing the same sweep locally. Send `protect_referenced: false` to
-  match the CLI default.
+  therefore disagree on purpose: being authenticated here says nothing about
+  whether this particular deletion was meant — one shared token admits a client
+  to everything published — so a remote caller who omits a member should not
+  get a weaker guard than the operator typing the same sweep locally. Send
+  `protect_referenced: false` to match the CLI default.
 
 - **`GET /v0/beads/config` and `GET /v0/beads/config/{key}` — the workspace's
   stored settings over HTTP** (bd-kzepq). `bd serve` now answers for the
@@ -675,8 +678,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `notion.token` does — **is published with `redacted: true` and no `value`.**
   Withheld values are OMITTED rather than masked, so a client cannot mistake a
   placeholder for configuration. The CLI is unchanged and still prints stored
-  values in full: its caller already holds the database, and this surface has
-  no authentication.
+  values in full: its caller already holds the database, while redaction is the
+  whole control on this surface — a bearer here is optional and, where
+  configured, shared and surface-wide, so it cannot withhold one value from one
+  caller.
 
   There is no HTTP WRITE, deliberately. `bd config set` routes most keys to
   `config.yaml` or to git config before the database is ever reached, and both

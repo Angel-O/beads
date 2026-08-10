@@ -224,9 +224,10 @@ in; 13 is the HTTP surface, which lands with the command rather than after it.
     the telemetry one.
 
     **There is NO name list to add to, and there has not been since #5460.**
-    `roleAccessorNames` is DERIVED by reflection over `DoltStorage`, in the
-    storage file only — the telemetry file borrows
-    `storage.assertRoleAccessorsAreDeclared`. That is the whole point of the
+    `roleAccessorNames` is DERIVED by reflection over `DoltStorage`; the
+    telemetry file duplicates the derivation and runs its own declaration
+    check, because the storage file's is unexported and in a test package it
+    cannot import. That is the whole point of the
     derivation: the decorators embed `DoltStorage`, so a new accessor is
     PROMOTED onto every one of them and everything still compiles, and a
     hand-kept list would simply never hear about it. What still costs you an
@@ -332,7 +333,9 @@ in; 13 is the HTTP surface, which lands with the command rather than after it.
 
     **What an operation costs beside the handler, measured against the two
     freshest wire slices** — `issueops.GraphCounter`'s (#5536) and
-    `issueops.Relations`' (#5540), which touched an identical set of files:
+    `issueops.Relations`' (#5540), whose full file sets differ (each has its own
+    handler, its own handler test and its own proxied integration test) around
+    an identical nine-file core:
 
     | File | Edit |
     |---|---|
@@ -347,6 +350,12 @@ in; 13 is the HTTP surface, which lands with the command rather than after it.
     Nine files, and the spec tests name most of them if you miss one. Budget
     `server.go` in particular: six lines in one file, and the `Config` field is
     REQUIRED, so every caller and test that built a Config grows a line too.
+
+    **And a tenth both slices paid, which is not in the core because it is a
+    test:** `internal/httpapi/roles_test.go` needs the role's fake and its entry
+    in `rolesConfig` — about thirty lines each time, and the compiler does not
+    ask for them, so it is the one on this list you can finish the operation
+    without noticing.
 
     **A role may honestly have none, and `issueops.VersionReconciler` is the
     one that does.** It answers a startup hook rather than a command: its two

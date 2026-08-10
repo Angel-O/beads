@@ -119,8 +119,9 @@ record — editing or deleting a bead does not redact it from the journal. And
 because this is an HTTP read, any process that can reach the address gets that
 history without the filesystem permissions on `.beads/` that `bd events tail`
 requires. Weigh both before binding a journal-enabled workspace with
-`--allow-non-loopback` — which requires `--auth-token-file`, and that token is
-shared and surface-wide: every client holding it reads the whole journal.
+`--allow-non-loopback` — which requires `--auth-token-file` (or the explicit
+`--insecure-no-auth`), and that token is shared and surface-wide: every client
+holding it reads the whole journal.
 </Warning>
 
 Two refusals are worth wiring into a consumer before it ships. A checkpoint
