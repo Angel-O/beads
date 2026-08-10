@@ -9,6 +9,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`bd serve` gets optional bearer authentication, and requires it beyond
+  loopback** ([#5516](https://github.com/gastownhall/beads/pull/5516)). The
+  help used to say "no authentication and no TLS", and the first half of that
+  is what kept the server on a developer's loopback. Two flags answer it, and
+  both default to today's behavior: a `bd serve` with no arguments is byte for
+  byte the server it has always been.
+
+  `--auth-token-file` names a file of accepted tokens, one per line, all
+  accepted. Every operation except `GET /healthz` then requires
+  `Authorization: Bearer <token>` — `GET /v0/beads/context` included, because
+  it reports the repo root, beads directory and database name. There is
+  deliberately no `--auth-token`: a credential passed as an argument is
+  readable out of `ps` by every local user. `BEADS_SERVE_TOKEN_FILE` is the
+  environment fallback.
+
+  **Rotation is a file rewrite, with no restart.** The accepted set is not a
+  startup snapshot: the file is re-read while the server runs, at most once a
+  second for the whole process, on the accepting path as well as on a
+  mismatch — which is what makes REVOCATION work and not just rotation. Write
+  `{new,old}`, roll the clients, drop `old`; both take effect within about a
+  second. A failed or empty re-read keeps the last-good set and logs, so a
+  writer that truncates before writing cannot lock every client out.
+
+  **`--allow-non-loopback` now requires a token file.** Beyond loopback,
+  reaching the address would otherwise be the whole authorization.
+  `--insecure-no-auth` is the explicit, auditable way to say you meant that
+  anyway. There is still NO TLS: a deployment beyond loopback supplies
+  confidentiality itself. `--allowed-host` (repeatable, exact, no wildcards)
+  adds Host header values to the DNS-rebinding allowlist, which is what a
+  service deployment behind a DNS name trips over first.
+
+  `401` / `unauthenticated` joins the frozen code vocabulary, with
+  `WWW-Authenticate: Bearer` and a FIXED `detail` that never echoes the
+  presented credential. A missing header, a wrong scheme and an unrecognized
+  token are one code deliberately — telling them apart would tell an
+  unauthenticated caller which guess was closer. **A token is a shared secret
+  granting the whole surface, not an identity**, so `actor` is still
+  caller-asserted provenance and not the authenticated principal.
+
+- **Six more v0 operations, and the guarded-write token they compose from**
+  ([#5506](https://github.com/gastownhall/beads/pull/5506),
+  [#5507](https://github.com/gastownhall/beads/pull/5507),
+  [#5508](https://github.com/gastownhall/beads/pull/5508),
+  [#5510](https://github.com/gastownhall/beads/pull/5510),
+  [#5535](https://github.com/gastownhall/beads/pull/5535),
+  [#5536](https://github.com/gastownhall/beads/pull/5536),
+  [#5540](https://github.com/gastownhall/beads/pull/5540)). Each is the wire
+  half of a role that already existed and was already pinned on three legs.
+
+  - `POST /v0/beads/issues/{id}:release` — give a claim back, what `bd
+    unclaim` spells. **It is NOT idempotent, and that is the one thing to read
+    before adopting it**: a release over a row holding no claim is `409` /
+    `not_releasable`, never a 200, because the post-state is anonymous. Do not
+    read the code as "already released" — it also covers "the status will not
+    accept a release", which is true of a row that is still ASSIGNED. Read the
+    row. `expected_assignee` is a compare-and-set on the holder and `force`
+    ignores it; the two may not be sent together.
+  - `POST /v0/beads/issues:claimNext` and `POST /v0/beads/issues:batchClose` —
+    take the next ready bead in one round trip, and close many as one act.
+  - `GET /v0/beads/issues:count` and `GET /v0/beads/dependencies:count` — the
+    two counting reads, each with its role's whole filter surface.
+    `dependencies:count` bounds `issue_id` at 100 anchors.
+  - `GET /v0/beads/issues/{id}/related` — one anchor's neighbors, direction-
+    parameterized and type-filterable. The length of `items` is a NEIGHBOR
+    count and not an EDGE count: a target that is an `external:` reference or
+    another repository's id has no far end here and is silently not a
+    neighbor, while the same edge IS a row on `GET /v0/beads/dependencies`.
+  - `expected_version` on close, reopen and delete, and `revision` on `GET
+    /v0/beads/issues/{id}` — the row's optimistic-concurrency token, so a
+    read-modify-write loop can start from a READ instead of seeding its first
+    guard from a write it did not want to make. A miss is `409` /
+    `precondition_failed` and writes nothing. **`revision` is deliberately NOT
+    on the listing rows**: `types.IssueWithCounts` is also the JSONL
+    interchange record, so a token there would write a per-write-random value
+    into every `bd export` line and every auto-flushed `issues.jsonl`.
+
+  `not_releasable` joins the frozen 409 vocabulary. Every one of these carries
+  the claim's posture unchanged: `actor` is caller-asserted provenance, hooks
+  do not fire, the per-command auto-commit machinery does not run, and the only
+  durable effect is the single storage commit the role makes in its own
+  transaction.
+
+- **`bd serve` answers a `Bd-Project-Id` header, and says so in
+  `capabilities`.** A client that knows which workspace it means to address
+  stamps the request with that workspace's project id; a server that serves a
+  different one refuses before any database work, so a misdirected read or
+  write mutates nothing. An ABSENT header is served exactly as before, so this
+  is additive wire surface and not a new precondition. `GET /healthz` and `GET
+  /v0/beads/context` are exempt — liveness must answer whatever workspace a
+  caller believed it reached, and the handshake is where a client LEARNS the id
+  to stamp with. Detect it with the `project.enforce` capability.
+
 - **A durable events journal, and `bd events` to read it** (bd-opisf). External
   tooling that wants to stay in step with a workspace had two options and
   neither was a feed: a fire-and-forget script hook that may not run, or polling
@@ -93,7 +185,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `200` with `already_closed: true`, a reopen of an open one
     `already_open: true`, and each still carries the row.
   - `PATCH /v0/beads/issues/{id}` — partial update of one issue. The `patch`
-    object publishes thirteen members; four of them (`estimated_minutes`,
+    object publishes nineteen members; four of them (`estimated_minutes`,
     `external_ref`, `due_at`, `defer_until`) are nullable, and an explicit
     `null` CLEARS them. That set is closed and machine-checked against the
     document, so a `null` on any other member is a `400` rather than an
@@ -217,6 +309,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Beads closed before this with a lowercase or mid-string "dismiss" in their
   reason move from the Dismissed count to the Responded count. Forward
   behavior is unchanged.
+
+- **`bd label add`/`remove` over many issues is no longer one atomic
+  transaction** (ga-26w10,
+  [#5489](https://github.com/gastownhall/beads/pull/5489)). Both routes — the
+  direct one and the proxied-server one — now end at `issueops.Lifecycle` and
+  `issueops.Reader`, which deletes the four-way `(add|remove) × (wisp|durable)`
+  switch the proxied route hand-rolled below the roles and the second
+  implementation of the command that came with it. The plane is resolved
+  inside the role's own transaction, so the wisp branch is gone rather than
+  moved.
+
+  **The deliberate delta:** a multi-issue edit is N guarded updates rather than
+  one raw transaction, so `bd label add a b c mylabel` records three history
+  entries instead of one, and a failure on the third leaves the first two
+  written where the old shape rolled them back. Neither is obviously right —
+  the new one attributes each edit to its own issue and lands what it could —
+  and the atomic shape is expressible today as one `issueops.BatchApplier`
+  update item per issue. The proxied route's resolution failure also lost its
+  `label added: ` prefix, which named a write the command never attempted;
+  both routes now print the direct route's message.
+
+  `bd label list-all` and `bd label propagate` are unchanged and stay off the
+  role: no role answers "every distinct label in this workspace", and
+  propagate is a search plus a fan-out needing the same batch question.
 
 - **The settings plane no longer serves the KV plane by any read** (bd-rfwtv,
   bd-klko9). `bd kv` keys and the `bd remember` memories nested under them are
