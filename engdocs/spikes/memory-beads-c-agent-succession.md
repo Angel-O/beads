@@ -1,113 +1,48 @@
-# Memory Beads C: fresh-agent succession spike
+# Memory Beads C: fresh-agent succession experiment
 
-Status: one-run feasibility passed against an isolated `bd`-shaped prototype
-on 2026-08-08. This tests the proposed workflow, not production command wiring,
-storage, ranking at scale, or behavior across agent models.
+**Status:** One observed workflow run plus an executable command-contract fixture, recorded 2026-08-08. This is feasibility evidence, not a model-wide success claim.
 
-## Verdict
+## Question
 
-A fresh coding agent recovered useful project knowledge without receiving any
-memory body in its initial context. It followed a task's explicit reference,
-found an unlinked memory through compact search, reported a real absence, and
-revised stale guidance without losing history. The evaluator observed exact
-Memory Bead and revision citations in its answers.
-
-Selective retrieval was enough for this fixture. The run gives no reason to
-inject linked bodies into task output or to load this corpus during priming. It
-establishes that the interaction can work; it does not establish a success rate
-or prove that every project and agent can work this way.
+Can a fresh coding agent recover and maintain useful project knowledge through compact discovery, explicit references, and complete recall without receiving Memory bodies in its initial context?
 
 ## Setup
 
-The throwaway command is `cmd/memory-beads-spike-bd`. Its state lives in a
-temporary workspace and starts from
-`internal/memorybeads/spikec/testdata/succession.json`. The agent was forked
-without this conversation's context and was told not to inspect the source,
-fixture, generated state, or evaluator telemetry.
+The throwaway command is `cmd/memory-beads-spike-bd`. Its temporary state starts from `internal/memorybeads/spikec/testdata/succession.json`.
 
-It began with the normal-looking entry sequence:
+The agent was forked without the originating conversation and was told not to inspect the prototype source, fixture, generated state, or evaluator telemetry. It began with:
 
 ```bash
 ./bd init --quiet --prefix test --skip-hooks --skip-agents
 ./bd prime
 ```
 
-`bd prime` explained task-reference inspection, compact search, exact recall,
-search-before-write, optimistic concurrency, and truthful absence. It included
-no stored body.
+Priming described task-reference inspection, compact search, explicit recall, search-before-write, common guarded-write behavior, and truthful absence. It included no stored body.
 
-The machine-verifiable run record is
-`internal/memorybeads/spikec/testdata/succession-run-evidence.json`. It contains
-the 13 events recorded before evaluator inspection, the final state, the later
-history check, source and binary hashes, and the task and command sequence
-reconstructed from that data. A fresh build produced the recorded binary hash.
+The machine-verifiable record is `internal/memorybeads/spikec/testdata/succession-run-evidence.json`. It contains 13 recorded stateful events, final state, a later history check, source and binary hashes, and a reconstructed task and command sequence. The runner did not retain the exact model identifier, original assignment text, or verbatim replies, and the artifact does not present reconstructed text as a transcript.
 
-The collaboration runner did not retain the exact model identifier, original
-assignment text, or verbatim replies. The artifact says so directly and does
-not pass reconstructed text off as a transcript. Claims about what the agent
-said remain evaluator observations; the event sequence, reads, writes,
-attribution, and retained history are independently checkable.
+## Observed run
 
-## What happened
+The agent:
 
-The task-linked case took one task read and one exact recall. The agent followed
-`task-1` to `mem-policy@rev-policy-1` and returned the repository test policy.
-Task output contained the reference metadata, not the policy body.
+- followed one task reference and explicitly recalled the linked policy body;
+- found an unlinked storage-boundary Memory through compact search and recall;
+- attempted to store the same durable fact and received an unchanged result with no new fixture version;
+- made three searches for absent catering policy, reported that the corpus did not answer, and wrote nothing; and
+- found stale deployment guidance, recalled it, updated the same Memory through the fixture's guarded-write path, and verified both the corrected current state and retained earlier state.
 
-For unlinked knowledge, the agent searched `storage boundary`, selected the
-single compact result, and recalled `mem-storage@rev-storage-1`. When asked to
-make sure the project remembered the same fact, it targeted that bead with the
-expected current revision. The result was `unchanged`; the provider created no
-new bead and no revision.
+The recorded fixture addresses included `mem-policy@rev-policy-1`, `mem-storage@rev-storage-1`, and `mem-deploy@rev-deploy-1`; these are test data, not a proposed Historical Bead Reference format. The correction was attributed to `Fresh Agent <fresh-agent@example.test>`.
 
-Three exploratory searches during the absent-policy task (`catering`,
-`catering vendor`, and `project events`) returned zero results. The agent said
-the corpus did not answer the question and wrote nothing.
+Telemetry recorded one task display, six searches, four relevant recalls, one unchanged write attempt, and one applied correction. It recorded no irrelevant recall, missed task link, duplicate Memory, or unnecessary version. The evaluator observed no fabricated answer, but the missing verbatim replies prevent independent rechecking of that judgment.
 
-The stale-guidance case found `mem-deploy@rev-deploy-1`, recalled its old
-`us-west-1` body, and revised the same bead with that exact revision as the
-precondition. The new address was `mem-deploy@rev-0031`, attributed to
-`Fresh Agent <fresh-agent@example.test>` with the message `Correct preview
-deployment region from us-west-1 to us-west-2.` A final exact recall returned
-the corrected body while history retained the original revision.
+`TestSuccessionWorkflowContract` rebuilds the spike executable and repeats the command workflow in a clean workspace. It checks absence of body injection, linked and unlinked recall, complete zero-result search, unchanged writes, non-mutating stale conflicts, same-Bead correction with attribution, retained history, event recording, and absence of duplicates. A separate test checks the recorded run's event and final-state invariants.
 
-Evaluator telemetry recorded 13 stateful reads or writes:
+## Current interpretation
 
-- one task display;
-- six searches: two useful hits, one recoverable overly specific miss, and
-  three searches establishing the genuine absence;
-- four exact recalls, all relevant to the task at hand;
-- one unchanged write attempt and one applied correction.
+Selective retrieval was sufficient for this small recorded case. The result supports keeping task display and priming body-free while allowing explicit complete recall. It does not establish a general success rate, ranking quality at scale, production latency, or behavior across model families.
 
-There were no irrelevant body recalls, missed task links, duplicate beads, or
-unnecessary revisions in the recorded state. The evaluator also observed no
-fabricated answer, though the missing verbatim replies keep that last judgment
-from being independently rechecked.
+The prototype's revision strings and guarded-write mechanics are not the Memory product model. Production Memory Beads inherits historical addressing and mutation behavior from shared Beads History and Versioned Bead contracts.
 
-`TestSuccessionWorkflowContract` builds the real spike executable and repeats
-the observable command workflow in a clean workspace. It checks that priming
-and task display do not inject a memory body; linked and unlinked exact recall;
-complete zero-result search; unchanged writes; non-mutating stale conflicts;
-same-bead correction with attribution; parented history; event recording; and
-the absence of duplicate beads. A separate test parses the recorded run and
-checks its event and final-state invariants. These tests protect the command
-contract. They do not simulate an agent or turn a single observed run into a
-model evaluation.
+## Friction observed
 
-## Friction and limits
-
-An unquoted two-word query was parsed as two positional arguments. Quoting it
-worked, but the guidance should show a multi-word example. The exact phrase
-`preview deployment region` did not match content split across title and body;
-the agent recovered by searching `preview`. Production lexical search should
-handle useful multi-token matches rather than require one contiguous
-substring.
-
-`remember --help` surfaced the standard flag package's `flag: help requested`
-error after printing help. That is command polish, not a retrieval-model issue.
-
-This was one agent, one small corpus, and an isolated CLI. It establishes that
-the interaction model is workable for the recorded case. It does not measure
-ranking quality at scale, production latency, or behavior across model
-families. Any specification should cite it as feasibility evidence, not as a
-general claim that selective retrieval always succeeds.
+The agent had to quote a multi-word query, and one useful phrase did not match content split across title and body until the query was shortened. `remember --help` also printed the standard flag package's help-requested error. These are prototype usability observations, not evidence against selective retrieval.

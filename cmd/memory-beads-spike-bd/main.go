@@ -1,8 +1,7 @@
-// Command memory-beads-spike-bd is a throwaway, bd-shaped executable for the
-// Memory Beads agent-succession spike. It is intentionally isolated from the
-// production bd command and storage schema: the question is whether a fresh
-// agent can use the proposed selective-retrieval workflow, not whether Phase 2
-// command wiring is finished.
+// Command memory-beads-spike-bd is a throwaway bd-shaped executable for the
+// Memory Beads agent-succession experiment. It is intentionally isolated from
+// production bd and its storage schema. It tests whether a fresh agent can use
+// compact discovery, explicit references, complete recall, and guarded updates.
 package main
 
 import (

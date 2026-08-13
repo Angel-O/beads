@@ -7,28 +7,24 @@ import (
 	"github.com/steveyegge/beads/beadserrors"
 )
 
-// InterfaceVersion identifies the contract in this package.
+// InterfaceVersion identifies this experimental descriptor contract.
 const InterfaceVersion = "memorybeads/v1"
 
-// Descriptor identifies the acquired Memory Module contract without exposing
-// a storage engine, connection, transaction, or transport.
+// Descriptor identifies the acquired experimental seam without exposing a
+// storage engine, connection, transaction, or transport.
 type Descriptor struct {
 	InterfaceVersion string
 }
 
-// Module is the versioned Memory Beads surface acquired by new Go callers.
-//
-// The A1 spike intentionally gives it only a descriptor. Memory operations are
-// not tunneled through the legacy memoryops.Memories role; they will be defined
-// as versioned Module behavior in Phase 2.
+// Module is the descriptor-only surface exercised by the A1 experiment.
+// It is not an operational Memory Beads API.
 type Module interface {
 	Descriptor() Descriptor
 }
 
-// Source is the optional capability a direct store, proxied provider, or
-// decorator may expose. It is intentionally separate from all existing storage
-// and unit-of-work interfaces so old consumers and out-of-tree backends do not
-// acquire a new required method.
+// Source is the optional experimental capability exercised by direct stores,
+// proxied providers, and decorators. It remains separate from existing storage
+// and unit-of-work interfaces so the experiment does not widen them.
 type Source interface {
 	MemoryModuleV1() (Module, error)
 }
@@ -38,9 +34,7 @@ type Source interface {
 // either package name.
 type ErrUnsupported = beadserrors.ErrUnsupported
 
-// Acquire obtains the v1 Memory Module from source. The same function accepts
-// a direct store, an embedded store, a proxied unit-of-work provider, or a
-// decorator around one of those values.
+// Acquire obtains the experimental descriptor surface from source.
 func Acquire(source any) (Module, error) {
 	if isNil(source) {
 		return nil, unsupported(source)

@@ -1,11 +1,10 @@
-// Package doltmemorymigration contains executable, provider-private evidence
-// for the Memory Beads A3 migration gate.
+// Package doltmemorymigration contains the executable A3 Dolt
+// conversion-coordination experiment.
 //
-// PROTOTYPE ONLY: this package is deliberately not wired into the released
-// Memory Module, storage interfaces, or schema migration chain. Its tables and
-// identifiers are throwaway test fixtures. The purpose is to prove that Dolt's
-// clone-local ignored plane can hide a resumable, branch-at-a-time conversion
-// from both the canonical and deprecated memory surfaces.
+// It is deliberately isolated from production command wiring, public APIs,
+// storage interfaces, and the schema migration chain. Its tables and markers
+// are fixture state for testing one truthful branch-at-a-time conversion
+// strategy on Dolt.
 package doltmemorymigration
 
 import (

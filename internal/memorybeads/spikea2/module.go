@@ -1,6 +1,7 @@
-// Package spikea2 is an executable, deliberately internal prototype of the
-// Memory Beads revision contract. It is not the public Memory Module selected
-// by spike A1 and must not be used as a compatibility surface.
+// Package spikea2 contains the provider-neutral fixture used to test exact
+// historical reads and atomic updates across several provider paths. Its
+// revision, view, and conflict types are experimental controls rather than the
+// shared Beads History or Versioned Bead contract.
 package spikea2
 
 import (
