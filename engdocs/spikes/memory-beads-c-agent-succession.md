@@ -19,6 +19,12 @@ The agent was forked without the originating conversation and was told not to in
 
 Priming described task-reference inspection, compact search, explicit recall, search-before-write, common guarded-write behavior, and truthful absence. It included no stored body.
 
+The current command-contract fixture additionally teaches the agent to keep
+short-lived progress and scratch state with the task or runtime, and to use
+`remember` only for deliberately chosen project knowledge that should outlast
+the current work. This wording postdates the recorded agent run and is covered
+by the regression test rather than claimed as evidence from that run.
+
 The machine-verifiable record is `internal/memorybeads/spikec/testdata/succession-run-evidence.json`. It contains 13 recorded stateful events, final state, a later history check, source and binary hashes, and a reconstructed task and command sequence. The runner did not retain the exact model identifier, original assignment text, or verbatim replies, and the artifact does not present reconstructed text as a transcript.
 
 ## Observed run

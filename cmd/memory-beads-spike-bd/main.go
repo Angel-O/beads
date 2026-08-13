@@ -154,6 +154,9 @@ here or by task display.
   then fetch one complete body with ` + "`bd recall <id> --revision <revision>`" + `.
 - If search does not answer the question, report that absence; do not invent a
   memory or treat a lookup failure as proof.
+- Keep short-lived progress and scratch state with the task or runtime. Use
+  ` + "`bd remember`" + ` only for deliberately chosen project knowledge that
+  should outlast the current work.
 - Before ` + "`bd remember`" + `, search and recall plausible matches. Revise an
   existing bead with ` + "`--id`" + ` and ` + "`--expected-revision`" + ` when it
   already represents the fact. An identical result is an unchanged no-op.

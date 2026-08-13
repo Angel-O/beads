@@ -27,3 +27,10 @@ go test -race ./internal/memorybeads/spikeb -run '^TestB2'
 ## Current interpretation
 
 The experiment shows that an exact foreign address can remain useful structured data without a working route, and that resolution can be a separate non-mutating observation. It does not define a public resolver, Historical Bead Reference format, authentication model, route authority, availability contract, or cross-project product behavior. Those are general Beads concerns and require evidence from real providers before becoming a shared contract.
+
+For Memory, the useful product boundary is narrower: a Beads-wide
+cross-project reference facility must be able to carry a Memory endpoint
+without the reference itself granting access, and local Memory operations must
+remain usable without a resolver. The fixture tested Memory as the foreign
+target only; it does not prove the broader facility's required support for
+either endpoint being any supported Bead kind.

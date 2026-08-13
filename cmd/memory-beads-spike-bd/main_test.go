@@ -170,6 +170,16 @@ func TestSuccessionWorkflowContract(t *testing.T) {
 			}
 		}
 	}
+	for _, guidance := range []string{
+		"Before `bd remember`, search and recall plausible matches",
+		"Keep short-lived progress and scratch state with the task or runtime",
+		"deliberately chosen project knowledge",
+		"should outlast the current work",
+	} {
+		if !bytes.Contains(prime, []byte(guidance)) {
+			t.Fatalf("prime omitted Memory habit guidance %q", guidance)
+		}
+	}
 
 	var shown task
 	showOutput := runner.run("show", "task-1", "--json")

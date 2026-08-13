@@ -25,4 +25,9 @@ go test -race ./internal/memorybeads/spikeb -run '^TestB3'
 
 Discovery and contribution are independent capabilities; neither follows merely from storing or resolving a foreign reference. The experiment found a candidate semantic separation across two fixtures, not a portable interface or governance model.
 
+The result supports keeping project-local Memory search distinct from
+cross-project discovery and treating a cross-project address as non-authorizing.
+It does not establish the general any-Bead-kind reference contract that Memory
+requires from the eventual Beads-wide facility.
+
 It did not select roles, approvals, authentication, cancellation, retry policy, discovery completeness, or production availability. The fixture publication outcomes are not a Memory-specific write contract. Real cross-project providers would need to establish any common Beads-wide contract independently.

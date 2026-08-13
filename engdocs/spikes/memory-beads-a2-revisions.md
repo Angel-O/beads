@@ -54,6 +54,11 @@ The following remain fixture choices rather than Memory requirements:
 
 Memory Beads now relies on shared, provider-neutral Beads History and Versioned Bead contracts. Those contracts define historical addressing, branches, retention, comparison, attribution, writes, retries, concurrency, and conflicts. A2 shows that the tested providers can support an exact-history abstraction; it does not define that abstraction or a Memory-private mutation protocol.
 
+At the Memory boundary, the result supports requiring an exact, non-substituted
+read while a historical state is retained. The experiment did not exercise
+policy-driven removal, so it does not establish a retention duration or the
+shared History facility's representation of explicit unavailability.
+
 ## Limits
 
 The experiment did not select production schema, public API, storage limits, native branch integration, or history-retention policy. It did not benchmark the fixture or prove production-scale concurrency. Any continuing use of this code should treat it as executable evidence behind a future shared-history implementation, not as a release gate for a Memory-specific revision system.

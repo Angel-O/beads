@@ -57,6 +57,12 @@ A Dolt provider can coordinate a truthful conversion even though it cannot atomi
 
 At the feature level, conversion needs to preserve representable content and provenance, avoid invented evidence, and never claim complete success over loss or partial visibility. The implementation may use this strategy, another strategy, or no automatic conversion. Rollout, timing, recovery commands, and deprecation policy are separate implementation decisions.
 
+The observable recovery boundary is stronger than a success message: after an
+interruption, Memory callers must see either the still-usable legacy view, the
+complete canonical view, or an inspectable recoverable-unavailable state. This
+spike supplies evidence for the third outcome through its maintenance gates and
+restart reconciliation; it does not prescribe that mechanism.
+
 ## Limits
 
 The prototype did not wire every production config, HTTP, import, Memory, or branch-mutating path. Its tables and identifiers are fixtures. It did not reconstruct the full available history or select retention behavior, production schema, title rules, reference encoding, or shared Beads History mechanics. The result is evidence that the tested Dolt coordination problem has at least one solution, not an obligation to ship that solution.
