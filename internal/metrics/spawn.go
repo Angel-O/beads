@@ -33,8 +33,17 @@ func inTestMode() bool {
 // shouldSpawnFlusher is the env/config half of the spawn gate, extracted so
 // tests can assert the decision without forking a real detached child. The
 // stateful half (pending events + throttle) is flusherDue.
+//
+// Enabled() is deliberately NOT part of this gate (GH#5712): with telemetry
+// disabled the detached child still has one job — pruning the queued backlog
+// a previously-enabled configuration left behind. RunSendMetrics exits after
+// the prune, before any upload, when disabled; and flusherDue's marker-first
+// throttle keeps the disabled path exactly as cheap as the enabled one (one
+// marker stat inside the interval, and no spawn at all once the queue has
+// decayed empty — a never-enabled machine has no queue dir, so its scan is a
+// single failed open).
 func shouldSpawnFlusher() bool {
-	return os.Getenv(EnvIsFlusher) != "1" && Enabled() && !flushDisabledByEnv() && !inTestMode()
+	return os.Getenv(EnvIsFlusher) != "1" && !flushDisabledByEnv() && !inTestMode()
 }
 
 // flushInterval is the minimum spacing between detached send-metrics spawns.
