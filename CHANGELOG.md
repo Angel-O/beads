@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`bd init` against a fresh Dolt server no longer fails permanently when
+  the first migration pass is interrupted.** A retryable failure (an
+  `i/o timeout` on a slow host, a dropped connection) mid-pass left the
+  pass's half-applied tables uncommitted in the working set; the retry then
+  tripped the #4566 dirty-table guard on its own debris and gave up with
+  `pending schema migrations alter pre-existing dirty tables: ...` on a
+  database that had not existed seconds earlier (gastownhall/beads#5012 —
+  surfaced by Homebrew's `gastown` dependent test on macOS x86_64 for the
+  1.2.2 formula bump). Server mode now records whether *this* process
+  created the database (bare `CREATE DATABASE` arbitration) and, only then,
+  discards the working set (`DOLT_RESET --hard` + `DOLT_CLEAN`) and retries.
+  A pre-existing database is never healed — the guard's refusal stands
+  there. This is the 1.1-line-sized counterpart of the 1.2.x fixes for the
+  same class (#4611, #5042, #5118), which do not apply to this line.
+
 ## [1.2.2] - 2026-08-15
 
 Recovery release. v1.2.0 and v1.2.1 were published by accident on
