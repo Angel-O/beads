@@ -182,7 +182,13 @@ func generate(path string) error {
 			tagDrift = append(tagDrift, TagDrift{Version: version, CurrentHash: tagHash})
 		}
 	}
-	catalog := Catalog{1, modulePath, entries, tagDrift, exclusions}
+	catalog := Catalog{
+		SchemaVersion:      1,
+		Module:             modulePath,
+		Versions:           entries,
+		RepositoryTagDrift: tagDrift,
+		Exclusions:         exclusions,
+	}
 	if err := validateCatalog(catalog); err != nil {
 		return err
 	}
@@ -190,7 +196,13 @@ func generate(path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, raw, 0o644) //nolint:gosec // G306: the checked catalog is public repository data.
+	if err := os.WriteFile(path, raw, 0o644); err != nil { //nolint:gosec // G306: the checked catalog is public repository data.
+		return err
+	}
+	// Print the recomputed identity digest so a maintainer can deliberately
+	// update expectedCatalogSHA256 without a separate manual sha256sum step.
+	fmt.Printf("catalog SHA-256: %x\n", sha256.Sum256(raw))
+	return nil
 }
 
 // The proxy protocol says @v/list is newline-delimited and omits pseudo-versions.
@@ -229,7 +241,7 @@ func downloadModules(ctx context.Context, versions []string, tmp string) (map[st
 	cmd.Dir = tmp
 	cmd.Env = append(os.Environ(), "GO111MODULE=on", "GOFLAGS=", "GOWORK=off", "GOTOOLCHAIN=local",
 		"GOMODCACHE="+filepath.Join(tmp, "mod"), "GOPROXY="+proxyURL, "GOSUMDB=sum.golang.org",
-		"GOPRIVATE=", "GONOPROXY=", "GONOSUMDB=")
+		"GOPRIVATE=", "GONOPROXY=")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
@@ -275,8 +287,13 @@ func catalogEntry(download downloadJSON, release *githubRelease, tagHash string)
 	if closeErr != nil {
 		return Entry{}, closeErr
 	}
-	entry := Entry{download.Version, download.Sum, download.GoModSum, download.Origin,
-		SourceZip{fmt.Sprintf("%x", h.Sum(nil)), size}, nil}
+	entry := Entry{
+		Version:   download.Version,
+		Sum:       download.Sum,
+		GoModSum:  download.GoModSum,
+		Origin:    download.Origin,
+		SourceZip: SourceZip{SHA256: fmt.Sprintf("%x", h.Sum(nil)), Size: size},
+	}
 	if release == nil {
 		return entry, nil
 	}
@@ -302,7 +319,7 @@ func catalogEntry(download downloadJSON, release *githubRelease, tagHash string)
 		if record.LinuxAMD64Asset != nil {
 			return Entry{}, fmt.Errorf("duplicate asset %s", want)
 		}
-		record.LinuxAMD64Asset = &AssetRecord{asset.Size, asset.Name, asset.Digest}
+		record.LinuxAMD64Asset = &AssetRecord{Size: asset.Size, Name: asset.Name, Digest: asset.Digest}
 	}
 	entry.GitHubRelease = record
 	return entry, nil
@@ -414,12 +431,21 @@ func validateVersionEntries(versions []Entry) (map[string]bool, map[string]Entry
 	return seen, byVersion, releases, assets, nil
 }
 
+// validOriginRef checks the authenticated origin ref against the exact shapes
+// the catalog uses: the version's own tag ref, or the known main-branch origin
+// for the two versions published from refs/heads/main. Accepting any "refs/"
+// prefix would let a generator typo or wrong ref family pass unchecked even
+// though origin.ref is part of the authenticated provenance record.
+func validOriginRef(version, ref string) bool {
+	return ref == "refs/tags/"+version || ref == "refs/heads/main"
+}
+
 // validateEntryProvenance validates one entry's authenticated sums, origin, and
 // source zip, plus any GitHub release and its linux/amd64 asset. It reports
 // whether the entry carries a release and an asset so the caller can count them.
 func validateEntryProvenance(entry Entry) (hasRelease, hasAsset bool, err error) {
 	if !h1RE.MatchString(entry.Sum) || !h1RE.MatchString(entry.GoModSum) ||
-		!hashRE.MatchString(entry.Origin.Hash) || !strings.HasPrefix(entry.Origin.Ref, "refs/") ||
+		!hashRE.MatchString(entry.Origin.Hash) || !validOriginRef(entry.Version, entry.Origin.Ref) ||
 		!shaRE.MatchString(entry.SourceZip.SHA256) || entry.SourceZip.Size <= 0 {
 		return false, false, fmt.Errorf("%s: invalid authenticated provenance", entry.Version)
 	}
@@ -660,7 +686,93 @@ func versionCompare(a, b string) int {
 	if c := compareNumeric(numericVersion(a), numericVersion(b)); c != 0 {
 		return c
 	}
-	return strings.Compare(a, b)
+	return comparePrerelease(prereleaseTag(a), prereleaseTag(b))
+}
+
+// prereleaseTag returns the SemVer prerelease tail after the first '-', or the
+// empty string for a stable version with no prerelease. The numeric core is
+// compared separately by versionCompare, so only the tail is returned here.
+func prereleaseTag(version string) string {
+	if _, tail, found := strings.Cut(version, "-"); found {
+		return tail
+	}
+	return ""
+}
+
+// comparePrerelease orders two prerelease tails by SemVer 2.0.0 precedence
+// (spec item 11). An empty tail (a stable release) outranks any prerelease that
+// shares the same numeric core. Dot-separated identifiers are compared left to
+// right; when every shared identifier is equal, the longer identifier set wins.
+// The prior lexicographic tiebreak misordered same-core prereleases such as
+// v1.2.3-rc.10 before v1.2.3-rc.2, and both generate and validate share this
+// comparator, so a wrong canonical order self-validated against the pinned
+// digest.
+func comparePrerelease(a, b string) int {
+	if a == b {
+		return 0
+	}
+	if a == "" { // a stable version outranks any prerelease of the same core
+		return 1
+	}
+	if b == "" {
+		return -1
+	}
+	aIdents, bIdents := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(aIdents) && i < len(bIdents); i++ {
+		if c := comparePrereleaseIdent(aIdents[i], bIdents[i]); c != 0 {
+			return c
+		}
+	}
+	return compareInt(len(aIdents), len(bIdents))
+}
+
+// comparePrereleaseIdent compares one dot-separated prerelease identifier.
+// All-numeric identifiers compare numerically and always rank below identifiers
+// containing letters or hyphens; two non-numeric identifiers compare in ASCII
+// order.
+func comparePrereleaseIdent(a, b string) int {
+	aNum, bNum := isNumericIdent(a), isNumericIdent(b)
+	switch {
+	case aNum && bNum:
+		// SemVer forbids leading zeros in numeric identifiers, so the longer
+		// digit run is the larger number; equal-width runs fall back to ASCII
+		// order, which matches numeric order for equal-width digit strings.
+		if c := compareInt(len(a), len(b)); c != 0 {
+			return c
+		}
+		return strings.Compare(a, b)
+	case aNum: // numeric identifiers have lower precedence than alphanumeric
+		return -1
+	case bNum:
+		return 1
+	default:
+		return strings.Compare(a, b)
+	}
+}
+
+// isNumericIdent reports whether s is a non-empty run of ASCII digits.
+func isNumericIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// compareInt returns -1, 0, or 1 as a is less than, equal to, or greater than b.
+func compareInt(a, b int) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
 }
 func numericVersion(version string) [3]int {
 	base := strings.SplitN(version, "-", 2)[0]

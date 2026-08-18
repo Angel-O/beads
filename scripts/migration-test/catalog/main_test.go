@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -119,6 +120,75 @@ func TestCatalogEntryHashesExactProxyZip(t *testing.T) {
 	want := fmt.Sprintf("%x", sha256.Sum256(content))
 	if entry.SourceZip.SHA256 != want || entry.SourceZip.Size != int64(len(content)) {
 		t.Fatalf("source zip = %+v, want sha256 %s size %d", entry.SourceZip, want, len(content))
+	}
+}
+
+func TestVersionComparePrereleaseOrdering(t *testing.T) {
+	// SemVer 2.0.0 §11 precedence for a shared numeric core, ascending. The
+	// prior strings.Compare tiebreak misordered several of these — rc.10 before
+	// rc.2, beta.11 before beta.2, and the stable release before its own
+	// prereleases — and because generate and validate share versionCompare, a
+	// wrong canonical order self-validated against the pinned digest.
+	ascending := []string{
+		"v1.2.3-alpha",
+		"v1.2.3-alpha.1",
+		"v1.2.3-alpha.beta",
+		"v1.2.3-beta",
+		"v1.2.3-beta.2",
+		"v1.2.3-beta.11",
+		"v1.2.3-rc.1",
+		"v1.2.3-rc.2",
+		"v1.2.3-rc.10",
+		"v1.2.3",
+	}
+	for i := range ascending {
+		for j := range ascending {
+			if got, want := versionCompare(ascending[i], ascending[j]), compareInt(i, j); got != want {
+				t.Errorf("versionCompare(%q, %q) = %d, want %d",
+					ascending[i], ascending[j], got, want)
+			}
+		}
+	}
+
+	// A different numeric core dominates the prerelease tail entirely.
+	if versionCompare("v1.2.3-rc.10", "v1.3.0-rc.2") >= 0 {
+		t.Error("numeric core must dominate the prerelease comparison")
+	}
+
+	// Sorting a shuffled copy must recover the canonical order, and the strict
+	// monotonicity guard the validator applies must then hold across it.
+	shuffled := []string{
+		"v1.2.3", "v1.2.3-rc.10", "v1.2.3-beta.2", "v1.2.3-alpha",
+		"v1.2.3-rc.2", "v1.2.3-beta.11", "v1.2.3-alpha.beta", "v1.2.3-rc.1",
+		"v1.2.3-alpha.1", "v1.2.3-beta",
+	}
+	slices.SortFunc(shuffled, versionCompare)
+	if !slices.Equal(shuffled, ascending) {
+		t.Fatalf("sorted = %v\nwant   = %v", shuffled, ascending)
+	}
+	for i := 1; i < len(shuffled); i++ {
+		if versionCompare(shuffled[i-1], shuffled[i]) >= 0 {
+			t.Fatalf("order not strictly increasing at %q, %q", shuffled[i-1], shuffled[i])
+		}
+	}
+}
+
+func TestValidOriginRefShapes(t *testing.T) {
+	cases := []struct {
+		version, ref string
+		want         bool
+	}{
+		{"v0.9.1", "refs/tags/v0.9.1", true},  // tag ref for the entry's own version
+		{"v0.9.11", "refs/heads/main", true},  // known main-branch origin
+		{"v0.9.1", "refs/tags/v9.9.9", false}, // tag ref for a different version
+		{"v0.9.1", "refs/pull/1/head", false}, // foreign ref family
+		{"v0.9.1", "refs/tags/", false},       // empty tag name
+		{"v0.9.1", "", false},                 // missing ref
+	}
+	for _, tc := range cases {
+		if got := validOriginRef(tc.version, tc.ref); got != tc.want {
+			t.Errorf("validOriginRef(%q, %q) = %v, want %v", tc.version, tc.ref, got, tc.want)
+		}
 	}
 }
 
