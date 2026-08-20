@@ -1183,6 +1183,14 @@ func TestCreateIssueAfterPull(t *testing.T) {
 		t.Fatalf("Pull failed: %v", err)
 	}
 
+	// Pin what the pull itself delivered, before any further write. Pull()
+	// reporting success while the peer's row never arrived, and Pull()
+	// delivering the row only for a later write to drop it, are different
+	// bugs; asserting only at the end of the test cannot tell them apart.
+	if pulled, pulledErr := store.GetIssue(ctx, "ai-clone-001"); pulledErr != nil || pulled == nil {
+		t.Fatalf("Pull reported success but the peer's ai-clone-001 is not in the source store (err=%v)", pulledErr)
+	}
+
 	postPullIssue := &types.Issue{
 		ID:        "ai-src-002",
 		Title:     "Source issue after pull",
