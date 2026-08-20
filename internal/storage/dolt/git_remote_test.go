@@ -228,6 +228,40 @@ func sourceCommitAndPush(t *testing.T, dir, msg string) {
 	doltPush(t, dir)
 }
 
+// doltGitRemoteReadCacheTTL mirrors dolt's own defaultSyncForReadTTL
+// (store/blobstore/git_blobstore.go). Dolt resolves a file:// URL that points
+// at a git repo to a git+file:// remote served by GitBlobstore, and
+// GitBlobstore.syncForRead skips the underlying `git fetch` entirely when it
+// last synced less than this long ago:
+//
+//	if ttl := gbs.syncForReadTTL; ttl > 0 { if sinceLast < ttl { return nil } }
+//
+// The blobstore is cached for the life of the sql-server process
+// (dbfactory.gitRemoteCache), so the window is per-server, not per-connection.
+const doltGitRemoteReadCacheTTL = 1 * time.Second
+
+// waitOutGitRemoteReadCache blocks until a push made by a *different* process
+// is guaranteed visible to the next remote read performed by a sql-server this
+// test already used to touch the same remote.
+//
+// Without it these tests race a silent upstream staleness window: a pull
+// issued inside doltGitRemoteReadCacheTTL of the server's previous remote sync
+// reads the cached view, finds the peer's commit absent, and reports
+// "Everything up-to-date" with fast_forward=0 — so store.Pull() returns nil
+// having merged nothing and the peer's rows never arrive. Verified against
+// dolt 2.3.1: with the peer's push and the pull 0.74s apart the pull reports
+// success and delivers nothing; at 1.18s apart the same sequence reports
+// "merge successful" and the row arrives. That is why these tests failed only
+// on CI, whose runners complete the intervening clone/insert/push faster than
+// a loaded developer machine.
+//
+// This sleep removes an unintended dependency on an upstream cache; it does
+// not weaken any assertion below it. If bd's push/pull were actually broken,
+// every assertion still fails exactly as before.
+func waitOutGitRemoteReadCache() {
+	time.Sleep(doltGitRemoteReadCacheTTL + 500*time.Millisecond)
+}
+
 // --- Clone verification helpers (all CLI-based) ---
 
 // queryCSV runs a SQL query via dolt CLI and returns parsed rows as maps.
@@ -811,6 +845,10 @@ func TestGitRemoteEmbeddedPushPull(t *testing.T) {
 	sourceInsertIssue(t, cloneDir, "emb-git-002", "Added in clone")
 	sourceCommitAndPush(t, cloneDir, "Add emb-git-002 from clone")
 
+	// The clone pushed from its own process; this store's sql-server last read
+	// the remote during store.Push() above and caches that view briefly.
+	waitOutGitRemoteReadCache()
+
 	// Pull via embedded driver
 	if err := store.Pull(ctx); err != nil {
 		t.Fatalf("Pull failed: %v", err)
@@ -1090,6 +1128,10 @@ func TestGitRemoteSyncRoundTrip(t *testing.T) {
 	// Close clone store before re-opening source
 	cloneStore.Close()
 
+	// The clone pushed from its own sql-server; the source's server last read
+	// the remote during step 1's push and caches that view briefly.
+	waitOutGitRemoteReadCache()
+
 	// Step 4: Re-open source and pull — verify bidirectional sync
 	sourceStore2, err := New(ctx, &Config{
 		Path:            filepath.Join(setup.baseDir, "embedded-dolt"),
@@ -1174,6 +1216,10 @@ func TestCreateIssueAfterPull(t *testing.T) {
 	}
 	sourceInsertIssue(t, cloneDir, "ai-clone-001", "Clone issue generating events")
 	sourceCommitAndPush(t, cloneDir, "Add ai-clone-001")
+
+	// The peer pushed from its own process; this store's sql-server last read
+	// the remote during store.Push() above and caches that view briefly.
+	waitOutGitRemoteReadCache()
 
 	// Pull into the source store — this is the code path under test.
 	// With UUID primary keys, there are no counter collisions after pull.
