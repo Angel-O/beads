@@ -12,11 +12,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/storage/schema"
@@ -45,10 +47,55 @@ import (
 
 // gitRemoteSetup holds resources for a git-remote test scenario.
 type gitRemoteSetup struct {
-	baseDir   string // root temp dir
-	remoteDir string // bare git repo path
-	remoteURL string // file:// URL for the bare repo
-	sourceDir string // dolt source repo directory
+	baseDir    string // root temp dir
+	remoteDir  string // bare git repo path
+	remoteURL  string // file:// URL for the bare repo
+	sourceDir  string // dolt source repo directory
+	serverPort int    // local dolt sql-server port (0 for CLI-only setups)
+}
+
+// startLocalDoltServer starts a `dolt sql-server` rooted at dataDir and
+// returns its port and an idempotent stop function.
+//
+// The suite's shared Dolt server (testmain_test.go) runs inside a Docker
+// container: its only mount is the image's own /var/lib/dolt volume, so it
+// can reach neither a host file:// git remote nor the store's own Path.
+// Tests that push to a local bare git repo, or that inspect the engine's
+// on-disk state, need a server that shares this process's filesystem.
+// TestGitRemoteExternalServerRouting, TestSQLRemotePersistsAcrossExternalServerRestart
+// and TestCredentialCLIRoutingE2E use the same arrangement.
+//
+// The server is spawned with doltserver.ServerSpawnEnv(), the same environment
+// bd gives the sql-server it starts. That is load-bearing, not cosmetic: a
+// `dolt` CLI command run against a directory a sql-server is already serving
+// is proxied to that server, so the git subprocess is spawned by the server,
+// not by the CLI — env guards applied to the CLI process (git tracing,
+// core.hooksPath) only take effect if the server carries them too.
+func startLocalDoltServer(t *testing.T, dataDir string) (int, func()) {
+	t.Helper()
+	port, err := testutil.FindFreePort()
+	if err != nil {
+		t.Fatalf("failed to find free port: %v", err)
+	}
+	cmd := exec.Command("dolt", "sql-server", "-H", "127.0.0.1", "-P", strconv.Itoa(port))
+	cmd.Dir = dataDir
+	cmd.Env = doltserver.ServerSpawnEnv()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start dolt sql-server in %s: %v", dataDir, err)
+	}
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		})
+	}
+	t.Cleanup(stop)
+	if !testutil.WaitForServer(port, 15*time.Second) {
+		stop()
+		t.Fatalf("dolt sql-server in %s did not become ready within timeout", dataDir)
+	}
+	return port, stop
 }
 
 // setupGitRemote creates a bare git repo (seeded with an initial commit)
@@ -588,18 +635,23 @@ func TestGitRemoteSpecialCharacters(t *testing.T) {
 	}
 }
 
-// --- Embedded driver git remote tests ---
+// --- SQL-driver git remote tests ---
 //
 // These tests verify that Dolt's git remote support works through the
 // SQL driver, not just the CLI. This is the critical question for the
 // Dolt-in-Git spike: can we use store.Push() and store.Pull() with a
 // bare git repo as the remote?
+//
+// CALL DOLT_PUSH runs inside the sql-server process, so the server must be
+// able to see the bare repo and the store's own data directory. These tests
+// therefore run against their own local sql-server (startLocalDoltServer),
+// not the suite's containerized shared server.
 
 // setupEmbeddedGitRemote creates a bare git repo and returns a DoltStore
 // connected with the bare repo configured as "origin".
 func setupEmbeddedGitRemote(t *testing.T) (*DoltStore, *gitRemoteSetup, func()) {
 	t.Helper()
-	skipIfNoDolt(t)
+	testutil.RequireDoltBinary(t)
 	skipIfNoGit(t)
 	acquireTestSlot()
 	t.Cleanup(releaseTestSlot)
@@ -625,47 +677,89 @@ func setupEmbeddedGitRemote(t *testing.T) (*DoltStore, *gitRemoteSetup, func()) 
 
 	remoteURL := "file://" + remoteDir
 
-	// Create embedded DoltStore
+	// Serve the store's own data directory from a local sql-server so the
+	// engine, the bare git repo and this test process all share one
+	// filesystem.
 	doltDir := filepath.Join(baseDir, "embedded-dolt")
+	if err := os.MkdirAll(doltDir, 0o755); err != nil {
+		os.RemoveAll(baseDir)
+		t.Fatalf("failed to create dolt dir: %v", err)
+	}
+	serverPort, stopServer := startLocalDoltServer(t, doltDir)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	dbName := uniqueTestDBName(t)
 	store, err := New(ctx, &Config{
 		Path:            doltDir,
+		ServerHost:      "127.0.0.1",
+		ServerPort:      serverPort,
+		ServerUser:      "root",
+		AutoStart:       false,
 		CommitterName:   "test",
 		CommitterEmail:  "test@example.com",
 		Database:        dbName,
 		CreateIfMissing: true, // test creates a fresh database
 	})
 	if err != nil {
+		stopServer()
 		os.RemoveAll(baseDir)
-		t.Fatalf("failed to create embedded DoltStore: %v", err)
+		t.Fatalf("failed to create DoltStore: %v", err)
+	}
+
+	// The whole point of the local server: the database it just created must
+	// be on this process's filesystem, under the store's own Path. Tests here
+	// push to a host bare repo and read the engine's git-remote cache mirror,
+	// and both silently stop being meaningful if the store ever drifts back
+	// onto a containerized server.
+	if _, statErr := os.Stat(filepath.Join(doltDir, dbName, ".dolt")); statErr != nil {
+		store.Close()
+		stopServer()
+		os.RemoveAll(baseDir)
+		t.Fatalf("store did not materialize %s/.dolt on this filesystem — the engine is not local to the test: %v", filepath.Join(doltDir, dbName), statErr)
 	}
 
 	// Set issue prefix (required for CreateIssue)
 	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
 		store.Close()
+		stopServer()
 		os.RemoveAll(baseDir)
 		t.Fatalf("failed to set prefix: %v", err)
 	}
 
-	// Add git remote via embedded SQL
+	// Add git remote via SQL
 	if err := store.AddRemote(ctx, "origin", remoteURL); err != nil {
 		store.Close()
+		stopServer()
 		os.RemoveAll(baseDir)
 		t.Fatalf("failed to add remote: %v", err)
 	}
 
+	// Genesis commit, sweeping config too — the CLI sibling setupGitRemote
+	// does the same with DOLT_COMMIT('-Am', 'Genesis: schema and config').
+	// Commit() deliberately skips config (GH#2455), so without this
+	// issue_prefix stays dirty forever: Pull() then refuses to auto-commit a
+	// dirty internal config key, and a peer cloning this database gets no
+	// prefix at all.
+	if _, err := store.CommitAll(ctx, "Genesis: schema and config"); err != nil {
+		store.Close()
+		stopServer()
+		os.RemoveAll(baseDir)
+		t.Fatalf("failed to commit genesis config: %v", err)
+	}
+
 	setup := &gitRemoteSetup{
-		baseDir:   baseDir,
-		remoteDir: remoteDir,
-		remoteURL: remoteURL,
-		sourceDir: doltDir,
+		baseDir:    baseDir,
+		remoteDir:  remoteDir,
+		remoteURL:  remoteURL,
+		sourceDir:  doltDir,
+		serverPort: serverPort,
 	}
 
 	cleanup := func() {
 		store.Close()
+		stopServer()
 		os.RemoveAll(baseDir)
 	}
 
@@ -940,8 +1034,15 @@ func TestGitRemoteSyncRoundTrip(t *testing.T) {
 		t.Fatal("expected bootstrap to occur (no existing dolt dir)")
 	}
 
+	// The clone is a second peer with its own data directory, so it needs its
+	// own local server for the same reason the source does.
+	clonePort, _ := startLocalDoltServer(t, cloneDoltDir)
 	cloneStore, err := New(ctx, &Config{
 		Path:            cloneDoltDir,
+		ServerHost:      "127.0.0.1",
+		ServerPort:      clonePort,
+		ServerUser:      "root",
+		AutoStart:       false,
 		CommitterName:   "clone-user",
 		CommitterEmail:  "clone@example.com",
 		Database:        cloneDBName,
@@ -992,6 +1093,10 @@ func TestGitRemoteSyncRoundTrip(t *testing.T) {
 	// Step 4: Re-open source and pull — verify bidirectional sync
 	sourceStore2, err := New(ctx, &Config{
 		Path:            filepath.Join(setup.baseDir, "embedded-dolt"),
+		ServerHost:      "127.0.0.1",
+		ServerPort:      setup.serverPort,
+		ServerUser:      "root",
+		AutoStart:       false,
 		CommitterName:   "test",
 		CommitterEmail:  "test@example.com",
 		Database:        findClonedDBName(t, filepath.Join(setup.baseDir, "embedded-dolt")),
