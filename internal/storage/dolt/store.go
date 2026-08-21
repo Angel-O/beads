@@ -4077,6 +4077,17 @@ func (s *DoltStore) branchHash(ctx context.Context, branch string) (string, erro
 // and a missing system table is not evidence of divergence. Turning "I cannot
 // tell" into a failed pull would break working remotes to catch a broken one.
 //
+// KNOWN BLIND SPOT, one second wide, on git-backed remotes. Dolt's
+// GitBlobstore.syncForRead skips the underlying git fetch when it last synced
+// less than defaultSyncForReadTTL (1s) ago, and the blobstore is cached for the
+// life of the sql-server. A pull issued inside that window — including the
+// refresh above, which is served from the same cached mirror — cannot see a
+// peer's commit pushed during it, so a pull that merged nothing is
+// indistinguishable here from one that had nothing to merge and is reported as
+// success. Bounded and upstream: the next pull outside the window sees the
+// commit and merges it. Tests that push from a second process and then pull
+// must wait the window out rather than depend on it.
+//
 // preHead is the branch head read before the transport ran, and is the cheap
 // way out: a head that MOVED is itself proof the transport landed in this
 // database on this branch, so the refresh below — the only part that costs a

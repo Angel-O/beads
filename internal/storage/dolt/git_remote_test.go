@@ -1678,6 +1678,10 @@ func TestPullReportsSuccessOnlyWhenTheMergeLanded(t *testing.T) {
 	sourceInsertIssue(t, cloneDir, "pl-clone-001", "Clone issue")
 	sourceCommitAndPush(t, cloneDir, "Add pl-clone-001")
 
+	// The peer pushed from its own process; this store's sql-server last read
+	// the remote during store.Push() above and caches that view briefly.
+	waitOutGitRemoteReadCache()
+
 	if err := store.Pull(ctx); err != nil {
 		t.Fatalf("control broken: a pull with real work to do failed: %v", err)
 	}
@@ -1685,8 +1689,13 @@ func TestPullReportsSuccessOnlyWhenTheMergeLanded(t *testing.T) {
 		t.Fatalf("control broken: Pull reported success but the peer's pl-clone-001 is absent (err=%v)", err)
 	}
 
-	// Control 2: the immediately repeated pull has nothing to merge. It must
-	// still succeed, and say nothing about it.
+	// Control 2: the repeated pull has nothing to merge. It must still succeed,
+	// and say nothing about it. Waiting the cache out again is what makes this
+	// a genuine no-op rather than a cached one: inside the TTL the fetch is
+	// skipped, so the pull would report "nothing to merge" without ever asking
+	// the remote, and the control would hold even if a real no-op pull errored.
+	waitOutGitRemoteReadCache()
+
 	if err := store.Pull(ctx); err != nil {
 		t.Fatalf("control broken: a pull with genuinely nothing to merge must succeed quietly, got: %v", err)
 	}
@@ -1713,6 +1722,13 @@ func TestPullReportsSuccessOnlyWhenTheMergeLanded(t *testing.T) {
 	// be asserting on its own bug instead of the product's.
 	runDoltSQL(t, cloneDir, "CALL DOLT_ADD('.'); CALL DOLT_COMMIT('-Am', 'Add pl-clone-002 on feature')")
 	runCmd(t, cloneDir, "dolt", "push", "origin", "feature")
+
+	// Same cache, and the subject needs it out of the way even more than the
+	// controls do: inside the TTL the pull's fetch is skipped, so
+	// remotes/origin/feature never moves, the post-condition sees a local
+	// branch that trivially contains it, and the divergence this case exists
+	// to build is never constructed.
+	waitOutGitRemoteReadCache()
 
 	pullErr := store.Pull(ctx)
 	landed, getErr := store.GetIssue(ctx, "pl-clone-002")
