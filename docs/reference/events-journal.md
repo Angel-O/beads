@@ -70,7 +70,7 @@ Output is JSON Lines, one record per line, in sequence order:
 
 ```json
 {"seq":1,"ts":"2026-01-02T03:04:05Z","op":"create","issue_id":"bd-100","actor":"worker-1","issue":{"id":"bd-100","title":"wire the seam","status":"open","priority":1,"issue_type":"task","created_at":"2026-01-02T03:00:00Z","updated_at":"2026-01-02T03:04:05Z"}}
-{"seq":4,"ts":"2026-01-02T03:04:05Z","op":"update","issue_id":"bd-100","actor":"worker-1","issue":{"id":"bd-100","title":"wire the seam","status":"open","priority":1,"issue_type":"task","is_blocked":true,"created_at":"2026-01-02T03:00:00Z","updated_at":"2026-01-02T03:04:05Z"}}
+{"seq":4,"ts":"2026-01-02T03:04:05Z","op":"update","issue_id":"bd-100","issue":{"id":"bd-100","title":"wire the seam","status":"open","priority":1,"issue_type":"task","is_blocked":true,"created_at":"2026-01-02T03:00:00Z","updated_at":"2026-01-02T03:04:05Z"}}
 {"seq":11,"ts":"2026-01-02T03:04:05Z","op":"delete","issue_id":"bd-100","issue":null}
 ```
 
