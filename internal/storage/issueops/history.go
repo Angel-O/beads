@@ -33,7 +33,10 @@ func HistoryInTx(ctx context.Context, tx DBTX, issueID string) ([]*storage.Histo
 // parameterized query. IDs are trimmed, blank IDs omitted, deduplicated, and
 // sorted lexically. Every normalized ID has a result group, including misses.
 func BulkHistoryInTx(ctx context.Context, tx DBTX, issueIDs []string) ([]storage.IssueHistory, error) {
-	ids := normalizeHistoryIDs(issueIDs)
+	ids, err := NormalizeBulkHistoryIDs(issueIDs)
+	if err != nil {
+		return nil, err
+	}
 	groups := make([]storage.IssueHistory, len(ids))
 	byID := make(map[string]int, len(ids))
 	for i, id := range ids {
@@ -63,7 +66,7 @@ func BulkHistoryInTx(ctx context.Context, tx DBTX, issueIDs []string) ([]storage
 			SELECT * FROM dolt_history_issues
 		) h
 		WHERE h.id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",") + `)
-		ORDER BY h.id ASC, h.commit_date DESC
+		ORDER BY h.id ASC, h.commit_date DESC, h.commit_hash DESC
 	`
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -145,19 +148,33 @@ func scanHistoryEntry(row historyScanner) (*storage.HistoryEntry, error) {
 	return &storage.HistoryEntry{CommitHash: commitHash, Committer: committer, CommitDate: commitDate, Issue: &issue}, nil
 }
 
-func normalizeHistoryIDs(issueIDs []string) []string {
-	seen := make(map[string]struct{}, len(issueIDs))
+// NormalizeBulkHistoryIDs validates, deduplicates, and sorts a bulk history
+// request without touching storage.
+func NormalizeBulkHistoryIDs(issueIDs []string) ([]string, error) {
+	capacity := min(len(issueIDs), storage.MaxBulkHistoryIDs)
+	seen := make(map[string]struct{}, capacity)
 	for _, id := range issueIDs {
-		if id = strings.TrimSpace(id); id != "" {
-			seen[id] = struct{}{}
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
 		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		if err := types.CheckFieldLen("issue ID", id); err != nil {
+			return nil, fmt.Errorf("%w: %v", storage.ErrValidation, err)
+		}
+		if len(seen) == storage.MaxBulkHistoryIDs {
+			return nil, fmt.Errorf("%w: bulk history accepts at most %d unique issue IDs", storage.ErrValidation, storage.MaxBulkHistoryIDs)
+		}
+		seen[id] = struct{}{}
 	}
 	ids := make([]string, 0, len(seen))
 	for id := range seen {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	return ids
+	return ids, nil
 }
 
 // PreviousExternalRefInTx returns the external_ref value recorded for

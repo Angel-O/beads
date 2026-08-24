@@ -7,6 +7,15 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
+const (
+	// MaxBulkHistoryIDs bounds the bind parameters and result groups in one
+	// BulkHistory query. Bulk history never chunks because one query is part of
+	// its contract.
+	MaxBulkHistoryIDs = 1000
+	// MaxBulkHistoryIDLength matches the VARCHAR(255) issue ID schema bound.
+	MaxBulkHistoryIDLength = types.MaxFieldLen
+)
+
 // HistoryViewer provides time-travel queries and diffs.
 type HistoryViewer interface {
 	History(ctx context.Context, issueID string) ([]*HistoryEntry, error)
@@ -18,6 +27,8 @@ type HistoryViewer interface {
 type BulkHistoryViewer interface {
 	// BulkHistory trims whitespace, ignores blank IDs, deduplicates and sorts
 	// IDs lexically, then returns one IssueHistory group for each normalized ID.
+	// It rejects more than MaxBulkHistoryIDs unique IDs or an ID longer than
+	// MaxBulkHistoryIDLength characters before querying storage.
 	BulkHistory(ctx context.Context, issueIDs []string) ([]IssueHistory, error)
 }
 

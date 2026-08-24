@@ -35,8 +35,15 @@ func (s *DoltStore) History(ctx context.Context, issueID string) ([]*storage.His
 
 // BulkHistory returns grouped history for exact issue IDs with one query.
 func (s *DoltStore) BulkHistory(ctx context.Context, issueIDs []string) ([]storage.IssueHistory, error) {
+	issueIDs, err := issueops.NormalizeBulkHistoryIDs(issueIDs)
+	if err != nil {
+		return nil, err
+	}
+	if len(issueIDs) == 0 {
+		return []storage.IssueHistory{}, nil
+	}
 	var result []storage.IssueHistory
-	err := s.withReadTxLongTimeout(ctx, func(tx *sql.Tx) error {
+	err = s.withReadTxLongTimeout(ctx, func(tx *sql.Tx) error {
 		var err error
 		result, err = issueops.BulkHistoryInTx(ctx, tx, issueIDs)
 		if err != nil {

@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 var historyColumns = []string{
@@ -41,7 +43,7 @@ func expectHistoryQuery(mock sqlmock.Sqlmock, ids []string, rows *sqlmock.Rows) 
 	for i, id := range ids {
 		args[i] = id
 	}
-	mock.ExpectQuery(regexp.QuoteMeta("FROM dolt_history_issues")).WithArgs(args...).WillReturnRows(rows)
+	mock.ExpectQuery(`(?s)FROM dolt_history_issues.*ORDER BY h\.id ASC, h\.commit_date DESC, h\.commit_hash DESC`).WithArgs(args...).WillReturnRows(rows)
 }
 
 func TestBulkHistoryInTxMatchesSingleHistory(t *testing.T) {
@@ -113,6 +115,121 @@ func TestBulkHistoryInTxEmptyIDsDoesNotQuery(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBulkHistoryInTxInputBounds(t *testing.T) {
+	t.Run("exact unique-ID boundary", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		ids := make([]string, storage.MaxBulkHistoryIDs)
+		for i := range ids {
+			ids[i] = fmt.Sprintf("bd-%04d", i)
+		}
+		expectHistoryQuery(mock, ids, historyRows())
+		groups, err := BulkHistoryInTx(t.Context(), db, ids)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(groups) != storage.MaxBulkHistoryIDs {
+			t.Fatalf("groups = %d", len(groups))
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("exact ID-length boundary", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		id := strings.Repeat("x", storage.MaxBulkHistoryIDLength)
+		expectHistoryQuery(mock, []string{id}, historyRows())
+		groups, err := BulkHistoryInTx(t.Context(), db, []string{id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(groups) != 1 || groups[0].IssueID != id {
+			t.Fatalf("groups = %#v", groups)
+		}
+	})
+
+	for _, test := range []struct {
+		name string
+		ids  []string
+	}{
+		{
+			name: "too many unique IDs",
+			ids: func() []string {
+				ids := make([]string, storage.MaxBulkHistoryIDs+1)
+				for i := range ids {
+					ids[i] = fmt.Sprintf("bd-%04d", i)
+				}
+				return ids
+			}(),
+		},
+		{name: "overlong ID", ids: []string{strings.Repeat("x", storage.MaxBulkHistoryIDLength+1)}},
+	} {
+		t.Run(test.name+" rejects before query", func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err := BulkHistoryInTx(t.Context(), db, test.ids); !errors.Is(err, storage.ErrValidation) {
+				t.Fatalf("error = %v, want ErrValidation", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("validation reached storage: %v", err)
+			}
+		})
+	}
+
+	t.Run("duplicates do not consume boundary", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		ids := make([]string, 0, storage.MaxBulkHistoryIDs*2)
+		unique := make([]string, storage.MaxBulkHistoryIDs)
+		for i := range unique {
+			unique[i] = fmt.Sprintf("bd-%04d", i)
+			ids = append(ids, unique[i], unique[i])
+		}
+		expectHistoryQuery(mock, unique, historyRows())
+		groups, err := BulkHistoryInTx(t.Context(), db, ids)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(groups) != storage.MaxBulkHistoryIDs {
+			t.Fatalf("groups = %d", len(groups))
+		}
+	})
+}
+
+func TestBulkHistoryInTxEqualTimestampsUseCommitHashOrder(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	date := time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)
+	expectHistoryQuery(mock, []string{"a"}, historyRows(
+		historyRow("a", "hash b", "b", date),
+		historyRow("a", "hash a", "a", date),
+	))
+	groups, err := BulkHistoryInTx(t.Context(), db, []string{"a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{groups[0].Entries[0].CommitHash, groups[0].Entries[1].CommitHash}; !reflect.DeepEqual(got, []string{"b", "a"}) {
+		t.Fatalf("equal-timestamp hashes = %v", got)
 	}
 }
 

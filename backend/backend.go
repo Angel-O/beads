@@ -87,6 +87,7 @@ type (
 	IssueLifecycleStore  = storage.IssueLifecycleStore
 	VersionControl       = storage.VersionControl
 	HistoryViewer        = storage.HistoryViewer
+	BulkHistoryViewer    = storage.BulkHistoryViewer
 	RemoteStore          = storage.RemoteStore
 	SyncStore            = storage.SyncStore
 	FederationStore      = storage.FederationStore
@@ -122,6 +123,7 @@ type (
 	EventCursor             = storage.EventCursor
 	FederationPeer          = storage.FederationPeer
 	HistoryEntry            = storage.HistoryEntry
+	IssueHistory            = storage.IssueHistory
 	MergeSlotResult         = storage.MergeSlotResult
 	MergeSlotStatus         = storage.MergeSlotStatus
 	RemoteInfo              = storage.RemoteInfo
@@ -129,6 +131,11 @@ type (
 	SyncResult              = storage.SyncResult
 	SyncStatus              = storage.SyncStatus
 	UpdateIssueOptions      = storage.UpdateIssueOptions
+)
+
+const (
+	MaxBulkHistoryIDs      = storage.MaxBulkHistoryIDs
+	MaxBulkHistoryIDLength = storage.MaxBulkHistoryIDLength
 )
 
 // VCStatus is the version-control status report (storage.Status). Named

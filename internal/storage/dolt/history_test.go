@@ -2,6 +2,7 @@ package dolt
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	mysql "github.com/go-sql-driver/mysql"
@@ -101,6 +102,9 @@ func TestHistory_UsesDedicatedLongTimeoutConnection(t *testing.T) {
 	}
 	if _, err := store.BulkHistory(ctx, []string{issue.ID}); err == nil {
 		t.Fatal("expected BulkHistory to use the dedicated long-timeout connection")
+	}
+	if _, err := store.BulkHistory(ctx, []string{strings.Repeat("x", storage.MaxBulkHistoryIDLength+1)}); !errors.Is(err, storage.ErrValidation) {
+		t.Fatalf("invalid BulkHistory input reached the broken connection: %v", err)
 	}
 }
 

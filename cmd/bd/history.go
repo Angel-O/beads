@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/metrics"
@@ -32,7 +33,8 @@ where the issue was modified.
 
 Bulk mode reads newline-delimited exact IDs without partial-ID resolution. It
 trims whitespace, ignores blank lines, deduplicates and sorts IDs, and emits an
-empty snapshots array for a missing ID. --limit applies to each issue group.
+empty snapshots array for a missing ID. Inputs are limited to 1000 unique IDs
+of at most 255 characters each. --limit applies to each issue group.
 
 Examples:
   bd history bd-123           # Show all history for issue bd-123
@@ -211,13 +213,27 @@ func readHistoryIDs(path string, stdin io.Reader) ([]string, error) {
 		reader = file
 	}
 
-	var ids []string
+	ids := make([]string, 0, storage.MaxBulkHistoryIDs)
+	seen := make(map[string]struct{}, storage.MaxBulkHistoryIDs)
 	scanner := bufio.NewScanner(reader)
+	maxTokenBytes := (storage.MaxBulkHistoryIDLength + 1) * utf8.UTFMax
+	scanner.Buffer(make([]byte, maxTokenBytes), maxTokenBytes)
 	for scanner.Scan() {
 		id := strings.TrimSpace(scanner.Text())
-		if id != "" {
-			ids = append(ids, id)
+		if id == "" {
+			continue
 		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		if err := types.CheckFieldLen("issue ID", id); err != nil {
+			return nil, err
+		}
+		if len(ids) == storage.MaxBulkHistoryIDs {
+			return nil, fmt.Errorf("bulk history accepts at most %d unique issue IDs", storage.MaxBulkHistoryIDs)
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
