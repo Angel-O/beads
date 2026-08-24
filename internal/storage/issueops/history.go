@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
@@ -17,7 +19,36 @@ import (
 // dolt_history_* tables return multiple rows per PK (one per commit), but
 // the query planner incorrectly assumes WHERE id=? returns one row.
 func HistoryInTx(ctx context.Context, tx DBTX, issueID string) ([]*storage.HistoryEntry, error) {
-	rows, err := tx.QueryContext(ctx, `
+	groups, err := BulkHistoryInTx(ctx, tx, []string{issueID})
+	if err != nil {
+		return nil, err
+	}
+	if len(groups) == 0 {
+		return []*storage.HistoryEntry{}, nil
+	}
+	return groups[0].Entries, nil
+}
+
+// BulkHistoryInTx returns complete version history for exact issue IDs with one
+// parameterized query. IDs are trimmed, blank IDs omitted, deduplicated, and
+// sorted lexically. Every normalized ID has a result group, including misses.
+func BulkHistoryInTx(ctx context.Context, tx DBTX, issueIDs []string) ([]storage.IssueHistory, error) {
+	ids := normalizeHistoryIDs(issueIDs)
+	groups := make([]storage.IssueHistory, len(ids))
+	byID := make(map[string]int, len(ids))
+	for i, id := range ids {
+		groups[i] = storage.IssueHistory{IssueID: id, Entries: []*storage.HistoryEntry{}}
+		byID[id] = i
+	}
+	if len(ids) == 0 {
+		return groups, nil
+	}
+
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	query := `
 		SELECT
 			id, title,
 			COALESCE(description, '') AS description,
@@ -31,76 +62,102 @@ func HistoryInTx(ctx context.Context, tx DBTX, issueID string) ([]*storage.Histo
 		FROM (
 			SELECT * FROM dolt_history_issues
 		) h
-		WHERE h.id = ?
-		ORDER BY h.commit_date DESC
-	`, issueID)
+		WHERE h.id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",") + `)
+		ORDER BY h.id ASC, h.commit_date DESC
+	`
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get issue history: %w", err)
 	}
-	defer rows.Close()
 
-	var entries []*storage.HistoryEntry
 	for rows.Next() {
-		var issue types.Issue
-		var createdAtStr, updatedAtStr sql.NullString
-		var closedAt sql.NullTime
-		var assignee, owner, createdBy, closeReason, molType sql.NullString
-		var estimatedMinutes sql.NullInt64
-		var pinned sql.NullInt64
-		var commitHash, committer string
-		var commitDate time.Time
-
-		if err := rows.Scan(
-			&issue.ID, &issue.Title, &issue.Description, &issue.Design, &issue.AcceptanceCriteria, &issue.Notes,
-			&issue.Status, &issue.Priority, &issue.IssueType, &assignee, &owner, &createdBy,
-			&estimatedMinutes, &createdAtStr, &updatedAtStr, &closedAt, &closeReason,
-			&pinned, &molType,
-			&commitHash, &committer, &commitDate,
-		); err != nil {
-			return nil, fmt.Errorf("failed to scan history: %w", err)
+		entry, err := scanHistoryEntry(rows)
+		if err != nil {
+			_ = rows.Close()
+			return nil, err
 		}
-
-		if createdAtStr.Valid {
-			issue.CreatedAt = ParseTimeString(createdAtStr.String)
-		}
-		if updatedAtStr.Valid {
-			issue.UpdatedAt = ParseTimeString(updatedAtStr.String)
-		}
-		if closedAt.Valid {
-			issue.ClosedAt = &closedAt.Time
-		}
-		if assignee.Valid {
-			issue.Assignee = assignee.String
-		}
-		if owner.Valid {
-			issue.Owner = owner.String
-		}
-		if createdBy.Valid {
-			issue.CreatedBy = createdBy.String
-		}
-		if estimatedMinutes.Valid {
-			mins := int(estimatedMinutes.Int64)
-			issue.EstimatedMinutes = &mins
-		}
-		if closeReason.Valid {
-			issue.CloseReason = closeReason.String
-		}
-		if pinned.Valid && pinned.Int64 != 0 {
-			issue.Pinned = true
-		}
-		if molType.Valid {
-			issue.MolType = types.MolType(molType.String)
-		}
-
-		entries = append(entries, &storage.HistoryEntry{
-			CommitHash: commitHash,
-			Committer:  committer,
-			CommitDate: commitDate,
-			Issue:      &issue,
-		})
+		groups[byID[entry.Issue.ID]].Entries = append(groups[byID[entry.Issue.ID]].Entries, entry)
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("failed to read history: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close history rows: %w", err)
+	}
+	return groups, nil
+}
 
-	return entries, rows.Err()
+type historyScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanHistoryEntry(row historyScanner) (*storage.HistoryEntry, error) {
+	var issue types.Issue
+	var createdAtStr, updatedAtStr sql.NullString
+	var closedAt sql.NullTime
+	var assignee, owner, createdBy, closeReason, molType sql.NullString
+	var estimatedMinutes sql.NullInt64
+	var pinned sql.NullInt64
+	var commitHash, committer string
+	var commitDate time.Time
+
+	if err := row.Scan(
+		&issue.ID, &issue.Title, &issue.Description, &issue.Design, &issue.AcceptanceCriteria, &issue.Notes,
+		&issue.Status, &issue.Priority, &issue.IssueType, &assignee, &owner, &createdBy,
+		&estimatedMinutes, &createdAtStr, &updatedAtStr, &closedAt, &closeReason,
+		&pinned, &molType,
+		&commitHash, &committer, &commitDate,
+	); err != nil {
+		return nil, fmt.Errorf("failed to scan history: %w", err)
+	}
+	if createdAtStr.Valid {
+		issue.CreatedAt = ParseTimeString(createdAtStr.String)
+	}
+	if updatedAtStr.Valid {
+		issue.UpdatedAt = ParseTimeString(updatedAtStr.String)
+	}
+	if closedAt.Valid {
+		issue.ClosedAt = &closedAt.Time
+	}
+	if assignee.Valid {
+		issue.Assignee = assignee.String
+	}
+	if owner.Valid {
+		issue.Owner = owner.String
+	}
+	if createdBy.Valid {
+		issue.CreatedBy = createdBy.String
+	}
+	if estimatedMinutes.Valid {
+		mins := int(estimatedMinutes.Int64)
+		issue.EstimatedMinutes = &mins
+	}
+	if closeReason.Valid {
+		issue.CloseReason = closeReason.String
+	}
+	if pinned.Valid && pinned.Int64 != 0 {
+		issue.Pinned = true
+	}
+	if molType.Valid {
+		issue.MolType = types.MolType(molType.String)
+	}
+	return &storage.HistoryEntry{CommitHash: commitHash, Committer: committer, CommitDate: commitDate, Issue: &issue}, nil
+}
+
+func normalizeHistoryIDs(issueIDs []string) []string {
+	seen := make(map[string]struct{}, len(issueIDs))
+	for _, id := range issueIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			seen[id] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // PreviousExternalRefInTx returns the external_ref value recorded for

@@ -93,6 +93,7 @@ type IssueSQLRepository interface {
 	CountIssues(ctx context.Context, query string, filter types.IssueFilter) (int64, error)
 	CountIssuesByGroup(ctx context.Context, filter types.IssueFilter, groupBy string) (map[string]int, error)
 	History(ctx context.Context, id string) ([]*storage.HistoryEntry, error)
+	BulkHistory(ctx context.Context, ids []string) ([]storage.IssueHistory, error)
 	IterEvents(ctx context.Context, id string, limit int) (storage.Iter[types.Event], error)
 	GetStaleIssues(ctx context.Context, filter types.StaleFilter) ([]*types.Issue, error)
 	GetEpicsEligibleForClosure(ctx context.Context) ([]*types.EpicStatus, error)
@@ -313,6 +314,7 @@ type IssueUseCase interface {
 	CountIssues(ctx context.Context, query string, filter types.IssueFilter) (int64, error)
 	CountIssuesByGroup(ctx context.Context, filter types.IssueFilter, groupBy string) (map[string]int, error)
 	History(ctx context.Context, id string) ([]*storage.HistoryEntry, error)
+	BulkHistory(ctx context.Context, ids []string) ([]storage.IssueHistory, error)
 	IterEvents(ctx context.Context, id string, limit int) (storage.Iter[types.Event], error)
 	GetStaleIssues(ctx context.Context, filter types.StaleFilter) ([]*types.Issue, error)
 	GetEpicsEligibleForClosure(ctx context.Context) ([]*types.EpicStatus, error)
@@ -1847,6 +1849,14 @@ func (u *issueUseCaseImpl) History(ctx context.Context, id string) ([]*storage.H
 	out, err := u.issueRepo.History(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("History: %w", err)
+	}
+	return out, nil
+}
+
+func (u *issueUseCaseImpl) BulkHistory(ctx context.Context, ids []string) ([]storage.IssueHistory, error) {
+	out, err := u.issueRepo.BulkHistory(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("BulkHistory: %w", err)
 	}
 	return out, nil
 }

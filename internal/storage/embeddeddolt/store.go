@@ -897,6 +897,16 @@ func (s *EmbeddedDoltStore) History(ctx context.Context, issueID string) ([]*sto
 	return result, err
 }
 
+func (s *EmbeddedDoltStore) BulkHistory(ctx context.Context, issueIDs []string) ([]storage.IssueHistory, error) {
+	var result []storage.IssueHistory
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.BulkHistoryInTx(ctx, tx, issueIDs)
+		return err
+	})
+	return result, err
+}
+
 func (s *EmbeddedDoltStore) AsOf(ctx context.Context, issueID string, ref string) (*types.Issue, error) {
 	var result *types.Issue
 	err := s.withConn(ctx, false, func(tx *sql.Tx) error {

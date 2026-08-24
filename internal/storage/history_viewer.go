@@ -14,6 +14,13 @@ type HistoryViewer interface {
 	Diff(ctx context.Context, fromRef, toRef string) ([]*DiffEntry, error)
 }
 
+// BulkHistoryViewer provides one-query history reads for exact issue IDs.
+type BulkHistoryViewer interface {
+	// BulkHistory trims whitespace, ignores blank IDs, deduplicates and sorts
+	// IDs lexically, then returns one IssueHistory group for each normalized ID.
+	BulkHistory(ctx context.Context, issueIDs []string) ([]IssueHistory, error)
+}
+
 // ExternalRefHistoryQuerier is implemented by history-capable Dolt storage
 // backends that can resolve what a given issue's external_ref was as of a
 // point in time, by querying Dolt's dolt_history_issues system table.

@@ -33,6 +33,20 @@ func (s *DoltStore) History(ctx context.Context, issueID string) ([]*storage.His
 	return result, err
 }
 
+// BulkHistory returns grouped history for exact issue IDs with one query.
+func (s *DoltStore) BulkHistory(ctx context.Context, issueIDs []string) ([]storage.IssueHistory, error) {
+	var result []storage.IssueHistory
+	err := s.withReadTxLongTimeout(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.BulkHistoryInTx(ctx, tx, issueIDs)
+		if err != nil {
+			return wrapQueryError("get bulk issue history", err)
+		}
+		return nil
+	})
+	return result, err
+}
+
 // AsOf returns the state of an issue at a specific commit hash or branch ref.
 // Implements storage.VersionedStorage.
 func (s *DoltStore) AsOf(ctx context.Context, issueID string, ref string) (*types.Issue, error) {

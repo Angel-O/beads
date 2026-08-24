@@ -3,10 +3,52 @@
 package embeddeddolt_test
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/types"
 )
+
+func TestBulkHistoryMatchesRepeatedHistory(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+
+	te := newTestEnv(t, "bh")
+	ctx := t.Context()
+	for _, issue := range []*types.Issue{
+		{ID: "bh-b", Title: "B v1", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask},
+		{ID: "bh-a", Title: "A v1", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask},
+	} {
+		if err := te.store.CreateIssue(ctx, issue, "tester"); err != nil {
+			t.Fatalf("CreateIssue(%s): %v", issue.ID, err)
+		}
+	}
+	if err := te.store.Commit(ctx, "create bulk history fixtures"); err != nil {
+		t.Fatal(err)
+	}
+	if err := te.store.UpdateIssue(ctx, "bh-a", map[string]interface{}{"title": "A v2"}, "tester"); err != nil {
+		t.Fatal(err)
+	}
+	if err := te.store.Commit(ctx, "update A"); err != nil {
+		t.Fatal(err)
+	}
+
+	groups, err := te.store.BulkHistory(ctx, []string{"bh-b", "bh-missing", "bh-a", "bh-b"})
+	if err != nil {
+		t.Fatalf("BulkHistory: %v", err)
+	}
+	if len(groups) != 3 || groups[0].IssueID != "bh-a" || groups[1].IssueID != "bh-b" || groups[2].IssueID != "bh-missing" {
+		t.Fatalf("groups = %#v", groups)
+	}
+	for _, group := range groups {
+		single, err := te.store.History(ctx, group.IssueID)
+		if err != nil {
+			t.Fatalf("History(%s): %v", group.IssueID, err)
+		}
+		if !reflect.DeepEqual(group.Entries, single) {
+			t.Fatalf("BulkHistory(%s) differs from History", group.IssueID)
+		}
+	}
+}
 
 // migration0049DDL replays migration 0049's exact column widening: the four
 // issues text columns move from TEXT to LONGTEXT NOT NULL. See

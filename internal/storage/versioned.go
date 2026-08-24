@@ -15,6 +15,14 @@ type HistoryEntry struct {
 	Issue      *types.Issue // The issue state at that commit
 }
 
+// IssueHistory groups the complete version history for one exact issue ID.
+// Bulk history results are ordered by IssueID, and Entries are newest-first.
+// Entries is an empty, non-nil slice when the requested ID has no history.
+type IssueHistory struct {
+	IssueID string          `json:"issue_id"`
+	Entries []*HistoryEntry `json:"snapshots"`
+}
+
 // DiffEntry represents a change between two commits.
 type DiffEntry struct {
 	IssueID  string       // The ID of the affected issue

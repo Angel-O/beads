@@ -1187,6 +1187,14 @@ func (r *issueSQLRepositoryImpl) History(ctx context.Context, id string) ([]*sto
 	return out, nil
 }
 
+func (r *issueSQLRepositoryImpl) BulkHistory(ctx context.Context, ids []string) ([]storage.IssueHistory, error) {
+	out, err := issueops.BulkHistoryInTx(ctx, r.runner, ids)
+	if err != nil {
+		return nil, fmt.Errorf("db: IssueSQLRepository.BulkHistory: %w", err)
+	}
+	return out, nil
+}
+
 func (r *issueSQLRepositoryImpl) IterEvents(ctx context.Context, id string, limit int) (storage.Iter[types.Event], error) {
 	events, err := issueops.GetEventsInTx(ctx, r.runner, id, limit)
 	if err != nil {

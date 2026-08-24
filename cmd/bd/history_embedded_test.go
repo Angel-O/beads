@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -77,6 +78,7 @@ func TestEmbeddedHistory(t *testing.T) {
 	bdUpdate(t, bd, dir, issue.ID, "--status", "in_progress")
 	bdUpdate(t, bd, dir, issue.ID, "--priority", "1")
 	bdUpdate(t, bd, dir, issue.ID, "--title", "History test issue updated")
+	second := bdCreate(t, bd, dir, "Second history issue", "--type", "task")
 
 	// ===== Basic history showing state changes =====
 
@@ -172,6 +174,75 @@ func TestEmbeddedHistory(t *testing.T) {
 		}
 		if issueMap["title"] != "History test issue updated" {
 			t.Errorf("expected latest title 'History test issue updated', got %v", issueMap["title"])
+		}
+	})
+
+	t.Run("bulk_history_file_and_stdin_contract", func(t *testing.T) {
+		idsPath := fmt.Sprintf("%s/history-ids.txt", t.TempDir())
+		contents := fmt.Sprintf("%s\nhi-missing\n%s\n%s\n", second.ID, issue.ID, second.ID)
+		if err := os.WriteFile(idsPath, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		run := func(t *testing.T, path string, stdin string) map[string]interface{} {
+			t.Helper()
+			cmd := exec.Command(bd, "history", "--ids-file", path, "--json")
+			cmd.Dir = dir
+			cmd.Env = bdEnv(dir)
+			if path == "-" {
+				cmd.Stdin = strings.NewReader(stdin)
+			}
+			stdout, stderr, err := runCommandBuffers(t, cmd)
+			if err != nil {
+				t.Fatalf("bulk history failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+			}
+			var envelope map[string]interface{}
+			if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+				t.Fatalf("bulk stdout is not pure JSON: %v\n%s", err, stdout.String())
+			}
+			return envelope
+		}
+
+		expectedIDs := []string{issue.ID, second.ID, "hi-missing"}
+		sort.Strings(expectedIDs)
+		for name, envelope := range map[string]map[string]interface{}{
+			"file":  run(t, idsPath, ""),
+			"stdin": run(t, "-", contents),
+		} {
+			if envelope["schema_version"] != float64(1) {
+				t.Fatalf("%s schema_version = %#v", name, envelope["schema_version"])
+			}
+			groups, ok := envelope["issues"].([]interface{})
+			if !ok || len(groups) != 3 {
+				t.Fatalf("%s issues = %#v", name, envelope["issues"])
+			}
+			for i, group := range groups {
+				if got := group.(map[string]interface{})["issue_id"]; got != expectedIDs[i] {
+					t.Fatalf("%s issue %d = %v, want %s", name, i, got, expectedIDs[i])
+				}
+			}
+			for _, group := range groups {
+				missing := group.(map[string]interface{})
+				if missing["issue_id"] == "hi-missing" && len(missing["snapshots"].([]interface{})) != 0 {
+					t.Fatalf("%s missing group = %#v", name, missing)
+				}
+			}
+		}
+	})
+
+	t.Run("bulk_history_rejects_incompatible_modes", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"--ids-file", "-"},
+			{"--ids-file", "-", "--json", "--events"},
+			{"--ids-file", "-", "--json", issue.ID},
+		} {
+			cmd := exec.Command(bd, append([]string{"history"}, args...)...)
+			cmd.Dir = dir
+			cmd.Env = bdEnv(dir)
+			cmd.Stdin = strings.NewReader(issue.ID + "\n")
+			if out, err := cmd.CombinedOutput(); err == nil {
+				t.Fatalf("history %v succeeded, output: %s", args, out)
+			}
 		}
 	})
 

@@ -4,6 +4,8 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -164,6 +166,36 @@ func TestProxiedServerHistory(t *testing.T) {
 		}
 		if issueMap["title"] != "History test issue updated" {
 			t.Errorf("expected latest title 'History test issue updated', got %v", issueMap["title"])
+		}
+	})
+
+	t.Run("bulk_history_uses_proxied_batch_contract", func(t *testing.T) {
+		second := bdProxiedCreate(t, bd, p.dir, "Second history issue", "--type", "task")
+		idsPath := filepath.Join(t.TempDir(), "ids.txt")
+		if err := os.WriteFile(idsPath, []byte(second.ID+"\n"+missingID+"\n"+issue.ID+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, err := bdProxiedRun(t, bd, p.dir, "history", "--ids-file", idsPath, "--json")
+		if err != nil {
+			t.Fatalf("bulk proxied history: %v\n%s", err, out)
+		}
+		var envelope struct {
+			SchemaVersion int `json:"schema_version"`
+			Issues        []struct {
+				IssueID   string            `json:"issue_id"`
+				Snapshots []json.RawMessage `json:"snapshots"`
+			} `json:"issues"`
+		}
+		if err := json.Unmarshal(out, &envelope); err != nil {
+			t.Fatalf("unmarshal bulk proxied history: %v\n%s", err, out)
+		}
+		if envelope.SchemaVersion != 1 || len(envelope.Issues) != 3 {
+			t.Fatalf("bulk envelope = %#v", envelope)
+		}
+		for _, group := range envelope.Issues {
+			if group.IssueID == missingID && len(group.Snapshots) != 0 {
+				t.Fatalf("missing group has snapshots: %#v", group)
+			}
 		}
 	})
 

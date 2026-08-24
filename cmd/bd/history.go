@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/metrics"
@@ -14,22 +18,28 @@ import (
 )
 
 var (
-	historyLimit  int
-	historyEvents bool
+	historyLimit   int
+	historyEvents  bool
+	historyIDsFile string
 )
 
 var historyCmd = &cobra.Command{
-	Use:     "history <id>",
+	Use:     "history <id> | history --ids-file <path|-> --json",
 	GroupID: "views",
 	Short:   "Show version history for an issue",
 	Long: `Show the complete version history of an issue, including all commits
 where the issue was modified.
 
+Bulk mode reads newline-delimited exact IDs without partial-ID resolution. It
+trims whitespace, ignores blank lines, deduplicates and sorts IDs, and emits an
+empty snapshots array for a missing ID. --limit applies to each issue group.
+
 Examples:
   bd history bd-123           # Show all history for issue bd-123
   bd history bd-123 --limit 5 # Show last 5 changes
-  bd history bd-123 --events  # Show database audit events`,
-	Args:          cobra.ExactArgs(1),
+  bd history bd-123 --events  # Show database audit events
+  bd history --ids-file - --json < issue-ids.txt # Bulk exact-ID snapshots`,
+	Args:          cobra.MaximumNArgs(1),
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -39,6 +49,33 @@ Examples:
 				c.CloseEventAndAdd(evt)
 			}
 		}()
+
+		if historyIDsFile != "" {
+			if len(args) != 0 {
+				return HandleErrorRespectJSON("an issue argument cannot be combined with --ids-file")
+			}
+			if !jsonOutput {
+				return HandleErrorRespectJSON("--ids-file requires --json")
+			}
+			if historyEvents {
+				return HandleErrorRespectJSON("--events is not supported with --ids-file")
+			}
+			ids, err := readHistoryIDs(historyIDsFile, cmd.InOrStdin())
+			if err != nil {
+				return HandleErrorRespectJSON("reading history IDs: %v", err)
+			}
+			if usesProxiedServer() {
+				return runBulkHistoryProxiedServer(rootCtx, ids, historyLimit)
+			}
+			bulkBackend, ok := storage.UnwrapStore(store).(bulkHistoryBackend)
+			if !ok {
+				return HandleErrorRespectJSON("the active storage backend does not support bulk history")
+			}
+			return runBulkHistory(rootCtx, bulkBackend, ids, historyLimit)
+		}
+		if len(args) != 1 {
+			return HandleErrorRespectJSON("exactly one issue ID is required unless --ids-file is used")
+		}
 
 		issueID := args[0]
 
@@ -65,6 +102,30 @@ Examples:
 type historyBackend interface {
 	History(ctx context.Context, id string) ([]*storage.HistoryEntry, error)
 	IterEvents(ctx context.Context, id string, limit int) (storage.Iter[types.Event], error)
+}
+
+type bulkHistoryBackend interface {
+	BulkHistory(ctx context.Context, ids []string) ([]storage.IssueHistory, error)
+}
+
+type bulkHistoryEnvelope struct {
+	SchemaVersion int                    `json:"schema_version"`
+	Issues        []storage.IssueHistory `json:"issues"`
+}
+
+func runBulkHistory(ctx context.Context, backend bulkHistoryBackend, issueIDs []string, limit int) error {
+	groups, err := backend.BulkHistory(ctx, issueIDs)
+	if err != nil {
+		return HandleErrorRespectJSON("failed to get bulk history: %v", err)
+	}
+	if limit > 0 {
+		for i := range groups {
+			if limit < len(groups[i].Entries) {
+				groups[i].Entries = groups[i].Entries[:limit]
+			}
+		}
+	}
+	return outputJSONRaw(bulkHistoryEnvelope{SchemaVersion: 1, Issues: groups})
 }
 
 func runHistory(ctx context.Context, backend historyBackend, issueID string, limit int, showEvents bool) error {
@@ -131,8 +192,37 @@ func runHistory(ctx context.Context, backend historyBackend, issueID string, lim
 func init() {
 	historyCmd.Flags().IntVar(&historyLimit, "limit", 0, "Limit number of history entries (0 = all)")
 	historyCmd.Flags().BoolVar(&historyEvents, "events", false, "Show database audit events instead of commit snapshots")
+	historyCmd.Flags().StringVar(&historyIDsFile, "ids-file", "", "Read exact issue IDs, one per line (use - for stdin; requires --json)")
 	historyCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(historyCmd)
+}
+
+func readHistoryIDs(path string, stdin io.Reader) ([]string, error) {
+	var reader io.Reader
+	if path == "-" {
+		reader = stdin
+	} else {
+		// #nosec G304 -- the path is explicitly supplied by the user.
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = file.Close() }()
+		reader = file
+	}
+
+	var ids []string
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		id := strings.TrimSpace(scanner.Text())
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 func collectHistoryEvents(ctx context.Context, backend historyBackend, issueID string, limit int) ([]types.Event, error) {

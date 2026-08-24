@@ -76,6 +76,10 @@ func TestHistory_UsesDedicatedLongTimeoutConnection(t *testing.T) {
 		t.Fatalf("expected history to contain the created issue %q (title %q), got entries: %+v",
 			issue.ID, issue.Title, sanityHistory)
 	}
+	bulkHistory, err := store.BulkHistory(ctx, []string{issue.ID})
+	if err != nil || len(bulkHistory) != 1 || len(bulkHistory[0].Entries) == 0 {
+		t.Fatalf("BulkHistory failed before connStr corruption: groups=%#v err=%v", bulkHistory, err)
+	}
 
 	// Break store.connStr to an address that fails DNS resolution fast and
 	// permanently (RFC 2606 .invalid TLD) — a clean signal distinct from
@@ -94,6 +98,9 @@ func TestHistory_UsesDedicatedLongTimeoutConnection(t *testing.T) {
 			"pool (store.db) instead of a fresh connection via " +
 			"openLongTimeoutConn/withReadTxLongTimeout, which is what lets " +
 			"the pool's 10s ReadTimeout keep biting long dolt_history_issues scans")
+	}
+	if _, err := store.BulkHistory(ctx, []string{issue.ID}); err == nil {
+		t.Fatal("expected BulkHistory to use the dedicated long-timeout connection")
 	}
 }
 

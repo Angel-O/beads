@@ -135,6 +135,7 @@ func TestRecordingIssueUseCaseCoversItsSurface(t *testing.T) {
 	assertPartition(t, "IssueUseCase", interfaceMethods(reflect.TypeOf((*domain.IssueUseCase)(nil)).Elem()),
 		reflect.TypeOf((*recordingIssueUC)(nil)), map[string]string{
 			"AsOf":                         reads,
+			"BulkHistory":                  reads,
 			"CountIssues":                  reads,
 			"CountIssuesByGroup":           reads,
 			"CountOpenChildren":            reads,
