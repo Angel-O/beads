@@ -10,14 +10,15 @@ Can materially different provider paths expose exact historical Memory states an
 
 The provider-neutral fixture lives under `internal/memorybeads/spikea2`. A SQL realization is isolated in `internal/memorybeads/spikea2/sqlprototype`, with adapters exercised through a real `EmbeddedDoltStore` path and a real proxied Dolt-server unit-of-work path. The experiment also used an independently represented provider.
 
-The SQL fixtures used throwaway tables for immutable state, named views, and head sets. No production migration creates those tables, and the experiment did not widen `memoryops.Memories`, storage interfaces, or the A1 descriptor package.
+The SQL fixtures used throwaway tables for immutable state, named views, and head sets. No production migration creates those tables, and the experiment did not widen `memoryops.Memories` or storage interfaces.
 
 Across the exercised providers, the fixtures demonstrated:
 
 - exact reads of complete historical Memory state after archive, restoration, view removal, provider close, and reopen;
 - reconstruction of persisted current and conflicting fixture state by a fresh module object;
 - atomic body-plus-reference updates and rejection of stale compare-and-swap attempts;
-- no new fixture version when normalized durable state was unchanged;
+- Stored Provenance changes, including origin or transfer evidence, produced a
+  new fixture version, while Change Attribution-only differences did not;
 - readable historical states when the fixture represented competing current states, without silently choosing one;
 - history, diff, line-blame, and field-blame computations over fixture data;
 - deterministic bounded history, search, and reference traversal tied to the original scope and snapshot; and
@@ -52,7 +53,14 @@ The following remain fixture choices rather than Memory requirements:
 - cursor encoding, repository tables, and comparison algorithms; and
 - the choice not to use Dolt commit hashes in this prototype.
 
-Memory Beads now relies on shared, provider-neutral Beads History and Versioned Bead contracts. Those contracts define historical addressing, branches, retention, comparison, attribution, writes, retries, concurrency, and conflicts. A2 shows that the tested providers can support an exact-history abstraction; it does not define that abstraction or a Memory-private mutation protocol.
+Memory Beads now relies on shared, provider-neutral Beads History and Versioned Bead contracts. Those contracts define historical addressing, branches, retention, comparison, Change Attribution, writes, retries, concurrency, and conflicts. A2 shows that the tested providers can support an exact-history abstraction; it does not define that abstraction or a Memory-private mutation protocol.
+
+Within the fixture, origin and source or transfer evidence are durable Stored
+Provenance. Changing either produces a version. Author, assisting agent, and
+change message describe Change Attribution for an accepted version; differences
+in those fields alone do not turn otherwise unchanged Memory state into a new
+version. These fixture fields do not prescribe the shared History contract's
+representation.
 
 At the Memory boundary, the result supports requiring an exact, non-substituted
 read while a historical state is retained. The experiment did not exercise

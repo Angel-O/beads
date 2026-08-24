@@ -12,7 +12,6 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
-	memorybeadsv1 "github.com/steveyegge/beads/memorybeads/v1"
 )
 
 const storageScopeName = "github.com/steveyegge/beads/storage"
@@ -71,17 +70,6 @@ func WrapStorage(s storage.DoltStorage) storage.DoltStorage {
 // Unwrap satisfies storage.Unwrapper so storage.UnwrapStore can peel the
 // instrumentation layer for optional-interface type assertions.
 func (s *InstrumentedStorage) Unwrap() storage.DoltStorage { return s.inner }
-
-// MemoryModuleV1 preserves the optional versioned Memory Beads capability
-// across instrumentation without adding it to storage.DoltStorage.
-func (s *InstrumentedStorage) MemoryModuleV1() (memorybeadsv1.Module, error) {
-	if s == nil {
-		return memorybeadsv1.Acquire(nil)
-	}
-	return memorybeadsv1.Acquire(s.inner)
-}
-
-var _ memorybeadsv1.Source = (*InstrumentedStorage)(nil)
 
 // op starts a span and records a metric for the named storage operation.
 func (s *InstrumentedStorage) op(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span, time.Time) {

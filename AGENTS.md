@@ -22,9 +22,10 @@ expected and should not be flagged.
 ## Project Scope
 
 Before adding new feature surface area, read
-[engdocs/PROJECT_CHARTER.md](engdocs/PROJECT_CHARTER.md). Beads owns issue tracking
-primitives and should not encode orchestration-layer policy, become a storage
-engine, or casually expand the database schema when metadata would work.
+[engdocs/PROJECT_CHARTER.md](engdocs/PROJECT_CHARTER.md). Beads owns peer core
+Task and Memory Bead kinds plus shared capabilities, while keeping
+orchestration policy, storage-provider mechanics, deployment topology,
+federation, authentication, and governance at their proper boundaries.
 
 ## PR Safety for Agents
 
@@ -58,13 +59,14 @@ See [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) for full development guidelin
 
 ## Storage Boundary
 
-The canonical storage boundary is in
+The current implementation's canonical storage boundary is in
 [engdocs/PROJECT_CHARTER.md](engdocs/PROJECT_CHARTER.md#storage-boundary). In short:
 Beads talks to storage through a driver interface (`dolthub/driver` for Dolt).
 Do not add beads-side flocks, engine introspection, storage-specific retry or
 crash-recovery logic, or public SDK return types that leak driver internals.
 If the boundary is too narrow, widen the interface or route the issue to the
-driver instead of patching around it in beads.
+provider instead of patching around it in beads. Dolt is the current primary
+provider, not the product definition of Task or Memory Beads.
 
 A live application of this rule: `bd doctor` support for embedded mode is
 enabled one subcommand at a time, each human-vetted (GH#3794). Do not lift the

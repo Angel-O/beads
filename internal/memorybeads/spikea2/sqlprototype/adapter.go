@@ -9,7 +9,7 @@ import (
 
 // Session is the deliberately small SQL seam needed by the prototype
 // repository. Provider adapters translate their real transaction/session
-// shape into this interface; it never reaches the caller-facing Memory Module.
+// shape into this interface; it never reaches the caller-facing A2 fixture.
 type Session interface {
 	Exec(context.Context, string, ...any) (int64, error)
 	Query(context.Context, string, ...any) ([][]any, error)

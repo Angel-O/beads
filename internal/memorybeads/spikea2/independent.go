@@ -117,7 +117,7 @@ func (p *IndependentProvider) Mutate(ctx context.Context, req Mutation) (Mutatio
 		beadID = BeadID("ind-bead-" + strconv.FormatUint(p.beadSeq, 10))
 	}
 
-	refs, err := normalizeReferences(p.projectID, beadID, req.References)
+	refs, err := normalizeReferences(beadID, req.References)
 	if err != nil {
 		return rejected(err)
 	}
@@ -713,11 +713,13 @@ func mutationMatchesRevision(req Mutation, aliases []string, refs []Reference, r
 		req.Title == revision.Title &&
 		req.Lifecycle == revision.Lifecycle &&
 		req.Body == revision.Body &&
-		referencesEqual(refs, revision.References)
+		referencesEqual(refs, revision.References) &&
+		req.Origin == revision.Origin &&
+		reflect.DeepEqual(req.Provenance, revision.Provenance)
 }
 
 func semanticFields() []string {
-	return []string{"key", "aliases", "title", "lifecycle", "outgoing_references"}
+	return []string{"key", "aliases", "title", "lifecycle", "outgoing_references", "origin", "provenance"}
 }
 
 func semanticFieldEqual(field string, left, right Revision) bool {
@@ -732,6 +734,10 @@ func semanticFieldEqual(field string, left, right Revision) bool {
 		return left.Lifecycle == right.Lifecycle
 	case "outgoing_references":
 		return referencesEqual(left.References, right.References)
+	case "origin":
+		return left.Origin == right.Origin
+	case "provenance":
+		return reflect.DeepEqual(left.Provenance, right.Provenance)
 	default:
 		return false
 	}
@@ -746,51 +752,37 @@ func searchableText(revision Revision) string {
 	}, "\n"))
 }
 
-func normalizeReferences(projectID ProjectID, source BeadID, refs []Reference) ([]Reference, error) {
+// normalizeReferences validates only the project-local structure exercised by
+// A2. Nonlocal locator and pin fields are opaque outgoing-reference state;
+// shared Graph and Federation contracts own their interpretation and validity.
+func normalizeReferences(source BeadID, refs []Reference) ([]Reference, error) {
 	result := make([]Reference, 0, len(refs))
-	byLocator := make(map[string]int, len(refs))
+	seen := make(map[string]struct{}, len(refs))
 	for _, ref := range refs {
 		target := ref.Target
-		if target.BeadID == "" || target.ExpectedScope == "" {
-			return nil, fmt.Errorf("%w: reference target, scope, and kind are required", ErrInvalid)
+		if target.BeadID == "" {
+			return nil, fmt.Errorf("%w: reference target is required", ErrInvalid)
 		}
-		if target.ExpectedKind != BeadKindTask && target.ExpectedKind != BeadKindMemory {
-			return nil, fmt.Errorf("%w: reference target kind %q", ErrInvalid, target.ExpectedKind)
+		if target.Local {
+			if target.ExpectedScope == "" {
+				return nil, fmt.Errorf("%w: local reference scope is required", ErrInvalid)
+			}
+			if target.ExpectedKind != BeadKindTask && target.ExpectedKind != BeadKindMemory {
+				return nil, fmt.Errorf("%w: local reference target kind %q", ErrInvalid, target.ExpectedKind)
+			}
+			if target.BeadID == source {
+				return nil, fmt.Errorf("%w: a memory cannot reference itself", ErrInvalid)
+			}
 		}
-		if target.Local && target.ProjectID != "" {
-			return nil, fmt.Errorf("%w: a source-local target cannot carry a foreign project ID", ErrInvalid)
-		}
-		if !target.Local && target.ProjectID == "" {
-			return nil, fmt.Errorf("%w: a foreign target requires a project ID", ErrInvalid)
-		}
-		if !target.Local && (target.ExpectedKind != BeadKindMemory || target.RevisionID == "") {
-			return nil, fmt.Errorf("%w: a foreign target must identify an exact memory revision", ErrInvalid)
-		}
-		if target.ExpectedKind == BeadKindTask && target.RevisionID != "" {
-			return nil, fmt.Errorf("%w: a task target cannot carry a memory revision pin", ErrInvalid)
-		}
-		if target.BeadID == source && (target.Local || target.ProjectID == projectID) {
-			return nil, fmt.Errorf("%w: a memory cannot reference itself", ErrInvalid)
-		}
-		locator := referenceLocatorKey(ref)
-		if index, exists := byLocator[locator]; exists {
-			// A pin or expected-target change updates the one edge identified by
-			// this locator; it does not create a parallel edge.
-			result[index] = ref
+		key := referenceKey(ref)
+		if _, exists := seen[key]; exists {
 			continue
 		}
-		byLocator[locator] = len(result)
+		seen[key] = struct{}{}
 		result = append(result, ref)
 	}
-	sort.Slice(result, func(i, j int) bool { return referenceLocatorKey(result[i]) < referenceLocatorKey(result[j]) })
+	sort.Slice(result, func(i, j int) bool { return referenceKey(result[i]) < referenceKey(result[j]) })
 	return result, nil
-}
-
-func referenceLocatorKey(ref Reference) string {
-	t := ref.Target
-	return strings.Join([]string{
-		strconv.FormatBool(t.Local), string(t.ProjectID), string(t.BeadID),
-	}, "\x00")
 }
 
 func referenceKey(ref Reference) string {

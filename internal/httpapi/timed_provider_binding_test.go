@@ -5,19 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"testing"
-
-	memorybeadsv1 "github.com/steveyegge/beads/memorybeads/v1"
 )
-
-func TestTimedProviderPreservesMemoryModuleV1(t *testing.T) {
-	module, err := memorybeadsv1.Acquire(timedProvider{inner: &fakeProvider{}})
-	if err != nil {
-		t.Fatalf("Acquire: %v", err)
-	}
-	if got := module.Descriptor().InterfaceVersion; got != memorybeadsv1.InterfaceVersion {
-		t.Fatalf("descriptor version = %q, want %q", got, memorybeadsv1.InterfaceVersion)
-	}
-}
 
 // TestEveryTimedProviderAccessorBindsToTheWrapper is the regression pin for the
 // hazard every accessor on timedProvider documents and only two of them could

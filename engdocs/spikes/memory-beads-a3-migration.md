@@ -8,7 +8,7 @@ Can a Dolt provider convert legacy keyed Memory state across multiple branch wor
 
 ## What ran
 
-The coordinator lives in `internal/storage/doltmemorymigration/prototype.go`. It is internal, is not registered with the production schema runner, and is not acquired through `memorybeads/v1`.
+The coordinator lives in `internal/storage/doltmemorymigration/prototype.go`. It is internal and is not registered with the production schema runner.
 
 Dolt has no multi-ref transaction, so the fixture tested one provider-specific strategy:
 

@@ -84,9 +84,11 @@ CI runs the same required wrapper on all pull requests.
 ### Project Scope
 
 Before adding new feature surface area, read
-[engdocs/PROJECT_CHARTER.md](engdocs/PROJECT_CHARTER.md). Beads owns issue tracking
-primitives. It should not encode orchestration-layer policy, become a storage
-engine, or expand the database schema when issue metadata is sufficient.
+[engdocs/PROJECT_CHARTER.md](engdocs/PROJECT_CHARTER.md). Beads owns peer core
+Task and Memory Bead kinds plus shared capabilities. It should not encode
+orchestration-layer policy, couple product meaning to a storage provider or
+deployment topology, or expand the database schema when Task metadata or
+Memory frontmatter is sufficient.
 
 ### Workflow
 

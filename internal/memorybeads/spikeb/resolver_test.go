@@ -55,7 +55,7 @@ func TestB2ResolverAbsenceDoesNotBreakIndependentMemoryModule(t *testing.T) {
 	created, err := provider.Mutate(ctx, a2.Mutation{
 		Key:        "resolver-independent",
 		Title:      "Stored exact foreign reference",
-		Body:       "Local Memory Module behavior does not require a resolver.",
+		Body:       "Local Memory Bead behavior does not require a resolver.",
 		References: []a2.Reference{foreign},
 		Author:     "Ada <ada@example.test>",
 	})

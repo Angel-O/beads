@@ -54,6 +54,9 @@ func Run(t *testing.T, factory Factory) {
 	t.Run("AtomicPublicationAndTruthfulOutcomes", func(t *testing.T) {
 		runAtomicPublicationAndTruthfulOutcomes(t, factory(t))
 	})
+	t.Run("StoredProvenanceIsDurableState", func(t *testing.T) {
+		runStoredProvenanceIsDurableState(t, factory(t))
+	})
 	t.Run("SemanticHistoryDiffAndBlame", func(t *testing.T) {
 		runSemanticHistoryDiffAndBlame(t, factory(t))
 	})
@@ -312,42 +315,20 @@ func runAtomicPublicationAndTruthfulOutcomes(t *testing.T, fixture Fixture) {
 		AssistingAgent: "agent-a",
 	})
 
-	// Foreign state is structurally accepted offline only when it identifies
-	// an exact Memory revision; target existence belongs to an optional resolver.
 	beforeInvalid := fixture.Publication.RevisionIDs(base.Address.BeadID)
-	invalid, err := fixture.Module.Mutate(ctx, a2.Mutation{
-		BeadID:          base.Address.BeadID,
-		ExpectedCurrent: base.Address.RevisionID,
-		Lifecycle:       base.Lifecycle,
-		Body:            "invalid foreign reference must not publish",
-		References: []a2.Reference{{Target: a2.Target{
-			ProjectID:     "foreign-project",
-			BeadID:        "foreign-memory",
-			ExpectedScope: "project",
-			ExpectedKind:  a2.BeadKindMemory,
-		}}},
-		Author: "Ada <ada@example.test>",
+	self := a2.Reference{Target: a2.Target{
+		Local:         true,
+		BeadID:        base.Address.BeadID,
+		ExpectedScope: "project",
+		ExpectedKind:  a2.BeadKindMemory,
+	}}
+	result, err := fixture.Module.Mutate(ctx, a2.Mutation{
+		BeadID: base.Address.BeadID, ExpectedCurrent: base.Address.RevisionID,
+		Key: base.Key, Aliases: base.Aliases, Title: base.Title,
+		Lifecycle: base.Lifecycle, Body: base.Body, References: []a2.Reference{self}, Author: "Ada",
 	})
-	if invalid.Outcome != a2.OutcomeRejected || !errors.Is(err, a2.ErrInvalid) {
-		t.Fatalf("unpinned foreign reference = result %+v error %v, want structural rejection", invalid, err)
-	}
-	if got := fixture.Publication.RevisionIDs(base.Address.BeadID); !reflect.DeepEqual(got, beforeInvalid) {
-		t.Fatalf("invalid reference minted a revision: before %v, after %v", beforeInvalid, got)
-	}
-	for name, self := range map[string]a2.Reference{
-		"local":                  {Target: a2.Target{Local: true, BeadID: base.Address.BeadID, ExpectedScope: "project", ExpectedKind: a2.BeadKindMemory}},
-		"same-project-qualified": {Target: a2.Target{ProjectID: base.Address.ProjectID, BeadID: base.Address.BeadID, ExpectedScope: "project", ExpectedKind: a2.BeadKindMemory, RevisionID: base.Address.RevisionID}},
-	} {
-		t.Run("reject-self-"+name, func(t *testing.T) {
-			result, err := fixture.Module.Mutate(ctx, a2.Mutation{
-				BeadID: base.Address.BeadID, ExpectedCurrent: base.Address.RevisionID,
-				Key: base.Key, Aliases: base.Aliases, Title: base.Title,
-				Lifecycle: base.Lifecycle, Body: base.Body, References: []a2.Reference{self}, Author: "Ada",
-			})
-			if result.Outcome != a2.OutcomeRejected || !errors.Is(err, a2.ErrInvalid) {
-				t.Fatalf("self-reference = result %+v error %v, want structural rejection", result, err)
-			}
-		})
+	if result.Outcome != a2.OutcomeRejected || !errors.Is(err, a2.ErrInvalid) {
+		t.Fatalf("self-reference = result %+v error %v, want structural rejection", result, err)
 	}
 	if got := fixture.Publication.RevisionIDs(base.Address.BeadID); !reflect.DeepEqual(got, beforeInvalid) {
 		t.Fatalf("self-reference rejection minted a revision: before %v, after %v", beforeInvalid, got)
@@ -356,13 +337,6 @@ func runAtomicPublicationAndTruthfulOutcomes(t *testing.T, fixture Fixture) {
 	compositeRequestRefs := []a2.Reference{
 		localTask("task-a"),
 		localTask("task-b"),
-		foreignMemory("foreign-project", "foreign-memory", "old-foreign-revision"),
-		foreignMemory("foreign-project", "foreign-memory", "foreign-revision"),
-	}
-	compositeRefs := []a2.Reference{
-		localTask("task-a"),
-		localTask("task-b"),
-		foreignMemory("foreign-project", "foreign-memory", "foreign-revision"),
 	}
 	beforeIDs := fixture.Publication.RevisionIDs(base.Address.BeadID)
 	fixture.Publication.FailNext(a2.FaultBeforePublication)
@@ -398,7 +372,7 @@ func runAtomicPublicationAndTruthfulOutcomes(t *testing.T, fixture Fixture) {
 		ChangeMessage:   "publish body and references",
 		Origin:          a2.OriginNative,
 	})
-	if composite.Body != "body and references publish together" || !sameReferenceSet(composite.References, compositeRefs) {
+	if composite.Body != "body and references publish together" || !sameReferenceSet(composite.References, compositeRequestRefs) {
 		t.Fatalf("successful composite revision is partial: %+v", composite)
 	}
 	idsBeforeUnchanged := fixture.Publication.RevisionIDs(base.Address.BeadID)
@@ -412,11 +386,13 @@ func runAtomicPublicationAndTruthfulOutcomes(t *testing.T, fixture Fixture) {
 		Body:            composite.Body,
 		References:      compositeRequestRefs,
 		Author:          "Another Author",
+		AssistingAgent:  "another-agent",
 		ChangeMessage:   "must not manufacture a revision",
-		Origin:          a2.OriginImport,
+		Origin:          composite.Origin,
+		Provenance:      composite.Provenance,
 	})
 	if err != nil || unchanged.Outcome != a2.OutcomeUnchanged || unchanged.Revision == nil || !reflect.DeepEqual(*unchanged.Revision, composite) {
-		t.Fatalf("byte-identical state = result %+v error %v, want unchanged current revision", unchanged, err)
+		t.Fatalf("attribution-only change = result %+v error %v, want unchanged current revision", unchanged, err)
 	}
 	if got := fixture.Publication.RevisionIDs(base.Address.BeadID); !reflect.DeepEqual(got, idsBeforeUnchanged) {
 		t.Fatalf("unchanged mutation minted a revision: before %v, after %v", idsBeforeUnchanged, got)
@@ -517,6 +493,80 @@ func runAtomicPublicationAndTruthfulOutcomes(t *testing.T, fixture Fixture) {
 	}
 }
 
+func runStoredProvenanceIsDurableState(t *testing.T, fixture Fixture) {
+	t.Helper()
+	ctx := context.Background()
+	initial := apply(t, ctx, fixture.Module, a2.Mutation{
+		Key:           "provenance-policy",
+		Title:         "Provenance policy",
+		Lifecycle:     a2.LifecycleActive,
+		Body:          "durable provenance body",
+		Author:        "Ada <ada@example.test>",
+		ChangeMessage: "create native memory",
+		Origin:        a2.OriginNative,
+		Provenance:    []a2.Provenance{{Gap: "created without external source evidence"}},
+	})
+
+	provenanceChanged := apply(t, ctx, fixture.Module, a2.Mutation{
+		BeadID:          initial.Address.BeadID,
+		ExpectedCurrent: initial.Address.RevisionID,
+		Key:             initial.Key,
+		Aliases:         initial.Aliases,
+		Title:           initial.Title,
+		Lifecycle:       initial.Lifecycle,
+		Body:            initial.Body,
+		References:      initial.References,
+		Author:          "Ada <ada@example.test>",
+		ChangeMessage:   "record source evidence",
+		Origin:          initial.Origin,
+		Provenance:      []a2.Provenance{{SourceProjectID: "source-project", SourceBeadID: "source-memory", SourceRevisionID: "source-revision", Evidence: "verified import source"}},
+	})
+	if provenanceChanged.Address.RevisionID == initial.Address.RevisionID || reflect.DeepEqual(provenanceChanged.Provenance, initial.Provenance) {
+		t.Fatalf("provenance-only mutation did not create distinct durable state: initial %+v, changed %+v", initial, provenanceChanged)
+	}
+
+	originChanged := apply(t, ctx, fixture.Module, a2.Mutation{
+		BeadID:          provenanceChanged.Address.BeadID,
+		ExpectedCurrent: provenanceChanged.Address.RevisionID,
+		Key:             provenanceChanged.Key,
+		Aliases:         provenanceChanged.Aliases,
+		Title:           provenanceChanged.Title,
+		Lifecycle:       provenanceChanged.Lifecycle,
+		Body:            provenanceChanged.Body,
+		References:      provenanceChanged.References,
+		Author:          "Ada <ada@example.test>",
+		ChangeMessage:   "classify imported state",
+		Origin:          a2.OriginImport,
+		Provenance:      provenanceChanged.Provenance,
+	})
+	if originChanged.Address.RevisionID == provenanceChanged.Address.RevisionID || originChanged.Origin != a2.OriginImport {
+		t.Fatalf("origin-only mutation did not create distinct durable state: before %+v, after %+v", provenanceChanged, originChanged)
+	}
+
+	idsBeforeAttribution := fixture.Publication.RevisionIDs(initial.Address.BeadID)
+	unchanged, err := fixture.Module.Mutate(ctx, a2.Mutation{
+		BeadID:          originChanged.Address.BeadID,
+		ExpectedCurrent: originChanged.Address.RevisionID,
+		Key:             originChanged.Key,
+		Aliases:         originChanged.Aliases,
+		Title:           originChanged.Title,
+		Lifecycle:       originChanged.Lifecycle,
+		Body:            originChanged.Body,
+		References:      originChanged.References,
+		Author:          "Grace <grace@example.test>",
+		AssistingAgent:  "agent-b",
+		ChangeMessage:   "attribution changes without durable state",
+		Origin:          originChanged.Origin,
+		Provenance:      originChanged.Provenance,
+	})
+	if err != nil || unchanged.Outcome != a2.OutcomeUnchanged || unchanged.Revision == nil || !reflect.DeepEqual(*unchanged.Revision, originChanged) {
+		t.Fatalf("attribution-only mutation = result %+v error %v, want unchanged durable state", unchanged, err)
+	}
+	if got := fixture.Publication.RevisionIDs(initial.Address.BeadID); !reflect.DeepEqual(got, idsBeforeAttribution) {
+		t.Fatalf("attribution-only mutation minted a revision: before %v, after %v", idsBeforeAttribution, got)
+	}
+}
+
 func runSemanticHistoryDiffAndBlame(t *testing.T, fixture Fixture) {
 	t.Helper()
 	ctx := context.Background()
@@ -588,7 +638,7 @@ func runSemanticHistoryDiffAndBlame(t *testing.T, fixture Fixture) {
 	for _, field := range blame.Fields {
 		fields[field.Field] = field.RevisionID
 	}
-	for _, field := range []string{"key", "aliases", "title", "lifecycle", "outgoing_references"} {
+	for _, field := range []string{"key", "aliases", "title", "lifecycle", "outgoing_references", "origin", "provenance"} {
 		if fields[field] != second.Address.RevisionID {
 			t.Errorf("field blame[%q] = %q, want second revision %q", field, fields[field], second.Address.RevisionID)
 		}
@@ -912,16 +962,6 @@ func localTask(id string) a2.Reference {
 		BeadID:        a2.BeadID(id),
 		ExpectedScope: "project",
 		ExpectedKind:  a2.BeadKindTask,
-	}}
-}
-
-func foreignMemory(projectID, beadID, revisionID string) a2.Reference {
-	return a2.Reference{Target: a2.Target{
-		ProjectID:     a2.ProjectID(projectID),
-		BeadID:        a2.BeadID(beadID),
-		ExpectedScope: "project",
-		ExpectedKind:  a2.BeadKindMemory,
-		RevisionID:    a2.RevisionID(revisionID),
 	}}
 }
 

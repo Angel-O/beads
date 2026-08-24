@@ -237,8 +237,8 @@ type BlameResult struct {
 }
 
 // Module is the smallest caller-facing surface needed to execute A2. Branch,
-// maintenance, and failure injection are provider test controls, not methods
-// on the Memory Module.
+// maintenance, and failure injection are provider test controls, not Memory
+// Bead operations exercised by this fixture.
 type Module interface {
 	Mutate(context.Context, Mutation) (MutationResult, error)
 	Read(context.Context, ReadRequest) (Revision, error)

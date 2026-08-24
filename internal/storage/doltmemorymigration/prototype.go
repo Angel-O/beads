@@ -120,7 +120,7 @@ func (e *MigrationInProgressError) Error() string {
 type LegacyNamespaceRetiredError struct{ Key string }
 
 func (e *LegacyNamespaceRetiredError) Error() string {
-	return fmt.Sprintf("legacy memory namespace is retired for key %q; use the Memory Module", e.Key)
+	return fmt.Sprintf("legacy memory namespace is retired for key %q; use canonical Memory Bead operations", e.Key)
 }
 
 // SourceChangedError proves stale preflight never publishes over a source view
