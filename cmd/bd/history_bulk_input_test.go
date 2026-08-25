@@ -1,72 +1,76 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"io"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 )
 
-func bulkHistoryInput(count int) string {
-	var input strings.Builder
-	for i := range count {
-		fmt.Fprintf(&input, "bd-%04d\n", i)
+func TestPositionalHistoryInputNormalization(t *testing.T) {
+	ids, err := issueops.NormalizeBulkHistoryIDs([]string{" bd-two ", "bd-one", "bd-two", "", "   "})
+	if err != nil {
+		t.Fatal(err)
 	}
-	return input.String()
+	if want := []string{"bd-one", "bd-two"}; !reflect.DeepEqual(ids, want) {
+		t.Fatalf("normalized IDs = %#v, want %#v", ids, want)
+	}
 }
 
-func TestReadHistoryIDsBoundsAndDeduplicates(t *testing.T) {
+func TestPositionalHistoryInputBounds(t *testing.T) {
 	t.Run("accepts exact boundary", func(t *testing.T) {
-		ids, err := readHistoryIDs(strings.NewReader(bulkHistoryInput(storage.MaxBulkHistoryIDs)))
-		if err != nil {
-			t.Fatal(err)
+		ids := make([]string, storage.MaxBulkHistoryIDs)
+		for i := range ids {
+			ids[i] = fmt.Sprintf("bd-%04d", i)
 		}
-		if len(ids) != storage.MaxBulkHistoryIDs {
-			t.Fatalf("IDs = %d", len(ids))
+		if _, err := issueops.NormalizeBulkHistoryIDs(ids); err != nil {
+			t.Fatal(err)
 		}
 	})
 
-	t.Run("duplicates do not consume boundary", func(t *testing.T) {
-		input := bulkHistoryInput(storage.MaxBulkHistoryIDs) + strings.Repeat("bd-0000\n", storage.MaxBulkHistoryIDs)
-		ids, err := readHistoryIDs(strings.NewReader(input))
-		if err != nil {
-			t.Fatal(err)
+	t.Run("rejects over limit", func(t *testing.T) {
+		ids := make([]string, storage.MaxBulkHistoryIDs+1)
+		for i := range ids {
+			ids[i] = fmt.Sprintf("bd-%04d", i)
 		}
-		if len(ids) != storage.MaxBulkHistoryIDs {
-			t.Fatalf("IDs = %d", len(ids))
-		}
-	})
-
-	t.Run("rejects count above boundary", func(t *testing.T) {
-		if _, err := readHistoryIDs(strings.NewReader(bulkHistoryInput(storage.MaxBulkHistoryIDs + 1))); err == nil || !strings.Contains(err.Error(), "at most 1000") {
+		if _, err := issueops.NormalizeBulkHistoryIDs(ids); err == nil || !strings.Contains(err.Error(), "at most 1000") {
 			t.Fatalf("error = %v", err)
-		}
-	})
-
-	t.Run("accepts exact ID length", func(t *testing.T) {
-		id := strings.Repeat("x", storage.MaxBulkHistoryIDLength)
-		ids, err := readHistoryIDs(strings.NewReader(id + "\n"))
-		if err != nil || len(ids) != 1 || ids[0] != id {
-			t.Fatalf("IDs = %#v, error = %v", ids, err)
 		}
 	})
 
 	t.Run("rejects overlong ID", func(t *testing.T) {
 		id := strings.Repeat("x", storage.MaxBulkHistoryIDLength+1)
-		if _, err := readHistoryIDs(strings.NewReader(id + "\n")); err == nil || !strings.Contains(err.Error(), "max 255") {
-			t.Fatalf("error = %v", err)
-		}
-	})
-
-	t.Run("propagates scanner errors", func(t *testing.T) {
-		if _, err := readHistoryIDs(io.MultiReader(strings.NewReader("bd-one\n"), errorReader{})); err == nil || err.Error() != "read failed" {
+		if _, err := issueops.NormalizeBulkHistoryIDs([]string{id}); err == nil || !strings.Contains(err.Error(), "max 255") {
 			t.Fatalf("error = %v", err)
 		}
 	})
 }
 
-type errorReader struct{}
+func TestRunBulkHistoryUsesOnePositionalBatch(t *testing.T) {
+	backend := &recordingBulkHistoryBackend{}
+	ids := []string{"bd-two", "bd-one", "bd-two"}
+	if err := runBulkHistory(context.Background(), backend, ids, 0); err != nil {
+		t.Fatal(err)
+	}
+	if backend.calls != 1 {
+		t.Fatalf("BulkHistory calls = %d, want 1", backend.calls)
+	}
+	if !reflect.DeepEqual(backend.ids, ids) {
+		t.Fatalf("BulkHistory IDs = %#v, want %#v", backend.ids, ids)
+	}
+}
 
-func (errorReader) Read([]byte) (int, error) { return 0, fmt.Errorf("read failed") }
+type recordingBulkHistoryBackend struct {
+	calls int
+	ids   []string
+}
+
+func (b *recordingBulkHistoryBackend) BulkHistory(_ context.Context, ids []string) ([]storage.IssueHistory, error) {
+	b.calls++
+	b.ids = append([]string(nil), ids...)
+	return []storage.IssueHistory{}, nil
+}

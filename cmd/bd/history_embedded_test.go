@@ -41,7 +41,7 @@ func bdHistoryFail(t *testing.T, bd, dir string, args ...string) string {
 	return string(out)
 }
 
-// bdHistoryJSON runs "bd history --json" and parses the result as a slice.
+// bdHistoryJSON runs "bd history --json" and returns the requested snapshots.
 func bdHistoryJSON(t *testing.T, bd, dir string, args ...string) []map[string]interface{} {
 	t.Helper()
 	fullArgs := append([]string{"history", "--json"}, args...)
@@ -52,16 +52,34 @@ func bdHistoryJSON(t *testing.T, bd, dir string, args ...string) []map[string]in
 	if err != nil {
 		t.Fatalf("bd history --json %s failed: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), err, stdout.String(), stderr.String())
 	}
-	s := strings.TrimSpace(stdout.String())
-	start := strings.Index(s, "[")
-	if start < 0 {
-		return nil
+	var events bool
+	for _, arg := range args {
+		if arg == "--events" {
+			events = true
+			break
+		}
 	}
-	var entries []map[string]interface{}
-	if err := json.Unmarshal([]byte(s[start:]), &entries); err != nil {
-		t.Fatalf("parse history JSON: %v\n%s", err, s)
+	if events {
+		var entries []map[string]interface{}
+		if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
+			t.Fatalf("parse history events JSON: %v\n%s", err, stdout.String())
+		}
+		return entries
 	}
-	return entries
+	var envelope struct {
+		SchemaVersion int `json:"schema_version"`
+		Issues        []struct {
+			IssueID   string                   `json:"issue_id"`
+			Snapshots []map[string]interface{} `json:"snapshots"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+		t.Fatalf("parse history JSON envelope: %v\n%s", err, stdout.String())
+	}
+	if envelope.SchemaVersion != 1 || len(envelope.Issues) != 1 {
+		t.Fatalf("unexpected history JSON envelope: %#v", envelope)
+	}
+	return envelope.Issues[0].Snapshots
 }
 
 func TestEmbeddedHistory(t *testing.T) {
@@ -177,12 +195,10 @@ func TestEmbeddedHistory(t *testing.T) {
 		}
 	})
 
-	t.Run("bulk_history_stdin_contract", func(t *testing.T) {
-		contents := fmt.Sprintf("%s\nhi-missing\n%s\n%s\n", second.ID, issue.ID, second.ID)
-		cmd := exec.Command(bd, "history", "--ids-stdin", "--json")
+	t.Run("bulk_history_positional_contract", func(t *testing.T) {
+		cmd := exec.Command(bd, "history", second.ID, "hi-missing", issue.ID, second.ID, "--json")
 		cmd.Dir = dir
 		cmd.Env = bdEnv(dir)
-		cmd.Stdin = strings.NewReader(contents)
 		stdout, stderr, err := runCommandBuffers(t, cmd)
 		if err != nil {
 			t.Fatalf("bulk history failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
@@ -214,22 +230,6 @@ func TestEmbeddedHistory(t *testing.T) {
 		}
 	})
 
-	t.Run("bulk_history_rejects_incompatible_modes", func(t *testing.T) {
-		for _, args := range [][]string{
-			{"--ids-stdin"},
-			{"--ids-stdin", "--json", "--events"},
-			{"--ids-stdin", "--json", issue.ID},
-		} {
-			cmd := exec.Command(bd, append([]string{"history"}, args...)...)
-			cmd.Dir = dir
-			cmd.Env = bdEnv(dir)
-			cmd.Stdin = strings.NewReader(issue.ID + "\n")
-			if out, err := cmd.CombinedOutput(); err == nil {
-				t.Fatalf("history %v succeeded, output: %s", args, out)
-			}
-		}
-	})
-
 	// ===== Short/partial issue ID resolution (GH#4868) =====
 
 	// issue.ID is "hi-<hash>"; the short id is the part after the prefix.
@@ -244,10 +244,6 @@ func TestEmbeddedHistory(t *testing.T) {
 			t.Errorf("expected full issue ID %s in history output for short id %s: %s", issue.ID, shortID, out)
 		}
 
-		entries := bdHistoryJSON(t, bd, dir, shortID)
-		if len(entries) < 4 {
-			t.Errorf("expected at least 4 history entries via short id, got %d", len(entries))
-		}
 	})
 
 	t.Run("partial_id_resolves_via_events_flag_too", func(t *testing.T) {
@@ -288,32 +284,6 @@ func TestEmbeddedHistory(t *testing.T) {
 			t.Errorf("ambiguous partial id incorrectly fell through to 'No history found': %s", out)
 		}
 
-		cmd = exec.Command(bd, "history", "--json", "zzzaaa")
-		cmd.Dir = dir
-		cmd.Env = bdEnv(dir)
-		stdout.Reset()
-		stderr.Reset()
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-		err := cmd.Run()
-		if err == nil {
-			t.Fatalf("expected bd history --json zzzaaa to fail, but succeeded:\n%s", stdout.String())
-		}
-		// HandleErrorRespectJSON writes the JSON error envelope to stdout.
-		s := strings.TrimSpace(stdout.String())
-		var errResp map[string]interface{}
-		if err := json.Unmarshal([]byte(s), &errResp); err != nil {
-			t.Fatalf("parse error JSON: %v\nstdout: %s\nstderr: %s", err, s, stderr.String())
-		}
-		errBody, _ := errResp["error"].(string)
-		if !strings.Contains(strings.ToLower(errBody), "ambiguous") {
-			t.Errorf("expected error JSON to mention ambiguity, got: %s", s)
-		}
-		for _, candidate := range []string{"hi-zzzaaa1", "hi-zzzaaa2"} {
-			if !strings.Contains(errBody, candidate) {
-				t.Errorf("expected error JSON to list candidate %q, got: %s", candidate, s)
-			}
-		}
 	})
 
 	// ===== Nonexistent issue ID =====
@@ -325,45 +295,17 @@ func TestEmbeddedHistory(t *testing.T) {
 		}
 	})
 
-	// --json must always produce parseable JSON, even when history is empty.
-	// Without this, consumers piping `bd history --json | jq` break on the
-	// empty case while every other --json subcommand returns valid JSON.
-	t.Run("nonexistent_issue_json_returns_empty_array", func(t *testing.T) {
-		cmd := exec.Command(bd, "history", "--json", "hi-nonexistent999")
-		cmd.Dir = dir
-		cmd.Env = bdEnv(dir)
-		stdout, stderr, err := runCommandBuffers(t, cmd)
-		if err != nil {
-			t.Fatalf("bd history --json failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
-		}
-		s := strings.TrimSpace(stdout.String())
-		var entries []map[string]interface{}
-		if err := json.Unmarshal([]byte(s), &entries); err != nil {
-			t.Fatalf("expected valid JSON for empty history, got prose:\n%s\n(parse error: %v)", s, err)
-		}
+	t.Run("nonexistent_issue_json_returns_empty_snapshots", func(t *testing.T) {
+		entries := bdHistoryJSON(t, bd, dir, "hi-nonexistent999")
 		if len(entries) != 0 {
-			t.Errorf("expected empty array for nonexistent issue, got %d entries", len(entries))
+			t.Errorf("expected empty snapshots for nonexistent issue, got %d entries", len(entries))
 		}
 	})
 
-	// --limit combined with --json on empty history must still produce [].
-	// Guards against future reordering that might apply limit semantics
-	// before the empty-check and skip the JSON branch.
-	t.Run("nonexistent_issue_json_with_limit_returns_empty_array", func(t *testing.T) {
-		cmd := exec.Command(bd, "history", "--json", "--limit", "2", "hi-nonexistent999")
-		cmd.Dir = dir
-		cmd.Env = bdEnv(dir)
-		stdout, stderr, err := runCommandBuffers(t, cmd)
-		if err != nil {
-			t.Fatalf("bd history --json --limit 2 failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
-		}
-		s := strings.TrimSpace(stdout.String())
-		var entries []map[string]interface{}
-		if err := json.Unmarshal([]byte(s), &entries); err != nil {
-			t.Fatalf("expected valid JSON for empty history with --limit, got prose:\n%s\n(parse error: %v)", s, err)
-		}
+	t.Run("nonexistent_issue_json_with_limit_returns_empty_snapshots", func(t *testing.T) {
+		entries := bdHistoryJSON(t, bd, dir, "hi-nonexistent999", "--limit", "2")
 		if len(entries) != 0 {
-			t.Errorf("expected empty array for nonexistent issue with --limit, got %d entries", len(entries))
+			t.Errorf("expected empty snapshots for nonexistent issue with --limit, got %d entries", len(entries))
 		}
 	})
 

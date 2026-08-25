@@ -32,16 +32,33 @@ func TestProxiedServerHistory(t *testing.T) {
 		if err != nil {
 			t.Fatalf("history --json %v: %v\n%s", args, err, out)
 		}
-		s := strings.TrimSpace(string(out))
-		start := strings.Index(s, "[")
-		if start < 0 {
-			return nil
+		var events bool
+		for _, arg := range args {
+			if arg == "--events" {
+				events = true
+				break
+			}
 		}
-		var entries []map[string]interface{}
-		if err := json.Unmarshal([]byte(s[start:]), &entries); err != nil {
-			t.Fatalf("parse history JSON: %v\n%s", err, s)
+		if events {
+			var entries []map[string]interface{}
+			if err := json.Unmarshal(out, &entries); err != nil {
+				t.Fatalf("parse history events JSON: %v\n%s", err, out)
+			}
+			return entries
 		}
-		return entries
+		var envelope struct {
+			SchemaVersion int `json:"schema_version"`
+			Issues        []struct {
+				Snapshots []map[string]interface{} `json:"snapshots"`
+			} `json:"issues"`
+		}
+		if err := json.Unmarshal(out, &envelope); err != nil {
+			t.Fatalf("parse history JSON envelope: %v\n%s", err, out)
+		}
+		if envelope.SchemaVersion != 1 || len(envelope.Issues) != 1 {
+			t.Fatalf("unexpected history JSON envelope: %#v", envelope)
+		}
+		return envelope.Issues[0].Snapshots
 	}
 
 	// ===== Basic plain-text history =====
@@ -170,10 +187,9 @@ func TestProxiedServerHistory(t *testing.T) {
 
 	t.Run("bulk_history_uses_proxied_batch_contract", func(t *testing.T) {
 		second := bdProxiedCreate(t, bd, p.dir, "Second history issue", "--type", "task")
-		cmd := exec.Command(bd, "history", "--ids-stdin", "--json")
+		cmd := exec.Command(bd, "history", second.ID, missingID, issue.ID, second.ID, "--json")
 		cmd.Dir = p.dir
 		cmd.Env = bdProxiedEnv(p.dir)
-		cmd.Stdin = strings.NewReader(second.ID + "\n" + missingID + "\n" + issue.ID + "\n")
 		stdout, stderr, err := runCommandBuffers(t, cmd)
 		if err != nil {
 			t.Fatalf("bulk proxied history: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
@@ -199,25 +215,13 @@ func TestProxiedServerHistory(t *testing.T) {
 	})
 
 	t.Run("commit_history_wrong_issue_guard", func(t *testing.T) {
-		out, err := bdProxiedRun(t, bd, p.dir, "history", issue.ID, "--json")
-		if err != nil {
-			t.Fatalf("history --json: %v\n%s", err, out)
-		}
-		var entries []struct {
-			CommitHash string `json:"CommitHash"`
-			Issue      *struct {
-				ID string `json:"id"`
-			} `json:"Issue"`
-		}
-		if err := json.Unmarshal(out, &entries); err != nil {
-			t.Fatalf("unmarshal history: %v\n%s", err, out)
-		}
+		entries := historyJSON(t, issue.ID)
 		for _, e := range entries {
-			if e.CommitHash == "" {
+			if e["CommitHash"] == "" {
 				t.Error("entry missing CommitHash")
 			}
-			if e.Issue != nil && e.Issue.ID != issue.ID {
-				t.Errorf("history entry for wrong issue: %s", e.Issue.ID)
+			if snapshot, ok := e["Issue"].(map[string]interface{}); ok && snapshot["id"] != issue.ID {
+				t.Errorf("history entry for wrong issue: %v", snapshot["id"])
 			}
 		}
 	})
@@ -234,33 +238,17 @@ func TestProxiedServerHistory(t *testing.T) {
 		}
 	})
 
-	// --json must always produce parseable JSON, even when history is empty.
-	t.Run("nonexistent_issue_json_returns_empty_array", func(t *testing.T) {
-		out, err := bdProxiedRun(t, bd, p.dir, "history", "--json", missingID)
-		if err != nil {
-			t.Fatalf("history --json %s: %v\n%s", missingID, err, out)
-		}
-		var entries []map[string]interface{}
-		if err := json.Unmarshal([]byte(strings.TrimSpace(string(out))), &entries); err != nil {
-			t.Fatalf("expected valid JSON for empty history, got prose:\n%s\n(parse error: %v)", out, err)
-		}
+	t.Run("nonexistent_issue_json_returns_empty_snapshots", func(t *testing.T) {
+		entries := historyJSON(t, missingID)
 		if len(entries) != 0 {
-			t.Errorf("expected empty array for nonexistent issue, got %d entries", len(entries))
+			t.Errorf("expected empty snapshots for nonexistent issue, got %d entries", len(entries))
 		}
 	})
 
-	// --limit combined with --json on empty history must still parse to empty.
-	t.Run("nonexistent_issue_json_with_limit_returns_empty_array", func(t *testing.T) {
-		out, err := bdProxiedRun(t, bd, p.dir, "history", "--json", "--limit", "2", missingID)
-		if err != nil {
-			t.Fatalf("history --json --limit 2 %s: %v\n%s", missingID, err, out)
-		}
-		var entries []map[string]interface{}
-		if err := json.Unmarshal([]byte(strings.TrimSpace(string(out))), &entries); err != nil {
-			t.Fatalf("expected valid JSON for empty history with --limit, got prose:\n%s\n(parse error: %v)", out, err)
-		}
+	t.Run("nonexistent_issue_json_with_limit_returns_empty_snapshots", func(t *testing.T) {
+		entries := historyJSON(t, missingID, "--limit", "2")
 		if len(entries) != 0 {
-			t.Errorf("expected empty array for nonexistent issue with --limit, got %d entries", len(entries))
+			t.Errorf("expected empty snapshots for nonexistent issue with --limit, got %d entries", len(entries))
 		}
 	})
 

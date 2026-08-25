@@ -1,13 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"strings"
-	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/metrics"
@@ -18,29 +14,27 @@ import (
 )
 
 var (
-	historyLimit    int
-	historyEvents   bool
-	historyIDsStdin bool
+	historyLimit  int
+	historyEvents bool
 )
 
 var historyCmd = &cobra.Command{
-	Use:     "history <id> | history --ids-stdin --json",
+	Use:     "history <bead-id>...",
 	GroupID: "views",
 	Short:   "Show version history for an issue",
 	Long: `Show the complete version history of an issue, including all commits
 where the issue was modified.
 
-Bulk mode reads newline-delimited exact IDs without partial-ID resolution. It
-trims whitespace, ignores blank lines, deduplicates and sorts IDs, and emits an
-empty snapshots array for a missing ID. Inputs are limited to 1000 unique IDs
-of at most 255 characters each. --limit applies to each issue group.
+With --json, one or more positional IDs are read as exact IDs without
+partial-ID resolution. IDs are deduplicated and sorted, and an empty snapshots
+array is emitted for a missing ID. Inputs are limited to 1000 unique IDs of at
+most 255 characters each. --limit applies to each issue group.
 
 Examples:
   bd history bd-123           # Show all history for issue bd-123
   bd history bd-123 --limit 5 # Show last 5 changes
   bd history bd-123 --events  # Show database audit events
-  bd history --ids-stdin --json < issue-ids.txt # Bulk exact-ID snapshots`,
-	Args:          cobra.MaximumNArgs(1),
+  bd history bd-123 bd-456 --json # Bulk exact-ID snapshots`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -51,31 +45,24 @@ Examples:
 			}
 		}()
 
-		if historyIDsStdin {
-			if len(args) != 0 {
-				return HandleErrorRespectJSON("an issue argument cannot be combined with --ids-stdin")
-			}
-			if !jsonOutput {
-				return HandleErrorRespectJSON("--ids-stdin requires --json")
-			}
-			if historyEvents {
-				return HandleErrorRespectJSON("--events is not supported with --ids-stdin")
-			}
-			ids, err := readHistoryIDs(cmd.InOrStdin())
-			if err != nil {
-				return HandleErrorRespectJSON("reading history IDs: %v", err)
-			}
+		if len(args) == 0 {
+			return HandleErrorRespectJSON("at least one issue ID is required")
+		}
+		if jsonOutput && !historyEvents {
 			if usesProxiedServer() {
-				return runBulkHistoryProxiedServer(rootCtx, ids, historyLimit)
+				return runBulkHistoryProxiedServer(rootCtx, args, historyLimit)
 			}
 			bulkBackend, ok := storage.UnwrapStore(store).(bulkHistoryBackend)
 			if !ok {
 				return HandleErrorRespectJSON("the active storage backend does not support bulk history")
 			}
-			return runBulkHistory(rootCtx, bulkBackend, ids, historyLimit)
+			return runBulkHistory(rootCtx, bulkBackend, args, historyLimit)
 		}
 		if len(args) != 1 {
-			return HandleErrorRespectJSON("exactly one issue ID is required unless --ids-stdin is used")
+			if historyEvents {
+				return HandleErrorRespectJSON("--events accepts exactly one issue ID")
+			}
+			return HandleErrorRespectJSON("exactly one issue ID is allowed without --json")
 		}
 
 		issueID := args[0]
@@ -148,19 +135,12 @@ func runHistory(ctx context.Context, backend historyBackend, issueID string, lim
 	}
 
 	if len(history) == 0 {
-		if jsonOutput {
-			return outputJSON(history)
-		}
 		fmt.Printf("No history found for issue %s\n", issueID)
 		return nil
 	}
 
 	if limit > 0 && limit < len(history) {
 		history = history[:limit]
-	}
-
-	if jsonOutput {
-		return outputJSON(history)
 	}
 
 	fmt.Printf("\n%s History for %s (%d entries)\n\n",
@@ -193,38 +173,8 @@ func runHistory(ctx context.Context, backend historyBackend, issueID string, lim
 func init() {
 	historyCmd.Flags().IntVar(&historyLimit, "limit", 0, "Limit number of history entries (0 = all)")
 	historyCmd.Flags().BoolVar(&historyEvents, "events", false, "Show database audit events instead of commit snapshots")
-	historyCmd.Flags().BoolVar(&historyIDsStdin, "ids-stdin", false, "Read exact issue IDs from stdin, one per line (requires --json)")
 	historyCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(historyCmd)
-}
-
-func readHistoryIDs(reader io.Reader) ([]string, error) {
-	ids := make([]string, 0, storage.MaxBulkHistoryIDs)
-	seen := make(map[string]struct{}, storage.MaxBulkHistoryIDs)
-	scanner := bufio.NewScanner(reader)
-	maxTokenBytes := (storage.MaxBulkHistoryIDLength + 1) * utf8.UTFMax
-	scanner.Buffer(make([]byte, maxTokenBytes), maxTokenBytes)
-	for scanner.Scan() {
-		id := strings.TrimSpace(scanner.Text())
-		if id == "" {
-			continue
-		}
-		if _, exists := seen[id]; exists {
-			continue
-		}
-		if err := types.CheckFieldLen("issue ID", id); err != nil {
-			return nil, err
-		}
-		if len(ids) == storage.MaxBulkHistoryIDs {
-			return nil, fmt.Errorf("bulk history accepts at most %d unique issue IDs", storage.MaxBulkHistoryIDs)
-		}
-		seen[id] = struct{}{}
-		ids = append(ids, id)
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return ids, nil
 }
 
 func collectHistoryEvents(ctx context.Context, backend historyBackend, issueID string, limit int) ([]types.Event, error) {
