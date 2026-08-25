@@ -13,24 +13,30 @@ the current bulk History work.
 
 - Fetch and update `feat/bulk-history-read` before creating a worktree.
 - Create dependent task branches and worktrees from its latest tip.
-- Keep the bulk History implementation aligned with the Viewer consumer on
-  `beads_viewer` branch `feature/repository-aware-correlations`.
 - Do not merge or retarget this integration to `main` unless the user
   explicitly ends the feature-integration phase.
 - The reference branch is an accepted integration artifact; merging into
   `main` is not required for this cross-repository work.
 
+## Hub Workflow
+
+- Use `wbd` for private Beads Hub issue tracking, correlations, and status
+  changes across repositories.
+- Do not use raw `bd`, `bv`, or `br` for Hub operations.
+- Keep private Hub IDs and `ctx:` identities out of branches, commits, source,
+  tests, documentation, and other Git-visible metadata.
+- Treat this repository's reference branch as the accepted integration point
+  for the current work unless the user explicitly changes that policy.
+
 ## Current Architecture Focus
 
-The active feature area is the bulk History contract used by the Viewer:
+The active feature area is bulk History support in this repository:
 
-- `bd history --json` accepts multiple exact positional issue IDs.
-- Bulk IDs can also be supplied through stdin for external integrations.
-- Inputs are normalized, deduplicated, bounded, and returned in deterministic
-  issue groups.
-- `--limit` applies per issue group while preserving the existing single-ID
-  history behavior and audit-event mode.
-- Embedded and proxied/server execution paths must expose the same contract.
+- Bulk History reads are bounded and deterministic.
+- Positional and stdin-driven bulk inputs share one validation contract.
+- Single-item history behavior and audit-event handling remain separate.
+- Embedded and proxied/server execution paths should preserve the same
+  externally visible behavior.
 
 Useful starting points:
 
@@ -40,7 +46,3 @@ Useful starting points:
 - `internal/storage/issueops/history.go`
 - `backend/bulk_history_test.go`
 - `cmd/bd/history_bulk_input_test.go`
-
-The corresponding Viewer consumer is tracked in the separate
-`beads_viewer` repository. Keep the command shape and JSON envelope compatible
-with that integration before extending the bulk History surface.
