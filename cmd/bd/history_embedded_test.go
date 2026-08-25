@@ -177,64 +177,48 @@ func TestEmbeddedHistory(t *testing.T) {
 		}
 	})
 
-	t.Run("bulk_history_file_and_stdin_contract", func(t *testing.T) {
-		idsPath := fmt.Sprintf("%s/history-ids.txt", t.TempDir())
+	t.Run("bulk_history_stdin_contract", func(t *testing.T) {
 		contents := fmt.Sprintf("%s\nhi-missing\n%s\n%s\n", second.ID, issue.ID, second.ID)
-		if err := os.WriteFile(idsPath, []byte(contents), 0o600); err != nil {
-			t.Fatal(err)
+		cmd := exec.Command(bd, "history", "--ids-stdin", "--json")
+		cmd.Dir = dir
+		cmd.Env = bdEnv(dir)
+		cmd.Stdin = strings.NewReader(contents)
+		stdout, stderr, err := runCommandBuffers(t, cmd)
+		if err != nil {
+			t.Fatalf("bulk history failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
 		}
-
-		run := func(t *testing.T, path string, stdin string) map[string]interface{} {
-			t.Helper()
-			cmd := exec.Command(bd, "history", "--ids-file", path, "--json")
-			cmd.Dir = dir
-			cmd.Env = bdEnv(dir)
-			if path == "-" {
-				cmd.Stdin = strings.NewReader(stdin)
-			}
-			stdout, stderr, err := runCommandBuffers(t, cmd)
-			if err != nil {
-				t.Fatalf("bulk history failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
-			}
-			var envelope map[string]interface{}
-			if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
-				t.Fatalf("bulk stdout is not pure JSON: %v\n%s", err, stdout.String())
-			}
-			return envelope
+		var envelope map[string]interface{}
+		if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+			t.Fatalf("bulk stdout is not pure JSON: %v\n%s", err, stdout.String())
 		}
 
 		expectedIDs := []string{issue.ID, second.ID, "hi-missing"}
 		sort.Strings(expectedIDs)
-		for name, envelope := range map[string]map[string]interface{}{
-			"file":  run(t, idsPath, ""),
-			"stdin": run(t, "-", contents),
-		} {
-			if envelope["schema_version"] != float64(1) {
-				t.Fatalf("%s schema_version = %#v", name, envelope["schema_version"])
+		if envelope["schema_version"] != float64(1) {
+			t.Fatalf("schema_version = %#v", envelope["schema_version"])
+		}
+		groups, ok := envelope["issues"].([]interface{})
+		if !ok || len(groups) != 3 {
+			t.Fatalf("issues = %#v", envelope["issues"])
+		}
+		for i, group := range groups {
+			if got := group.(map[string]interface{})["issue_id"]; got != expectedIDs[i] {
+				t.Fatalf("issue %d = %v, want %s", i, got, expectedIDs[i])
 			}
-			groups, ok := envelope["issues"].([]interface{})
-			if !ok || len(groups) != 3 {
-				t.Fatalf("%s issues = %#v", name, envelope["issues"])
-			}
-			for i, group := range groups {
-				if got := group.(map[string]interface{})["issue_id"]; got != expectedIDs[i] {
-					t.Fatalf("%s issue %d = %v, want %s", name, i, got, expectedIDs[i])
-				}
-			}
-			for _, group := range groups {
-				missing := group.(map[string]interface{})
-				if missing["issue_id"] == "hi-missing" && len(missing["snapshots"].([]interface{})) != 0 {
-					t.Fatalf("%s missing group = %#v", name, missing)
-				}
+		}
+		for _, group := range groups {
+			missing := group.(map[string]interface{})
+			if missing["issue_id"] == "hi-missing" && len(missing["snapshots"].([]interface{})) != 0 {
+				t.Fatalf("missing group = %#v", missing)
 			}
 		}
 	})
 
 	t.Run("bulk_history_rejects_incompatible_modes", func(t *testing.T) {
 		for _, args := range [][]string{
-			{"--ids-file", "-"},
-			{"--ids-file", "-", "--json", "--events"},
-			{"--ids-file", "-", "--json", issue.ID},
+			{"--ids-stdin"},
+			{"--ids-stdin", "--json", "--events"},
+			{"--ids-stdin", "--json", issue.ID},
 		} {
 			cmd := exec.Command(bd, append([]string{"history"}, args...)...)
 			cmd.Dir = dir

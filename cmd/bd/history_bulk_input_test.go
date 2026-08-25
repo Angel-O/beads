@@ -19,7 +19,7 @@ func bulkHistoryInput(count int) string {
 
 func TestReadHistoryIDsBoundsAndDeduplicates(t *testing.T) {
 	t.Run("accepts exact boundary", func(t *testing.T) {
-		ids, err := readHistoryIDs("-", strings.NewReader(bulkHistoryInput(storage.MaxBulkHistoryIDs)))
+		ids, err := readHistoryIDs(strings.NewReader(bulkHistoryInput(storage.MaxBulkHistoryIDs)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -30,7 +30,7 @@ func TestReadHistoryIDsBoundsAndDeduplicates(t *testing.T) {
 
 	t.Run("duplicates do not consume boundary", func(t *testing.T) {
 		input := bulkHistoryInput(storage.MaxBulkHistoryIDs) + strings.Repeat("bd-0000\n", storage.MaxBulkHistoryIDs)
-		ids, err := readHistoryIDs("-", strings.NewReader(input))
+		ids, err := readHistoryIDs(strings.NewReader(input))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -40,14 +40,14 @@ func TestReadHistoryIDsBoundsAndDeduplicates(t *testing.T) {
 	})
 
 	t.Run("rejects count above boundary", func(t *testing.T) {
-		if _, err := readHistoryIDs("-", strings.NewReader(bulkHistoryInput(storage.MaxBulkHistoryIDs+1))); err == nil || !strings.Contains(err.Error(), "at most 1000") {
+		if _, err := readHistoryIDs(strings.NewReader(bulkHistoryInput(storage.MaxBulkHistoryIDs + 1))); err == nil || !strings.Contains(err.Error(), "at most 1000") {
 			t.Fatalf("error = %v", err)
 		}
 	})
 
 	t.Run("accepts exact ID length", func(t *testing.T) {
 		id := strings.Repeat("x", storage.MaxBulkHistoryIDLength)
-		ids, err := readHistoryIDs("-", strings.NewReader(id+"\n"))
+		ids, err := readHistoryIDs(strings.NewReader(id + "\n"))
 		if err != nil || len(ids) != 1 || ids[0] != id {
 			t.Fatalf("IDs = %#v, error = %v", ids, err)
 		}
@@ -55,13 +55,13 @@ func TestReadHistoryIDsBoundsAndDeduplicates(t *testing.T) {
 
 	t.Run("rejects overlong ID", func(t *testing.T) {
 		id := strings.Repeat("x", storage.MaxBulkHistoryIDLength+1)
-		if _, err := readHistoryIDs("-", strings.NewReader(id+"\n")); err == nil || !strings.Contains(err.Error(), "max 255") {
+		if _, err := readHistoryIDs(strings.NewReader(id + "\n")); err == nil || !strings.Contains(err.Error(), "max 255") {
 			t.Fatalf("error = %v", err)
 		}
 	})
 
 	t.Run("propagates scanner errors", func(t *testing.T) {
-		if _, err := readHistoryIDs("-", io.MultiReader(strings.NewReader("bd-one\n"), errorReader{})); err == nil || err.Error() != "read failed" {
+		if _, err := readHistoryIDs(io.MultiReader(strings.NewReader("bd-one\n"), errorReader{})); err == nil || err.Error() != "read failed" {
 			t.Fatalf("error = %v", err)
 		}
 	})

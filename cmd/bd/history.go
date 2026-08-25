@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"unicode/utf8"
 
@@ -19,13 +18,13 @@ import (
 )
 
 var (
-	historyLimit   int
-	historyEvents  bool
-	historyIDsFile string
+	historyLimit    int
+	historyEvents   bool
+	historyIDsStdin bool
 )
 
 var historyCmd = &cobra.Command{
-	Use:     "history <id> | history --ids-file <path|-> --json",
+	Use:     "history <id> | history --ids-stdin --json",
 	GroupID: "views",
 	Short:   "Show version history for an issue",
 	Long: `Show the complete version history of an issue, including all commits
@@ -40,7 +39,7 @@ Examples:
   bd history bd-123           # Show all history for issue bd-123
   bd history bd-123 --limit 5 # Show last 5 changes
   bd history bd-123 --events  # Show database audit events
-  bd history --ids-file - --json < issue-ids.txt # Bulk exact-ID snapshots`,
+  bd history --ids-stdin --json < issue-ids.txt # Bulk exact-ID snapshots`,
 	Args:          cobra.MaximumNArgs(1),
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -52,17 +51,17 @@ Examples:
 			}
 		}()
 
-		if historyIDsFile != "" {
+		if historyIDsStdin {
 			if len(args) != 0 {
-				return HandleErrorRespectJSON("an issue argument cannot be combined with --ids-file")
+				return HandleErrorRespectJSON("an issue argument cannot be combined with --ids-stdin")
 			}
 			if !jsonOutput {
-				return HandleErrorRespectJSON("--ids-file requires --json")
+				return HandleErrorRespectJSON("--ids-stdin requires --json")
 			}
 			if historyEvents {
-				return HandleErrorRespectJSON("--events is not supported with --ids-file")
+				return HandleErrorRespectJSON("--events is not supported with --ids-stdin")
 			}
-			ids, err := readHistoryIDs(historyIDsFile, cmd.InOrStdin())
+			ids, err := readHistoryIDs(cmd.InOrStdin())
 			if err != nil {
 				return HandleErrorRespectJSON("reading history IDs: %v", err)
 			}
@@ -76,7 +75,7 @@ Examples:
 			return runBulkHistory(rootCtx, bulkBackend, ids, historyLimit)
 		}
 		if len(args) != 1 {
-			return HandleErrorRespectJSON("exactly one issue ID is required unless --ids-file is used")
+			return HandleErrorRespectJSON("exactly one issue ID is required unless --ids-stdin is used")
 		}
 
 		issueID := args[0]
@@ -194,25 +193,12 @@ func runHistory(ctx context.Context, backend historyBackend, issueID string, lim
 func init() {
 	historyCmd.Flags().IntVar(&historyLimit, "limit", 0, "Limit number of history entries (0 = all)")
 	historyCmd.Flags().BoolVar(&historyEvents, "events", false, "Show database audit events instead of commit snapshots")
-	historyCmd.Flags().StringVar(&historyIDsFile, "ids-file", "", "Read exact issue IDs, one per line (use - for stdin; requires --json)")
+	historyCmd.Flags().BoolVar(&historyIDsStdin, "ids-stdin", false, "Read exact issue IDs from stdin, one per line (requires --json)")
 	historyCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(historyCmd)
 }
 
-func readHistoryIDs(path string, stdin io.Reader) ([]string, error) {
-	var reader io.Reader
-	if path == "-" {
-		reader = stdin
-	} else {
-		// #nosec G304 -- the path is explicitly supplied by the user.
-		file, err := os.Open(path)
-		if err != nil {
-			return nil, err
-		}
-		defer func() { _ = file.Close() }()
-		reader = file
-	}
-
+func readHistoryIDs(reader io.Reader) ([]string, error) {
 	ids := make([]string, 0, storage.MaxBulkHistoryIDs)
 	seen := make(map[string]struct{}, storage.MaxBulkHistoryIDs)
 	scanner := bufio.NewScanner(reader)

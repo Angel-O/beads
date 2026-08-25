@@ -4,8 +4,7 @@ package main
 
 import (
 	"encoding/json"
-	"os"
-	"path/filepath"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -171,13 +170,13 @@ func TestProxiedServerHistory(t *testing.T) {
 
 	t.Run("bulk_history_uses_proxied_batch_contract", func(t *testing.T) {
 		second := bdProxiedCreate(t, bd, p.dir, "Second history issue", "--type", "task")
-		idsPath := filepath.Join(t.TempDir(), "ids.txt")
-		if err := os.WriteFile(idsPath, []byte(second.ID+"\n"+missingID+"\n"+issue.ID+"\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		out, err := bdProxiedRun(t, bd, p.dir, "history", "--ids-file", idsPath, "--json")
+		cmd := exec.Command(bd, "history", "--ids-stdin", "--json")
+		cmd.Dir = p.dir
+		cmd.Env = bdProxiedEnv(p.dir)
+		cmd.Stdin = strings.NewReader(second.ID + "\n" + missingID + "\n" + issue.ID + "\n")
+		stdout, stderr, err := runCommandBuffers(t, cmd)
 		if err != nil {
-			t.Fatalf("bulk proxied history: %v\n%s", err, out)
+			t.Fatalf("bulk proxied history: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
 		}
 		var envelope struct {
 			SchemaVersion int `json:"schema_version"`
@@ -186,8 +185,8 @@ func TestProxiedServerHistory(t *testing.T) {
 				Snapshots []json.RawMessage `json:"snapshots"`
 			} `json:"issues"`
 		}
-		if err := json.Unmarshal(out, &envelope); err != nil {
-			t.Fatalf("unmarshal bulk proxied history: %v\n%s", err, out)
+		if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+			t.Fatalf("unmarshal bulk proxied history: %v\n%s", err, stdout.String())
 		}
 		if envelope.SchemaVersion != 1 || len(envelope.Issues) != 3 {
 			t.Fatalf("bulk envelope = %#v", envelope)
