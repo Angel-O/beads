@@ -1,0 +1,9 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "references": {
+    "project-focus": {
+      "path": "docs/project-focus.md",
+      "description": "Use for the current beads project focus and Git workflow: feat/bulk-history-read is the accepted reference branch for bulk History integration, not main."
+    }
+  }
+}
