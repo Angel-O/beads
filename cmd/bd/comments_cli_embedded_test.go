@@ -82,6 +82,47 @@ func TestEmbeddedCommentsCLI(t *testing.T) {
 		}
 	})
 
+	t.Run("comments_edit_and_delete", func(t *testing.T) {
+		issue := bdCreate(t, bd, dir, "Edit and delete comment", "--type", "task")
+		addedJSON := bdComments(t, bd, dir, "add", issue.ID, "before", "--json")
+		var added struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(addedJSON), &added); err != nil {
+			t.Fatalf("decode added comment: %v\n%s", err, addedJSON)
+		}
+		if added.ID == "" {
+			t.Fatal("added comment ID is empty")
+		}
+
+		editedJSON := bdComments(t, bd, dir, "edit", issue.ID, added.ID, "after", "--json")
+		var edited map[string]interface{}
+		if err := json.Unmarshal([]byte(editedJSON), &edited); err != nil {
+			t.Fatalf("decode edited comment: %v\n%s", err, editedJSON)
+		}
+		if edited["id"] != added.ID || edited["text"] != "after" {
+			t.Fatalf("edited comment = %v", edited)
+		}
+
+		deletedJSON := bdComments(t, bd, dir, "delete", issue.ID, added.ID, "--json")
+		var deleted map[string]interface{}
+		if err := json.Unmarshal([]byte(deletedJSON), &deleted); err != nil {
+			t.Fatalf("decode deleted comment: %v\n%s", err, deletedJSON)
+		}
+		if deleted["comment_id"] != added.ID || deleted["issue_id"] != issue.ID {
+			t.Fatalf("deleted comment = %v", deleted)
+		}
+
+		listJSON := bdComments(t, bd, dir, issue.ID, "--json")
+		var comments []map[string]interface{}
+		if err := json.Unmarshal([]byte(listJSON), &comments); err != nil {
+			t.Fatalf("decode comments after delete: %v\n%s", err, listJSON)
+		}
+		if len(comments) != 0 {
+			t.Fatalf("comments after delete = %v, want empty", comments)
+		}
+	})
+
 	t.Run("comments_add_nonexistent_issue", func(t *testing.T) {
 		cmd := exec.Command(bd, "comments", "add", "cc-nonexistent999", "nope")
 		cmd.Dir = dir

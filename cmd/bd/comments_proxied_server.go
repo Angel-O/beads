@@ -97,6 +97,32 @@ func runCommentsAddProxiedServer(ctx context.Context, issueID, author, text stri
 	return nil
 }
 
+func runCommentsEditProxiedServer(ctx context.Context, issueID, commentID, text string) error {
+	comment, issue, err := editCommentProxied(ctx, issueID, commentID, text)
+	if err != nil {
+		return HandleErrorRespectJSON("%v", err)
+	}
+	SetLastTouchedID(issue.ID)
+	if jsonOutput {
+		return outputJSON(comment)
+	}
+	fmt.Printf("Comment edited on %s\n", issue.ID)
+	return nil
+}
+
+func runCommentsDeleteProxiedServer(ctx context.Context, issueID, commentID string) error {
+	result, issue, err := deleteCommentProxied(ctx, issueID, commentID)
+	if err != nil {
+		return HandleErrorRespectJSON("%v", err)
+	}
+	SetLastTouchedID(issue.ID)
+	if jsonOutput {
+		return outputJSON(result)
+	}
+	fmt.Printf("Comment deleted from %s\n", issue.ID)
+	return nil
+}
+
 // proxiedCommenter hands back the guarded add-comment surface for the
 // proxied-server provider, through the provider's OWN capability accessor —
 // the same two-step proxiedIssueReader performs, and for the same reason: the
@@ -140,6 +166,42 @@ func addCommentProxied(ctx context.Context, id, author, text string) (*types.Com
 		return nil, nil, fmt.Errorf("adding comment: %w", err)
 	}
 	return result.Comment, issue, nil
+}
+
+func editCommentProxied(ctx context.Context, id, commentID, text string) (*types.Comment, *types.Issue, error) {
+	issue, err := resolveCommentTargetProxied(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	commenter, err := proxiedCommenter()
+	if err != nil {
+		return nil, nil, err
+	}
+	result, err := commenter.EditComment(ctx, issueops.EditCommentRequest{
+		IssueID: issue.ID, CommentID: commentID, Text: text,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("editing comment: %w", err)
+	}
+	return result.Comment, issue, nil
+}
+
+func deleteCommentProxied(ctx context.Context, id, commentID string) (issueops.DeleteCommentResult, *types.Issue, error) {
+	issue, err := resolveCommentTargetProxied(ctx, id)
+	if err != nil {
+		return issueops.DeleteCommentResult{}, nil, err
+	}
+	commenter, err := proxiedCommenter()
+	if err != nil {
+		return issueops.DeleteCommentResult{}, nil, err
+	}
+	result, err := commenter.DeleteComment(ctx, issueops.DeleteCommentRequest{
+		IssueID: issue.ID, CommentID: commentID,
+	})
+	if err != nil {
+		return issueops.DeleteCommentResult{}, nil, fmt.Errorf("deleting comment: %w", err)
+	}
+	return result, issue, nil
 }
 
 // resolveCommentTargetProxied resolves the anchor and applies the CLI's own

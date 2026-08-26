@@ -1,8 +1,11 @@
 package dolt
 
 import (
+	"encoding/json"
+	"errors"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	publicops "github.com/steveyegge/beads/issueops"
 )
@@ -53,6 +56,100 @@ func TestDoltStoreCommenterNamesTheIssueInHistoryAndCommitsTheTable(t *testing.T
 	requireCleanTables(ctx, t, store, "comments")
 }
 
+func TestDoltStoreCommenterEditsAndDeletesByBothIdentities(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+	enableJournalForTest(t, store)
+	clearJournal(t, store)
+	seedIssues(ctx, t, store, "test-comment-edit", "test-comment-other")
+
+	commenter, err := store.Commenter()
+	if err != nil {
+		t.Fatalf("Commenter(): %v", err)
+	}
+	added, err := commenter.AddComment(ctx, publicops.AddCommentRequest{
+		Author: "author", IssueID: "test-comment-edit", Text: "before",
+	})
+	if err != nil {
+		t.Fatalf("AddComment: %v", err)
+	}
+
+	edited, err := commenter.EditComment(ctx, publicops.EditCommentRequest{
+		IssueID: "test-comment-edit", CommentID: added.Comment.ID, Text: "after",
+	})
+	if err != nil {
+		t.Fatalf("EditComment: %v", err)
+	}
+	if edited.Comment.ID != added.Comment.ID || edited.Comment.IssueID != added.Comment.IssueID || edited.Comment.Author != added.Comment.Author {
+		t.Fatalf("edited identity fields = %+v, want %+v", edited.Comment, added.Comment)
+	}
+	if edited.Comment.Text != "after" || !edited.Comment.CreatedAt.Equal(added.Comment.CreatedAt) {
+		t.Fatalf("edited comment = %+v, want text changed and timestamp preserved", edited.Comment)
+	}
+	if !doltHasCommitMessage(ctx, t, store, "bd: edit comment test-comment-edit "+added.Comment.ID) {
+		t.Error("comment edit did not create its durable history entry")
+	}
+
+	deleted, err := commenter.DeleteComment(ctx, publicops.DeleteCommentRequest{
+		IssueID: "test-comment-edit", CommentID: added.Comment.ID,
+	})
+	if err != nil {
+		t.Fatalf("DeleteComment: %v", err)
+	}
+	if deleted.IssueID != "test-comment-edit" || deleted.CommentID != added.Comment.ID {
+		t.Fatalf("delete result = %+v", deleted)
+	}
+	comments, err := store.GetIssueComments(ctx, "test-comment-edit")
+	if err != nil {
+		t.Fatalf("GetIssueComments: %v", err)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments after delete = %d, want 0", len(comments))
+	}
+	if !doltHasCommitMessage(ctx, t, store, "bd: delete comment test-comment-edit "+added.Comment.ID) {
+		t.Error("comment delete did not create its durable history entry")
+	}
+	var commentJSON []byte
+	if err := store.db.QueryRowContext(ctx, `SELECT comment_json FROM bd_events_journal WHERE op = 'comment' AND issue_id = ? ORDER BY seq DESC LIMIT 1`, "test-comment-edit").Scan(&commentJSON); err != nil {
+		t.Fatalf("read delete journal entry: %v", err)
+	}
+	var tombstone struct {
+		ID      string `json:"id"`
+		Deleted bool   `json:"deleted"`
+	}
+	if err := json.Unmarshal(commentJSON, &tombstone); err != nil {
+		t.Fatalf("decode delete journal entry: %v", err)
+	}
+	if tombstone.ID != added.Comment.ID || !tombstone.Deleted {
+		t.Fatalf("delete journal entry = %+v, want tombstone for %s", tombstone, added.Comment.ID)
+	}
+
+	if _, err := commenter.EditComment(ctx, publicops.EditCommentRequest{
+		IssueID: "test-comment-edit", CommentID: added.Comment.ID, Text: "   ",
+	}); !errors.Is(err, storage.ErrValidation) {
+		t.Fatalf("blank replacement error = %v, want ErrValidation", err)
+	}
+	if _, err := commenter.DeleteComment(ctx, publicops.DeleteCommentRequest{
+		IssueID: "test-comment-other", CommentID: added.Comment.ID,
+	}); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("comment on another issue error = %v, want ErrNotFound", err)
+	}
+	if _, err := commenter.DeleteComment(ctx, publicops.DeleteCommentRequest{
+		IssueID: "test-comment-missing", CommentID: added.Comment.ID,
+	}); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("missing issue error = %v, want ErrNotFound", err)
+	}
+
+	_, err = commenter.EditComment(ctx, publicops.EditCommentRequest{
+		IssueID: "test-comment-edit", CommentID: added.Comment.ID, Text: "again",
+	})
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("editing deleted comment error = %v, want ErrNotFound", err)
+	}
+}
+
 // TestDoltStoreCommenterOnAWispSweepsNoPendingRow pins the staging half of the
 // ephemeral case, which no data read can see.
 //
@@ -85,12 +182,26 @@ func TestDoltStoreCommenterOnAWispSweepsNoPendingRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Commenter(): %v", err)
 	}
-	if _, err := commenter.AddComment(ctx, publicops.AddCommentRequest{
+	added, err := commenter.AddComment(ctx, publicops.AddCommentRequest{
 		Author:  "author",
 		IssueID: wisp.ID,
 		Text:    "on the ephemeral plane",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("AddComment on a wisp: %v", err)
+	}
+	if _, err := commenter.EditComment(ctx, publicops.EditCommentRequest{
+		IssueID: wisp.ID, CommentID: added.Comment.ID, Text: "edited on the ephemeral plane",
+	}); err != nil {
+		t.Fatalf("EditComment on a wisp: %v", err)
+	}
+	if _, err := commenter.DeleteComment(ctx, publicops.DeleteCommentRequest{
+		IssueID: wisp.ID, CommentID: added.Comment.ID,
+	}); err != nil {
+		t.Fatalf("DeleteComment on a wisp: %v", err)
+	}
+	if doltHasCommitMessage(ctx, t, store, "bd: edit comment "+wisp.ID+" "+added.Comment.ID) || doltHasCommitMessage(ctx, t, store, "bd: delete comment "+wisp.ID+" "+added.Comment.ID) {
+		t.Fatal("wisp comment mutation created durable history")
 	}
 
 	var dirty int

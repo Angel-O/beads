@@ -64,3 +64,46 @@ func (c *commenter) AddComment(ctx context.Context, request publicops.AddComment
 			storageissueops.AddCommentCommitMessage(issue.ID), nil
 	})
 }
+
+func (c *commenter) EditComment(ctx context.Context, request publicops.EditCommentRequest) (publicops.EditCommentResult, error) {
+	if err := storageissueops.ValidateEditCommentRequest(request); err != nil {
+		return publicops.EditCommentResult{}, err
+	}
+	return RunTxResult(ctx, c.provider, func(ctx context.Context, uw UnitOfWork) (publicops.EditCommentResult, string, error) {
+		issue, isWisp, err := workapi.GetIssueOrWisp(ctx, workapi.NewUOWDetailSource(uw), request.IssueID)
+		if err != nil {
+			return publicops.EditCommentResult{}, "", err
+		}
+		var comment *publicops.Comment
+		if isWisp {
+			comment, err = uw.CommentUseCase().EditCommentOnWisp(ctx, issue.ID, request.CommentID, request.Text)
+		} else {
+			comment, err = uw.CommentUseCase().EditCommentOnIssue(ctx, issue.ID, request.CommentID, request.Text)
+		}
+		if err != nil {
+			return publicops.EditCommentResult{}, "", err
+		}
+		return publicops.EditCommentResult{Comment: comment}, storageissueops.EditCommentCommitMessage(issue.ID, request.CommentID), nil
+	})
+}
+
+func (c *commenter) DeleteComment(ctx context.Context, request publicops.DeleteCommentRequest) (publicops.DeleteCommentResult, error) {
+	if err := storageissueops.ValidateDeleteCommentRequest(request); err != nil {
+		return publicops.DeleteCommentResult{}, err
+	}
+	return RunTxResult(ctx, c.provider, func(ctx context.Context, uw UnitOfWork) (publicops.DeleteCommentResult, string, error) {
+		issue, isWisp, err := workapi.GetIssueOrWisp(ctx, workapi.NewUOWDetailSource(uw), request.IssueID)
+		if err != nil {
+			return publicops.DeleteCommentResult{}, "", err
+		}
+		if isWisp {
+			err = uw.CommentUseCase().DeleteCommentFromWisp(ctx, issue.ID, request.CommentID)
+		} else {
+			err = uw.CommentUseCase().DeleteCommentFromIssue(ctx, issue.ID, request.CommentID)
+		}
+		if err != nil {
+			return publicops.DeleteCommentResult{}, "", err
+		}
+		return publicops.DeleteCommentResult{IssueID: issue.ID, CommentID: request.CommentID}, storageissueops.DeleteCommentCommitMessage(issue.ID, request.CommentID), nil
+	})
+}

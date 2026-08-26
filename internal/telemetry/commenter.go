@@ -34,3 +34,17 @@ func (c *instrumentedCommenter) AddComment(ctx context.Context, request issueops
 	c.storage.done(ctx, span, started, err)
 	return result, err
 }
+
+func (c *instrumentedCommenter) EditComment(ctx context.Context, request issueops.EditCommentRequest) (result issueops.EditCommentResult, err error) {
+	ctx, span, started := c.storage.op(ctx, "Commenter.EditComment")
+	result, err = c.inner.EditComment(ctx, request)
+	c.storage.done(ctx, span, started, err)
+	return result, err
+}
+
+func (c *instrumentedCommenter) DeleteComment(ctx context.Context, request issueops.DeleteCommentRequest) (result issueops.DeleteCommentResult, err error) {
+	ctx, span, started := c.storage.op(ctx, "Commenter.DeleteComment")
+	result, err = c.inner.DeleteComment(ctx, request)
+	c.storage.done(ctx, span, started, err)
+	return result, err
+}

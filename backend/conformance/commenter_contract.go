@@ -676,6 +676,74 @@ func RunCommenterLeavesTheCallersRequestAlone(t *testing.T, ctx context.Context,
 	}
 }
 
+// RunCommenterEditsTheNamedComment pins the exact identity contract for an
+// edit: the issue and comment ids select one row, only its text changes, and
+// the stored row is returned.
+func RunCommenterEditsTheNamedComment(t *testing.T, ctx context.Context, fixture CommenterFixture) {
+	t.Helper()
+	anchor := fixture.IssuePrefix + "-edit"
+	seedCommenterIssue(t, ctx, fixture, anchor)
+
+	added, err := fixture.Commenter.AddComment(ctx, publicops.AddCommentRequest{
+		Author: "original-author", IssueID: anchor, Text: "before",
+	})
+	if err != nil {
+		t.Fatalf("AddComment: %v", err)
+	}
+	if added.Comment == nil {
+		t.Fatal("AddComment returned no comment")
+	}
+
+	edited, err := fixture.Commenter.EditComment(ctx, publicops.EditCommentRequest{
+		IssueID: anchor, CommentID: added.Comment.ID, Text: "after",
+	})
+	if err != nil {
+		t.Fatalf("EditComment: %v", err)
+	}
+	if edited.Comment == nil {
+		t.Fatal("EditComment returned no comment")
+	}
+	if edited.Comment.ID != added.Comment.ID || edited.Comment.IssueID != anchor {
+		t.Errorf("edited identity = %+v, want comment %s on %s", edited.Comment, added.Comment.ID, anchor)
+	}
+	if edited.Comment.Author != added.Comment.Author || edited.Comment.Text != "after" || !edited.Comment.CreatedAt.Equal(added.Comment.CreatedAt) {
+		t.Errorf("edited comment = %+v, want author and created_at preserved with new text", edited.Comment)
+	}
+	stored := readCommenterRow(t, ctx, fixture, "comments", added.Comment.ID)
+	if stored.Text != "after" || stored.Author != added.Comment.Author {
+		t.Errorf("stored edited row = %+v, want text after and original author", stored)
+	}
+}
+
+// RunCommenterDeletesTheNamedComment pins that deletion addresses both the
+// issue and comment identity, returns those identities, and removes the row.
+func RunCommenterDeletesTheNamedComment(t *testing.T, ctx context.Context, fixture CommenterFixture) {
+	t.Helper()
+	anchor := fixture.IssuePrefix + "-delete"
+	seedCommenterIssue(t, ctx, fixture, anchor)
+
+	added, err := fixture.Commenter.AddComment(ctx, publicops.AddCommentRequest{
+		Author: "author", IssueID: anchor, Text: "to remove",
+	})
+	if err != nil {
+		t.Fatalf("AddComment: %v", err)
+	}
+	if added.Comment == nil {
+		t.Fatal("AddComment returned no comment")
+	}
+
+	deleted, err := fixture.Commenter.DeleteComment(ctx, publicops.DeleteCommentRequest{
+		IssueID: anchor, CommentID: added.Comment.ID,
+	})
+	if err != nil {
+		t.Fatalf("DeleteComment: %v", err)
+	}
+	if deleted.IssueID != anchor || deleted.CommentID != added.Comment.ID {
+		t.Errorf("delete result = %+v, want issue %s and comment %s", deleted, anchor, added.Comment.ID)
+	}
+	assertCommenterRowCount(t, ctx, fixture, "comments", anchor, 0)
+}
+
 func seedCommenterIssue(t *testing.T, ctx context.Context, fixture CommenterFixture, id string) {
 	t.Helper()
 	if err := fixture.CreateIssue(ctx, commenterSeed(id, false), "seed"); err != nil {

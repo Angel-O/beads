@@ -63,6 +63,12 @@ func TestCommenterContract(t *testing.T) {
 	t.Run("LeavesTheCallersRequestAlone", func(t *testing.T) {
 		conformance.RunCommenterLeavesTheCallersRequestAlone(t, ctx, fixture)
 	})
+	t.Run("EditsTheNamedComment", func(t *testing.T) {
+		conformance.RunCommenterEditsTheNamedComment(t, ctx, fixture)
+	})
+	t.Run("DeletesTheNamedComment", func(t *testing.T) {
+		conformance.RunCommenterDeletesTheNamedComment(t, ctx, fixture)
+	})
 }
 
 func newEmbeddedCommenterFixture(t *testing.T, te *testEnv, prefix string) conformance.CommenterFixture {

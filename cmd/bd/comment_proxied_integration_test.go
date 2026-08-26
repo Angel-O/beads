@@ -216,6 +216,45 @@ func TestProxiedServerComment(t *testing.T) {
 		}
 	})
 
+	t.Run("edit_and_delete_round_trip", func(t *testing.T) {
+		t.Parallel()
+		p := newSharedProxiedProject(t, bd, "ce")
+		issue := bdProxiedCreate(t, bd, p.dir, "Editable comment")
+
+		stdout, stderr, err := bdProxiedRunBuffers(t, bd, p.dir, "comments", "add", issue.ID, "before", "--json")
+		if err != nil {
+			t.Fatalf("add comment failed: %v\nstdout:%s\nstderr:%s", err, stdout, stderr)
+		}
+		var added types.Comment
+		if err := json.Unmarshal([]byte(stdout), &added); err != nil {
+			t.Fatalf("decode added comment: %v\n%s", err, stdout)
+		}
+
+		stdout, stderr, err = bdProxiedRunBuffers(t, bd, p.dir, "comments", "edit", issue.ID, added.ID, "after", "--json")
+		if err != nil {
+			t.Fatalf("edit comment failed: %v\nstdout:%s\nstderr:%s", err, stdout, stderr)
+		}
+		var edited types.Comment
+		if err := json.Unmarshal([]byte(stdout), &edited); err != nil {
+			t.Fatalf("decode edited comment: %v\n%s", err, stdout)
+		}
+		if edited.ID != added.ID || edited.Text != "after" {
+			t.Fatalf("edited comment = %+v", edited)
+		}
+
+		stdout, stderr, err = bdProxiedRunBuffers(t, bd, p.dir, "comments", "delete", issue.ID, added.ID, "--json")
+		if err != nil {
+			t.Fatalf("delete comment failed: %v\nstdout:%s\nstderr:%s", err, stdout, stderr)
+		}
+		var deleted map[string]string
+		if err := json.Unmarshal([]byte(stdout), &deleted); err != nil {
+			t.Fatalf("decode deleted comment: %v\n%s", err, stdout)
+		}
+		if deleted["issue_id"] != issue.ID || deleted["comment_id"] != added.ID {
+			t.Fatalf("deleted comment = %v", deleted)
+		}
+	})
+
 	t.Run("wisp_comments_add_round_trip_and_physical_routing", func(t *testing.T) {
 		t.Parallel()
 		p := newSharedProxiedProject(t, bd, "wa")

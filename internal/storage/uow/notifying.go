@@ -1387,3 +1387,35 @@ func (u *recordingCommentUC) AddCommentToWisp(ctx context.Context, wispID, autho
 	}
 	return comment, err
 }
+
+func (u *recordingCommentUC) EditCommentOnIssue(ctx context.Context, issueID, commentID, text string) (*types.Comment, error) {
+	comment, err := u.CommentUseCase.EditCommentOnIssue(ctx, issueID, commentID, text)
+	if err == nil {
+		u.rec.record(opUpdate, u.snap.issue(ctx, issueID))
+	}
+	return comment, err
+}
+
+func (u *recordingCommentUC) EditCommentOnWisp(ctx context.Context, wispID, commentID, text string) (*types.Comment, error) {
+	comment, err := u.CommentUseCase.EditCommentOnWisp(ctx, wispID, commentID, text)
+	if err == nil {
+		u.rec.record(opUpdate, u.snap.wisp(ctx, wispID))
+	}
+	return comment, err
+}
+
+func (u *recordingCommentUC) DeleteCommentFromIssue(ctx context.Context, issueID, commentID string) error {
+	err := u.CommentUseCase.DeleteCommentFromIssue(ctx, issueID, commentID)
+	if err == nil {
+		u.rec.record(opUpdate, u.snap.issue(ctx, issueID))
+	}
+	return err
+}
+
+func (u *recordingCommentUC) DeleteCommentFromWisp(ctx context.Context, wispID, commentID string) error {
+	err := u.CommentUseCase.DeleteCommentFromWisp(ctx, wispID, commentID)
+	if err == nil {
+		u.rec.record(opUpdate, u.snap.wisp(ctx, wispID))
+	}
+	return err
+}

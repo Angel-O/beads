@@ -72,7 +72,13 @@ Examples:
   bd comments add bd-123 "This is a comment"
 
   # Add a comment from a file
-  bd comments add bd-123 -f notes.txt`,
+  bd comments add bd-123 -f notes.txt
+
+  # Edit a comment by issue and comment id
+  bd comments edit bd-123 <comment-id> "Updated text"
+
+  # Delete a comment by issue and comment id
+  bd comments delete bd-123 <comment-id>`,
 	Args:          validateCommentsArgs,
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -249,6 +255,104 @@ Examples:
 	},
 }
 
+var commentsEditCmd = &cobra.Command{
+	Use:           "edit <issue-id> <comment-id> [text...]",
+	Short:         "Edit a comment on an issue",
+	Args:          cobra.MinimumNArgs(2),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		CheckReadonly("comments edit")
+		issueID, commentID := args[0], args[1]
+		text, err := requireTextFromSources("comment text", "use positional args, --stdin, or --file", cmdTextSources(cmd, args[2:]))
+		if err != nil {
+			return HandleErrorRespectJSON("%v", err)
+		}
+		if usesProxiedServer() {
+			return runCommentsEditProxiedServer(rootCtx, issueID, commentID, text)
+		}
+		if err := ensureStoreActive(); err != nil {
+			return HandleErrorRespectJSON("editing comment: %v", err)
+		}
+		result, err := resolveAndGetIssueForMutation(rootCtx, store, issueID)
+		if err != nil {
+			if result != nil {
+				result.Close()
+			}
+			return HandleErrorRespectJSON("resolving %s: %v", issueID, err)
+		}
+		if result == nil || result.Issue == nil {
+			if result != nil {
+				result.Close()
+			}
+			return HandleErrorRespectJSON("issue %s not found", issueID)
+		}
+		defer result.Close()
+		comment, err := editCommentDirect(rootCtx, result.Store, result.ResolvedID, commentID, text)
+		if err != nil {
+			return HandleErrorRespectJSON("editing comment: %v", err)
+		}
+		if err := commitPendingIfEmbedded(rootCtx, result.Store, actor, doltAutoCommitParams{
+			Command: "comments edit", IssueIDs: []string{result.ResolvedID},
+		}); err != nil {
+			return HandleErrorRespectJSON("failed to commit: %v", err)
+		}
+		SetLastTouchedID(result.ResolvedID)
+		if jsonOutput {
+			return outputJSON(comment)
+		}
+		fmt.Printf("Comment edited on %s\n", result.ResolvedID)
+		return nil
+	},
+}
+
+var commentsDeleteCmd = &cobra.Command{
+	Use:           "delete <issue-id> <comment-id>",
+	Short:         "Delete a comment from an issue",
+	Args:          cobra.ExactArgs(2),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		CheckReadonly("comments delete")
+		issueID, commentID := args[0], args[1]
+		if usesProxiedServer() {
+			return runCommentsDeleteProxiedServer(rootCtx, issueID, commentID)
+		}
+		if err := ensureStoreActive(); err != nil {
+			return HandleErrorRespectJSON("deleting comment: %v", err)
+		}
+		result, err := resolveAndGetIssueForMutation(rootCtx, store, issueID)
+		if err != nil {
+			if result != nil {
+				result.Close()
+			}
+			return HandleErrorRespectJSON("resolving %s: %v", issueID, err)
+		}
+		if result == nil || result.Issue == nil {
+			if result != nil {
+				result.Close()
+			}
+			return HandleErrorRespectJSON("issue %s not found", issueID)
+		}
+		defer result.Close()
+		deleted, err := deleteCommentDirect(rootCtx, result.Store, result.ResolvedID, commentID)
+		if err != nil {
+			return HandleErrorRespectJSON("deleting comment: %v", err)
+		}
+		if err := commitPendingIfEmbedded(rootCtx, result.Store, actor, doltAutoCommitParams{
+			Command: "comments delete", IssueIDs: []string{result.ResolvedID},
+		}); err != nil {
+			return HandleErrorRespectJSON("failed to commit: %v", err)
+		}
+		SetLastTouchedID(result.ResolvedID)
+		if jsonOutput {
+			return outputJSON(deleted)
+		}
+		fmt.Printf("Comment deleted from %s\n", result.ResolvedID)
+		return nil
+	},
+}
+
 // addCommentDirect appends one comment through the Commenter role and returns
 // the stored comment. It is the direct-route sibling of addCommentProxied and
 // builds the SAME request, so the two front doors ask the storage layer one
@@ -293,12 +397,48 @@ func addCommentDirect(ctx context.Context, st storage.DoltStorage, issueID, auth
 	return result.Comment, nil
 }
 
+func editCommentDirect(ctx context.Context, st storage.DoltStorage, issueID, commentID, text string) (*types.Comment, error) {
+	opsCtx, err := issueOpsContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	commenter, err := st.Commenter()
+	if err != nil {
+		return nil, err
+	}
+	result, err := commenter.EditComment(opsCtx, issueops.EditCommentRequest{
+		IssueID: issueID, CommentID: commentID, Text: text,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.Comment, nil
+}
+
+func deleteCommentDirect(ctx context.Context, st storage.DoltStorage, issueID, commentID string) (issueops.DeleteCommentResult, error) {
+	opsCtx, err := issueOpsContext(ctx)
+	if err != nil {
+		return issueops.DeleteCommentResult{}, err
+	}
+	commenter, err := st.Commenter()
+	if err != nil {
+		return issueops.DeleteCommentResult{}, err
+	}
+	return commenter.DeleteComment(opsCtx, issueops.DeleteCommentRequest{
+		IssueID: issueID, CommentID: commentID,
+	})
+}
+
 func init() {
 	commentsCmd.AddCommand(commentsMisplacedListCmd)
 	commentsCmd.AddCommand(commentsAddCmd)
+	commentsCmd.AddCommand(commentsEditCmd)
+	commentsCmd.AddCommand(commentsDeleteCmd)
 	commentsCmd.Flags().Bool("local-time", false, "Show timestamps in local time instead of UTC")
 	commentsAddCmd.Flags().StringP("file", "f", "", "Read comment text from file")
 	commentsAddCmd.Flags().StringP("author", "a", "", "Add author to comment")
+	commentsDeleteCmd.ValidArgsFunction = issueIDCompletion
+	registerTextSourceFlags(commentsEditCmd, "replacement text")
 
 	// Issue ID completions
 	commentsCmd.ValidArgsFunction = issueIDCompletion

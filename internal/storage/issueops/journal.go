@@ -114,6 +114,7 @@ type EventComment struct {
 	Text      string    `json:"text"`
 	CreatedAt time.Time `json:"created_at"`
 	Source    string    `json:"source"`
+	Deleted   bool      `json:"deleted,omitempty"`
 }
 
 // The closed set of EventComment.Source values. Consumers switch on these, so

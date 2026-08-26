@@ -180,3 +180,12 @@ func (r *commentSQLRepositoryImpl) InsertRecord(ctx context.Context, comment *ty
 	}
 	return &copy, nil
 }
+
+func (r *commentSQLRepositoryImpl) Edit(ctx context.Context, issueID, commentID, text string, opts domain.CommentOpts) (*types.Comment, error) {
+	return issueops.EditCommentInTx(ctx, r.runner, issueID, commentID, text, opts.UseWispsTable)
+}
+
+func (r *commentSQLRepositoryImpl) Delete(ctx context.Context, issueID, commentID string, opts domain.CommentOpts) error {
+	_, err := issueops.DeleteCommentInTx(ctx, r.runner, issueID, commentID, opts.UseWispsTable)
+	return err
+}
