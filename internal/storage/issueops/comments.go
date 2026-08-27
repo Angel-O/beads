@@ -284,7 +284,7 @@ func addIssueCommentInTx(ctx context.Context, tx *sql.Tx, issueID, author, text 
 	}
 	if err := RecordCommentEventInTx(ctx, tx, issueID, &EventComment{
 		ID: id, Author: author, Text: text, CreatedAt: stored, Source: CommentSourceStructured,
-	}); err != nil {
+	}, author); err != nil {
 		return nil, err
 	}
 	return comment, nil
@@ -318,5 +318,5 @@ func AddCommentEventInTx(ctx context.Context, tx DBTX, issueID, actor, comment s
 	// distinguished by Source.
 	return RecordCommentEventInTx(ctx, tx, issueID, &EventComment{
 		ID: id, Author: actor, Text: comment, CreatedAt: stored, Source: CommentSourceAudit,
-	})
+	}, actor)
 }

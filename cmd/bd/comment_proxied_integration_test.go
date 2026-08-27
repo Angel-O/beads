@@ -229,6 +229,11 @@ func TestProxiedServerComment(t *testing.T) {
 		if err := json.Unmarshal([]byte(stdout), &added); err != nil {
 			t.Fatalf("decode added comment: %v\n%s", err, stdout)
 		}
+		partialIssueID := issue.ID[:len(issue.ID)-1]
+		stdout, stderr, err = bdProxiedRunBuffers(t, bd, p.dir, "comments", "edit", partialIssueID, added.ID, "must fail")
+		if err == nil {
+			t.Fatalf("partial issue id edit unexpectedly succeeded\nstdout:%s\nstderr:%s", stdout, stderr)
+		}
 
 		stdout, stderr, err = bdProxiedRunBuffers(t, bd, p.dir, "comments", "edit", issue.ID, added.ID, "after", "--json")
 		if err != nil {

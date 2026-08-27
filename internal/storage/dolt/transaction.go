@@ -1235,7 +1235,7 @@ func (t *doltTransaction) ImportIssueComment(ctx context.Context, issueID, autho
 	// — the create/comment entry points cover their own writes, not this one.
 	if err := issueops.RecordCommentEventInTx(ctx, t.txFor(table), issueID, &issueops.EventComment{
 		ID: id, Author: author, Text: text, CreatedAt: stored, Source: issueops.CommentSourceStructured,
-	}); err != nil {
+	}, author); err != nil {
 		return nil, wrapExecError("journal import comment in tx", err)
 	}
 	return &types.Comment{ID: id, IssueID: issueID, Author: author, Text: text, CreatedAt: stored}, nil
@@ -1298,7 +1298,7 @@ func (t *doltTransaction) AddComment(ctx context.Context, issueID, actor, commen
 	// structured comment, distinguished by Source.
 	if err := issueops.RecordCommentEventInTx(ctx, t.txFor(table), issueID, &issueops.EventComment{
 		ID: id, Author: actor, Text: comment, CreatedAt: stored, Source: issueops.CommentSourceAudit,
-	}); err != nil {
+	}, actor); err != nil {
 		return wrapExecError("journal comment in tx", err)
 	}
 	return nil

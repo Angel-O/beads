@@ -695,7 +695,7 @@ func RunCommenterEditsTheNamedComment(t *testing.T, ctx context.Context, fixture
 	}
 
 	edited, err := fixture.Commenter.EditComment(ctx, publicops.EditCommentRequest{
-		IssueID: anchor, CommentID: added.Comment.ID, Text: "after",
+		IssueID: anchor, CommentID: added.Comment.ID, Text: "after", Actor: "editor",
 	})
 	if err != nil {
 		t.Fatalf("EditComment: %v", err)
@@ -733,7 +733,7 @@ func RunCommenterDeletesTheNamedComment(t *testing.T, ctx context.Context, fixtu
 	}
 
 	deleted, err := fixture.Commenter.DeleteComment(ctx, publicops.DeleteCommentRequest{
-		IssueID: anchor, CommentID: added.Comment.ID,
+		IssueID: anchor, CommentID: added.Comment.ID, Actor: "deleter",
 	})
 	if err != nil {
 		t.Fatalf("DeleteComment: %v", err)

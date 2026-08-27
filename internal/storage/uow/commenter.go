@@ -76,9 +76,9 @@ func (c *commenter) EditComment(ctx context.Context, request publicops.EditComme
 		}
 		var comment *publicops.Comment
 		if isWisp {
-			comment, err = uw.CommentUseCase().EditCommentOnWisp(ctx, issue.ID, request.CommentID, request.Text)
+			comment, err = uw.CommentUseCase().EditCommentOnWisp(ctx, issue.ID, request.CommentID, request.Text, request.Actor)
 		} else {
-			comment, err = uw.CommentUseCase().EditCommentOnIssue(ctx, issue.ID, request.CommentID, request.Text)
+			comment, err = uw.CommentUseCase().EditCommentOnIssue(ctx, issue.ID, request.CommentID, request.Text, request.Actor)
 		}
 		if err != nil {
 			return publicops.EditCommentResult{}, "", err
@@ -97,9 +97,9 @@ func (c *commenter) DeleteComment(ctx context.Context, request publicops.DeleteC
 			return publicops.DeleteCommentResult{}, "", err
 		}
 		if isWisp {
-			err = uw.CommentUseCase().DeleteCommentFromWisp(ctx, issue.ID, request.CommentID)
+			err = uw.CommentUseCase().DeleteCommentFromWisp(ctx, issue.ID, request.CommentID, request.Actor)
 		} else {
-			err = uw.CommentUseCase().DeleteCommentFromIssue(ctx, issue.ID, request.CommentID)
+			err = uw.CommentUseCase().DeleteCommentFromIssue(ctx, issue.ID, request.CommentID, request.Actor)
 		}
 		if err != nil {
 			return publicops.DeleteCommentResult{}, "", err

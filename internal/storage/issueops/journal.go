@@ -366,9 +366,9 @@ func RecordDepEventInTx(ctx context.Context, tx DBTX, op EventOp, issueID, kind,
 }
 
 // RecordCommentEventInTx records a replayable structured or audit comment. The
-// journal row's actor is the comment's Author — the identity that wrote it —
-// so this takes no separate actor parameter.
-func RecordCommentEventInTx(ctx context.Context, tx DBTX, issueID string, comment *EventComment) error {
+// payload preserves the comment author, while actor records the principal that
+// performed the mutation.
+func RecordCommentEventInTx(ctx context.Context, tx DBTX, issueID string, comment *EventComment, actor string) error {
 	if !journalEnabled(ctx, tx) {
 		return nil
 	}
@@ -376,7 +376,7 @@ func RecordCommentEventInTx(ctx context.Context, tx DBTX, issueID string, commen
 	if err != nil {
 		return fmt.Errorf("journal: snapshot comment for %s: %w", issueID, err)
 	}
-	return insertEventRow(ctx, tx, EventCommentWrite, issueID, issue, nil, comment, comment.Author)
+	return insertEventRow(ctx, tx, EventCommentWrite, issueID, issue, nil, comment, actor)
 }
 
 // getJournalIssueInTx augments the normal issue snapshot with the persisted

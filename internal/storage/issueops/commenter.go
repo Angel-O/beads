@@ -32,6 +32,9 @@ func ValidateAddCommentRequest(request publicops.AddCommentRequest) error {
 }
 
 func ValidateEditCommentRequest(request publicops.EditCommentRequest) error {
+	if request.Actor == "" {
+		return fmt.Errorf("%w: edit comment requires an actor", storage.ErrValidation)
+	}
 	if request.IssueID == "" {
 		return fmt.Errorf("%w: edit comment requires an issue ID", storage.ErrValidation)
 	}
@@ -45,6 +48,9 @@ func ValidateEditCommentRequest(request publicops.EditCommentRequest) error {
 }
 
 func ValidateDeleteCommentRequest(request publicops.DeleteCommentRequest) error {
+	if request.Actor == "" {
+		return fmt.Errorf("%w: delete comment requires an actor", storage.ErrValidation)
+	}
 	if request.IssueID == "" {
 		return fmt.Errorf("%w: delete comment requires an issue ID", storage.ErrValidation)
 	}
@@ -92,7 +98,7 @@ func ExecuteAddComment(ctx context.Context, tx *sql.Tx, request publicops.AddCom
 
 func ExecuteEditComment(ctx context.Context, tx *sql.Tx, request publicops.EditCommentRequest) (publicops.EditCommentResult, ChangedTables, error) {
 	isWisp := IsActiveWispInTx(ctx, tx, request.IssueID)
-	comment, err := EditCommentInTx(ctx, tx, request.IssueID, request.CommentID, request.Text, isWisp)
+	comment, err := EditCommentInTx(ctx, tx, request.IssueID, request.CommentID, request.Text, request.Actor, isWisp)
 	if err != nil {
 		return publicops.EditCommentResult{}, nil, err
 	}
@@ -103,7 +109,7 @@ func ExecuteEditComment(ctx context.Context, tx *sql.Tx, request publicops.EditC
 
 func ExecuteDeleteComment(ctx context.Context, tx *sql.Tx, request publicops.DeleteCommentRequest) (publicops.DeleteCommentResult, ChangedTables, error) {
 	isWisp := IsActiveWispInTx(ctx, tx, request.IssueID)
-	result, err := DeleteCommentInTx(ctx, tx, request.IssueID, request.CommentID, isWisp)
+	result, err := DeleteCommentInTx(ctx, tx, request.IssueID, request.CommentID, request.Actor, isWisp)
 	if err != nil {
 		return publicops.DeleteCommentResult{}, nil, err
 	}
@@ -123,7 +129,7 @@ func commentTable(useWisp bool) string {
 // creation timestamp. The issue and comment checks share the write transaction.
 //
 //nolint:gosec // G201: table names are hardcoded routing constants
-func EditCommentInTx(ctx context.Context, tx DBTX, issueID, commentID, text string, useWisp bool) (*types.Comment, error) {
+func EditCommentInTx(ctx context.Context, tx DBTX, issueID, commentID, text, actor string, useWisp bool) (*types.Comment, error) {
 	table := commentTable(useWisp)
 	if err := requireCommentIssue(ctx, tx, issueID, useWisp); err != nil {
 		return nil, err
@@ -138,7 +144,7 @@ func EditCommentInTx(ctx context.Context, tx DBTX, issueID, commentID, text stri
 	comment.Text = text
 	if err := RecordCommentEventInTx(ctx, tx, issueID, &EventComment{
 		ID: comment.ID, Author: comment.Author, Text: comment.Text, CreatedAt: comment.CreatedAt, Source: CommentSourceStructured,
-	}); err != nil {
+	}, actor); err != nil {
 		return nil, err
 	}
 	return comment, nil
@@ -147,7 +153,7 @@ func EditCommentInTx(ctx context.Context, tx DBTX, issueID, commentID, text stri
 // DeleteCommentInTx removes a comment and journals its tombstone.
 //
 //nolint:gosec // G201: table names are hardcoded routing constants
-func DeleteCommentInTx(ctx context.Context, tx DBTX, issueID, commentID string, useWisp bool) (publicops.DeleteCommentResult, error) {
+func DeleteCommentInTx(ctx context.Context, tx DBTX, issueID, commentID, actor string, useWisp bool) (publicops.DeleteCommentResult, error) {
 	table := commentTable(useWisp)
 	if err := requireCommentIssue(ctx, tx, issueID, useWisp); err != nil {
 		return publicops.DeleteCommentResult{}, err
@@ -162,7 +168,7 @@ func DeleteCommentInTx(ctx context.Context, tx DBTX, issueID, commentID string, 
 	if err := RecordCommentEventInTx(ctx, tx, issueID, &EventComment{
 		ID: comment.ID, Author: comment.Author, Text: comment.Text, CreatedAt: comment.CreatedAt,
 		Source: CommentSourceStructured, Deleted: true,
-	}); err != nil {
+	}, actor); err != nil {
 		return publicops.DeleteCommentResult{}, err
 	}
 	return publicops.DeleteCommentResult{IssueID: issueID, CommentID: comment.ID}, nil

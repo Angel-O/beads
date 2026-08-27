@@ -264,12 +264,13 @@ var commentsEditCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		CheckReadonly("comments edit")
 		issueID, commentID := args[0], args[1]
+		mutationActor := getActorWithGit()
 		text, err := requireTextFromSources("comment text", "use positional args, --stdin, or --file", cmdTextSources(cmd, args[2:]))
 		if err != nil {
 			return HandleErrorRespectJSON("%v", err)
 		}
 		if usesProxiedServer() {
-			return runCommentsEditProxiedServer(rootCtx, issueID, commentID, text)
+			return runCommentsEditProxiedServer(rootCtx, issueID, commentID, text, mutationActor)
 		}
 		if err := ensureStoreActive(); err != nil {
 			return HandleErrorRespectJSON("editing comment: %v", err)
@@ -287,8 +288,12 @@ var commentsEditCmd = &cobra.Command{
 			}
 			return HandleErrorRespectJSON("issue %s not found", issueID)
 		}
+		if result.ResolvedID != issueID {
+			result.Close()
+			return HandleErrorRespectJSON("issue %s not found", issueID)
+		}
 		defer result.Close()
-		comment, err := editCommentDirect(rootCtx, result.Store, result.ResolvedID, commentID, text)
+		comment, err := editCommentDirect(rootCtx, result.Store, result.ResolvedID, commentID, text, mutationActor)
 		if err != nil {
 			return HandleErrorRespectJSON("editing comment: %v", err)
 		}
@@ -315,8 +320,9 @@ var commentsDeleteCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		CheckReadonly("comments delete")
 		issueID, commentID := args[0], args[1]
+		mutationActor := getActorWithGit()
 		if usesProxiedServer() {
-			return runCommentsDeleteProxiedServer(rootCtx, issueID, commentID)
+			return runCommentsDeleteProxiedServer(rootCtx, issueID, commentID, mutationActor)
 		}
 		if err := ensureStoreActive(); err != nil {
 			return HandleErrorRespectJSON("deleting comment: %v", err)
@@ -334,8 +340,12 @@ var commentsDeleteCmd = &cobra.Command{
 			}
 			return HandleErrorRespectJSON("issue %s not found", issueID)
 		}
+		if result.ResolvedID != issueID {
+			result.Close()
+			return HandleErrorRespectJSON("issue %s not found", issueID)
+		}
 		defer result.Close()
-		deleted, err := deleteCommentDirect(rootCtx, result.Store, result.ResolvedID, commentID)
+		deleted, err := deleteCommentDirect(rootCtx, result.Store, result.ResolvedID, commentID, mutationActor)
 		if err != nil {
 			return HandleErrorRespectJSON("deleting comment: %v", err)
 		}
@@ -397,7 +407,7 @@ func addCommentDirect(ctx context.Context, st storage.DoltStorage, issueID, auth
 	return result.Comment, nil
 }
 
-func editCommentDirect(ctx context.Context, st storage.DoltStorage, issueID, commentID, text string) (*types.Comment, error) {
+func editCommentDirect(ctx context.Context, st storage.DoltStorage, issueID, commentID, text, actor string) (*types.Comment, error) {
 	opsCtx, err := issueOpsContext(ctx)
 	if err != nil {
 		return nil, err
@@ -407,7 +417,7 @@ func editCommentDirect(ctx context.Context, st storage.DoltStorage, issueID, com
 		return nil, err
 	}
 	result, err := commenter.EditComment(opsCtx, issueops.EditCommentRequest{
-		IssueID: issueID, CommentID: commentID, Text: text,
+		IssueID: issueID, CommentID: commentID, Text: text, Actor: actor,
 	})
 	if err != nil {
 		return nil, err
@@ -415,7 +425,7 @@ func editCommentDirect(ctx context.Context, st storage.DoltStorage, issueID, com
 	return result.Comment, nil
 }
 
-func deleteCommentDirect(ctx context.Context, st storage.DoltStorage, issueID, commentID string) (issueops.DeleteCommentResult, error) {
+func deleteCommentDirect(ctx context.Context, st storage.DoltStorage, issueID, commentID, actor string) (issueops.DeleteCommentResult, error) {
 	opsCtx, err := issueOpsContext(ctx)
 	if err != nil {
 		return issueops.DeleteCommentResult{}, err
@@ -425,7 +435,7 @@ func deleteCommentDirect(ctx context.Context, st storage.DoltStorage, issueID, c
 		return issueops.DeleteCommentResult{}, err
 	}
 	return commenter.DeleteComment(opsCtx, issueops.DeleteCommentRequest{
-		IssueID: issueID, CommentID: commentID,
+		IssueID: issueID, CommentID: commentID, Actor: actor,
 	})
 }
 
@@ -445,11 +455,4 @@ func init() {
 	commentsAddCmd.ValidArgsFunction = issueIDCompletion
 
 	rootCmd.AddCommand(commentsCmd)
-}
-
-func isUnknownOperationError(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "unknown operation")
 }

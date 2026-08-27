@@ -50,6 +50,9 @@ type EditCommentRequest struct {
 	IssueID   string
 	CommentID string
 	Text      string
+	// Actor is the principal performing the edit, distinct from the comment's
+	// original Author.
+	Actor string
 }
 
 // EditCommentResult reports the edited comment.
@@ -61,6 +64,8 @@ type EditCommentResult struct {
 type DeleteCommentRequest struct {
 	IssueID   string
 	CommentID string
+	// Actor is the principal performing the deletion.
+	Actor string
 }
 
 // DeleteCommentResult reports the removed comment identity.
@@ -105,11 +110,14 @@ type Commenter interface {
 	// caller reconstructing threads from durable history alone will not see
 	// it.
 	AddComment(ctx context.Context, req AddCommentRequest) (AddCommentResult, error)
-	// EditComment replaces one comment's text as one atomic mutation. IssueID and
-	// CommentID are exact identities; a missing issue or comment is ErrNotFound,
-	// and blank replacement text is ErrValidation.
+	// EditComment replaces one comment's text as one atomic mutation. Actor is
+	// the principal performing the mutation and is kept separate from the
+	// comment's original Author. IssueID and CommentID are exact identities; a
+	// missing issue or comment is ErrNotFound, and blank replacement text is
+	// ErrValidation.
 	EditComment(ctx context.Context, req EditCommentRequest) (EditCommentResult, error)
-	// DeleteComment removes one comment as one atomic mutation. IssueID and
-	// CommentID are exact identities; a missing issue or comment is ErrNotFound.
+	// DeleteComment removes one comment as one atomic mutation. Actor is the
+	// principal performing the mutation. IssueID and CommentID are exact
+	// identities; a missing issue or comment is ErrNotFound.
 	DeleteComment(ctx context.Context, req DeleteCommentRequest) (DeleteCommentResult, error)
 }

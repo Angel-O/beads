@@ -94,6 +94,13 @@ func TestEmbeddedCommentsCLI(t *testing.T) {
 		if added.ID == "" {
 			t.Fatal("added comment ID is empty")
 		}
+		partialIssueID := issue.ID[:len(issue.ID)-1]
+		cmd := exec.Command(bd, "comments", "edit", partialIssueID, added.ID, "must fail")
+		cmd.Dir = dir
+		cmd.Env = bdEnv(dir)
+		if out, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("partial issue id edit unexpectedly succeeded: %s", out)
+		}
 
 		editedJSON := bdComments(t, bd, dir, "edit", issue.ID, added.ID, "after", "--json")
 		var edited map[string]interface{}

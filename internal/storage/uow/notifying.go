@@ -1388,32 +1388,32 @@ func (u *recordingCommentUC) AddCommentToWisp(ctx context.Context, wispID, autho
 	return comment, err
 }
 
-func (u *recordingCommentUC) EditCommentOnIssue(ctx context.Context, issueID, commentID, text string) (*types.Comment, error) {
-	comment, err := u.CommentUseCase.EditCommentOnIssue(ctx, issueID, commentID, text)
+func (u *recordingCommentUC) EditCommentOnIssue(ctx context.Context, issueID, commentID, text, actor string) (*types.Comment, error) {
+	comment, err := u.CommentUseCase.EditCommentOnIssue(ctx, issueID, commentID, text, actor)
 	if err == nil {
 		u.rec.record(opUpdate, u.snap.issue(ctx, issueID))
 	}
 	return comment, err
 }
 
-func (u *recordingCommentUC) EditCommentOnWisp(ctx context.Context, wispID, commentID, text string) (*types.Comment, error) {
-	comment, err := u.CommentUseCase.EditCommentOnWisp(ctx, wispID, commentID, text)
+func (u *recordingCommentUC) EditCommentOnWisp(ctx context.Context, wispID, commentID, text, actor string) (*types.Comment, error) {
+	comment, err := u.CommentUseCase.EditCommentOnWisp(ctx, wispID, commentID, text, actor)
 	if err == nil {
 		u.rec.record(opUpdate, u.snap.wisp(ctx, wispID))
 	}
 	return comment, err
 }
 
-func (u *recordingCommentUC) DeleteCommentFromIssue(ctx context.Context, issueID, commentID string) error {
-	err := u.CommentUseCase.DeleteCommentFromIssue(ctx, issueID, commentID)
+func (u *recordingCommentUC) DeleteCommentFromIssue(ctx context.Context, issueID, commentID, actor string) error {
+	err := u.CommentUseCase.DeleteCommentFromIssue(ctx, issueID, commentID, actor)
 	if err == nil {
 		u.rec.record(opUpdate, u.snap.issue(ctx, issueID))
 	}
 	return err
 }
 
-func (u *recordingCommentUC) DeleteCommentFromWisp(ctx context.Context, wispID, commentID string) error {
-	err := u.CommentUseCase.DeleteCommentFromWisp(ctx, wispID, commentID)
+func (u *recordingCommentUC) DeleteCommentFromWisp(ctx context.Context, wispID, commentID, actor string) error {
+	err := u.CommentUseCase.DeleteCommentFromWisp(ctx, wispID, commentID, actor)
 	if err == nil {
 		u.rec.record(opUpdate, u.snap.wisp(ctx, wispID))
 	}
