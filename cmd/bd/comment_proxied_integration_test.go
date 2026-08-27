@@ -251,7 +251,7 @@ func TestProxiedServerComment(t *testing.T) {
 		if err != nil {
 			t.Fatalf("delete comment failed: %v\nstdout:%s\nstderr:%s", err, stdout, stderr)
 		}
-		var deleted map[string]string
+		var deleted map[string]any
 		if err := json.Unmarshal([]byte(stdout), &deleted); err != nil {
 			t.Fatalf("decode deleted comment: %v\n%s", err, stdout)
 		}
