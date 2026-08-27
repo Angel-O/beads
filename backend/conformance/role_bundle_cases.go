@@ -176,6 +176,8 @@ var roleContractCases = []roleContract{
 		RunCommenterRefusesBlankText,
 		RunCommenterRefusesAnEmptyAuthor,
 		RunCommenterLeavesTheCallersRequestAlone,
+		RunCommenterEditsTheNamedComment,
+		RunCommenterDeletesTheNamedComment,
 	),
 
 	roleCases("Counter", "Counter()", oncePerRole,

@@ -45,13 +45,42 @@ type AddCommentResult struct {
 	Comment *Comment
 }
 
-// Commenter describes adding a comment to an issue: the write side of `bd
-// comment`, and — like Lifecycle, Reader, ReadyClaimer, BatchCloser and
-// DependencyEditor — a role with its own accessor. A new capability gets a new
-// role interface and its own accessor; never append a method here.
+// EditCommentRequest names the comment to replace.
+type EditCommentRequest struct {
+	IssueID   string
+	CommentID string
+	Text      string
+	// Actor is the principal performing the edit, distinct from the comment's
+	// original Author.
+	Actor string
+}
+
+// EditCommentResult reports the edited comment.
+type EditCommentResult struct {
+	Comment *Comment
+}
+
+// DeleteCommentRequest names the comment to remove.
+type DeleteCommentRequest struct {
+	IssueID   string
+	CommentID string
+	// Actor is the principal performing the deletion.
+	Actor string
+}
+
+// DeleteCommentResult reports the removed comment identity.
+type DeleteCommentResult struct {
+	IssueID   string `json:"issue_id"`
+	CommentID string `json:"comment_id"`
+}
+
+// Commenter describes comment mutations: the write side of `bd comment`, and —
+// like Lifecycle, Reader, ReadyClaimer, BatchCloser and DependencyEditor — a
+// role with its own accessor. Comment edits and deletes remain on this role
+// because they mutate the same comment thread and share its identity contract.
 //
 // It is its own role rather than a Lifecycle verb because a comment is not a
-// patch to an issue. It appends a row to a thread the issue owns and leaves
+// patch to an issue. It mutates a row in a thread the issue owns and leaves
 // every field of the issue untouched, so an IssuePatch has nothing to carry
 // and an UpdateResult has nowhere to put the comment.
 //
@@ -81,4 +110,14 @@ type Commenter interface {
 	// caller reconstructing threads from durable history alone will not see
 	// it.
 	AddComment(ctx context.Context, req AddCommentRequest) (AddCommentResult, error)
+	// EditComment replaces one comment's text as one atomic mutation. Actor is
+	// the principal performing the mutation and is kept separate from the
+	// comment's original Author. IssueID and CommentID are exact identities; a
+	// missing issue or comment is ErrNotFound, and blank replacement text is
+	// ErrValidation.
+	EditComment(ctx context.Context, req EditCommentRequest) (EditCommentResult, error)
+	// DeleteComment removes one comment as one atomic mutation. Actor is the
+	// principal performing the mutation. IssueID and CommentID are exact
+	// identities; a missing issue or comment is ErrNotFound.
+	DeleteComment(ctx context.Context, req DeleteCommentRequest) (DeleteCommentResult, error)
 }

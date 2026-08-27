@@ -175,8 +175,17 @@ func (r *commentSQLRepositoryImpl) InsertRecord(ctx context.Context, comment *ty
 
 	if err := issueops.RecordCommentEventInTx(ctx, r.runner, copy.IssueID, &issueops.EventComment{
 		ID: copy.ID, Author: copy.Author, Text: copy.Text, CreatedAt: copy.CreatedAt, Source: issueops.CommentSourceStructured,
-	}); err != nil {
+	}, copy.Author); err != nil {
 		return nil, err
 	}
 	return &copy, nil
+}
+
+func (r *commentSQLRepositoryImpl) Edit(ctx context.Context, issueID, commentID, text, actor string, opts domain.CommentOpts) (*types.Comment, error) {
+	return issueops.EditCommentInTx(ctx, r.runner, issueID, commentID, text, actor, opts.UseWispsTable)
+}
+
+func (r *commentSQLRepositoryImpl) Delete(ctx context.Context, issueID, commentID, actor string, opts domain.CommentOpts) error {
+	_, err := issueops.DeleteCommentInTx(ctx, r.runner, issueID, commentID, actor, opts.UseWispsTable)
+	return err
 }

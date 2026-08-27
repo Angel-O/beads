@@ -18,6 +18,8 @@ type CommentSQLRepository interface {
 	IterByIssueID(ctx context.Context, issueID string, opts CommentOpts) (storage.Iter[types.Comment], error)
 	Insert(ctx context.Context, issueID, author, text string, opts CommentOpts) (*types.Comment, error)
 	InsertRecord(ctx context.Context, comment *types.Comment, opts CommentOpts) (*types.Comment, error)
+	Edit(ctx context.Context, issueID, commentID, text, actor string, opts CommentOpts) (*types.Comment, error)
+	Delete(ctx context.Context, issueID, commentID, actor string, opts CommentOpts) error
 }
 
 type CommentUseCase interface {
@@ -35,6 +37,10 @@ type CommentUseCase interface {
 
 	AddCommentToIssue(ctx context.Context, issueID, author, text string) (*types.Comment, error)
 	AddCommentToWisp(ctx context.Context, wispID, author, text string) (*types.Comment, error)
+	EditCommentOnIssue(ctx context.Context, issueID, commentID, text, actor string) (*types.Comment, error)
+	EditCommentOnWisp(ctx context.Context, wispID, commentID, text, actor string) (*types.Comment, error)
+	DeleteCommentFromIssue(ctx context.Context, issueID, commentID, actor string) error
+	DeleteCommentFromWisp(ctx context.Context, wispID, commentID, actor string) error
 }
 
 func NewCommentUseCase(commentRepo CommentSQLRepository) CommentUseCase {
@@ -137,6 +143,22 @@ func (u *commentUseCaseImpl) AddCommentToIssue(ctx context.Context, issueID, aut
 
 func (u *commentUseCaseImpl) AddCommentToWisp(ctx context.Context, wispID, author, text string) (*types.Comment, error) {
 	return u.add(ctx, wispID, author, text, true)
+}
+
+func (u *commentUseCaseImpl) EditCommentOnIssue(ctx context.Context, issueID, commentID, text, actor string) (*types.Comment, error) {
+	return u.commentRepo.Edit(ctx, issueID, commentID, text, actor, CommentOpts{})
+}
+
+func (u *commentUseCaseImpl) EditCommentOnWisp(ctx context.Context, wispID, commentID, text, actor string) (*types.Comment, error) {
+	return u.commentRepo.Edit(ctx, wispID, commentID, text, actor, CommentOpts{UseWispsTable: true})
+}
+
+func (u *commentUseCaseImpl) DeleteCommentFromIssue(ctx context.Context, issueID, commentID, actor string) error {
+	return u.commentRepo.Delete(ctx, issueID, commentID, actor, CommentOpts{})
+}
+
+func (u *commentUseCaseImpl) DeleteCommentFromWisp(ctx context.Context, wispID, commentID, actor string) error {
+	return u.commentRepo.Delete(ctx, wispID, commentID, actor, CommentOpts{UseWispsTable: true})
 }
 
 func (u *commentUseCaseImpl) add(ctx context.Context, id, author, text string, useWisp bool) (*types.Comment, error) {

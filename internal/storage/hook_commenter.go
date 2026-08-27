@@ -35,3 +35,19 @@ func (c *hookCommenter) AddComment(ctx context.Context, request issueops.AddComm
 	}
 	return result, err
 }
+
+func (c *hookCommenter) EditComment(ctx context.Context, request issueops.EditCommentRequest) (issueops.EditCommentResult, error) {
+	result, err := c.inner.EditComment(ctx, request)
+	if err == nil && result.Comment != nil {
+		c.hooks.CompleteIssueOperationComment(ctx, result.Comment.IssueID)
+	}
+	return result, err
+}
+
+func (c *hookCommenter) DeleteComment(ctx context.Context, request issueops.DeleteCommentRequest) (issueops.DeleteCommentResult, error) {
+	result, err := c.inner.DeleteComment(ctx, request)
+	if err == nil {
+		c.hooks.CompleteIssueOperationComment(ctx, result.IssueID)
+	}
+	return result, err
+}

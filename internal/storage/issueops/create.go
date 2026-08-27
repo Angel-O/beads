@@ -200,7 +200,7 @@ func CreateIssueInTxWithResult(ctx context.Context, tx DBTX, bc *BatchContext, i
 	// bead it has not seen created. Dedup hits above inserted nothing and emit
 	// nothing.
 	for i := range result.persistedComments {
-		if err := RecordCommentEventInTx(ctx, tx, issue.ID, &result.persistedComments[i]); err != nil {
+		if err := RecordCommentEventInTx(ctx, tx, issue.ID, &result.persistedComments[i], result.persistedComments[i].Author); err != nil {
 			return result, err
 		}
 	}
