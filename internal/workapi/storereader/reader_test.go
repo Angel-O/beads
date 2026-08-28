@@ -29,7 +29,10 @@ type fakeReaderStore struct {
 
 	readyFilters  []types.WorkFilter
 	searchFilters []types.IssueFilter
+	wakeCalls     int
 }
+
+func (s *fakeReaderStore) WakeExpiredDefers(context.Context) { s.wakeCalls++ }
 
 func (s *fakeReaderStore) GetReadyWorkWithCounts(_ context.Context, f types.WorkFilter) ([]*types.IssueWithCounts, error) {
 	s.readyFilters = append(s.readyFilters, f)
@@ -67,7 +70,7 @@ func readerFixture(n int) []*types.IssueWithCounts {
 func storeReaderFor(t *testing.T, rows []*types.IssueWithCounts) (issueops.Reader, *fakeReaderStore) {
 	t.Helper()
 	store := &fakeReaderStore{rows: rows}
-	rd, err := New(store)
+	rd, err := New(store, store)
 	if err != nil {
 		t.Fatalf("storereader.New: %v", err)
 	}
@@ -195,6 +198,23 @@ func TestStoreReaderListOverFetchesForAPushdownSort(t *testing.T) {
 	}
 }
 
+func TestStoreReaderListReadyUsesTheOrdinarySearchQuery(t *testing.T) {
+	limit := 2
+	rd, store := storeReaderFor(t, readerFixture(3))
+	if _, err := rd.List(context.Background(), issueops.ListRequest{ReadyFlag: true, SortBy: "created", Limit: &limit}); err != nil {
+		t.Fatalf("List ready: %v", err)
+	}
+	if len(store.readyFilters) != 0 || len(store.searchFilters) != 1 {
+		t.Fatalf("ran %d ready queries and %d ordinary searches", len(store.readyFilters), len(store.searchFilters))
+	}
+	if store.wakeCalls != 1 {
+		t.Fatalf("expired-defer wake calls = %d, want 1", store.wakeCalls)
+	}
+	if !store.searchFilters[0].Ready {
+		t.Fatal("ordinary search filter lost ready selection")
+	}
+}
+
 // TestStoreReaderReachesPastTheOffset pins the mechanism this body pages with,
 // which the page alone cannot show. The seam renders LIMIT without OFFSET, so
 // the reader has to ask for the skipped rows TOO — limit + offset + the probe
@@ -285,12 +305,18 @@ func TestStoreReaderServesOffsetZero(t *testing.T) {
 // that hands back a reader over nothing would fail on the first query with a
 // nil dereference instead of at the seam that knows what is missing.
 func TestStoreReaderRefusesANilStore(t *testing.T) {
-	rd, err := New(nil)
+	rd, err := New(nil, nil)
 	if err == nil {
 		t.Fatalf("New(nil) = %v, want an error", rd)
 	}
 	if rd != nil {
 		t.Errorf("New(nil) returned %T alongside its error", rd)
+	}
+
+	store := &fakeReaderStore{}
+	rd, err = New(store, nil)
+	if err == nil || rd != nil {
+		t.Fatalf("New(store, nil) = (%T, %v), want constructor error", rd, err)
 	}
 	var unsupported *storage.ErrUnsupported
 	if !errors.As(err, &unsupported) {

@@ -84,7 +84,7 @@ func runListProxiedPage(ctx context.Context, out io.Writer, in listInput) error 
 		if err != nil {
 			return err
 		}
-		return emitProxiedListJSONResult(page.Items, in, page.HasMore)
+		return emitProxiedListJSONResult(page.Items, in, page.HasMore, page.NextCursor)
 	}
 
 	// SkipCounts for the reason the direct route sets it: no text rendering
@@ -195,17 +195,13 @@ func runListProxiedWatch(_ *cobra.Command, ctx context.Context, in listInput) er
 // no epilogue of its own: the sort, the trim and the has-more verdict are
 // workapi.FinishPage's, inside issueops.Reader.List, where the direct route's
 // are too.
-func emitProxiedListJSONResult(iwc []*types.IssueWithCounts, in listInput, hasMore bool) error {
-	var err error
-	if in.SkipLabels {
-		err = outputJSON(newSkipLabelsListJSONResponse(iwc))
-	} else {
-		err = outputJSON(iwc)
-	}
-	if err != nil {
+func emitProxiedListJSONResult(iwc []*types.IssueWithCounts, in listInput, hasMore bool, nextCursor string) error {
+	if err := emitListJSONPage(iwc, in, hasMore, nextCursor); err != nil {
 		return err
 	}
-	printTruncationHint(hasMore, in.effectiveLimit)
+	if !in.Paginate && in.Cursor == "" {
+		printTruncationHint(hasMore, in.effectiveLimit)
+	}
 	return nil
 }
 

@@ -88,6 +88,7 @@ func (s readerStore) GetCustomStatusesDetailed(context.Context) ([]types.CustomS
 }
 func (s readerStore) GetCustomTypes(context.Context) ([]string, error) { return nil, nil }
 func (s readerStore) GetInfraTypes(context.Context) map[string]bool    { return nil }
+func (s readerStore) WakeExpiredDefers(context.Context)                {}
 
 func pageIDs(page publicops.IssuePage) []string {
 	out := make([]string, 0, len(page.Items))
@@ -130,7 +131,7 @@ func TestBothReaderImplementationsAgreeOnTheListEpilogue(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewIssueReader: %v", err)
 			}
-			overStore, err := storereader.New(readerStore{rows: readerRows()})
+			overStore, err := storereader.New(readerStore{rows: readerRows()}, readerStore{rows: readerRows()})
 			if err != nil {
 				t.Fatalf("storereader.New: %v", err)
 			}

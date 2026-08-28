@@ -1851,21 +1851,27 @@ type Statistics struct {
 
 // IssueFilter is used to filter issue queries
 type IssueFilter struct {
-	Status        *Status
-	Statuses      []Status // Multiple status OR filter (from comma-separated --status)
-	Priority      *int
-	IssueType     *IssueType
-	Assignee      *string
-	Labels        []string // AND semantics: issue must have ALL these labels
-	LabelsAny     []string // OR semantics: issue must have AT LEAST ONE of these labels
-	ExcludeLabels []string // Exclusion: issue must NOT have ANY of these labels
-	LabelPattern  string   // Glob pattern for label matching (e.g., "tech-*")
-	LabelRegex    string   // Regex pattern for label matching (e.g., "tech-(debt|legacy)")
-	TitleSearch   string
-	IDs           []string // Filter by specific issue IDs
-	IDPrefix      string   // Filter by ID prefix (e.g., "bd-" to match "bd-abc123")
-	SpecIDPrefix  string   // Filter by spec_id prefix
-	Limit         int
+	// Ready adds the blocker-aware ready-work selection to the ordinary issue
+	// query so it composes with every other filter and SQL keyset pagination.
+	Ready bool `json:"-"`
+	// ReadyDeferredChildIDs is populated by the storage execution seam from the
+	// shared ready-work deferred-parent traversal. It is not caller input.
+	ReadyDeferredChildIDs []string `json:"-"`
+	Status                *Status
+	Statuses              []Status // Multiple status OR filter (from comma-separated --status)
+	Priority              *int
+	IssueType             *IssueType
+	Assignee              *string
+	Labels                []string // AND semantics: issue must have ALL these labels
+	LabelsAny             []string // OR semantics: issue must have AT LEAST ONE of these labels
+	ExcludeLabels         []string // Exclusion: issue must NOT have ANY of these labels
+	LabelPattern          string   // Glob pattern for label matching (e.g., "tech-*")
+	LabelRegex            string   // Regex pattern for label matching (e.g., "tech-(debt|legacy)")
+	TitleSearch           string
+	IDs                   []string // Filter by specific issue IDs
+	IDPrefix              string   // Filter by ID prefix (e.g., "bd-" to match "bd-abc123")
+	SpecIDPrefix          string   // Filter by spec_id prefix
+	Limit                 int
 
 	// Pattern matching
 	TitleContains       string
@@ -1900,6 +1906,15 @@ type IssueFilter struct {
 	// ORDER BY is created_at DESC, id ASC — the order the predicate assumes.
 	AfterCreatedAt *time.Time
 	AfterID        string
+
+	// AfterSortAtSet carries the generalized date-sort keyset position used by
+	// bounded list pagination. AfterSortAt is nil only for the nullable closed_at
+	// group, and AfterSortID is its independent ID tie-break. SortBy selects
+	// created_at, updated_at, or closed_at. The legacy AfterCreatedAt/AfterID pair
+	// above remains independently supported.
+	AfterSortAtSet bool       `json:"-"`
+	AfterSortAt    *time.Time `json:"-"`
+	AfterSortID    string     `json:"-"`
 
 	// Empty/null checks
 	EmptyDescription bool

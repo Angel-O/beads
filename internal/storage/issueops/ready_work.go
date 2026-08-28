@@ -47,7 +47,7 @@ func buildReadyWorkOrder(policy types.SortPolicy) sqlbuild.ReadyWorkOrder {
 func buildReadyWorkPredicates(ctx context.Context, tx DBTX, filter types.WorkFilter, tables FilterTables) (*readyWorkPredicates, error) {
 	var inputs sqlbuild.ReadyWorkWhereInputs
 	if !filter.IncludeDeferred {
-		deferredChildIDs, dcErr := getChildrenOfDeferredParentsInTx(ctx, tx)
+		deferredChildIDs, dcErr := getDescendantsOfDeferredParentsInTx(ctx, tx)
 		if dcErr != nil {
 			return nil, fmt.Errorf("get ready work: compute deferred parent children: %w", dcErr)
 		}
@@ -581,6 +581,110 @@ func getChildrenOfDeferredParentsInTx(ctx context.Context, tx DBTX) ([]string, e
 		}
 	}
 	return childIDs, nil
+}
+
+// getDescendantsOfDeferredParentsInTx returns all descendants of issues with
+// a future defer_until. It deliberately uses the same recursive traversal as
+// parent filtering so ready work cannot expose grandchildren of deferred
+// parents.
+func getDescendantsOfDeferredParentsInTx(ctx context.Context, tx DBTX) ([]string, error) {
+	// Keep the cheap existence probe in front of the recursive walk. Besides
+	// avoiding extra queries in the common case, this preserves the existing
+	// error boundary for ready-work callers.
+	hasDeferredParent := false
+	for _, issueTable := range []string{"issues", "wisps"} {
+		//nolint:gosec // G201: issueTable is hardcoded to "issues" or "wisps"
+		var exists int
+		err := tx.QueryRowContext(ctx, fmt.Sprintf(`
+			SELECT 1 FROM %s
+			WHERE defer_until IS NOT NULL
+			  AND defer_until > UTC_TIMESTAMP()
+			LIMIT 1
+		`, issueTable)).Scan(&exists)
+		if err == nil {
+			hasDeferredParent = true
+			break
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if issueTable == "wisps" && isTableNotExistError(err) {
+			continue
+		}
+		return nil, fmt.Errorf("deferred parents: check future-deferred parents from %s: %w", issueTable, err)
+	}
+	if !hasDeferredParent {
+		return nil, nil
+	}
+
+	parentIDs := make([]string, 0)
+	seenParents := make(map[string]struct{})
+	for _, issueTable := range []string{"issues", "wisps"} {
+		//nolint:gosec // G201: issueTable is hardcoded to "issues" or "wisps"
+		rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+			SELECT id FROM %s
+			WHERE defer_until IS NOT NULL
+			  AND defer_until > UTC_TIMESTAMP()
+		`, issueTable))
+		if err != nil {
+			if issueTable == "wisps" && isTableNotExistError(err) {
+				continue
+			}
+			return nil, fmt.Errorf("deferred parents: list future-deferred parents from %s: %w", issueTable, err)
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("deferred parents: scan parent from %s: %w", issueTable, err)
+			}
+			if _, ok := seenParents[id]; !ok {
+				seenParents[id] = struct{}{}
+				parentIDs = append(parentIDs, id)
+			}
+		}
+		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("deferred parents: parent rows from %s: %w", issueTable, err)
+		}
+	}
+
+	if len(parentIDs) == 0 {
+		return nil, nil
+	}
+
+	childIDs := make([]string, 0)
+	seenChildren := make(map[string]struct{})
+	for _, parentID := range parentIDs {
+		descendants, err := GetDescendantIDsInTx(ctx, tx, parentID, 0)
+		if err != nil {
+			return nil, fmt.Errorf("deferred parents: get descendants of %s: %w", parentID, err)
+		}
+		for _, id := range descendants {
+			if _, ok := seenChildren[id]; ok {
+				continue
+			}
+			seenChildren[id] = struct{}{}
+			childIDs = append(childIDs, id)
+		}
+	}
+	return childIDs, nil
+}
+
+// PopulateReadyDeferredChildIDs applies the same future-deferred parent-child
+// selection used by ready-work queries to an ordinary list filter. The caller
+// owns the filter value, so this adds execution-derived exclusion IDs without
+// changing the public request.
+func PopulateReadyDeferredChildIDs(ctx context.Context, tx DBTX, filter *types.IssueFilter) error {
+	if filter == nil || !filter.Ready {
+		return nil
+	}
+	ids, err := getDescendantsOfDeferredParentsInTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	filter.ReadyDeferredChildIDs = ids
+	return nil
 }
 
 //nolint:gosec // G201: depTable is hardcoded to "dependencies" or "wisp_dependencies"

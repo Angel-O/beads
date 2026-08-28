@@ -11,6 +11,9 @@ import (
 )
 
 func SearchIssuesWithCountsInTx(ctx context.Context, tx *sql.Tx, query string, filter types.IssueFilter) ([]*types.IssueWithCounts, error) {
+	if err := PopulateReadyDeferredChildIDs(ctx, tx, &filter); err != nil {
+		return nil, fmt.Errorf("search issues with counts: compute deferred parent children: %w", err)
+	}
 	wispDepsExist, err := optionalTableExistsInTx(ctx, tx, "wisp_dependencies")
 	if err != nil {
 		return nil, fmt.Errorf("search issues with counts: wisp dependency probe: %w", err)

@@ -51,6 +51,10 @@ func (s *EmbeddedDoltStore) GetReadyWork(ctx context.Context, filter types.WorkF
 	return result, err
 }
 
+func (s *EmbeddedDoltStore) WakeExpiredDefers(ctx context.Context) {
+	s.wakeExpiredDefers(ctx)
+}
+
 func (s *EmbeddedDoltStore) GetReadyWorkWithCounts(ctx context.Context, filter types.WorkFilter) ([]*types.IssueWithCounts, error) {
 	s.wakeExpiredDefers(ctx)
 	var result []*types.IssueWithCounts

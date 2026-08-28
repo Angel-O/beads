@@ -19,6 +19,11 @@ import (
 // unlimited.
 const DefaultListLimit = 50
 
+// MaxListPageLimit bounds explicit keyset pages before the storage seam adds
+// its one-row probe. Keeping the cap here prevents int overflow from turning a
+// hostile limit into an unbounded query.
+const MaxListPageLimit = 1000
+
 // PageLimit is the number of rows a list request asks to RECEIVE.
 func PageLimit(in issueops.ListRequest) int {
 	return LimitOr(in.Limit, DefaultListLimit)
@@ -184,18 +189,8 @@ func LoadUOWListConfig(ctx context.Context, uw UnitOfWork) (ListConfig, error) {
 // exclusions, the pinned and template defaults, and the gate, infra-type, and
 // wisp suppression that make the default listing show durable work only.
 func BuildListFilter(in issueops.ListRequest, cfg ListConfig) (types.IssueFilter, error) {
-	// The --ready arm reaches its query through ReadyFilterFromIssueFilter,
-	// which carries only part of what this filter can express. A request that
-	// asks --ready to honor something the projection drops is refused here,
-	// at the one point every frontend and every implementation of
-	// issueops.Reader passes through, rather than answered with the wider set.
-	// The drop set and the refusal text live beside the promise they enforce,
-	// in issueops.
-	if err := issueops.ValidateReadyFlagScope(in); err != nil {
-		return types.IssueFilter{}, err
-	}
-
 	filter := types.IssueFilter{
+		Ready: in.ReadyFlag,
 		Limit: SQLLimit(in),
 		// The offset is carried for the callers that consume this filter as a
 		// VALUE and run their own query — `bd list --watch` and the proxied
@@ -216,6 +211,9 @@ func BuildListFilter(in issueops.ListRequest, cfg ListConfig) (types.IssueFilter
 		// implementation of Reader.List.
 		MaxRows:       in.MaxRows,
 		MaxRowsSource: in.MaxRowsSource,
+	}
+	if err := ApplyListCursor(in, &filter); err != nil {
+		return types.IssueFilter{}, err
 	}
 
 	// The status selector is parsed once here; every consumer below — the

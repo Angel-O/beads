@@ -20,6 +20,25 @@ func TestProxiedServerList(t *testing.T) {
 	p := newSharedProxiedProject(t, bd, "lst")
 	seed := seedProxiedListData(t, bd, p)
 
+	t.Run("paginated_json_contract", func(t *testing.T) {
+		stdout, stderr, err := bdProxiedRunBuffers(t, bd, p.dir, "list", "--json", "--paginate", "--sort", "updated", "--limit", "2", "--all")
+		if err != nil {
+			t.Fatalf("first paginated page: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		}
+		first := parseListPaginatedJSON(t, []byte(stdout))
+		if len(first.Issues) != 2 || !first.Pagination.HasMore || first.Pagination.NextCursor == "" {
+			t.Fatalf("first page = %+v", first)
+		}
+		stdout, stderr, err = bdProxiedRunBuffers(t, bd, p.dir, "list", "--json", "--cursor", first.Pagination.NextCursor, "--sort", "updated", "--limit", "3", "--all", "--brief")
+		if err != nil {
+			t.Fatalf("resumed paginated page: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		}
+		second := parseListPaginatedJSON(t, []byte(stdout))
+		if second.Pagination.Limit != 3 {
+			t.Fatalf("changed limit not reflected: %+v", second.Pagination)
+		}
+	})
+
 	// --- A. Basic filtering ---
 
 	t.Run("status_open", func(t *testing.T) {

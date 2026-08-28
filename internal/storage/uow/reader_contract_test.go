@@ -83,11 +83,20 @@ func TestReaderContract(t *testing.T) {
 	t.Run("ListKeysetPositionResumesTheCreatedDescIDAscOrder", func(t *testing.T) {
 		conformance.RunReaderListKeysetPositionResumesTheCreatedDescIDAscOrder(t, ctx, fixture)
 	})
+	t.Run("ListBoundedDatePagination", func(t *testing.T) {
+		conformance.RunReaderListBoundedDatePagination(t, ctx, fixture)
+	})
+	t.Run("ListReadyKeysetPagination", func(t *testing.T) {
+		conformance.RunReaderListReadyKeysetPagination(t, ctx, fixture)
+	})
+	t.Run("ListReadyKeysetSortsAndExclusions", func(t *testing.T) {
+		conformance.RunReaderListReadyKeysetSortsAndExclusions(t, ctx, fixture)
+	})
 	t.Run("ListReadyFlagAnswersTheBlockerAwareSet", func(t *testing.T) {
 		conformance.RunReaderListReadyFlagAnswersTheBlockerAwareSet(t, ctx, fixture)
 	})
-	t.Run("ListReadyFlagRefusesAFilterItCannotCarry", func(t *testing.T) {
-		conformance.RunReaderListReadyFlagRefusesAFilterItCannotCarry(t, ctx, fixture)
+	t.Run("ListReadyFlagComposesWithOrdinaryFilters", func(t *testing.T) {
+		conformance.RunReaderListReadyFlagComposesWithOrdinaryFilters(t, ctx, fixture)
 	})
 	t.Run("ListEmptyPageIsWellFormed", func(t *testing.T) {
 		conformance.RunReaderListEmptyPageIsWellFormed(t, ctx, fixture)

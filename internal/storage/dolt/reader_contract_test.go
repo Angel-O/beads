@@ -116,16 +116,34 @@ func TestReaderListKeysetPositionResumesTheCreatedDescIDAscOrder(t *testing.T) {
 	conformance.RunReaderListKeysetPositionResumesTheCreatedDescIDAscOrder(t, ctx, fixture)
 }
 
+func TestReaderListBoundedDatePagination(t *testing.T) {
+	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
+	defer cleanup()
+	conformance.RunReaderListBoundedDatePagination(t, ctx, fixture)
+}
+
+func TestReaderListReadyKeysetPagination(t *testing.T) {
+	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
+	defer cleanup()
+	conformance.RunReaderListReadyKeysetPagination(t, ctx, fixture)
+}
+
+func TestReaderListReadyKeysetSortsAndExclusions(t *testing.T) {
+	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
+	defer cleanup()
+	conformance.RunReaderListReadyKeysetSortsAndExclusions(t, ctx, fixture)
+}
+
 func TestReaderListReadyFlagAnswersTheBlockerAwareSet(t *testing.T) {
 	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
 	defer cleanup()
 	conformance.RunReaderListReadyFlagAnswersTheBlockerAwareSet(t, ctx, fixture)
 }
 
-func TestReaderListReadyFlagRefusesAFilterItCannotCarry(t *testing.T) {
+func TestReaderListReadyFlagComposesWithOrdinaryFilters(t *testing.T) {
 	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
 	defer cleanup()
-	conformance.RunReaderListReadyFlagRefusesAFilterItCannotCarry(t, ctx, fixture)
+	conformance.RunReaderListReadyFlagComposesWithOrdinaryFilters(t, ctx, fixture)
 }
 
 func TestReaderListEmptyPageIsWellFormed(t *testing.T) {

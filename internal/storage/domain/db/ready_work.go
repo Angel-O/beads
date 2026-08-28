@@ -30,7 +30,7 @@ func buildReadyWorkOrder(policy types.SortPolicy) sqlbuild.ReadyWorkOrder {
 func (r *issueSQLRepositoryImpl) buildReadyWorkPredicates(ctx context.Context, filter types.WorkFilter, tables filterTables) (*readyWorkPredicates, error) {
 	var inputs sqlbuild.ReadyWorkWhereInputs
 	if !filter.IncludeDeferred {
-		deferredChildIDs, dcErr := r.getChildrenOfDeferredParents(ctx)
+		deferredChildIDs, dcErr := r.getDescendantsOfFutureDeferredParents(ctx)
 		if dcErr != nil {
 			return nil, fmt.Errorf("get ready work: compute deferred parent children: %w", dcErr)
 		}
@@ -68,6 +68,44 @@ func (r *issueSQLRepositoryImpl) getChildrenOfDeferredParents(ctx context.Contex
 		return nil, err
 	}
 	return r.descendantsOfFutureDeferredParents(ctx)
+}
+
+func (r *issueSQLRepositoryImpl) getDescendantsOfFutureDeferredParents(ctx context.Context) ([]string, error) {
+	has, err := r.anyFutureDeferredParent(ctx)
+	if err != nil || !has {
+		return nil, err
+	}
+
+	var parentIDs []string
+	for _, table := range []string{"issues", "wisps"} {
+		//nolint:gosec // G201: table is a hardcoded constant.
+		rows, err := r.runner.QueryContext(ctx, fmt.Sprintf(
+			`SELECT id FROM %s WHERE defer_until IS NOT NULL AND defer_until > UTC_TIMESTAMP()`, table))
+		if err != nil {
+			if table == "wisps" && dberrors.IsTableNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("deferred parents: list %s: %w", table, err)
+		}
+		if err := scanStringsInto(rows, &parentIDs); err != nil {
+			return nil, fmt.Errorf("deferred parents: scan %s: %w", table, err)
+		}
+	}
+
+	seen := make(map[string]struct{}, len(parentIDs))
+	var childIDs []string
+	for _, parentID := range parentIDs {
+		if _, ok := seen[parentID]; ok {
+			continue
+		}
+		seen[parentID] = struct{}{}
+		descendants, err := r.getDescendantIDs(ctx, parentID, 0)
+		if err != nil {
+			return nil, fmt.Errorf("deferred parents: descendants of %s: %w", parentID, err)
+		}
+		childIDs = append(childIDs, descendants...)
+	}
+	return childIDs, nil
 }
 
 func (r *issueSQLRepositoryImpl) anyFutureDeferredParent(ctx context.Context) (bool, error) {

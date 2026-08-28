@@ -15,6 +15,9 @@ import (
 )
 
 func (r *issueSQLRepositoryImpl) searchAcrossIssuesAndWispsWithCounts(ctx context.Context, query string, filter types.IssueFilter) (domain.SearchCountsPage, error) {
+	if err := issueops.PopulateReadyDeferredChildIDs(ctx, r.runner, &filter); err != nil {
+		return domain.SearchCountsPage{}, fmt.Errorf("search issues with counts: compute deferred parent children: %w", err)
+	}
 	wispDepsExist, err := r.optionalTableExists(ctx, "wisp_dependencies")
 	if err != nil {
 		return domain.SearchCountsPage{}, fmt.Errorf("search issues with counts: wisp dependency probe: %w", err)

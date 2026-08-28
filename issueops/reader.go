@@ -143,12 +143,11 @@ type ListRequest struct {
 	// IDFilter is a comma-separated id set.
 	IDFilter string
 
-	Labels        []string
-	LabelsAny     []string
-	ExcludeLabels []string
-	LabelPattern  string
-	LabelRegex    string
-
+	Labels           []string
+	LabelsAny        []string
+	ExcludeLabels    []string
+	LabelPattern     string
+	LabelRegex       string
 	TitleContains    string
 	DescContains     string
 	NotesContains    string
@@ -335,40 +334,10 @@ type ListRequest struct {
 
 	// AllFlag drops the default status exclusions.
 	//
-	// ReadyFlag switches the query to the blocker-aware ready set. It does NOT
-	// simply add a blocker predicate to this listing: that query reads a
-	// narrower filter vocabulary than this request can describe, and only part
-	// of the request reaches it.
-	//
-	// WHAT IT CARRIES: IssueType, all five label forms, Assignee, NoAssignee,
-	// the exact Priority, ParentID, MolType, WispType, MetadataFields,
-	// HasMetadataKey, the type exclusions (ExcludeTypes, and with them
-	// IncludeGates and IncludeInfra), IncludeEphemeral — the ready query has an
-	// ephemeral gate of its own, so the plane bit crosses intact and
-	// IncludeInfra's plane half crosses with it — Limit, Offset and the MaxRows
-	// cap with its attribution. SortBy and Reverse
-	// still apply, because the display order is applied to the page after the
-	// query rather than inside it. Status and AllFlag are resolved to "open"
-	// and have no further effect: ready work is open work.
-	//
-	// WHAT IT REFUSES: every other filter here is one the ready query cannot
-	// carry, so combining it with ReadyFlag returns ErrValidation naming the
-	// fields rather than answering a wider question than was asked. That is
-	// IDFilter, TitleSearch, SpecPrefix, the four *Contains fields,
-	// ExternalRef, every Created/Updated/Closed/Defer/Due bound, DeferredFlag,
-	// OverdueFlag, EmptyDesc, NoLabels, NoParent, PinnedFlag, PriorityMin,
-	// PriorityMax, and the keyset position. There is no fallback: no
-	// combination of the two silently widens the answer.
-	//
-	// TWO THINGS THE READY SET DECIDES FOR ITSELF, which no field here
-	// overrides. It never returns pinned issues, which is why NoPinnedFlag is
-	// accepted and PinnedFlag refused. And it applies no template predicate at
-	// all, so this request's default template exclusion does not reach it and
-	// IncludeTemplates changes nothing here: a template is left out of a
-	// ReadyFlag listing only when its issue type is one the ready query
-	// already excludes. SkipLabels and SkipCounts are likewise not carried —
-	// labels and cardinalities are hydrated either way, which costs time and
-	// not correctness.
+	// ReadyFlag adds the blocker-aware ready selection to the ordinary list
+	// query. It therefore composes with every list filter and keyset pagination
+	// without loading or offset-paging the full ready set. Ready rows are open,
+	// unpinned, not future-deferred, and have no unresolved blocking dependency.
 	AllFlag   bool
 	ReadyFlag bool
 
@@ -378,6 +347,14 @@ type ListRequest struct {
 	// which sorts those are.
 	SortBy  string
 	Reverse bool
+
+	// Paginate requests bounded keyset pagination. Cursor is an opaque token
+	// returned by a previous List page; supplying one implies Paginate. The
+	// implementation owns its encoding and validates that the sort and row
+	// selection still match. Limit may change between pages, and projection-only
+	// fields such as Brief do not invalidate a cursor.
+	Paginate bool
+	Cursor   string
 
 	// Limit bounds the page the caller RECEIVES. Nil means the shared list
 	// default; 0 means unlimited. The row limit actually pushed into the query
@@ -498,6 +475,9 @@ type IssuePage struct {
 	Items []*IssueWithCounts
 	// HasMore reports that the limit truncated the result.
 	HasMore bool
+	// NextCursor resumes after the final item. It is present only for an
+	// explicitly paginated page with HasMore true.
+	NextCursor string
 }
 
 // Reader describes guarded issue queries: the read counterpart of Lifecycle,

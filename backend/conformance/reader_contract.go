@@ -504,6 +504,7 @@ func RunReaderListDefaultExclusionsAndTheirOverrides(t *testing.T, ctx context.C
 		{"IncludeEphemeral reaches the plane and takes no type exclusion off", publicops.ListRequest{IDFilter: scope, IncludeEphemeral: true}, []string{open, wisp}},
 		// And they compose rather than fight: the union of the two answers.
 		{"IncludeEphemeral with IncludeInfra", publicops.ListRequest{IDFilter: scope, IncludeEphemeral: true, IncludeInfra: true}, []string{open, wisp, infraWisp}},
+		{"IncludeAllTypes with AllFlag reaches every non-tombstoned row", publicops.ListRequest{IDFilter: scope, IncludeAllTypes: true, AllFlag: true}, []string{open, closed, gate, template, wisp, infraWisp, flagOnly, statusOnly, flagAndStatus, flagAndClosed}},
 	} {
 		page, err := fixture.Reader.List(ctx, test.req)
 		if err != nil {
@@ -643,11 +644,8 @@ func RunReaderListKeysetPositionResumesTheCreatedDescIDAscOrder(t *testing.T, ct
 // sorted and trimmed.
 //
 // Scoped by LABEL rather than by the id set every other list case here uses,
-// and that is now the doc's promise rather than a workaround: the ready query
-// is reached through a narrower filter vocabulary, Labels is on the carried
-// side of it and IDFilter is not. The DROPPED half — and the refusal that
-// replaced the silent widening — is
-// RunReaderListReadyFlagRefusesAFilterItCannotCarry.
+// and that is now the doc's promise rather than a workaround. The ordinary
+// list query applies the ready predicate alongside this label selection.
 //
 // THREE READY IDS, not two, and the reason is the regression's other half. With
 // only bd-1 and bd-10 in the set, natural-numeric order, lexical order and the
@@ -697,93 +695,35 @@ func RunReaderListReadyFlagAnswersTheBlockerAwareSet(t *testing.T, ctx context.C
 	}
 }
 
-// RunReaderListReadyFlagRefusesAFilterItCannotCarry pins the DROPPED half of
-// the --ready arm (reader.go:219-226): a request that asks the blocker-aware
-// query to honor a filter it cannot carry is REFUSED with ErrValidation
-// naming the field, not answered with the wider set.
-//
-// This is the case that would have caught the original defect. An
-// IDFilter-scoped --ready request used to answer with every open row in the
-// workspace — measured at 18 rows for a three-id scope on the unit-of-work leg,
-// where the suite shares one database. The store-backed leg ran the same
-// unscoped query and passed anyway, because each of its cases owns a private
-// branch and the workspace happened to BE the seeded rows. A silently dropped
-// filter looks exactly like a passing test, so the assertion cannot be on the
-// rows: it has to be on the refusal.
-//
-// The message is asserted, not just the sentinel. A generic "unsupported
-// combination" would leave a caller to bisect their own request to find which
-// half of it was the problem.
-func RunReaderListReadyFlagRefusesAFilterItCannotCarry(t *testing.T, ctx context.Context, fixture ReaderFixture) {
+// RunReaderListReadyFlagComposesWithOrdinaryFilters pins ReadyFlag as an
+// ordinary SQL selection rather than a projection onto the narrower ready-work
+// query vocabulary. Every predicate here must narrow the ready set in place.
+func RunReaderListReadyFlagComposesWithOrdinaryFilters(t *testing.T, ctx context.Context, fixture ReaderFixture) {
 	t.Helper()
 	scope := readerLabel(fixture, "lsdrop")
 	one := readerID(fixture, "lsdrop", "1")
 	two := readerID(fixture, "lsdrop", "2")
-	for _, id := range []string{one, two} {
-		seedReaderIssue(t, ctx, fixture, readerIssue(id, types.TypeTask, scope))
-	}
-	cutoff := time.Now().UTC().Add(-time.Hour)
+	at := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+	first := readerIssue(one, types.TypeTask, scope)
+	first.Title = "selected ready row"
+	first.CreatedAt, first.UpdatedAt, first.Priority = at, at, 1
+	second := readerIssue(two, types.TypeTask, scope)
+	second.Title = "other row"
+	second.CreatedAt, second.UpdatedAt, second.Priority = at.Add(-time.Hour), at.Add(-time.Hour), 3
+	seedReaderIssue(t, ctx, fixture, first)
+	seedReaderIssue(t, ctx, fixture, second)
+	cutoff := at.Add(-time.Minute)
 	maxPriority := 1
 
-	// One per family the doc names, not one per field: the id set, the text
-	// searches, the date bounds, the pinned/absent-relation flags, the numeric
-	// range and the keyset position.
-	for _, tc := range []struct {
-		name  string
-		req   publicops.ListRequest
-		field string
-	}{
-		{"IDFilter", publicops.ListRequest{IDFilter: readerIDFilter(one), ReadyFlag: true}, "IDFilter"},
-		{"TitleContains", publicops.ListRequest{Labels: []string{scope}, TitleContains: one, ReadyFlag: true}, "TitleContains"},
-		{"CreatedAfter", publicops.ListRequest{Labels: []string{scope}, CreatedAfter: &cutoff, ReadyFlag: true}, "CreatedAfter"},
-		{"PinnedFlag", publicops.ListRequest{Labels: []string{scope}, PinnedFlag: true, ReadyFlag: true}, "PinnedFlag"},
-		{"PriorityMax", publicops.ListRequest{Labels: []string{scope}, PriorityMax: &maxPriority, ReadyFlag: true}, "PriorityMax"},
-		{"keyset position", publicops.ListRequest{Labels: []string{scope}, AfterCreatedAt: &cutoff, AfterID: one, ReadyFlag: true}, "AfterCreatedAt"},
-	} {
-		page, err := fixture.Reader.List(ctx, tc.req)
-		if !errors.Is(err, publicops.ErrValidation) {
-			t.Errorf("List --ready with %s: got (%d items, %v); want ErrValidation", tc.name, len(page.Items), err)
-			continue
-		}
-		if !strings.Contains(err.Error(), tc.field) {
-			t.Errorf("List --ready with %s refused without naming the field: %v", tc.name, err)
-		}
-	}
-
-	// Naming every field it could not honor, not just the first: a caller who
-	// fixes one and retries should not have to discover the next one the same
-	// way.
-	_, err := fixture.Reader.List(ctx, publicops.ListRequest{
-		IDFilter: readerIDFilter(one), OverdueFlag: true, ReadyFlag: true,
-	})
-	if !errors.Is(err, publicops.ErrValidation) {
-		t.Fatalf("List --ready with two dropped fields: %v; want ErrValidation", err)
-	}
-	for _, field := range []string{"IDFilter", "OverdueFlag"} {
-		if !strings.Contains(err.Error(), field) {
-			t.Errorf("List --ready with two dropped fields did not name %s: %v", field, err)
-		}
-	}
-
-	// The refusal is scoped to what the query cannot carry. Labels is carried,
-	// and NoPinnedFlag is already true of the ready set, so neither is refused
-	// — the doc promises both, and a validator that refused every flag it did
-	// not recognize would break `bd list --ready` outright.
 	page, err := fixture.Reader.List(ctx, publicops.ListRequest{
-		Labels: []string{scope}, NoPinnedFlag: true, ReadyFlag: true, SortBy: "id",
+		ReadyFlag: true, IDFilter: readerIDFilter(one, two), Labels: []string{scope},
+		TitleContains: "selected", CreatedAfter: &cutoff, PriorityMax: &maxPriority,
+		NoPinnedFlag: true, SortBy: "created",
 	})
 	if err != nil {
-		t.Fatalf("List --ready --no-pinned on a carried scope: %v", err)
+		t.Fatalf("List --ready with ordinary filters: %v", err)
 	}
-	assertReaderPageIDs(t, "List --ready --no-pinned on a carried scope", page, []string{one, two})
-
-	// Without ReadyFlag the same dropped fields are ordinary list filters and
-	// must still work: the refusal belongs to the arm, not to the request type.
-	page, err = fixture.Reader.List(ctx, publicops.ListRequest{IDFilter: readerIDFilter(one), SortBy: "id"})
-	if err != nil {
-		t.Fatalf("List --id without --ready: %v", err)
-	}
-	assertReaderPageIDs(t, "List --id without --ready", page, []string{one})
+	assertReaderPageIDs(t, "List --ready with ordinary filters", page, []string{one})
 }
 
 // RunReaderListEmptyPageIsWellFormed pins the page shape when nothing matches
@@ -1584,18 +1524,14 @@ func RunReaderListLimitBoundaryUnderASortTheDatabaseCanExpress(t *testing.T, ctx
 // the ready set decides for itself, which no request field overrides
 // (reader.go:216-217, 228-235, 415-416).
 //
-// STATUS: ready work is open work — "Open only, not in_progress"
-// (workapi/ready.go:44) — so neither an in_progress nor a closed row is in it.
-// PINNED: it never returns pinned issues. TEMPLATES: it applies no template
-// predicate AT ALL, which is the counter-intuitive half — the default listing's
-// template exclusion does not reach this query, so an open task-type template IS
-// ready work and IncludeTemplates changes nothing. And SkipLabels is not carried
-// either: labels are hydrated on this arm either way.
+// STATUS: ready work is open work, so neither an in_progress nor a closed row
+// is in it. PINNED: it never returns pinned issues. Ready() retains its own type
+// policy, while List(ReadyFlag) composes with ordinary list type controls.
 //
 // Asserted through BOTH doors, because they are two entry points to one query
 // and the doc states the promise as a property of the SET rather than of either
-// request. RunReaderListReadyFlagRefusesAFilterItCannotCarry pins only that the
-// flags are accepted or refused, never what the rows underneath them are; the
+// request. RunReaderListReadyFlagComposesWithOrdinaryFilters pins the list
+// composition; the
 // audit leaf that pins the pinned and type exclusions at the storage surface
 // (audit_dependencies_readiness.go) runs through the Factory, which hands back a
 // bare storage.DoltStorage, so it never runs on the unit-of-work backend at all
@@ -1626,8 +1562,6 @@ func RunReaderReadySetOwnsItsStatusPinnedAndTemplateDecisions(t *testing.T, ctx 
 	seedReaderIssue(t, ctx, fixture, pinnedIssue)
 	seedReaderIssue(t, ctx, fixture, templateIssue)
 
-	// The template is IN the answer: the ready query has no template predicate,
-	// and this type is not one it already excludes.
 	want := []string{open, template}
 
 	page, err := fixture.Reader.Ready(ctx, publicops.ReadyRequest{Labels: []string{scope}})
@@ -1639,18 +1573,16 @@ func RunReaderReadySetOwnsItsStatusPinnedAndTemplateDecisions(t *testing.T, ctx 
 	for _, test := range []struct {
 		name string
 		req  publicops.ListRequest
+		want []string
 	}{
-		{"List --ready", publicops.ListRequest{Labels: []string{scope}, ReadyFlag: true}},
-		{"List --ready --templates", publicops.ListRequest{Labels: []string{scope}, ReadyFlag: true, IncludeTemplates: true}},
-		{"List --ready --skip-labels", publicops.ListRequest{Labels: []string{scope}, ReadyFlag: true, SkipLabels: true}},
+		{"List --ready", publicops.ListRequest{Labels: []string{scope}, ReadyFlag: true}, []string{open}},
+		{"List --ready --templates", publicops.ListRequest{Labels: []string{scope}, ReadyFlag: true, IncludeTemplates: true}, want},
 	} {
 		page, err := fixture.Reader.List(ctx, test.req)
 		if err != nil {
 			t.Fatalf("%s: %v", test.name, err)
 		}
-		assertReaderPageIDSet(t, test.name, page, want)
-		// SkipLabels is not carried onto the ready query, so the rows come back
-		// hydrated on every one of these requests, not just the first two.
+		assertReaderPageIDSet(t, test.name, page, test.want)
 		assertReaderItemsCarryLabel(t, test.name, page, scope)
 	}
 }
@@ -1660,14 +1592,9 @@ func RunReaderReadySetOwnsItsStatusPinnedAndTemplateDecisions(t *testing.T, ctx 
 // NoAssignee and the exact Priority.
 //
 // RunReaderListReadyFlagAnswersTheBlockerAwareSet pins that list for Labels
-// alone. The rest of it reaches the ready query through
-// workapi.ReadyFilterFromIssueFilter (sort.go:49-84), the projection that stands
-// between "these filters reach the ready query" and a silently WIDER answer, and
-// nothing pins that projection field by field at any layer: the builder goldens
-// stop at BuildListFilter's IssueFilter, one step before it. A field dropped
-// there reproduces the defect class this file's own header narrates — a silently
-// dropped filter looks exactly like a passing test — so the assertion is that
-// the answer NARROWS, with a row present that the filter has to leave out.
+// alone. The rest of it is carried directly by the ordinary IssueFilter. A
+// field dropped there reproduces the defect class this file's own header
+// narrates, so the assertion is that the answer NARROWS.
 //
 // The three chosen are the three projection lines with distinct shapes:
 // Assignee copies a pointer, NoAssignee changes NAME on the way across (it
@@ -2477,6 +2404,307 @@ func RunReaderListKeysetPositionNarrowsWithoutReplacingTheOtherPredicates(t *tes
 		t.Fatalf("List resumed from the cursor under CreatedBefore: %v", err)
 	}
 	assertReaderPageIDs(t, "List resumed from the cursor under CreatedBefore", narrowed, []string{older, oldest})
+}
+
+// RunReaderListBoundedDatePagination exercises the backend-owned cursor over
+// every supported date order, including ties and the nullable closed_at tail.
+// It also pins terminal/empty pages, selection validation, projection and limit
+// changes, and insertion ahead of a created-order cursor between pages.
+func RunReaderListBoundedDatePagination(t *testing.T, ctx context.Context, fixture ReaderFixture) {
+	t.Helper()
+	scope := readerLabel(fixture, "bounded-page")
+	day := func(n int) time.Time { return time.Date(2026, 2, n, 12, 0, 0, 0, time.UTC) }
+	closedTie := day(4)
+	seeds := []struct {
+		name    string
+		created time.Time
+		updated time.Time
+		closed  *time.Time
+	}{
+		{"a", day(5), day(2), &closedTie},
+		{"b", day(5), day(4), &closedTie},
+		{"c", day(3), day(4), nil},
+		{"d", day(2), day(1), nil},
+	}
+	ids := make(map[string]string, len(seeds))
+	for _, seed := range seeds {
+		id := readerID(fixture, "bounded-page", seed.name)
+		ids[seed.name] = id
+		issue := readerIssue(id, types.TypeTask, scope)
+		issue.CreatedAt = seed.created
+		issue.UpdatedAt = seed.updated
+		issue.ClosedAt = seed.closed
+		if seed.closed != nil {
+			issue.Status = types.StatusClosed
+		}
+		seedReaderIssue(t, ctx, fixture, issue)
+	}
+
+	for _, test := range []struct {
+		sort string
+		want []string
+	}{
+		{"created", []string{ids["a"], ids["b"], ids["c"], ids["d"]}},
+		{"updated", []string{ids["b"], ids["c"], ids["a"], ids["d"]}},
+		{"closed", []string{ids["a"], ids["b"], ids["c"], ids["d"]}},
+	} {
+		t.Run(test.sort, func(t *testing.T) {
+			limit := 1
+			req := publicops.ListRequest{Labels: []string{scope}, AllFlag: true, Paginate: true, SortBy: test.sort, Limit: &limit}
+			var got []string
+			for pageNumber := 0; pageNumber < len(test.want)+1; pageNumber++ {
+				page, err := fixture.Reader.List(ctx, req)
+				if err != nil {
+					t.Fatalf("page %d: %v", pageNumber, err)
+				}
+				got = append(got, readerPageIDs(page)...)
+				if !page.HasMore {
+					if page.NextCursor != "" {
+						t.Fatalf("terminal page cursor = %q, want empty", page.NextCursor)
+					}
+					break
+				}
+				if page.NextCursor == "" {
+					t.Fatalf("page %d has_more without next cursor", pageNumber)
+				}
+				req.Cursor = page.NextCursor
+			}
+			if !slices.Equal(got, test.want) {
+				t.Fatalf("walk = %v, want %v", got, test.want)
+			}
+		})
+	}
+
+	limit := 2
+	base := publicops.ListRequest{Labels: []string{scope}, AllFlag: true, Paginate: true, SortBy: "created", Limit: &limit}
+	first, err := fixture.Reader.List(ctx, base)
+	if err != nil || first.NextCursor == "" {
+		t.Fatalf("first mutation page = %+v, %v", first, err)
+	}
+	ahead := readerIssue(readerID(fixture, "bounded-page", "new-ahead"), types.TypeTask, scope)
+	ahead.CreatedAt, ahead.UpdatedAt = day(6), day(6)
+	seedReaderIssue(t, ctx, fixture, ahead)
+	base.Cursor = first.NextCursor
+	second, err := fixture.Reader.List(ctx, base)
+	if err != nil {
+		t.Fatalf("page after insertion: %v", err)
+	}
+	if slices.Contains(readerPageIDs(second), ahead.ID) {
+		t.Fatalf("row inserted ahead of cursor repeated into later page: %v", readerPageIDs(second))
+	}
+
+	changedLimit := 1
+	base.Limit, base.Brief = &changedLimit, true
+	if _, err := fixture.Reader.List(ctx, base); err != nil {
+		t.Fatalf("limit and projection change invalidated cursor: %v", err)
+	}
+	changedSelection := base
+	changedSelection.Labels = []string{"different"}
+	if _, err := fixture.Reader.List(ctx, changedSelection); err == nil || !strings.Contains(err.Error(), "current list filters") {
+		t.Fatalf("changed selection error = %v", err)
+	}
+	changedSort := base
+	changedSort.SortBy = "updated"
+	if _, err := fixture.Reader.List(ctx, changedSort); err == nil || !strings.Contains(err.Error(), "created for sort") {
+		t.Fatalf("changed sort error = %v", err)
+	}
+
+	empty, err := fixture.Reader.List(ctx, publicops.ListRequest{
+		IDFilter: readerID(fixture, "bounded-page", "absent"), Paginate: true, SortBy: "created", Limit: &limit,
+	})
+	if err != nil {
+		t.Fatalf("empty page: %v", err)
+	}
+	if len(empty.Items) != 0 || empty.HasMore || empty.NextCursor != "" {
+		t.Fatalf("empty page = %+v", empty)
+	}
+}
+
+// RunReaderListReadyKeysetPagination proves ready selection, a date bound and
+// a stable keyset walk are one SQL query. The timestamp tie exceeds one page.
+func RunReaderListReadyKeysetPagination(t *testing.T, ctx context.Context, fixture ReaderFixture) {
+	t.Helper()
+	scope := readerLabel(fixture, "ready-page")
+	at := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	cutoff := at.Add(-time.Hour)
+	ready := []string{
+		readerID(fixture, "ready-page", "a"),
+		readerID(fixture, "ready-page", "b"),
+		readerID(fixture, "ready-page", "c"),
+		readerID(fixture, "ready-page", "d"),
+	}
+	blocked := readerID(fixture, "ready-page", "e-blocked")
+	blocker := readerID(fixture, "ready-page", "z-blocker")
+	for _, id := range append(slices.Clone(ready), blocked) {
+		issue := readerIssue(id, types.TypeTask, scope)
+		issue.CreatedAt, issue.UpdatedAt = at, at
+		seedReaderIssue(t, ctx, fixture, issue)
+	}
+	blockerIssue := readerIssue(blocker, types.TypeTask, "")
+	blockerIssue.CreatedAt, blockerIssue.UpdatedAt = at, at
+	seedReaderIssue(t, ctx, fixture, blockerIssue)
+	if err := fixture.AddDependency(ctx, &types.Dependency{IssueID: blocked, DependsOnID: blocker, Type: types.DepBlocks}, "seed"); err != nil {
+		t.Fatalf("seed blocker: %v", err)
+	}
+
+	limit := 2
+	req := publicops.ListRequest{
+		ReadyFlag: true, Labels: []string{scope}, CreatedAfter: &cutoff,
+		Paginate: true, SortBy: "created", Limit: &limit,
+	}
+	var walked []string
+	for pageNumber := 0; pageNumber < 4; pageNumber++ {
+		page, err := fixture.Reader.List(ctx, req)
+		if err != nil {
+			t.Fatalf("ready page %d: %v", pageNumber, err)
+		}
+		walked = append(walked, readerPageIDs(page)...)
+		if !page.HasMore {
+			if page.NextCursor != "" {
+				t.Fatalf("terminal ready cursor = %q", page.NextCursor)
+			}
+			break
+		}
+		if page.NextCursor == "" {
+			t.Fatalf("ready page %d has no cursor", pageNumber)
+		}
+		if pageNumber == 0 {
+			mismatch := req
+			mismatch.ReadyFlag = false
+			mismatch.Cursor = page.NextCursor
+			if _, err := fixture.Reader.List(ctx, mismatch); err == nil || !strings.Contains(err.Error(), "current list filters") {
+				t.Fatalf("ready cursor reused without ready error = %v", err)
+			}
+		}
+		req.Cursor = page.NextCursor
+	}
+	if !slices.Equal(walked, ready) {
+		t.Fatalf("ready keyset walk = %v, want %v (blocked %s excluded)", walked, ready, blocked)
+	}
+}
+
+// RunReaderListReadyKeysetSortsAndExclusions proves that the first-class ready
+// selection remains keyset-paginable for every supported date sort. The rows
+// excluded by readiness are deliberately in the same label scope so a page
+// cannot pass by filtering them out earlier: one is blocked, one is pinned,
+// one is future-deferred, and a grandparent-parent-grandchild chain hangs
+// beneath a future-deferred ancestor. An expired defer proves the wake sweep
+// makes the row visible again.
+func RunReaderListReadyKeysetSortsAndExclusions(t *testing.T, ctx context.Context, fixture ReaderFixture) {
+	t.Helper()
+	for _, test := range []struct {
+		sort string
+		want []string
+	}{
+		{"created", []string{"c", "b", "a"}},
+		{"updated", []string{"c", "b", "a"}},
+		{"closed", []string{"a", "b", "c"}},
+	} {
+		t.Run(test.sort, func(t *testing.T) {
+			scope := readerLabel(fixture, "ready-sort-"+test.sort)
+			base := time.Date(2026, 4, 5, 6, 7, 8, 0, time.UTC)
+			for i, name := range []string{"a", "b", "c"} {
+				issue := readerIssue(readerID(fixture, "ready-sort-"+test.sort, name), types.TypeTask, scope)
+				at := base.Add(time.Duration(i) * time.Hour)
+				issue.CreatedAt, issue.UpdatedAt = at, at
+				seedReaderIssue(t, ctx, fixture, issue)
+			}
+
+			blocked := readerID(fixture, "ready-sort-"+test.sort, "blocked")
+			blocker := readerID(fixture, "ready-sort-"+test.sort, "blocker")
+			seedReaderIssue(t, ctx, fixture, readerIssue(blocked, types.TypeTask, scope))
+			seedReaderIssue(t, ctx, fixture, readerIssue(blocker, types.TypeTask, ""))
+			if err := fixture.AddDependency(ctx, &types.Dependency{
+				IssueID: blocked, DependsOnID: blocker, Type: types.DepBlocks,
+			}, "seed"); err != nil {
+				t.Fatalf("seed blocker: %v", err)
+			}
+
+			pinned := readerIssue(readerID(fixture, "ready-sort-"+test.sort, "pinned"), types.TypeTask, scope)
+			pinned.Pinned = true
+			seedReaderIssue(t, ctx, fixture, pinned)
+			deferred := readerIssue(readerID(fixture, "ready-sort-"+test.sort, "deferred"), types.TypeTask, scope)
+			future := time.Now().UTC().Add(24 * time.Hour)
+			deferred.DeferUntil = &future
+			seedReaderIssue(t, ctx, fixture, deferred)
+			expired := readerIssue(readerID(fixture, "ready-sort-"+test.sort, "expired"), types.TypeTask, scope)
+			past := time.Now().UTC().Add(-24 * time.Hour)
+			expired.DeferUntil = &past
+			expired.CreatedAt, expired.UpdatedAt = base.Add(-time.Hour), base.Add(-time.Hour)
+			seedReaderIssue(t, ctx, fixture, expired)
+			deferredGrandparent := readerIssue(readerID(fixture, "ready-sort-"+test.sort, "deferred-grandparent"), types.TypeTask, "")
+			deferredGrandparent.DeferUntil = &future
+			deferredParent := readerIssue(readerID(fixture, "ready-sort-"+test.sort, "deferred-parent"), types.TypeTask, scope)
+			deferredGrandchild := readerIssue(readerID(fixture, "ready-sort-"+test.sort, "deferred-grandchild"), types.TypeTask, scope)
+			seedReaderIssue(t, ctx, fixture, deferredGrandparent)
+			seedReaderIssue(t, ctx, fixture, deferredParent)
+			seedReaderIssue(t, ctx, fixture, deferredGrandchild)
+			for _, dep := range []*types.Dependency{
+				{IssueID: deferredParent.ID, DependsOnID: deferredGrandparent.ID, Type: types.DepParentChild},
+				{IssueID: deferredGrandchild.ID, DependsOnID: deferredParent.ID, Type: types.DepParentChild},
+			} {
+				if err := fixture.AddDependency(ctx, dep, "seed"); err != nil {
+					t.Fatalf("seed deferred ancestor: %v", err)
+				}
+			}
+
+			limit := 2
+			req := publicops.ListRequest{
+				ReadyFlag: true, Labels: []string{scope}, Paginate: true,
+				SortBy: test.sort, Limit: &limit,
+			}
+			var walked []string
+			terminal := false
+			for pageNumber := 0; pageNumber < 3; pageNumber++ {
+				page, err := fixture.Reader.List(ctx, req)
+				if err != nil {
+					t.Fatalf("ready %s page %d: %v", test.sort, pageNumber, err)
+				}
+				walked = append(walked, readerPageIDs(page)...)
+				if pageNumber == 0 {
+					if !page.HasMore || page.NextCursor == "" {
+						t.Fatalf("ready %s first page = %+v, want continuation cursor", test.sort, page)
+					}
+					mismatch := req
+					mismatch.ReadyFlag = false
+					mismatch.Cursor = page.NextCursor
+					if _, err := fixture.Reader.List(ctx, mismatch); err == nil || !strings.Contains(err.Error(), "current list filters") {
+						t.Fatalf("ready %s cursor reused after ReadyFlag change: %v", test.sort, err)
+					}
+					req.Cursor = page.NextCursor
+				} else {
+					terminal = true
+					if page.NextCursor != "" {
+						t.Fatalf("ready %s terminal page = %+v", test.sort, page)
+					}
+					break
+				}
+			}
+			if !terminal {
+				t.Fatalf("ready %s pagination did not terminate", test.sort)
+			}
+			if !slices.Equal(walked, []string{
+				readerID(fixture, "ready-sort-"+test.sort, test.want[0]),
+				readerID(fixture, "ready-sort-"+test.sort, test.want[1]),
+				readerID(fixture, "ready-sort-"+test.sort, test.want[2]),
+				readerID(fixture, "ready-sort-"+test.sort, "expired"),
+			}) {
+				t.Fatalf("ready %s keyset walk = %v, want %v", test.sort, walked, test.want)
+			}
+
+			readyPage, err := fixture.Reader.Ready(ctx, publicops.ReadyRequest{Labels: []string{scope}})
+			if err != nil {
+				t.Fatalf("ready %s direct query: %v", test.sort, err)
+			}
+			assertReaderPageIDSet(t, "ready "+test.sort+" direct query", readyPage,
+				[]string{
+					readerID(fixture, "ready-sort-"+test.sort, "a"),
+					readerID(fixture, "ready-sort-"+test.sort, "b"),
+					readerID(fixture, "ready-sort-"+test.sort, "c"),
+					readerID(fixture, "ready-sort-"+test.sort, "expired"),
+				})
+		})
+	}
 }
 
 // RunReaderListIncludeEphemeralMergesThePlanesIntoOneOrder pins what

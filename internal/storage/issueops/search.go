@@ -171,6 +171,9 @@ func missingOptionalWispTable(err error) bool {
 // here once. Both SearchIssuesInTx and SearchIssueIDsInTx use this body —
 // future projections pick up improvements (e.g., the empty-probe) for free.
 func searchInTx[T any](ctx context.Context, tx DBTX, query string, filter types.IssueFilter, proj searchProjection[T]) ([]T, error) {
+	if err := PopulateReadyDeferredChildIDs(ctx, tx, &filter); err != nil {
+		return nil, fmt.Errorf("search ready work: compute deferred parent children: %w", err)
+	}
 	// Route ephemeral-only queries to wisps table.
 	if filter.Ephemeral != nil && *filter.Ephemeral {
 		results, err := searchTableInTxT(ctx, tx, query, filter, WispsFilterTables, proj)
