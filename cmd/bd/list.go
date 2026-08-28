@@ -62,6 +62,17 @@ type skipLabelsListMeta struct {
 	Count      int  `json:"count"`
 }
 
+type listPaginationJSON struct {
+	Limit      int    `json:"limit"`
+	HasMore    bool   `json:"has_more"`
+	NextCursor string `json:"next_cursor,omitempty"`
+}
+
+type paginatedListJSONResponse struct {
+	Issues     any                `json:"issues"`
+	Pagination listPaginationJSON `json:"pagination"`
+}
+
 func newSkipLabelsListJSONResponse(issues []*types.IssueWithCounts) skipLabelsListJSONResponse {
 	views := make([]skipLabelsIssueView, len(issues))
 	for i, issue := range issues {
@@ -77,6 +88,28 @@ func newSkipLabelsListJSONResponse(issues []*types.IssueWithCounts) skipLabelsLi
 			Count:      len(views),
 		},
 	}
+}
+
+func emitListJSONPage(items []*types.IssueWithCounts, in listInput, hasMore bool, nextCursor string) error {
+	if in.Paginate || in.Cursor != "" {
+		var issues any = items
+		if in.SkipLabels {
+			views := newSkipLabelsListJSONResponse(items)
+			issues = views.Issues
+		}
+		return outputJSONRaw(paginatedListJSONResponse{
+			Issues: issues,
+			Pagination: listPaginationJSON{
+				Limit:      in.effectiveLimit,
+				HasMore:    hasMore,
+				NextCursor: nextCursor,
+			},
+		})
+	}
+	if in.SkipLabels {
+		return outputJSON(newSkipLabelsListJSONResponse(items))
+	}
+	return outputJSON(items)
 }
 
 // skipLabelsConflicts returns the names of label-filter flags that conflict
@@ -270,17 +303,12 @@ func runListCore(cmd *cobra.Command, _ []string) error {
 			}
 			return HandleError("%v", err)
 		}
-		if in.SkipLabels {
-			if err := outputJSON(newSkipLabelsListJSONResponse(page.Items)); err != nil {
-				return err
-			}
-			printTruncationHint(page.HasMore, in.effectiveLimit)
-			return nil
-		}
-		if err := outputJSON(page.Items); err != nil {
+		if err := emitListJSONPage(page.Items, in, page.HasMore, page.NextCursor); err != nil {
 			return err
 		}
-		printTruncationHint(page.HasMore, in.effectiveLimit)
+		if !in.Paginate && in.Cursor == "" {
+			printTruncationHint(page.HasMore, in.effectiveLimit)
+		}
 		return nil
 	}
 
@@ -410,6 +438,8 @@ func init() {
 	listCmd.Flags().String("spec", "", "Filter by spec_id prefix")
 	listCmd.Flags().String("id", "", "Filter by specific issue IDs (comma-separated, e.g., bd-1,bd-5,bd-10)")
 	listCmd.Flags().IntP("limit", "n", workapi.DefaultListLimit, "Limit results (default 50, use 0 for unlimited)")
+	listCmd.Flags().Bool("paginate", false, "Return a bounded JSON page with cursor metadata")
+	listCmd.Flags().String("cursor", "", "Resume a paginated JSON listing from an opaque cursor")
 	listCmd.Flags().Int("offset", 0, "Skip the first N matching results (0-based). Only supported under --proxied-server.")
 	listCmd.Flags().String("format", "", "Output format: 'digraph' (for golang.org/x/tools/cmd/digraph), 'dot' (Graphviz), or Go template")
 	listCmd.Flags().Bool("all", false, "Show all issues including closed (overrides default filter)")
@@ -469,6 +499,8 @@ func init() {
 
 	// Infra type filtering: exclude agent/role/message by default
 	listCmd.Flags().Bool("include-infra", false, "Include infrastructure beads (agent/role/message) in output")
+	listCmd.Flags().Bool("include-all-types", false, "Include all issue types and both durable and wisp storage planes")
+	listCmd.Flags().Bool("no-directory-labels", false, "Do not apply directory.labels configuration to the list filter")
 
 	// Explicit type exclusion
 	listCmd.Flags().StringSlice("exclude-type", nil, "Exclude issue types from results (comma-separated or repeatable, e.g., --exclude-type=convoy,epic)")

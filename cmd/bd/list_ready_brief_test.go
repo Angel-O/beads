@@ -3,14 +3,100 @@ package main
 import (
 	"bytes"
 	"os"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/workapi"
 	"github.com/steveyegge/beads/issueops"
 )
+
+func TestListDirectoryLabelsCanBeDisabled(t *testing.T) {
+	configureDirectoryLabel(t, "configured-scope")
+	for _, test := range []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"default applies configured labels", nil, []string{"configured-scope"}},
+		{"switch leaves labels unset", []string{"--no-directory-labels"}, nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			in, err := gatherListInput(newListFlagsCommand(t, test.args...))
+			if err != nil {
+				t.Fatalf("gatherListInput(%v): %v", test.args, err)
+			}
+			if !slices.Equal(in.LabelsAny, test.want) {
+				t.Errorf("LabelsAny = %v, want %v", in.LabelsAny, test.want)
+			}
+			if in.NoDirectoryLabels != (len(test.want) == 0) {
+				t.Errorf("NoDirectoryLabels = %v, want %v", in.NoDirectoryLabels, len(test.want) == 0)
+			}
+		})
+	}
+}
+
+func TestNoDirectoryLabelsDoesNotAffectEquivalentCursorSelection(t *testing.T) {
+	configureDirectoryLabel(t, "configured-scope")
+	pinJSONOutput(t, true)
+	args := []string{"--paginate", "--limit", "1", "--sort", "created"}
+	defaultInput, err := gatherListInput(newListFlagsCommand(t, args...))
+	if err != nil {
+		t.Fatalf("default gatherListInput: %v", err)
+	}
+	explicitInput, err := gatherListInput(newListFlagsCommand(t, append(args, "--no-directory-labels", "--label-any", "configured-scope")...))
+	if err != nil {
+		t.Fatalf("explicit gatherListInput: %v", err)
+	}
+	if defaultInput.NoDirectoryLabels || !explicitInput.NoDirectoryLabels {
+		t.Fatalf("CLI-only directory-label state = %v, %v", defaultInput.NoDirectoryLabels, explicitInput.NoDirectoryLabels)
+	}
+	if !slices.Equal(defaultInput.LabelsAny, explicitInput.LabelsAny) {
+		t.Fatalf("effective label selection = %v, %v", defaultInput.LabelsAny, explicitInput.LabelsAny)
+	}
+
+	row := &types.IssueWithCounts{Issue: &types.Issue{ID: "bd-cursor", CreatedAt: time.Now().UTC()}}
+	cursor, err := workapi.NextListCursor(defaultInput.ListRequest, []*types.IssueWithCounts{row}, true)
+	if err != nil {
+		t.Fatalf("NextListCursor: %v", err)
+	}
+	explicitInput.Cursor = cursor
+	filter, err := workapi.BuildListFilter(explicitInput.ListRequest, workapi.ListConfig{})
+	if err != nil {
+		t.Fatalf("BuildListFilter: %v", err)
+	}
+	if err := workapi.ApplyListCursor(explicitInput.ListRequest, &filter); err != nil {
+		t.Fatalf("equivalent selection rejected cursor: %v", err)
+	}
+}
+
+func TestPaginatedListLimitCap(t *testing.T) {
+	pinJSONOutput(t, true)
+	for _, test := range []struct {
+		name  string
+		limit string
+		want  bool
+	}{
+		{"maximum accepted", "1000", true},
+		{"above maximum rejected", "1001", false},
+		{"maximum integer rejected", "9223372036854775807", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err, shown := runGatherListInput(t, newListFlagsCommand(t,
+				"--paginate", "--limit", test.limit, "--sort", "created"))
+			if (err == nil) != test.want {
+				t.Fatalf("gatherListInput limit %s error = %v, want accepted=%v", test.limit, err, test.want)
+			}
+			if !test.want && !strings.Contains(shown, "--limit <= 1000") {
+				t.Errorf("output = %q, want maximum-limit validation", shown)
+			}
+		})
+	}
+}
 
 // newListFlagsCommand clones listCmd's flag definitions onto a fresh command,
 // for newReadyFlagsCommand's reason: re-declaring a default here would be a

@@ -115,16 +115,34 @@ func TestEmbeddedReaderListKeysetPositionResumesTheCreatedDescIDAscOrder(t *test
 	conformance.RunReaderListKeysetPositionResumesTheCreatedDescIDAscOrder(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
 }
 
+func TestEmbeddedReaderListBoundedDatePagination(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderListBoundedDatePagination(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderListReadyKeysetPagination(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderListReadyKeysetPagination(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderListReadyKeysetSortsAndExclusions(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderListReadyKeysetSortsAndExclusions(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
 func TestEmbeddedReaderListReadyFlagAnswersTheBlockerAwareSet(t *testing.T) {
 	skipUnlessEmbeddedDolt(t)
 	ctx := t.Context()
 	conformance.RunReaderListReadyFlagAnswersTheBlockerAwareSet(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
 }
 
-func TestEmbeddedReaderListReadyFlagRefusesAFilterItCannotCarry(t *testing.T) {
+func TestEmbeddedReaderListReadyFlagComposesWithOrdinaryFilters(t *testing.T) {
 	skipUnlessEmbeddedDolt(t)
 	ctx := t.Context()
-	conformance.RunReaderListReadyFlagRefusesAFilterItCannotCarry(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+	conformance.RunReaderListReadyFlagComposesWithOrdinaryFilters(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
 }
 
 func TestEmbeddedReaderListEmptyPageIsWellFormed(t *testing.T) {

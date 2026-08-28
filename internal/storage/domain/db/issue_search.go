@@ -37,6 +37,9 @@ func missingOptionalWispTable(err error) bool {
 }
 
 func (r *issueSQLRepositoryImpl) searchAcrossIssuesAndWisps(ctx context.Context, query string, filter types.IssueFilter) (domain.SearchPage, error) {
+	if err := issueops.PopulateReadyDeferredChildIDs(ctx, r.runner, &filter); err != nil {
+		return domain.SearchPage{}, fmt.Errorf("search ready work: compute deferred parent children: %w", err)
+	}
 	if filter.Ephemeral != nil && *filter.Ephemeral {
 		page, err := r.searchTable(ctx, query, filter, wispsFilterTables)
 		if err != nil && !missingOptionalWispTable(err) {

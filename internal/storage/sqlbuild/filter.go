@@ -27,6 +27,12 @@ import (
 // a change here then breaks the guard.
 const KeysetCreatedAtIDPredicate = "(created_at <= ? AND ((created_at < ?) OR (id > ?)))"
 
+const (
+	keysetUpdatedAtIDPredicate    = "(updated_at <= ? AND ((updated_at < ?) OR (id > ?)))"
+	keysetClosedAtIDPredicate     = "(closed_at IS NULL OR (closed_at <= ? AND ((closed_at < ?) OR (id > ?))))"
+	keysetClosedAtNullIDPredicate = "(closed_at IS NULL AND id > ?)"
+)
+
 // BuildIssueFilterClauses builds WHERE clause fragments and args from a query
 // string and IssueFilter. The tables parameter controls which table names are
 // referenced in subqueries (issues vs wisps).
@@ -98,6 +104,18 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 			args = append(args, string(s))
 		}
 		whereClauses = append(whereClauses, fmt.Sprintf("status NOT IN (%s)", strings.Join(placeholders, ",")))
+	}
+	if filter.Ready {
+		whereClauses = append(whereClauses, ReadySelectionClauses(false)...)
+		for start := 0; start < len(filter.ReadyDeferredChildIDs); start += QueryBatchSize {
+			end := start + QueryBatchSize
+			if end > len(filter.ReadyDeferredChildIDs) {
+				end = len(filter.ReadyDeferredChildIDs)
+			}
+			placeholders, batchArgs := InPlaceholders(filter.ReadyDeferredChildIDs[start:end])
+			whereClauses = append(whereClauses, fmt.Sprintf("id NOT IN (%s)", placeholders))
+			args = append(args, batchArgs...)
+		}
 	}
 
 	if filter.IssueType != nil {
@@ -265,7 +283,7 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 	} {
 		if tc.v != nil {
 			whereClauses = append(whereClauses, fmt.Sprintf("%s %s ?", tc.col, tc.op))
-			args = append(args, tc.v.Format(time.RFC3339))
+			args = append(args, tc.v.UTC().Format(time.RFC3339Nano))
 		}
 	}
 
@@ -279,6 +297,36 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 		ac := *filter.AfterCreatedAt
 		whereClauses = append(whereClauses, KeysetCreatedAtIDPredicate)
 		args = append(args, ac, ac, filter.AfterID)
+	}
+
+	if filter.AfterSortAtSet {
+		switch filter.SortBy {
+		case "created":
+			if filter.AfterSortAt == nil {
+				return nil, nil, fmt.Errorf("created keyset position requires a timestamp")
+			}
+			at := *filter.AfterSortAt
+			whereClauses = append(whereClauses, KeysetCreatedAtIDPredicate)
+			args = append(args, at, at, filter.AfterSortID)
+		case "updated":
+			if filter.AfterSortAt == nil {
+				return nil, nil, fmt.Errorf("updated keyset position requires a timestamp")
+			}
+			at := *filter.AfterSortAt
+			whereClauses = append(whereClauses, keysetUpdatedAtIDPredicate)
+			args = append(args, at, at, filter.AfterSortID)
+		case "closed":
+			if filter.AfterSortAt == nil {
+				whereClauses = append(whereClauses, keysetClosedAtNullIDPredicate)
+				args = append(args, filter.AfterSortID)
+			} else {
+				at := *filter.AfterSortAt
+				whereClauses = append(whereClauses, keysetClosedAtIDPredicate)
+				args = append(args, at, at, filter.AfterSortID)
+			}
+		default:
+			return nil, nil, fmt.Errorf("unsupported keyset sort %q", filter.SortBy)
+		}
 	}
 
 	if filter.Deferred {

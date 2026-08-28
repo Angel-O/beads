@@ -20,5 +20,5 @@ func newIssueReader(store *DoltStore) (issueops.Reader, error) {
 	if store == nil {
 		return nil, &storage.ErrUnsupported{Op: "newIssueReader", Backend: "nil"}
 	}
-	return storereader.New(store)
+	return storereader.New(store, store)
 }

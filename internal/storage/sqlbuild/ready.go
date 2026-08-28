@@ -80,6 +80,21 @@ type ReadyWorkWhereInputs struct {
 	ParentDescendantIDs []string
 }
 
+// ReadySelectionClauses is the row-level ready predicate shared by ready-work
+// queries and ordinary issue listings. Status is selected by each caller so
+// QueryReadyWork can retain its explicit status vocabulary while list --ready
+// remains open-only.
+func ReadySelectionClauses(includeDeferred bool) []string {
+	clauses := []string{
+		"(pinned = 0 OR pinned IS NULL)",
+		"is_blocked = 0",
+	}
+	if !includeDeferred {
+		clauses = append(clauses, "(defer_until IS NULL OR defer_until <= UTC_TIMESTAMP())")
+	}
+	return clauses
+}
+
 // BuildReadyWorkWhere renders the full ready-work WHERE clause for one table
 // family. Both stacks must keep ready semantics identical (Seam A parity
 // suite); all ready predicates live here.
@@ -104,11 +119,7 @@ func BuildReadyWorkWhere(filter types.WorkFilter, tables FilterTables, in ReadyW
 	default:
 		statusClause = "status IN ('open', 'in_progress')"
 	}
-	whereClauses := []string{
-		statusClause,
-		"(pinned = 0 OR pinned IS NULL)",
-		"is_blocked = 0",
-	}
+	whereClauses := append([]string{statusClause}, ReadySelectionClauses(filter.IncludeDeferred)...)
 	if !filter.IncludeEphemeral {
 		whereClauses = append(whereClauses, "(ephemeral = 0 OR ephemeral IS NULL)")
 	}
@@ -133,7 +144,6 @@ func BuildReadyWorkWhere(filter types.WorkFilter, tables FilterTables, in ReadyW
 	}
 
 	if !filter.IncludeDeferred {
-		whereClauses = append(whereClauses, "(defer_until IS NULL OR defer_until <= UTC_TIMESTAMP())")
 		for start := 0; start < len(in.DeferredChildIDs); start += QueryBatchSize {
 			end := start + QueryBatchSize
 			if end > len(in.DeferredChildIDs) {

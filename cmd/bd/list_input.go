@@ -32,6 +32,9 @@ type listInput struct {
 	noPager      bool
 	formatStr    string
 	jsonOutput   bool
+	// NoDirectoryLabels is CLI preprocessing state. It must not cross into the
+	// backend request or affect the effective-selection cursor fingerprint.
+	NoDirectoryLabels bool
 
 	limitChanged   bool
 	effectiveLimit int
@@ -79,6 +82,11 @@ func gatherListInput(cmd *cobra.Command) (listInput, error) {
 	in.longFormat, _ = cmd.Flags().GetBool("long")
 	in.SortBy, _ = cmd.Flags().GetString("sort")
 	in.Reverse, _ = cmd.Flags().GetBool("reverse")
+	in.Paginate, _ = cmd.Flags().GetBool("paginate")
+	in.Cursor, _ = cmd.Flags().GetString("cursor")
+	if in.Cursor != "" {
+		in.Paginate = true
+	}
 
 	in.TitleContains, _ = cmd.Flags().GetString("title-contains")
 	in.DescContains, _ = cmd.Flags().GetString("desc-contains")
@@ -134,6 +142,8 @@ func gatherListInput(cmd *cobra.Command) (listInput, error) {
 	in.IncludeTemplates, _ = cmd.Flags().GetBool("include-templates")
 	in.IncludeGates, _ = cmd.Flags().GetBool("include-gates")
 	in.IncludeInfra, _ = cmd.Flags().GetBool("include-infra")
+	in.IncludeAllTypes, _ = cmd.Flags().GetBool("include-all-types")
+	in.NoDirectoryLabels, _ = cmd.Flags().GetBool("no-directory-labels")
 	in.ExcludeTypes, _ = cmd.Flags().GetStringSlice("exclude-type")
 
 	in.ParentID, _ = cmd.Flags().GetString("parent")
@@ -289,12 +299,30 @@ func gatherListInput(cmd *cobra.Command) (listInput, error) {
 			return in, HandleError("invalid sort field %q (valid: priority, created, updated, closed, status, id, title, type, assignee)", in.SortBy)
 		}
 	}
+	if in.Paginate {
+		switch {
+		case !in.jsonOutput:
+			return in, HandleError("--paginate and --cursor require --json")
+		case !in.limitChanged || limit <= 0:
+			return in, HandleError("--paginate and --cursor require an explicitly supplied positive --limit")
+		case limit > workapi.MaxListPageLimit:
+			return in, HandleError("--paginate and --cursor require --limit <= %d", workapi.MaxListPageLimit)
+		case !cmd.Flags().Changed("sort") || (in.SortBy != "created" && in.SortBy != "updated" && in.SortBy != "closed"):
+			return in, HandleError("--paginate and --cursor require --sort created, updated, or closed")
+		case in.Reverse:
+			return in, HandleError("--paginate and --cursor cannot be combined with --reverse")
+		case cmd.Flags().Changed("offset"):
+			return in, HandleError("--paginate and --cursor cannot be combined with --offset")
+		case in.watchMode:
+			return in, HandleError("--paginate and --cursor cannot be combined with --watch")
+		}
+	}
 
 	in.Labels = utils.NormalizeLabels(in.Labels)
 	in.LabelsAny = utils.NormalizeLabels(in.LabelsAny)
 	in.ExcludeLabels = utils.NormalizeLabels(in.ExcludeLabels)
 
-	if !in.SkipLabels && len(in.Labels) == 0 && len(in.LabelsAny) == 0 {
+	if !in.NoDirectoryLabels && !in.SkipLabels && len(in.Labels) == 0 && len(in.LabelsAny) == 0 {
 		if dirLabels := config.GetDirectoryLabels(); len(dirLabels) > 0 {
 			in.LabelsAny = dirLabels
 		}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/workapi"
 	publicops "github.com/steveyegge/beads/issueops"
 )
@@ -108,20 +107,7 @@ func (r *issueReader) List(ctx context.Context, req publicops.ListRequest) (publ
 		// (issueops.SearchProbeLimit, EnforceMaxRowsCap), so the same request
 		// trips the same breaker on either implementation.
 		filter = workapi.WithRowsBeforeThePage(filter, req.Offset)
-		// WHICH QUERY is the only thing --ready changes. The epilogue below is
-		// deliberately outside the branch: when it lived inside the non-ready
-		// arm only, the two arms of one contract method answered in different
-		// orders, and a --ready page under a sort the database cannot express
-		// came back untrimmed. The sibling implementation
-		// (workapi.storeReader.List) sorts and trims both arms, so the split
-		// was drift between two implementations of one method — seeded inside
-		// the seam built to eliminate drift.
-		var page domain.SearchCountsPage
-		if req.ReadyFlag {
-			page, err = uw.IssueUseCase().GetReadyWorkWithCounts(ctx, workapi.ReadyFilterFromIssueFilter(filter))
-		} else {
-			page, err = uw.IssueUseCase().SearchIssuesWithCounts(ctx, "", filter)
-		}
+		page, err := uw.IssueUseCase().SearchIssuesWithCounts(ctx, "", filter)
 		if err != nil {
 			return publicops.IssuePage{}, err
 		}
@@ -131,7 +117,11 @@ func (r *issueReader) List(ctx context.Context, req publicops.ListRequest) (publ
 		// between this implementation and its store-backed sibling, and it is
 		// an argument to the shared function rather than a second copy of it.
 		items, hasMore := workapi.FinishPageAt(page.Items, req.SortBy, req.Reverse, req.Offset, workapi.PageLimit(req), page.HasMore)
-		return publicops.IssuePage{Items: items, HasMore: hasMore}, nil
+		nextCursor, err := workapi.NextListCursor(req, items, hasMore)
+		if err != nil {
+			return publicops.IssuePage{}, err
+		}
+		return publicops.IssuePage{Items: items, HasMore: hasMore, NextCursor: nextCursor}, nil
 	})
 }
 

@@ -1,6 +1,8 @@
 package sqlbuild
 
 import (
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -88,5 +90,102 @@ func TestKeysetComposesWithCreatedBefore(t *testing.T) {
 	// CreatedBefore contributes one arg, keyset contributes three.
 	if len(args) != 4 {
 		t.Fatalf("arg count = %d, want 4 (1 CreatedBefore + 3 keyset)", len(args))
+	}
+}
+
+func TestGeneralizedDateKeysetPredicates(t *testing.T) {
+	t.Parallel()
+	at := time.Date(2025, 4, 3, 2, 1, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		filter types.IssueFilter
+		clause string
+		args   []any
+	}{
+		{"created", types.IssueFilter{SortBy: "created", AfterSortAtSet: true, AfterSortAt: &at, AfterSortID: "b"}, KeysetCreatedAtIDPredicate, []any{at, at, "b"}},
+		{"updated", types.IssueFilter{SortBy: "updated", AfterSortAtSet: true, AfterSortAt: &at, AfterSortID: "b"}, keysetUpdatedAtIDPredicate, []any{at, at, "b"}},
+		{"closed timestamp includes null group", types.IssueFilter{SortBy: "closed", AfterSortAtSet: true, AfterSortAt: &at, AfterSortID: "b"}, keysetClosedAtIDPredicate, []any{at, at, "b"}},
+		{"closed null group", types.IssueFilter{SortBy: "closed", AfterSortAtSet: true, AfterSortID: "b"}, keysetClosedAtNullIDPredicate, []any{"b"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clauses, args, err := BuildIssueFilterClauses("", tt.filter, IssuesFilterTables)
+			if err != nil {
+				t.Fatalf("BuildIssueFilterClauses: %v", err)
+			}
+			if !slices.Contains(clauses, tt.clause) {
+				t.Fatalf("clauses = %v, want %q", clauses, tt.clause)
+			}
+			if !reflect.DeepEqual(args, tt.args) {
+				t.Fatalf("args = %#v, want %#v", args, tt.args)
+			}
+		})
+	}
+}
+
+func TestGeneralizedKeysetComposesWithLegacyCreatedSelection(t *testing.T) {
+	t.Parallel()
+	legacyAt := time.Date(2025, 4, 3, 2, 1, 0, 0, time.UTC)
+	pageAt := time.Date(2026, 4, 3, 2, 1, 0, 0, time.UTC)
+	for _, test := range []struct {
+		sort   string
+		clause string
+	}{
+		{"updated", keysetUpdatedAtIDPredicate},
+		{"closed", keysetClosedAtIDPredicate},
+	} {
+		t.Run(test.sort, func(t *testing.T) {
+			clauses, args, err := BuildIssueFilterClauses("", types.IssueFilter{
+				AfterCreatedAt: &legacyAt,
+				AfterID:        "legacy-id",
+				SortBy:         test.sort,
+				AfterSortAtSet: true,
+				AfterSortAt:    &pageAt,
+				AfterSortID:    "page-id",
+			}, IssuesFilterTables)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Contains(clauses, KeysetCreatedAtIDPredicate) || !slices.Contains(clauses, test.clause) {
+				t.Fatalf("composed clauses = %v", clauses)
+			}
+			if !reflect.DeepEqual(args, []any{legacyAt, legacyAt, "legacy-id", pageAt, pageAt, "page-id"}) {
+				t.Fatalf("composed args = %#v", args)
+			}
+		})
+	}
+}
+
+func TestIssueDateBoundsPreserveFractionalPrecisionAndStrictness(t *testing.T) {
+	t.Parallel()
+	instant := time.Date(2026, 4, 3, 2, 1, 0, 123456789, time.UTC)
+	equivalentOffset := instant.In(time.FixedZone("offset", 5*60*60+30*60))
+	wantArg := instant.Format(time.RFC3339Nano)
+
+	tests := []struct {
+		name   string
+		filter types.IssueFilter
+		clause string
+	}{
+		{"created after", types.IssueFilter{CreatedAfter: &instant}, "created_at > ?"},
+		{"created before equivalent offset", types.IssueFilter{CreatedBefore: &equivalentOffset}, "created_at < ?"},
+		{"updated after", types.IssueFilter{UpdatedAfter: &instant}, "updated_at > ?"},
+		{"updated before equivalent offset", types.IssueFilter{UpdatedBefore: &equivalentOffset}, "updated_at < ?"},
+		{"closed after", types.IssueFilter{ClosedAfter: &instant}, "closed_at > ?"},
+		{"closed before equivalent offset", types.IssueFilter{ClosedBefore: &equivalentOffset}, "closed_at < ?"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clauses, args, err := BuildIssueFilterClauses("", tt.filter, IssuesFilterTables)
+			if err != nil {
+				t.Fatalf("BuildIssueFilterClauses: %v", err)
+			}
+			if !slices.Contains(clauses, tt.clause) {
+				t.Fatalf("clauses = %v, want strict boundary %q", clauses, tt.clause)
+			}
+			if len(args) != 1 || args[0] != wantArg {
+				t.Fatalf("args = %#v, want nanosecond boundary %q", args, wantArg)
+			}
+		})
 	}
 }

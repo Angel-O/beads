@@ -18,10 +18,16 @@ import (
 	"context"
 
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/workapi"
 	"github.com/steveyegge/beads/issueops"
 )
+
+// ExpiredDeferWaker is the narrow capability the store reader needs before a
+// ready list. It is kept separate from storage.DoltStorage so callers cannot
+// accidentally construct a reader that silently skips the wake sweep.
+type ExpiredDeferWaker interface {
+	WakeExpiredDefers(context.Context)
+}
 
 // New returns the issue-query surface backed by a store handle. *DoltStore and
 // *EmbeddedDoltStore answer identically because the difference between them is
@@ -42,14 +48,20 @@ import (
 // ready` calls the workapi builders directly because it consumes the FILTER
 // for --claim, --gated, --explain and --mol; see issueops.Reader's doc comment
 // for why routing only its JSON path through the role would be worse.
-func New(store storage.DoltStorage) (issueops.Reader, error) {
+func New(store storage.DoltStorage, waker ExpiredDeferWaker) (issueops.Reader, error) {
 	if store == nil {
 		return nil, &issueops.ErrUnsupported{Op: "storereader.New", Backend: "nil"}
 	}
-	return &storeReader{store: store}, nil
+	if waker == nil {
+		return nil, &issueops.ErrUnsupported{Op: "storereader.New", Backend: "missing expired-defer waker"}
+	}
+	return &storeReader{store: store, waker: waker}, nil
 }
 
-type storeReader struct{ store storage.DoltStorage }
+type storeReader struct {
+	store storage.DoltStorage
+	waker ExpiredDeferWaker
+}
 
 var _ issueops.Reader = (*storeReader)(nil)
 
@@ -98,6 +110,9 @@ func (r *storeReader) Ready(ctx context.Context, req issueops.ReadyRequest) (iss
 // Offset rides on the two workapi calls this method already made for the
 // has-more probe row — one widens the bound, the other cuts the page.
 func (r *storeReader) List(ctx context.Context, req issueops.ListRequest) (issueops.IssuePage, error) {
+	if req.ReadyFlag {
+		r.waker.WakeExpiredDefers(ctx)
+	}
 	cfg, err := workapi.LoadStoreListConfig(ctx, r.store)
 	if err != nil {
 		return issueops.IssuePage{}, err
@@ -110,12 +125,7 @@ func (r *storeReader) List(ctx context.Context, req issueops.ListRequest) (issue
 	// the cap the seam enforces counts every row the query matched.
 	filter = workapi.WithFetchOneExtra(workapi.WithRowsBeforeThePage(filter, req.Offset))
 
-	var items []*types.IssueWithCounts
-	if req.ReadyFlag {
-		items, err = r.store.GetReadyWorkWithCounts(ctx, workapi.ReadyFilterFromIssueFilter(filter))
-	} else {
-		items, err = r.store.SearchIssuesWithCounts(ctx, "", filter)
-	}
+	items, err := r.store.SearchIssuesWithCounts(ctx, "", filter)
 	if err != nil {
 		return issueops.IssuePage{}, err
 	}
@@ -127,7 +137,11 @@ func (r *storeReader) List(ctx context.Context, req issueops.ListRequest) (issue
 	// one is presentation. This seam reports no HasMore of its own, so the
 	// over-fetched row above is what speaks.
 	items, hasMore := workapi.FinishPageAt(items, req.SortBy, req.Reverse, req.Offset, workapi.PageLimit(req), false)
-	return issueops.IssuePage{Items: items, HasMore: hasMore}, nil
+	nextCursor, err := workapi.NextListCursor(req, items, hasMore)
+	if err != nil {
+		return issueops.IssuePage{}, err
+	}
+	return issueops.IssuePage{Items: items, HasMore: hasMore, NextCursor: nextCursor}, nil
 }
 
 func (r *storeReader) Get(ctx context.Context, req issueops.GetRequest) (*issueops.IssueDetails, error) {

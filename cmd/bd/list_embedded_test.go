@@ -69,6 +69,48 @@ type bdListSkipLabelsJSON struct {
 	} `json:"meta"`
 }
 
+type bdListPaginatedJSON struct {
+	Issues     []*types.IssueWithCounts `json:"issues"`
+	Pagination struct {
+		Limit      int    `json:"limit"`
+		HasMore    bool   `json:"has_more"`
+		NextCursor string `json:"next_cursor,omitempty"`
+	} `json:"pagination"`
+}
+
+func TestListExposesIncludeAllTypesFlag(t *testing.T) {
+	flag := listCmd.Flags().Lookup("include-all-types")
+	if flag == nil {
+		t.Fatal("bd list must expose --include-all-types")
+	}
+	if flag.DefValue != "false" {
+		t.Fatalf("--include-all-types default = %q, want false", flag.DefValue)
+	}
+}
+
+func parseListPaginatedJSON(t *testing.T, raw []byte) bdListPaginatedJSON {
+	t.Helper()
+	var shape map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &shape); err != nil {
+		t.Fatalf("parse paginated list JSON shape: %v\n%s", err, raw)
+	}
+	if len(shape) != 2 || shape["issues"] == nil || shape["pagination"] == nil {
+		t.Fatalf("paginated list must contain exactly issues and pagination: %s", raw)
+	}
+	var paginationShape map[string]json.RawMessage
+	if err := json.Unmarshal(shape["pagination"], &paginationShape); err != nil {
+		t.Fatalf("parse pagination shape: %v\n%s", err, raw)
+	}
+	if paginationShape["limit"] == nil || paginationShape["has_more"] == nil {
+		t.Fatalf("pagination is missing limit or has_more: %s", raw)
+	}
+	var page bdListPaginatedJSON
+	if err := json.Unmarshal(raw, &page); err != nil {
+		t.Fatalf("parse paginated list JSON: %v\n%s", err, raw)
+	}
+	return page
+}
+
 func bdListSkipLabelsJSONOutput(t *testing.T, bd, dir string, args ...string) bdListSkipLabelsJSON {
 	t.Helper()
 	fullArgs := append([]string{"list", "--json", "--skip-labels"}, args...)
@@ -826,6 +868,67 @@ func TestEmbeddedList(t *testing.T) {
 			t.Errorf("expected --offset direct-mode rejection, got: %s", out)
 		}
 	})
+}
+
+func TestEmbeddedListPaginationJSONContract(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
+	}
+	t.Parallel()
+	bd := buildEmbeddedBD(t)
+	dir, _, _ := bdInit(t, bd, "--prefix", "pg")
+	for _, title := range []string{"one", "two", "three"} {
+		bdCreate(t, bd, dir, title, "--type", "task")
+	}
+
+	runPage := func(args ...string) bdListPaginatedJSON {
+		cmd := exec.Command(bd, append([]string{"list", "--json", "--paginate", "--sort", "created", "--limit", "2"}, args...)...)
+		cmd.Dir, cmd.Env = dir, bdEnv(dir)
+		stdout, stderr, err := runCommandBuffers(t, cmd)
+		if err != nil {
+			t.Fatalf("paginated list failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+		}
+		return parseListPaginatedJSON(t, stdout.Bytes())
+	}
+
+	first := runPage()
+	if len(first.Issues) != 2 || first.Pagination.Limit != 2 || !first.Pagination.HasMore || first.Pagination.NextCursor == "" {
+		t.Fatalf("first page = %+v", first)
+	}
+	second := runPage("--cursor", first.Pagination.NextCursor)
+	if len(second.Issues) != 1 || second.Pagination.HasMore || second.Pagination.NextCursor != "" {
+		t.Fatalf("terminal page = %+v", second)
+	}
+	if got := bdListFail(t, bd, dir, "--json", "--cursor", first.Pagination.NextCursor, "--sort", "updated", "--limit", "2"); !strings.Contains(got, "created for sort") {
+		t.Fatalf("changed sort error = %q", got)
+	}
+	if got := bdListFail(t, bd, dir, "--json", "--cursor", first.Pagination.NextCursor, "--sort", "created", "--limit", "2", "--all"); !strings.Contains(got, "current list filters") {
+		t.Fatalf("changed selection error = %q", got)
+	}
+	empty := runPage("--id", "pg-absent")
+	if empty.Issues == nil || len(empty.Issues) != 0 || empty.Pagination.HasMore || empty.Pagination.NextCursor != "" {
+		t.Fatalf("empty page = %+v", empty)
+	}
+
+	ordinary := bdList(t, bd, dir, "--json", "--sort", "created", "--limit", "2")
+	if strings.TrimSpace(ordinary)[0] != '[' {
+		t.Fatalf("ordinary list JSON is no longer a bare array: %s", ordinary)
+	}
+
+	for _, test := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--paginate", "--sort", "created", "--limit", "2"}, "require --json"},
+		{[]string{"--json", "--paginate", "--sort", "created"}, "explicitly supplied positive --limit"},
+		{[]string{"--json", "--paginate", "--sort", "priority", "--limit", "2"}, "require --sort created"},
+		{[]string{"--json", "--paginate", "--sort", "created", "--limit", "2", "--reverse"}, "cannot be combined with --reverse"},
+		{[]string{"--json", "--cursor", "v2.e30", "--sort", "created", "--limit", "2"}, "unsupported list cursor version"},
+	} {
+		if got := bdListFail(t, bd, dir, test.args...); !strings.Contains(got, test.want) {
+			t.Errorf("failure %v = %q, want %q", test.args, got, test.want)
+		}
+	}
 }
 
 // seedTestData creates a rich set of test issues covering all filter dimensions.

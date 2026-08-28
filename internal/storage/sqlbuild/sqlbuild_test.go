@@ -1,6 +1,7 @@
 package sqlbuild
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -159,6 +160,28 @@ func TestBuildReadyWorkWhereBatchesIDSets(t *testing.T) {
 	wantArgs := len(ids) + len(ReadyWorkExcludeTypes(nil))
 	if len(args) != wantArgs {
 		t.Errorf("args = %d, want %d", len(args), wantArgs)
+	}
+}
+
+func TestReadySelectionClausesAreSharedWithIssueFilters(t *testing.T) {
+	t.Parallel()
+	clauses, _, err := BuildIssueFilterClauses("", types.IssueFilter{Ready: true}, IssuesFilterTables)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range ReadySelectionClauses(false) {
+		if !slices.Contains(clauses, want) {
+			t.Errorf("ordinary ready clauses = %v, missing %q", clauses, want)
+		}
+	}
+	where, _, err := BuildReadyWorkWhere(types.WorkFilter{}, IssuesFilterTables, ReadyWorkWhereInputs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range ReadySelectionClauses(false) {
+		if !strings.Contains(where, want) {
+			t.Errorf("ready-work WHERE = %q, missing %q", where, want)
+		}
 	}
 }
 
