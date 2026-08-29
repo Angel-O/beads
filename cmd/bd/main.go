@@ -1077,6 +1077,7 @@ var rootCmd = &cobra.Command{
 			"quickstart",
 			metrics.SendMetricsSubcommand,
 			"setup",
+			"store-copy",
 			"version",
 			"where",
 			"zsh",
