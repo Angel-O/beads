@@ -141,6 +141,9 @@ func TestOpenGatedLifecycle(t *testing.T) {
 	if _, ok := beads.AsBlockedQuerier(st); !ok {
 		t.Error("OpenGated store lost BlockedQuerier")
 	}
+	if _, ok := beads.AsSnapshotImporter(st); !ok {
+		t.Error("OpenGated store lost SnapshotImporter")
+	}
 	if _, ok := st.(beads.RemoteStore); !ok {
 		t.Error("OpenGated store lost RemoteStore")
 	}

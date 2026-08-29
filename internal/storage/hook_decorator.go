@@ -20,6 +20,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/types"
+	publicops "github.com/steveyegge/beads/issueops"
 )
 
 // HookFiringStore wraps a DoltStorage and fires hooks after mutations.
@@ -59,6 +60,20 @@ type Unwrapper interface {
 
 // Unwrap returns the underlying store, satisfying Unwrapper.
 func (h *HookFiringStore) Unwrap() DoltStorage { return h.inner }
+
+// SnapshotImporter preserves the optional snapshot capability through this
+// decorator. Snapshot imports intentionally do not fire issue hooks because
+// they restore the database plane and leave the sidecar logical commit to the
+// caller.
+func (h *HookFiringStore) SnapshotImporter() (publicops.SnapshotImporter, error) {
+	source, ok := h.inner.(interface {
+		SnapshotImporter() (publicops.SnapshotImporter, error)
+	})
+	if !ok {
+		return nil, &publicops.ErrUnsupported{Op: "SnapshotImporter", Backend: "wrapped storage"}
+	}
+	return source.SnapshotImporter()
+}
 
 // RoleFiresHooks reports whether an issue role taken off a store carries this
 // decorator's hook layer — that is, whether a landed write through it runs the

@@ -104,6 +104,29 @@ func InsertIssueIntoTable(ctx context.Context, tx DBTX, table string, issue *typ
 	return insertIssueIntoTable(ctx, tx, table, issue, false)
 }
 
+// ReplaceIssueIntoTable writes every persisted issue column. Unlike the
+// ordinary import upsert, this is only for an explicit snapshot replacement;
+// keeping it separate prevents snapshot semantics from changing incremental
+// ImportBatch's partial/stale merge behavior.
+func ReplaceIssueIntoTable(ctx context.Context, tx DBTX, table string, issue *types.Issue) error {
+	assignments := make([]string, 0, len(issueReplaceColumns))
+	for _, column := range issueReplaceColumns {
+		assignments = append(assignments, fmt.Sprintf("%s = VALUES(%s)", column, column))
+	}
+	return executeIssueInsert(ctx, tx, table, issue, "ON DUPLICATE KEY UPDATE\n\t\t\t"+strings.Join(assignments, ",\n\t\t\t"))
+}
+
+var issueReplaceColumns = []string{
+	"content_hash", "title", "description", "design", "acceptance_criteria", "notes",
+	"status", "priority", "issue_type", "assignee", "estimated_minutes", "created_at",
+	"created_by", "owner", "updated_at", "started_at", "closed_at", "external_ref", "spec_id",
+	"compaction_level", "compacted_at", "compacted_at_commit", "original_size", "sender",
+	"ephemeral", "no_history", "wisp_type", "pinned", "is_template", "mol_type", "work_type",
+	"source_system", "source_repo", "close_reason", "closed_by_session", "event_kind", "actor",
+	"target", "payload", "await_type", "await_id", "timeout_ns", "waiters", "due_at", "defer_until",
+	"metadata", "row_lock", "storage_class",
+}
+
 //nolint:gosec // G201: table is a hardcoded constant ("issues" or "wisps")
 func insertIssueIntoTable(ctx context.Context, tx DBTX, table string, issue *types.Issue, rejectStaleUpdate bool) error {
 	return executeIssueInsert(ctx, tx, table, issue, "ON DUPLICATE KEY UPDATE\n\t\t\t"+issueUpsertAssignments(table, rejectStaleUpdate))

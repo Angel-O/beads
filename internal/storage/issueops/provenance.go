@@ -144,6 +144,79 @@ func RecordProvenanceEventInTx(ctx context.Context, tx *sql.Tx, ev types.Provena
 	return id, affected == 1, nil
 }
 
+// InsertImportedProvenanceEventInTx writes a provenance row with its supplied
+// ingest timestamp. Ordinary recording intentionally uses the database default
+// for CreatedAt; snapshot restore must preserve both event-time and ingest-time.
+// The deterministic ID rule remains the same, so duplicate provenance facts are
+// harmless and the caller-supplied source ID cannot bypass idempotency.
+func InsertImportedProvenanceEventInTx(ctx context.Context, tx DBTX, ev types.ProvenanceEvent) (bool, error) {
+	if err := ValidateProvenanceEvent(ev); err != nil {
+		return false, err
+	}
+	if ev.CreatedAt.IsZero() {
+		return false, fmt.Errorf("provenance: created_at is required for snapshot import")
+	}
+	id := ProvenanceEventID(ev)
+	var (
+		existingIssueID, existingKind, existingSource string
+		actor, ref, refKind, payload                  sql.NullString
+		existingOccurredAt, existingCreatedAt         sql.NullTime
+	)
+	err := tx.QueryRowContext(ctx, `
+		SELECT issue_id, kind, actor, ref, ref_kind, payload, source, occurred_at, created_at
+		FROM provenance_events WHERE id = ?
+	`, id).Scan(&existingIssueID, &existingKind, &actor, &ref, &refKind, &payload, &existingSource, &existingOccurredAt, &existingCreatedAt)
+	if err == nil {
+		if provenanceRowMatches(ev, existingIssueID, existingKind, actor, ref, refKind, payload, existingSource, existingOccurredAt, existingCreatedAt) {
+			return false, nil
+		}
+		return false, fmt.Errorf("provenance: deterministic ID %q already contains a different event", id)
+	}
+	if err != sql.ErrNoRows {
+		return false, fmt.Errorf("provenance: check existing event %q: %w", id, err)
+	}
+	var occurredAt any
+	if ev.OccurredAt != nil {
+		occurredAt = ev.OccurredAt.UTC().Truncate(time.Second)
+	}
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO provenance_events
+			(id, issue_id, kind, actor, ref, ref_kind, payload, source, occurred_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, id, ev.IssueID, string(ev.Kind), NullStringPtr(ev.Actor), NullStringPtr(ev.Ref),
+		NullStringPtr(ev.RefKind), NullStringPtr(ev.Payload), ev.Source, occurredAt,
+		ev.CreatedAt.UTC().Truncate(time.Second))
+	if err != nil {
+		return false, fmt.Errorf("recording imported provenance event: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("imported provenance rows affected: %w", err)
+	}
+	return affected == 1, nil
+}
+
+func provenanceRowMatches(ev types.ProvenanceEvent, issueID, kind string, actor, ref, refKind, payload sql.NullString, source string, occurredAt, createdAt sql.NullTime) bool {
+	if !createdAt.Valid || issueID != ev.IssueID || kind != string(ev.Kind) || source != ev.Source || !occurredAtMatches(ev.OccurredAt, occurredAt) || !createdAt.Time.Equal(ev.CreatedAt.UTC().Truncate(time.Second)) {
+		return false
+	}
+	return nullableStringMatches(ev.Actor, actor) && nullableStringMatches(ev.Ref, ref) && nullableStringMatches(ev.RefKind, refKind) && nullableStringMatches(ev.Payload, payload)
+}
+
+func nullableStringMatches(want *string, got sql.NullString) bool {
+	if want == nil || *want == "" {
+		return !got.Valid || got.String == ""
+	}
+	return got.Valid && got.String == *want
+}
+
+func occurredAtMatches(want *time.Time, got sql.NullTime) bool {
+	if want == nil {
+		return !got.Valid
+	}
+	return got.Valid && got.Time.Equal(want.UTC().Truncate(time.Second))
+}
+
 // GetProvenanceEventsInTx returns the provenance events for an issue, ordered by
 // occurred_at (nulls last) then id. When kindFilter is non-empty, only events of
 // that kind are returned.

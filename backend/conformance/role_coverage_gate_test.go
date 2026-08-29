@@ -19,7 +19,9 @@ import (
 // the gate takes away is doing it quietly: an addition must name a real method,
 // carry a reason, and land in a diff a reviewer reads. It converts silence into
 // an argument someone has to make.
-var uncoveredRoleMethods = map[string]string{}
+var uncoveredRoleMethods = map[string]string{
+	"issueops.SnapshotImporter.ImportSnapshot": "specialized snapshot-copy contract is exercised by the UOW snapshot importer tests; it is not part of the portable backend role bundle",
+}
 
 // TestEveryRoleMethodHasAContractCase is the exhaustiveness gate on the role
 // tier: every method of every interface the public facade declares must be
