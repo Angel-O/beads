@@ -24,6 +24,16 @@ type storeSnapshotImporter struct {
 
 var _ publicops.SnapshotImporter = (*storeSnapshotImporter)(nil)
 
+func (i *storeSnapshotImporter) PlanIDs(ctx context.Context, request publicops.SnapshotIDPlanRequest) (publicops.SnapshotIDPlan, error) {
+	var plan publicops.SnapshotIDPlan
+	err := i.store.runIssueOperationTxWithMessage(ctx, func(tx *sql.Tx) (storageissueops.ChangedTables, string, error) {
+		var err error
+		plan, err = storageissueops.PlanSnapshotIDsInTx(ctx, tx, request)
+		return nil, "", err
+	})
+	return plan, err
+}
+
 func (i *storeSnapshotImporter) ImportSnapshot(ctx context.Context, request publicops.SnapshotImportRequest) (publicops.SnapshotImportResult, error) {
 	normalized, result, err := storageissueops.PrepareSnapshotImport(request)
 	if err != nil {

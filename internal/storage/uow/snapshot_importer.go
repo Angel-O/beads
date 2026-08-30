@@ -33,6 +33,17 @@ type snapshotImporter struct {
 
 var _ publicops.SnapshotImporter = (*snapshotImporter)(nil)
 
+func (o *snapshotImporter) PlanIDs(ctx context.Context, request publicops.SnapshotIDPlanRequest) (publicops.SnapshotIDPlan, error) {
+	return RunTxResult(ctx, o.provider, func(ctx context.Context, uw UnitOfWork) (publicops.SnapshotIDPlan, string, error) {
+		runner, err := importStatementRunner(uw)
+		if err != nil {
+			return publicops.SnapshotIDPlan{}, "", err
+		}
+		plan, err := storageissueops.PlanSnapshotIDsInTx(ctx, runner, request)
+		return plan, "", err
+	})
+}
+
 func (o *snapshotImporter) ImportSnapshot(ctx context.Context, request publicops.SnapshotImportRequest) (publicops.SnapshotImportResult, error) {
 	normalized, result, err := storageissueops.PrepareSnapshotImport(request)
 	if err != nil {

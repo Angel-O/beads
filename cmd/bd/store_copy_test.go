@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -72,19 +73,30 @@ func TestReadStoreCopySnapshotPreservesAndRemapsFullState(t *testing.T) {
 		provenance:   map[string][]types.ProvenanceEvent{"src-1": {prov}},
 	}
 	sourceDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(sourceDir, "interactions.jsonl"), []byte(`{"id":"int-1","kind":"tool","created_at":"2026-01-02T03:04:05Z","issue_id":"src-1"}`+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(sourceDir, "interactions.jsonl"), []byte(strings.Join([]string{
+		`{"id":"int-1","kind":"tool","created_at":"2026-01-02T03:04:05Z","issue_id":"src-1"}`,
+		`{"id":"int-deleted","kind":"tool","created_at":"2026-01-02T03:04:05Z","issue_id":"src-deleted"}`,
+		"",
+	}, "\n")), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	bundle, ids, err := readStoreCopySnapshot(t.Context(), source, sourceDir, "copy", "repo-a", []string{"copied"})
+	ids := beads.SnapshotIDMap{
+		Issues:            map[string]string{"src-1": "copy-8c2", "src-2": "copy-k91"},
+		AuditInteractions: make(map[string]string),
+	}
+	bundle, err := readStoreCopySnapshot(t.Context(), source, sourceDir, "copy", "repo-a", []string{"copied"}, source.issues, ids)
 	if err != nil {
 		t.Fatalf("readStoreCopySnapshot: %v", err)
 	}
-	if got := ids.Issues["src-1"]; got != storeCopyID("copy", "repo-a", "issue", "src-1") {
-		t.Fatalf("issue mapping = %q, want deterministic namespace ID", got)
+	if got := ids.Issues["src-1"]; !regexp.MustCompile(`^copy-[0-9a-z]{3,8}$`).MatchString(got) {
+		t.Fatalf("issue mapping = %q, want ordinary short hash ID", got)
 	}
 	if got := ids.AuditInteractions["int-1"]; got != storeCopyID("copy", "repo-a", "interaction", "int-1") {
 		t.Fatalf("interaction mapping = %q, want deterministic namespace ID", got)
+	}
+	if _, copied := ids.AuditInteractions["int-deleted"]; copied || strings.Contains(string(bundle.AuditInteractionsJSONL), "int-deleted") {
+		t.Fatal("interaction for deleted issue was copied")
 	}
 	if issue.ID != "src-1" || issue.Labels != nil || issue.Dependencies != nil || issue.Comments != nil {
 		t.Fatal("source issue was mutated while building the snapshot")
@@ -95,10 +107,10 @@ func TestReadStoreCopySnapshotPreservesAndRemapsFullState(t *testing.T) {
 		t.Fatalf("PrepareSnapshotImport: %v", err)
 	}
 	got := normalized.Bundle.Issues[0]
-	if got.ID != storeCopyID("copy", "repo-a", "issue", "src-1") || got.Dependencies[0].DependsOnID != storeCopyID("copy", "repo-a", "issue", "src-2") || got.Comments[0].IssueID != got.ID {
+	if got.ID != ids.Issues["src-1"] || got.Dependencies[0].DependsOnID != ids.Issues["src-2"] || got.Comments[0].IssueID != got.ID {
 		t.Fatalf("remapped issue aggregate = %+v", got)
 	}
-	if !strings.Contains(string(result.StagedAuditJSONL), `"id":"`+storeCopyID("copy", "repo-a", "interaction", "int-1")+`"`) || !strings.Contains(string(result.StagedAuditJSONL), `"issue_id":"`+storeCopyID("copy", "repo-a", "issue", "src-1")+`"`) {
+	if !strings.Contains(string(result.StagedAuditJSONL), `"id":"`+storeCopyID("copy", "repo-a", "interaction", "int-1")+`"`) || !strings.Contains(string(result.StagedAuditJSONL), `"issue_id":"`+ids.Issues["src-1"]+`"`) {
 		t.Fatalf("staged interactions were not remapped: %s", result.StagedAuditJSONL)
 	}
 }
@@ -142,12 +154,12 @@ func TestInstallStoreCopyInteractionsIsIdempotentAndDetectsCollision(t *testing.
 
 func storeCopyStringPtr(value string) *string { return &value }
 
-func TestStoreCopyIDsAreNamespaceAndKindScoped(t *testing.T) {
-	issueA := storeCopyID("copy", "repo:a", "issue", "same-id")
-	issueB := storeCopyID("copy", "repo:b", "issue", "same-id")
+func TestStoreCopyContextAndInteractionIDsAreNamespaceScoped(t *testing.T) {
+	mapA := storeCopyMapKey("copy", "repo:a")
+	mapB := storeCopyMapKey("copy", "repo:b")
 	interaction := storeCopyID("copy", "repo:a", "interaction", "same-id")
-	if issueA == issueB || issueA == interaction || !strings.HasPrefix(issueA, "copy-") || !strings.HasPrefix(issueB, "copy-") || strings.Contains(issueA, "repo:a") || strings.Contains(issueB, "repo:b") {
-		t.Fatalf("IDs are not namespace/kind scoped: issueA=%q issueB=%q interaction=%q", issueA, issueB, interaction)
+	if mapA == mapB || !strings.HasPrefix(mapA, "store-copy/id-map/") || strings.Contains(mapA, "repo:a") || !strings.HasPrefix(interaction, "copy-") {
+		t.Fatalf("store-copy identities are not namespace scoped: mapA=%q mapB=%q interaction=%q", mapA, mapB, interaction)
 	}
 }
 

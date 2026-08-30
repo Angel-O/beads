@@ -7,11 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/beads"
+	"github.com/steveyegge/beads/internal/idgen"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -71,16 +73,43 @@ func TestEmbeddedStoreCopyRoundTripIsAtomicAndIdempotent(t *testing.T) {
 		t.Fatalf("write source interactions: %v", err)
 	}
 
-	bundle, ids, err := readStoreCopySnapshot(ctx, source, sourceDir, "copy", "repo-a", []string{"copied"})
+	issues, err := readStoreCopyIssues(ctx, source)
 	if err != nil {
-		t.Fatalf("read source snapshot: %v", err)
+		t.Fatalf("read source issues: %v", err)
 	}
-	beforeSource := append([]byte(nil), mustMarshalStoreCopy(t, bundle)...)
+	mapKey := storeCopyMapKey("copy", "repo-a")
 	importer, ok := beads.AsSnapshotImporter(destination)
 	if !ok {
 		t.Fatal("destination does not expose SnapshotImporter")
 	}
-	request := beads.SnapshotImportRequest{Bundle: bundle, IDs: ids, Mode: beads.SnapshotCreateOnly}
+	var firstSource *types.Issue
+	for _, issue := range issues {
+		if issue.ID == "src-1" {
+			firstSource = issue
+			break
+		}
+	}
+	if firstSource == nil {
+		t.Fatal("source issue src-1 was not returned")
+	}
+	collisionID := idgen.GenerateHashID("copy", firstSource.Title, firstSource.Description, "store-copy:repo-a", firstSource.CreatedAt, 3, 0)
+	if err := destination.CreateIssue(ctx, &types.Issue{ID: collisionID, Title: "unrelated collision", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2, CreatedAt: created, UpdatedAt: created}, "seed"); err != nil {
+		t.Fatalf("seed destination collision: %v", err)
+	}
+	plan, err := importer.PlanIDs(ctx, beads.SnapshotIDPlanRequest{Issues: issues, Prefix: "copy", Actor: "store-copy:repo-a", MetadataKey: mapKey})
+	if err != nil {
+		t.Fatalf("plan destination IDs: %v", err)
+	}
+	if plan.Persisted || plan.Issues["src-1"] == collisionID || !regexp.MustCompile(`^copy-[0-9a-z]{3,8}$`).MatchString(plan.Issues["src-1"]) {
+		t.Fatalf("initial ID plan did not use short collision-safe IDs: %+v collision=%q", plan, collisionID)
+	}
+	ids := beads.SnapshotIDMap{Issues: plan.Issues, AuditInteractions: make(map[string]string)}
+	bundle, err := readStoreCopySnapshot(ctx, source, sourceDir, "copy", "repo-a", []string{"copied"}, issues, ids)
+	if err != nil {
+		t.Fatalf("read source snapshot: %v", err)
+	}
+	beforeSource := append([]byte(nil), mustMarshalStoreCopy(t, bundle)...)
+	request := beads.SnapshotImportRequest{Bundle: bundle, IDs: ids, Mode: beads.SnapshotCreateOnly, IDMapMetadataKey: mapKey}
 	first, err := importer.ImportSnapshot(ctx, request)
 	if err != nil {
 		t.Fatalf("first ImportSnapshot: %v", err)
@@ -90,6 +119,14 @@ func TestEmbeddedStoreCopyRoundTripIsAtomicAndIdempotent(t *testing.T) {
 	}
 	if err := installStoreCopyInteractions(destinationDir, first.StagedAuditJSONL); err != nil {
 		t.Fatalf("install interactions: %v", err)
+	}
+	persistedMap, err := destination.GetMetadata(ctx, mapKey)
+	if err != nil {
+		t.Fatalf("read persisted ID map: %v", err)
+	}
+	wantMap, _ := json.Marshal(ids.Issues)
+	if persistedMap != string(wantMap) {
+		t.Fatalf("persisted ID map = %s, want %s", persistedMap, wantMap)
 	}
 
 	parentID := ids.Issues["src-1"]
@@ -140,7 +177,19 @@ func TestEmbeddedStoreCopyRoundTripIsAtomicAndIdempotent(t *testing.T) {
 		t.Fatalf("destination interaction mode = %o, want 600", got)
 	}
 
-	second, err := importer.ImportSnapshot(ctx, request)
+	recovered, err := importer.PlanIDs(ctx, beads.SnapshotIDPlanRequest{Issues: issues, Prefix: "copy", Actor: "store-copy:repo-a", MetadataKey: mapKey})
+	if err != nil {
+		t.Fatalf("recover persisted ID plan: %v", err)
+	}
+	if !recovered.Persisted || !reflect.DeepEqual(recovered.Issues, ids.Issues) {
+		t.Fatalf("recovered ID plan = %+v, want persisted %+v", recovered, ids.Issues)
+	}
+	retryIDs := beads.SnapshotIDMap{Issues: recovered.Issues, AuditInteractions: make(map[string]string)}
+	retryBundle, err := readStoreCopySnapshot(ctx, source, sourceDir, "copy", "repo-a", []string{"copied"}, issues, retryIDs)
+	if err != nil {
+		t.Fatalf("rebuild retry snapshot: %v", err)
+	}
+	second, err := importer.ImportSnapshot(ctx, beads.SnapshotImportRequest{Bundle: retryBundle, IDs: retryIDs, Mode: beads.SnapshotCreateOnly, IDMapMetadataKey: mapKey})
 	if err != nil {
 		t.Fatalf("repeated ImportSnapshot: %v", err)
 	}
@@ -151,12 +200,44 @@ func TestEmbeddedStoreCopyRoundTripIsAtomicAndIdempotent(t *testing.T) {
 		t.Fatalf("reinstall interactions: %v", err)
 	}
 
-	afterBundle, _, err := readStoreCopySnapshot(ctx, source, sourceDir, "copy", "repo-a", []string{"copied"})
+	afterBundle, err := readStoreCopySnapshot(ctx, source, sourceDir, "copy", "repo-a", []string{"copied"}, issues, retryIDs)
 	if err != nil {
 		t.Fatalf("read source after copy: %v", err)
 	}
 	if after := mustMarshalStoreCopy(t, afterBundle); !reflect.DeepEqual(beforeSource, after) {
 		t.Fatalf("source changed during copy\nbefore: %s\nafter:  %s", beforeSource, after)
+	}
+	unrelated, err := destination.GetIssue(ctx, collisionID)
+	if err != nil || unrelated.Title != "unrelated collision" {
+		t.Fatalf("unrelated collision record changed: issue=%+v err=%v", unrelated, err)
+	}
+}
+
+func TestEmbeddedStoreCopyRejectsInvalidPersistedMap(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded Dolt integration tests")
+	}
+	ctx := t.Context()
+	destination, err := embeddeddolt.Open(ctx, t.TempDir(), "beads", "main")
+	if err != nil {
+		t.Fatalf("open destination: %v", err)
+	}
+	defer func() { _ = destination.Close() }()
+	key := storeCopyMapKey("copy", "repo-a")
+	if err := destination.SetMetadata(ctx, key, `{"other":"copy-abc"}`); err != nil {
+		t.Fatalf("seed invalid map: %v", err)
+	}
+	importer, ok := beads.AsSnapshotImporter(destination)
+	if !ok {
+		t.Fatal("destination does not expose SnapshotImporter")
+	}
+	when := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	_, err = importer.PlanIDs(ctx, beads.SnapshotIDPlanRequest{
+		Issues: []*types.Issue{{ID: "src-1", Title: "source", CreatedAt: when}},
+		Prefix: "copy", Actor: "store-copy:repo-a", MetadataKey: key,
+	})
+	if err == nil || !strings.Contains(err.Error(), "persisted map") {
+		t.Fatalf("invalid persisted map error = %v", err)
 	}
 }
 

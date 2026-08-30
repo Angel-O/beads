@@ -81,6 +81,11 @@ func PrepareSnapshotImport(request publicops.SnapshotImportRequest) (publicops.S
 			return publicops.SnapshotImportRequest{}, publicops.SnapshotImportResult{}, fmt.Errorf("snapshot import: validate issue %q: %w", destination, err)
 		}
 	}
+	if request.IDMapMetadataKey != "" {
+		if err := validateSnapshotIssueMap(request.IDs.Issues, seenSource, ""); err != nil {
+			return publicops.SnapshotImportRequest{}, publicops.SnapshotImportResult{}, fmt.Errorf("snapshot import: ID map: %w", err)
+		}
+	}
 
 	for _, issue := range request.Bundle.Issues {
 		seenLabels := make(map[string]struct{}, len(issue.Labels))
@@ -244,10 +249,94 @@ func PrepareSnapshotImport(request publicops.SnapshotImportRequest) (publicops.S
 	return request, result, nil
 }
 
+// PlanSnapshotIDsInTx loads a committed source-to-destination map or generates
+// one with the same adaptive hash and collision retries used by issue creation.
+func PlanSnapshotIDsInTx(ctx context.Context, tx DBTX, request publicops.SnapshotIDPlanRequest) (publicops.SnapshotIDPlan, error) {
+	if strings.TrimSpace(request.Prefix) == "" || strings.TrimSpace(request.Actor) == "" || strings.TrimSpace(request.MetadataKey) == "" {
+		return publicops.SnapshotIDPlan{}, fmt.Errorf("snapshot ID plan: prefix, actor, and metadata key are required")
+	}
+	issues := cloneSnapshotIssues(request.Issues)
+	if len(issues) == 0 {
+		return publicops.SnapshotIDPlan{}, fmt.Errorf("snapshot ID plan: at least one source issue is required")
+	}
+	seen := make(map[string]struct{}, len(issues))
+	for _, issue := range issues {
+		if issue == nil || strings.TrimSpace(issue.ID) == "" {
+			return publicops.SnapshotIDPlan{}, fmt.Errorf("snapshot ID plan: every source issue requires an ID")
+		}
+		if _, exists := seen[issue.ID]; exists {
+			return publicops.SnapshotIDPlan{}, fmt.Errorf("snapshot ID plan: duplicate source issue ID %q", issue.ID)
+		}
+		seen[issue.ID] = struct{}{}
+	}
+	sort.Slice(issues, func(i, j int) bool { return issues[i].ID < issues[j].ID })
+	raw, err := GetMetadataInTx(ctx, tx, request.MetadataKey)
+	if err != nil {
+		return publicops.SnapshotIDPlan{}, fmt.Errorf("snapshot ID plan: read persisted map: %w", err)
+	}
+	if raw != "" {
+		var ids map[string]string
+		if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+			return publicops.SnapshotIDPlan{}, fmt.Errorf("snapshot ID plan: decode persisted map: %w", err)
+		}
+		if err := validateSnapshotIssueMap(ids, seen, request.Prefix); err != nil {
+			return publicops.SnapshotIDPlan{}, fmt.Errorf("snapshot ID plan: persisted map: %w", err)
+		}
+		return publicops.SnapshotIDPlan{Issues: ids, Persisted: true}, nil
+	}
+
+	ids := make(map[string]string, len(issues))
+	reserved := make(map[string]struct{}, len(issues))
+	rows, err := tx.QueryContext(ctx, "SELECT id FROM issues UNION SELECT id FROM wisps")
+	if err != nil {
+		return publicops.SnapshotIDPlan{}, fmt.Errorf("snapshot ID plan: read destination IDs: %w", err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return publicops.SnapshotIDPlan{}, fmt.Errorf("snapshot ID plan: scan destination ID: %w", err)
+		}
+		reserved[id] = struct{}{}
+	}
+	if err := rows.Close(); err != nil {
+		return publicops.SnapshotIDPlan{}, fmt.Errorf("snapshot ID plan: read destination IDs: %w", err)
+	}
+	for _, issue := range issues {
+		table, _ := TableRouting(issue)
+		id, err := GenerateIssueIDInTableAvoiding(ctx, tx, table, request.Prefix, issue, request.Actor, reserved)
+		if err != nil {
+			return publicops.SnapshotIDPlan{}, fmt.Errorf("snapshot ID plan: generate ID for %q: %w", issue.ID, err)
+		}
+		ids[issue.ID] = id
+		reserved[id] = struct{}{}
+	}
+	return publicops.SnapshotIDPlan{Issues: ids}, nil
+}
+
 // ApplySnapshotImportInTx applies a prepared snapshot to one transaction. It
 // never writes the audit interaction sidecar; callers receive that payload from
 // PrepareSnapshotImport and install it in their own recoverable logical commit.
 func ApplySnapshotImportInTx(ctx context.Context, tx DBTX, request publicops.SnapshotImportRequest, result publicops.SnapshotImportResult) (publicops.SnapshotImportResult, error) {
+	mapValue, err := snapshotIssueMapValue(request)
+	if err != nil {
+		return publicops.SnapshotImportResult{}, err
+	}
+	if request.IDMapMetadataKey != "" {
+		existing, err := GetMetadataInTx(ctx, tx, request.IDMapMetadataKey)
+		if err != nil {
+			return publicops.SnapshotImportResult{}, fmt.Errorf("snapshot import: read ID map: %w", err)
+		}
+		if existing != "" {
+			var persisted map[string]string
+			if err := json.Unmarshal([]byte(existing), &persisted); err != nil {
+				return publicops.SnapshotImportResult{}, fmt.Errorf("snapshot import: decode persisted ID map: %w", err)
+			}
+			if !equalSnapshotIssueMaps(persisted, request.IDs.Issues) {
+				return publicops.SnapshotImportResult{}, fmt.Errorf("snapshot import: persisted ID map conflicts with request")
+			}
+		}
+	}
 	markerKey := publicops.SnapshotImportMarkerKey(result.Digest)
 	var recorded snapshotMarker
 	var marker string
@@ -384,6 +473,11 @@ func ApplySnapshotImportInTx(ctx context.Context, tx DBTX, request publicops.Sna
 	if _, err := tx.ExecContext(ctx, "REPLACE INTO metadata (`key`, value) VALUES (?, ?)", markerKey, markerValue); err != nil {
 		return publicops.SnapshotImportResult{}, fmt.Errorf("snapshot import: write migration marker: %w", err)
 	}
+	if request.IDMapMetadataKey != "" {
+		if err := SetMetadataInTx(ctx, tx, request.IDMapMetadataKey, mapValue); err != nil {
+			return publicops.SnapshotImportResult{}, fmt.Errorf("snapshot import: write ID map: %w", err)
+		}
+	}
 
 	result.Applied = true
 	result.IssuesImported = len(request.Bundle.Issues)
@@ -391,6 +485,53 @@ func ApplySnapshotImportInTx(ctx context.Context, tx DBTX, request publicops.Sna
 	result.EventsImported = len(request.Bundle.Events)
 	result.ProvenanceImported = provenanceImported
 	return result, nil
+}
+
+func snapshotIssueMapValue(request publicops.SnapshotImportRequest) (string, error) {
+	if request.IDMapMetadataKey == "" {
+		return "", nil
+	}
+	if strings.TrimSpace(request.IDMapMetadataKey) == "" {
+		return "", fmt.Errorf("snapshot import: ID map metadata key must not be blank")
+	}
+	raw, err := json.Marshal(request.IDs.Issues)
+	if err != nil {
+		return "", fmt.Errorf("snapshot import: encode ID map: %w", err)
+	}
+	return string(raw), nil
+}
+
+func validateSnapshotIssueMap(ids map[string]string, sources map[string]struct{}, prefix string) error {
+	if len(ids) != len(sources) {
+		return fmt.Errorf("contains %d entries for %d source issues", len(ids), len(sources))
+	}
+	destinations := make(map[string]string, len(ids))
+	for source := range sources {
+		destination, ok := ids[source]
+		if !ok || strings.TrimSpace(destination) == "" {
+			return fmt.Errorf("no destination ID for source issue %q", source)
+		}
+		if prefix != "" && !strings.HasPrefix(destination, prefix+"-") {
+			return fmt.Errorf("destination ID %q does not use prefix %q", destination, prefix)
+		}
+		if previous, exists := destinations[destination]; exists {
+			return fmt.Errorf("source issues %q and %q share destination ID %q", previous, source, destination)
+		}
+		destinations[destination] = source
+	}
+	return nil
+}
+
+func equalSnapshotIssueMaps(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for source, destination := range left {
+		if right[source] != destination {
+			return false
+		}
+	}
+	return true
 }
 
 // SnapshotChangedTables is the durable table set an explicit snapshot may
