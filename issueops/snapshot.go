@@ -34,6 +34,20 @@ type SnapshotIDMap struct {
 	AuditInteractions map[string]string
 }
 
+// SnapshotIDPlanRequest identifies source issues that need ordinary destination
+// IDs. MetadataKey names the durable map used to recover a committed import.
+type SnapshotIDPlanRequest struct {
+	Issues      []*Issue
+	Prefix      string
+	Actor       string
+	MetadataKey string
+}
+
+type SnapshotIDPlan struct {
+	Issues    map[string]string
+	Persisted bool
+}
+
 // SnapshotImportBundle is the complete database portion of a snapshot plus an
 // optional, not-yet-installed audit sidecar. Issues carry their labels,
 // dependencies, and comments in the same form used by the existing interchange
@@ -52,9 +66,10 @@ type SnapshotImportBundle struct {
 // behavior, requires caller-supplied destination IDs, and can replace named
 // aggregates in a non-empty destination.
 type SnapshotImportRequest struct {
-	Bundle SnapshotImportBundle
-	IDs    SnapshotIDMap
-	Mode   SnapshotImportMode
+	Bundle           SnapshotImportBundle
+	IDs              SnapshotIDMap
+	Mode             SnapshotImportMode
+	IDMapMetadataKey string
 }
 
 // SnapshotImportResult reports the committed database operation and the exact
@@ -85,5 +100,6 @@ func SnapshotImportMarkerKey(digest string) string {
 // SnapshotImporter is the database half of a snapshot copy. The caller owns
 // any recoverable logical commit that installs StagedAuditJSONL and its ledger.
 type SnapshotImporter interface {
+	PlanIDs(ctx context.Context, request SnapshotIDPlanRequest) (SnapshotIDPlan, error)
 	ImportSnapshot(ctx context.Context, request SnapshotImportRequest) (SnapshotImportResult, error)
 }

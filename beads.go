@@ -61,6 +61,8 @@ const (
 )
 
 type SnapshotIDMap = publicops.SnapshotIDMap
+type SnapshotIDPlanRequest = publicops.SnapshotIDPlanRequest
+type SnapshotIDPlan = publicops.SnapshotIDPlan
 type ProvenanceEvent = publicops.ProvenanceEvent
 type SnapshotHistoryRow = publicops.SnapshotHistoryRow
 type SnapshotImportBundle = publicops.SnapshotImportBundle

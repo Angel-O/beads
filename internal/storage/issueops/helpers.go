@@ -198,6 +198,12 @@ func RecordEventInTable(ctx context.Context, tx DBTX, table, issueID string, eve
 //
 //nolint:gosec // G201: table is a hardcoded constant
 func GenerateIssueIDInTable(ctx context.Context, tx DBTX, table, prefix string, issue *types.Issue, actor string) (string, error) {
+	return GenerateIssueIDInTableAvoiding(ctx, tx, table, prefix, issue, actor, nil)
+}
+
+// GenerateIssueIDInTableAvoiding applies the standard adaptive hash and retry
+// rules while also excluding IDs reserved by the caller's current batch.
+func GenerateIssueIDInTableAvoiding(ctx context.Context, tx DBTX, table, prefix string, issue *types.Issue, actor string, reserved map[string]struct{}) (string, error) {
 	// Counter mode only applies to the issues table (not wisps).
 	if table == "issues" {
 		counterMode, err := IsCounterModeTx(ctx, tx)
@@ -223,6 +229,9 @@ func GenerateIssueIDInTable(ctx context.Context, tx DBTX, table, prefix string, 
 	for length := baseLength; length <= maxLength; length++ {
 		for nonce := 0; nonce < 10; nonce++ {
 			candidate := idgen.GenerateHashID(prefix, issue.Title, issue.Description, actor, issue.CreatedAt, length, nonce)
+			if _, exists := reserved[candidate]; exists {
+				continue
+			}
 
 			var count int
 			err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE id = ?`, table), candidate).Scan(&count)

@@ -81,18 +81,28 @@ func runStoreCopy(cmd *cobra.Command, args []string) error {
 	if !ok {
 		return HandleErrorRespectJSON("source store does not expose the full offline copy read surface")
 	}
-	bundle, ids, err := readStoreCopySnapshot(ctx, sourceReader, sourceDir, prefix, namespace, storeCopyLabels)
-	if err != nil {
-		return HandleErrorRespectJSON("read source store: %v", err)
-	}
 	importer, ok := beads.AsSnapshotImporter(destination)
 	if !ok {
 		return HandleErrorRespectJSON("destination store does not support atomic snapshot import")
 	}
+	issues, err := readStoreCopyIssues(ctx, sourceReader)
+	if err != nil {
+		return HandleErrorRespectJSON("read source issues: %v", err)
+	}
+	mapKey := storeCopyMapKey(prefix, namespace)
+	plan, err := importer.PlanIDs(ctx, beads.SnapshotIDPlanRequest{
+		Issues: issues, Prefix: prefix, Actor: "store-copy:" + namespace, MetadataKey: mapKey,
+	})
+	if err != nil {
+		return HandleErrorRespectJSON("plan destination IDs: %v", err)
+	}
+	ids := beads.SnapshotIDMap{Issues: plan.Issues, AuditInteractions: make(map[string]string)}
+	bundle, err := readStoreCopySnapshot(ctx, sourceReader, sourceDir, prefix, namespace, storeCopyLabels, issues, ids)
+	if err != nil {
+		return HandleErrorRespectJSON("read source store: %v", err)
+	}
 	result, err := importer.ImportSnapshot(ctx, beads.SnapshotImportRequest{
-		Bundle: bundle,
-		IDs:    ids,
-		Mode:   beads.SnapshotCreateOnly,
+		Bundle: bundle, IDs: ids, Mode: beads.SnapshotCreateOnly, IDMapMetadataKey: mapKey,
 	})
 	if err != nil {
 		return HandleErrorRespectJSON("import snapshot: %v", err)
@@ -129,7 +139,7 @@ type storeCopySource interface {
 	GetProvenanceEvents(context.Context, string, string) ([]types.ProvenanceEvent, error)
 }
 
-func readStoreCopySnapshot(ctx context.Context, source storeCopySource, sourceDir, prefix, namespace string, extraLabels []string) (beads.SnapshotImportBundle, beads.SnapshotIDMap, error) {
+func readStoreCopyIssues(ctx context.Context, source storeCopySource) ([]*types.Issue, error) {
 	issues, err := source.SearchIssues(ctx, "", types.IssueFilter{
 		Limit:      0,
 		MaxRows:    0,
@@ -138,23 +148,28 @@ func readStoreCopySnapshot(ctx context.Context, source storeCopySource, sourceDi
 		SkipWisps:  false,
 	})
 	if err != nil {
-		return beads.SnapshotImportBundle{}, beads.SnapshotIDMap{}, err
+		return nil, err
 	}
-	ids := beads.SnapshotIDMap{Issues: make(map[string]string, len(issues)), AuditInteractions: make(map[string]string)}
+	return issues, nil
+}
+
+func readStoreCopySnapshot(ctx context.Context, source storeCopySource, sourceDir, prefix, namespace string, extraLabels []string, issues []*types.Issue, ids beads.SnapshotIDMap) (beads.SnapshotImportBundle, error) {
+	seenDestinations := make(map[string]string, len(issues))
 	for _, issue := range issues {
 		if issue == nil || strings.TrimSpace(issue.ID) == "" {
-			return beads.SnapshotImportBundle{}, beads.SnapshotIDMap{}, fmt.Errorf("source contains an issue without an ID")
+			return beads.SnapshotImportBundle{}, fmt.Errorf("source contains an issue without an ID")
 		}
-		mapped := storeCopyID(prefix, namespace, "issue", issue.ID)
-		if previous, exists := ids.Issues[issue.ID]; exists && previous != mapped {
-			return beads.SnapshotImportBundle{}, beads.SnapshotIDMap{}, fmt.Errorf("source issue ID %q maps inconsistently", issue.ID)
+		mapped, exists := ids.Issues[issue.ID]
+		if !exists || strings.TrimSpace(mapped) == "" {
+			return beads.SnapshotImportBundle{}, fmt.Errorf("source issue ID %q has no planned destination ID", issue.ID)
 		}
-		for sourceID, destinationID := range ids.Issues {
-			if sourceID != issue.ID && destinationID == mapped {
-				return beads.SnapshotImportBundle{}, beads.SnapshotIDMap{}, fmt.Errorf("source issue IDs %q and %q both map to destination ID %q", sourceID, issue.ID, mapped)
-			}
+		if previous, exists := seenDestinations[mapped]; exists {
+			return beads.SnapshotImportBundle{}, fmt.Errorf("source issue IDs %q and %q both map to destination ID %q", previous, issue.ID, mapped)
 		}
-		ids.Issues[issue.ID] = mapped
+		seenDestinations[mapped] = issue.ID
+	}
+	if len(ids.Issues) != len(issues) {
+		return beads.SnapshotImportBundle{}, fmt.Errorf("planned ID map contains %d entries for %d source issues", len(ids.Issues), len(issues))
 	}
 
 	issueIDs := make([]string, 0, len(issues))
@@ -165,15 +180,15 @@ func readStoreCopySnapshot(ctx context.Context, source storeCopySource, sourceDi
 	}
 	labels, err := source.GetLabelsForIssues(ctx, issueIDs)
 	if err != nil {
-		return beads.SnapshotImportBundle{}, beads.SnapshotIDMap{}, fmt.Errorf("read labels: %w", err)
+		return beads.SnapshotImportBundle{}, fmt.Errorf("read labels: %w", err)
 	}
 	dependencies, err := source.GetDependencyRecordsForIssues(ctx, issueIDs)
 	if err != nil {
-		return beads.SnapshotImportBundle{}, beads.SnapshotIDMap{}, fmt.Errorf("read dependencies: %w", err)
+		return beads.SnapshotImportBundle{}, fmt.Errorf("read dependencies: %w", err)
 	}
 	comments, err := source.GetCommentsForIssues(ctx, issueIDs)
 	if err != nil {
-		return beads.SnapshotImportBundle{}, beads.SnapshotIDMap{}, fmt.Errorf("read comments: %w", err)
+		return beads.SnapshotImportBundle{}, fmt.Errorf("read comments: %w", err)
 	}
 	for i, issue := range clonedIssues {
 		issue.Labels = appendUniqueStoreCopyLabels(labels[issueIDs[i]], extraLabels)
@@ -183,23 +198,23 @@ func readStoreCopySnapshot(ctx context.Context, source storeCopySource, sourceDi
 
 	history, err := source.ReadEventsJournal(ctx, 0, 0)
 	if err != nil {
-		return beads.SnapshotImportBundle{}, beads.SnapshotIDMap{}, fmt.Errorf("read journal history: %w", err)
+		return beads.SnapshotImportBundle{}, fmt.Errorf("read journal history: %w", err)
 	}
 	events, err := source.GetAllEventsSince(ctx, timeZero)
 	if err != nil {
-		return beads.SnapshotImportBundle{}, beads.SnapshotIDMap{}, fmt.Errorf("read events: %w", err)
+		return beads.SnapshotImportBundle{}, fmt.Errorf("read events: %w", err)
 	}
 	var provenance []types.ProvenanceEvent
 	for _, issueID := range issueIDs {
 		rows, err := source.GetProvenanceEvents(ctx, issueID, "")
 		if err != nil {
-			return beads.SnapshotImportBundle{}, beads.SnapshotIDMap{}, fmt.Errorf("read provenance for %q: %w", issueID, err)
+			return beads.SnapshotImportBundle{}, fmt.Errorf("read provenance for %q: %w", issueID, err)
 		}
 		provenance = append(provenance, rows...)
 	}
 	auditJSONL, err := readStoreCopyInteractions(sourceDir, prefix, namespace, ids)
 	if err != nil {
-		return beads.SnapshotImportBundle{}, beads.SnapshotIDMap{}, err
+		return beads.SnapshotImportBundle{}, err
 	}
 
 	for _, event := range events {
@@ -207,12 +222,12 @@ func readStoreCopySnapshot(ctx context.Context, source storeCopySource, sourceDi
 			continue
 		}
 		if _, ok := ids.Issues[event.IssueID]; !ok {
-			return beads.SnapshotImportBundle{}, beads.SnapshotIDMap{}, fmt.Errorf("event %q references issue %q outside the source snapshot", event.ID, event.IssueID)
+			return beads.SnapshotImportBundle{}, fmt.Errorf("event %q references issue %q outside the source snapshot", event.ID, event.IssueID)
 		}
 	}
 	for i := range history {
 		if _, ok := ids.Issues[history[i].IssueID]; !ok {
-			return beads.SnapshotImportBundle{}, beads.SnapshotIDMap{}, fmt.Errorf("journal row %d references issue %q outside the source snapshot", history[i].Seq, history[i].IssueID)
+			return beads.SnapshotImportBundle{}, fmt.Errorf("journal row %d references issue %q outside the source snapshot", history[i].Seq, history[i].IssueID)
 		}
 	}
 
@@ -223,7 +238,7 @@ func readStoreCopySnapshot(ctx context.Context, source storeCopySource, sourceDi
 		Provenance:             provenance,
 		AuditInteractionsJSONL: auditJSONL,
 		MigrationMarker:        "bd-store-copy-v1",
-	}, ids, nil
+	}, nil
 }
 
 var timeZero = time.Time{}
@@ -232,6 +247,11 @@ func storeCopyID(prefix, namespace, kind, sourceID string) string {
 	input := namespace + "\x00" + kind + "\x00" + sourceID
 	sum := sha256.Sum256([]byte(input))
 	return prefix + "-" + hex.EncodeToString(sum[:])
+}
+
+func storeCopyMapKey(prefix, namespace string) string {
+	sum := sha256.Sum256([]byte(prefix + "\x00" + namespace))
+	return "store-copy/id-map/" + hex.EncodeToString(sum[:])
 }
 
 func cloneStoreCopyIssue(issue *types.Issue) *types.Issue {
@@ -297,6 +317,7 @@ func readStoreCopyInteractions(sourceDir, prefix, namespace string, ids beads.Sn
 		return nil, fmt.Errorf("read interactions: %w", err)
 	}
 	lines := strings.Split(string(raw), "\n")
+	var filtered bytes.Buffer
 	for lineNo, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -310,12 +331,22 @@ func readStoreCopyInteractions(sourceDir, prefix, namespace string, ids beads.Sn
 		if err := json.Unmarshal(object["id"], &id); err != nil || id == "" {
 			return nil, fmt.Errorf("interactions line %d has no valid id", lineNo+1)
 		}
+		if rawIssueID, ok := object["issue_id"]; ok {
+			var issueID string
+			if err := json.Unmarshal(rawIssueID, &issueID); err != nil || issueID == "" {
+				return nil, fmt.Errorf("interactions line %d has no valid issue_id", lineNo+1)
+			}
+			if _, copied := ids.Issues[issueID]; !copied {
+				continue
+			}
+		}
 		mappedID := storeCopyID(prefix, namespace, "interaction", id)
 		ids.AuditInteractions[id] = mappedID
+		filtered.WriteString(line)
+		filtered.WriteByte('\n')
 	}
 	// The importer performs the actual interaction and issue-reference remapping.
-	// Keep the source bytes here; only the identity map is needed before import.
-	return raw, nil
+	return filtered.Bytes(), nil
 }
 
 func canonicalStoreCopyPath(path string) (string, error) {
