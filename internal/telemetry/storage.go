@@ -12,6 +12,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
+	publicops "github.com/steveyegge/beads/issueops"
 )
 
 const storageScopeName = "github.com/steveyegge/beads/storage"
@@ -70,6 +71,19 @@ func WrapStorage(s storage.DoltStorage) storage.DoltStorage {
 // Unwrap satisfies storage.Unwrapper so storage.UnwrapStore can peel the
 // instrumentation layer for optional-interface type assertions.
 func (s *InstrumentedStorage) Unwrap() storage.DoltStorage { return s.inner }
+
+// SnapshotImporter preserves the optional snapshot capability through the
+// telemetry decorator without adding a second instrumentation layer around the
+// database transaction.
+func (s *InstrumentedStorage) SnapshotImporter() (publicops.SnapshotImporter, error) {
+	source, ok := s.inner.(interface {
+		SnapshotImporter() (publicops.SnapshotImporter, error)
+	})
+	if !ok {
+		return nil, &publicops.ErrUnsupported{Op: "SnapshotImporter", Backend: "instrumented storage"}
+	}
+	return source.SnapshotImporter()
+}
 
 // op starts a span and records a metric for the named storage operation.
 func (s *InstrumentedStorage) op(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span, time.Time) {

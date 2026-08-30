@@ -181,6 +181,12 @@ var beadDMLExemptions = map[string]string{
 	// omission is invisible to consumers.
 	"ApplyCompactionInTx":     "compaction content rewrite outside the op vocabulary; consumer mirrors of this bead go stale until its next journaled mutation (known contract gap, carried from the reference lineage)",
 	"RestoreFromSnapshotInTx": "restores a compacted issue outside the op vocabulary; consumer mirrors of this bead go stale until its next journaled mutation (known contract gap, carried from the reference lineage)",
+
+	// (5) explicit snapshot restore. Snapshot import copies the durable database
+	// plane and writes one operation-level journal/commit boundary; it must not
+	// regenerate per-row mutation events while restoring source history.
+	"ApplySnapshotImportInTx": "atomic snapshot restore copies durable rows and source history; the operation-level commit boundary replaces per-row mutation events",
+	"ReplaceIssueIntoTable":   "raw full-row snapshot replacement; ApplySnapshotImportInTx owns the operation-level boundary",
 }
 
 // journalExemptMutations are mutation paths that deliberately do NOT journal

@@ -378,6 +378,14 @@ func (p *notifyingProvider) RunEventsMaintenanceTx(ctx context.Context, fn func(
 	return runner.RunEventsMaintenanceTx(ctx, fn)
 }
 
+// SnapshotImporter preserves the capability accessor through the hook
+// decorator. Snapshot imports intentionally bypass mutation hooks: the durable
+// database operation is the source of truth and the caller owns the separate
+// sidecar logical commit.
+func (p *notifyingProvider) SnapshotImporter() (publicops.SnapshotImporter, error) {
+	return NewSnapshotImporter(p)
+}
+
 var (
 	_ UnitOfWorkProvider        = (*notifyingProvider)(nil)
 	_ MaintenanceProvider       = (*notifyingProvider)(nil)
@@ -403,6 +411,7 @@ var (
 	_ DeleterSource             = (*notifyingProvider)(nil)
 	_ SweeperSource             = (*notifyingProvider)(nil)
 	_ ImporterSource            = (*notifyingProvider)(nil)
+	_ SnapshotImporterSource    = (*notifyingProvider)(nil)
 	_ BootstrapperSource        = (*notifyingProvider)(nil)
 	_ InitVerifierSource        = (*notifyingProvider)(nil)
 	_ WorkspaceConfigSource     = (*notifyingProvider)(nil)

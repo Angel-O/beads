@@ -28,6 +28,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/workspacegate"
+	publicops "github.com/steveyegge/beads/issueops"
 )
 
 // Storage is the interface for beads storage operations. Its
@@ -48,6 +49,53 @@ func configuredBackendUnavailable(backend string) error {
 // Transaction provides atomic multi-operation support within a database transaction.
 // Use Storage.RunInTransaction() to obtain a Transaction instance.
 type Transaction = beads.Transaction
+
+// SnapshotImportMode controls explicit snapshot copying. Snapshot import is
+// exposed as a capability rather than added to Storage or Transaction so the
+// incremental ImportBatch contract remains unchanged.
+type SnapshotImportMode = publicops.SnapshotImportMode
+
+const (
+	SnapshotCreateOnly = publicops.SnapshotCreateOnly
+	SnapshotReplace    = publicops.SnapshotReplace
+)
+
+type SnapshotIDMap = publicops.SnapshotIDMap
+type ProvenanceEvent = publicops.ProvenanceEvent
+type SnapshotHistoryRow = publicops.SnapshotHistoryRow
+type SnapshotImportBundle = publicops.SnapshotImportBundle
+type SnapshotImportRequest = publicops.SnapshotImportRequest
+type SnapshotImportResult = publicops.SnapshotImportResult
+type SnapshotImporter = publicops.SnapshotImporter
+
+// SnapshotImporterSource is the optional capability that exposes atomic
+// full-snapshot import. It is deliberately separate from Storage so existing
+// storage implementations are not forced to add snapshot semantics.
+type SnapshotImporterSource interface {
+	SnapshotImporter() (SnapshotImporter, error)
+}
+
+// AsSnapshotImporter returns the snapshot-import capability when the backing
+// store supports it. The returned role owns the database transaction; callers
+// receive staged audit JSONL in the result and remain responsible for its
+// separate logical commit.
+func AsSnapshotImporter(s Storage) (SnapshotImporter, bool) {
+	importer, ok := s.(SnapshotImporterSource)
+	if !ok {
+		return nil, false
+	}
+	result, err := importer.SnapshotImporter()
+	if err != nil {
+		return nil, false
+	}
+	return result, true
+}
+
+const SnapshotImportMetadataPrefix = publicops.SnapshotImportMetadataPrefix
+
+func SnapshotImportMarkerKey(digest string) string {
+	return publicops.SnapshotImportMarkerKey(digest)
+}
 
 // DependencyAddOptions controls transaction-scoped dependency insertion for
 // Transaction.AddDependencyWithOptions. Exported so embedders' bulk graph
@@ -374,6 +422,18 @@ type gatedStorage struct {
 }
 
 var _ storage.DoltStorage = (*gatedStorage)(nil)
+var _ SnapshotImporterSource = (*gatedStorage)(nil)
+
+// SnapshotImporter preserves the optional snapshot capability through the
+// lifetime-gated storage wrapper. Embedding storage.DoltStorage cannot promote
+// this method because snapshot import is intentionally an optional capability.
+func (g *gatedStorage) SnapshotImporter() (SnapshotImporter, error) {
+	source, ok := g.DoltStorage.(SnapshotImporterSource)
+	if !ok {
+		return nil, &publicops.ErrUnsupported{Op: "SnapshotImporter", Backend: "gated storage"}
+	}
+	return source.SnapshotImporter()
+}
 
 // Unwrap exposes the inner store for storage.UnwrapStore, matching
 // HookFiringStore's decorator shape.
