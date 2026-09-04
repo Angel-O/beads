@@ -10,6 +10,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/internal/storage/scopeops"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -69,6 +70,72 @@ func wrapCommitIndeterminate(op string, err error) error {
 type embeddedTransaction struct {
 	tx    *sql.Tx
 	dirty *versioncontrolops.DirtyTableTracker
+}
+
+func (t *embeddedTransaction) CreateScope(ctx context.Context, scope *types.Scope, activate bool) error {
+	if err := scopeops.Create(ctx, t.tx, scope, activate); err != nil {
+		return err
+	}
+	t.markScopeTables()
+	return nil
+}
+
+func (t *embeddedTransaction) ListScopes(ctx context.Context) ([]*types.Scope, error) {
+	return scopeops.List(ctx, t.tx)
+}
+
+func (t *embeddedTransaction) GetScope(ctx context.Context, id string) (*types.ScopeDetails, error) {
+	return scopeops.Get(ctx, t.tx, id)
+}
+
+func (t *embeddedTransaction) GetActiveScope(ctx context.Context) (*types.Scope, error) {
+	return scopeops.Active(ctx, t.tx)
+}
+
+func (t *embeddedTransaction) ActivateScope(ctx context.Context, id string) error {
+	if err := scopeops.Activate(ctx, t.tx, id); err != nil {
+		return err
+	}
+	t.markScopeTables()
+	return nil
+}
+
+func (t *embeddedTransaction) DeactivateScope(ctx context.Context) error {
+	if err := scopeops.Deactivate(ctx, t.tx); err != nil {
+		return err
+	}
+	t.markScopeTables()
+	return nil
+}
+
+func (t *embeddedTransaction) AddScopeMembers(ctx context.Context, scopeID string, issueIDs []string) error {
+	if err := scopeops.AddMembers(ctx, t.tx, scopeID, issueIDs); err != nil {
+		return err
+	}
+	t.markScopeTables()
+	return nil
+}
+
+func (t *embeddedTransaction) RemoveScopeMembers(ctx context.Context, scopeID string, issueIDs []string) error {
+	if err := scopeops.RemoveMembers(ctx, t.tx, scopeID, issueIDs); err != nil {
+		return err
+	}
+	t.markScopeTables()
+	return nil
+}
+
+func (t *embeddedTransaction) MoveScopeMembers(ctx context.Context, sourceID, targetID string, issueIDs []string) error {
+	if err := scopeops.MoveMembers(ctx, t.tx, sourceID, targetID, issueIDs); err != nil {
+		return err
+	}
+	t.markScopeTables()
+	return nil
+}
+
+func (t *embeddedTransaction) markScopeTables() {
+	for _, table := range []string{"scopes", "scope_state", "scope_members"} {
+		t.dirty.MarkDirty(table)
+	}
 }
 
 func (t *embeddedTransaction) CreateIssue(ctx context.Context, issue *types.Issue, actor string) error {

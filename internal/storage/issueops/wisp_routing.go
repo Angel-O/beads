@@ -244,6 +244,9 @@ func DeleteCascadeTables(isWisp bool) []string {
 		"child_counters",
 		"issue_snapshots",
 		"compaction_snapshots",
+		// Cross-plane membership: deleting an issue cascades its durable scope
+		// membership row.
+		"scope_members",
 		// Cross-plane: wisp_dependencies.depends_on_issue_id points at
 		// issues(id) ON DELETE CASCADE, so deleting an ordinary issue also
 		// drops the wisp edges that depended on it.

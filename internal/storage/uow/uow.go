@@ -22,6 +22,7 @@ type UnitOfWork interface {
 	CommentUseCase() domain.CommentUseCase
 	RawSQLUseCase() domain.RawSQLUseCase
 	EventsJournalUseCase() domain.EventsJournalUseCase
+	ScopeUseCase() domain.ScopeUseCase
 }
 
 type UnitOfWorkProvider interface {
@@ -49,6 +50,7 @@ type baseUOW struct {
 	commentUseCase       domain.CommentUseCase
 	rawSQLUseCase        domain.RawSQLUseCase
 	eventsJournalUseCase domain.EventsJournalUseCase
+	scopeUseCase         domain.ScopeUseCase
 }
 
 func (u *baseUOW) Commit(ctx context.Context, message string) error {
@@ -131,4 +133,12 @@ func (u *baseUOW) EventsJournalUseCase() domain.EventsJournalUseCase {
 		u.eventsJournalUseCase = domain.NewEventsJournalUseCase(db.NewEventsJournalSQLRepository(u.tx.Runner()))
 	}
 	return u.eventsJournalUseCase
+}
+
+// ScopeUseCase returns the scope domain surface over this UOW's transaction.
+func (u *baseUOW) ScopeUseCase() domain.ScopeUseCase {
+	if u.scopeUseCase == nil {
+		u.scopeUseCase = domain.NewScopeUseCase(db.NewScopeSQLRepository(u.tx.Runner()))
+	}
+	return u.scopeUseCase
 }

@@ -39,6 +39,8 @@ type (
 	ReclaimFilter               = types.ReclaimFilter
 	ReclaimedLease              = types.ReclaimedLease
 	SortPolicy                  = types.SortPolicy
+	Scope                       = types.Scope
+	ScopeDetails                = types.ScopeDetails
 	StaleFilter                 = types.StaleFilter
 	Statistics                  = types.Statistics
 	Status                      = types.Status

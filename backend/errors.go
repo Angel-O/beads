@@ -37,6 +37,14 @@ var (
 	ErrFieldTooLong = types.ErrFieldTooLong
 )
 
+var ErrScopeInvalid = storage.ErrScopeInvalid
+var ErrScopeAlreadyExists = storage.ErrScopeAlreadyExists
+var ErrScopeNotFound = storage.ErrScopeNotFound
+var ErrScopeIssueNotFound = storage.ErrScopeIssueNotFound
+var ErrScopeMembershipConflict = storage.ErrScopeMembershipConflict
+var ErrScopeCapacityExceeded = storage.ErrScopeCapacityExceeded
+var ErrScopeSourceMembership = storage.ErrScopeSourceMembership
+
 // ClaimedByFragment and NotClaimableStatusFragment are the exact message
 // fragments the claim path appends after ErrAlreadyClaimed / ErrNotClaimable
 // to carry the conflicting assignee or status. A backend that produces claim
