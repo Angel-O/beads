@@ -1851,6 +1851,10 @@ type Statistics struct {
 
 // IssueFilter is used to filter issue queries
 type IssueFilter struct {
+	// Unscoped selects rows with no corresponding scope_members row. The
+	// storage query renders this as NOT EXISTS; false leaves ordinary searches
+	// unchanged.
+	Unscoped bool `json:"-"`
 	// Ready adds the blocker-aware ready-work selection to the ordinary issue
 	// query so it composes with every other filter and SQL keyset pagination.
 	Ready bool `json:"-"`

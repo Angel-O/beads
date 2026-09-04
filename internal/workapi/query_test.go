@@ -130,6 +130,19 @@ func TestBuildQueryPlanExcludesClosedUnlessTheExpressionSaysOtherwise(t *testing
 	}
 }
 
+func TestBuildQueryPlanUnscopedSelectsWithoutDefaultClosedExclusion(t *testing.T) {
+	plan, err := BuildQueryPlan(issueops.QueryRequest{Expression: "type=task", Unscoped: true})
+	if err != nil {
+		t.Fatalf("BuildQueryPlan: %v", err)
+	}
+	if !plan.Filter.Unscoped {
+		t.Fatal("unscoped request did not reach the storage filter")
+	}
+	if slices.Contains(plan.Filter.ExcludeStatus, types.StatusClosed) {
+		t.Fatalf("unscoped filter excludes closed issues: %v", plan.Filter.ExcludeStatus)
+	}
+}
+
 // TestBuildQueryPlanRefusals pins every deterministic refusal, each of which a
 // front door would otherwise make for itself — which is how the two routes came
 // to disagree about what an offset means.

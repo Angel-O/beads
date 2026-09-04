@@ -1,6 +1,33 @@
 package sqlbuild
 
-import "testing"
+import (
+	"slices"
+	"testing"
+
+	"github.com/steveyegge/beads/internal/types"
+)
+
+func TestBuildIssueFilterClausesUnscopedUsesNotExists(t *testing.T) {
+	clauses, args, err := BuildIssueFilterClauses("", types.IssueFilter{Unscoped: true}, IssuesFilterTables)
+	if err != nil {
+		t.Fatalf("BuildIssueFilterClauses: %v", err)
+	}
+	want := "NOT EXISTS (SELECT 1 FROM scope_members sm WHERE sm.issue_id = id)"
+	if !slices.Contains(clauses, want) {
+		t.Fatalf("clauses = %v, want %q", clauses, want)
+	}
+	if len(args) != 0 {
+		t.Fatalf("args = %v, want none", args)
+	}
+
+	ordinary, _, err := BuildIssueFilterClauses("", types.IssueFilter{}, IssuesFilterTables)
+	if err != nil {
+		t.Fatalf("ordinary BuildIssueFilterClauses: %v", err)
+	}
+	if slices.Contains(ordinary, want) {
+		t.Fatal("ordinary filter unexpectedly included the scope selection")
+	}
+}
 
 // TestGlobToLikePattern exercises globToLikePattern directly against the
 // package that actually calls it from BuildIssueFilterClauses (be-ucslk4).
