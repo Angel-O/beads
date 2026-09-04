@@ -170,6 +170,7 @@ var readOnlyCommands = map[string]bool{
 	"export":     true, // reads from Dolt, writes JSONL to file/stdout
 	"tail":       true, // bd events tail: reads bd_events_journal, writes nothing
 	"history":    true,
+	"active":     true,
 }
 
 // isReadOnlyCommand returns true if the command only reads from the database.

@@ -63,6 +63,7 @@ func gatherListInput(cmd *cobra.Command) (listInput, error) {
 		limit = config.GetInt("list.limit")
 	}
 	in.AllFlag, _ = cmd.Flags().GetBool("all")
+	in.Unscoped, _ = cmd.Flags().GetBool("unscoped")
 
 	in.formatStr, _ = cmd.Flags().GetString("format")
 	if strings.EqualFold(in.formatStr, "json") {
