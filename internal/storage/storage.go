@@ -647,6 +647,7 @@ type FastStatisticsStore interface {
 // EmbeddedDoltStore satisfy this interface.
 type DoltStorage interface {
 	Storage
+	ScopeStore
 	IssueLifecycleStore
 	VersionControl
 	HistoryViewer
@@ -926,6 +927,18 @@ type ReadyWorkCounter interface {
 //	    return nil // Triggers commit
 //	})
 type Transaction interface {
+	// Scope operations. These use the transaction's snapshot and are atomic
+	// with any other work in the callback.
+	CreateScope(ctx context.Context, scope *types.Scope, activate bool) error
+	ListScopes(ctx context.Context) ([]*types.Scope, error)
+	GetScope(ctx context.Context, id string) (*types.ScopeDetails, error)
+	GetActiveScope(ctx context.Context) (*types.Scope, error)
+	ActivateScope(ctx context.Context, id string) error
+	DeactivateScope(ctx context.Context) error
+	AddScopeMembers(ctx context.Context, scopeID string, issueIDs []string) error
+	RemoveScopeMembers(ctx context.Context, scopeID string, issueIDs []string) error
+	MoveScopeMembers(ctx context.Context, sourceID, targetID string, issueIDs []string) error
+
 	// Issue operations
 	CreateIssue(ctx context.Context, issue *types.Issue, actor string) error
 	CreateIssues(ctx context.Context, issues []*types.Issue, actor string) error

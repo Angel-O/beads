@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/internal/storage/scopeops"
 	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 	"github.com/steveyegge/beads/internal/types"
@@ -40,6 +41,72 @@ type doltTransaction struct {
 	// journal collapsed the two planes into one transaction, so the finish path
 	// must not commit or roll it back a second time.
 	journalPinned bool
+}
+
+func (t *doltTransaction) CreateScope(ctx context.Context, scope *types.Scope, activate bool) error {
+	if err := scopeops.Create(ctx, t.regularTx, scope, activate); err != nil {
+		return err
+	}
+	t.markScopeTables()
+	return nil
+}
+
+func (t *doltTransaction) ListScopes(ctx context.Context) ([]*types.Scope, error) {
+	return scopeops.List(ctx, t.regularTx)
+}
+
+func (t *doltTransaction) GetScope(ctx context.Context, id string) (*types.ScopeDetails, error) {
+	return scopeops.Get(ctx, t.regularTx, id)
+}
+
+func (t *doltTransaction) GetActiveScope(ctx context.Context) (*types.Scope, error) {
+	return scopeops.Active(ctx, t.regularTx)
+}
+
+func (t *doltTransaction) ActivateScope(ctx context.Context, id string) error {
+	if err := scopeops.Activate(ctx, t.regularTx, id); err != nil {
+		return err
+	}
+	t.markScopeTables()
+	return nil
+}
+
+func (t *doltTransaction) DeactivateScope(ctx context.Context) error {
+	if err := scopeops.Deactivate(ctx, t.regularTx); err != nil {
+		return err
+	}
+	t.markScopeTables()
+	return nil
+}
+
+func (t *doltTransaction) AddScopeMembers(ctx context.Context, scopeID string, issueIDs []string) error {
+	if err := scopeops.AddMembers(ctx, t.regularTx, scopeID, issueIDs); err != nil {
+		return err
+	}
+	t.markScopeTables()
+	return nil
+}
+
+func (t *doltTransaction) RemoveScopeMembers(ctx context.Context, scopeID string, issueIDs []string) error {
+	if err := scopeops.RemoveMembers(ctx, t.regularTx, scopeID, issueIDs); err != nil {
+		return err
+	}
+	t.markScopeTables()
+	return nil
+}
+
+func (t *doltTransaction) MoveScopeMembers(ctx context.Context, sourceID, targetID string, issueIDs []string) error {
+	if err := scopeops.MoveMembers(ctx, t.regularTx, sourceID, targetID, issueIDs); err != nil {
+		return err
+	}
+	t.markScopeTables()
+	return nil
+}
+
+func (t *doltTransaction) markScopeTables() {
+	for table := range scopeTables() {
+		t.dirty.MarkDirty(table)
+	}
 }
 
 func (t *doltTransaction) txFor(table string) *sql.Tx {

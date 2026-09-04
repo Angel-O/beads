@@ -47,6 +47,7 @@ func (m *mockUnitOfWork) IssueUseCase() domain.IssueUseCase           { return m
 func (m *mockUnitOfWork) DependencyUseCase() domain.DependencyUseCase { return m.dependencyUseCase }
 func (m *mockUnitOfWork) LabelUseCase() domain.LabelUseCase           { return m.labelUseCase }
 func (m *mockUnitOfWork) CommentUseCase() domain.CommentUseCase       { return m.commentUseCase }
+func (m *mockUnitOfWork) ScopeUseCase() domain.ScopeUseCase           { return nil }
 func (m *mockUnitOfWork) RawSQLUseCase() domain.RawSQLUseCase         { return nil }
 func (m *mockUnitOfWork) EventsJournalUseCase() domain.EventsJournalUseCase {
 	return nil
