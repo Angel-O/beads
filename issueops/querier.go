@@ -16,6 +16,10 @@ import (
 // and the choice of how to execute the result all happen inside; a caller says
 // what it wants matched and never how the match is shaped.
 type QueryRequest struct {
+	// Unscoped restricts the result to issues with no scope_members row. It is
+	// an explicit selection and lifts the default closed-issue exclusion.
+	Unscoped bool
+
 	// Expression is the query, in the language `bd query --help` documents:
 	// field comparisons (`status=open`, `priority>1`, `created>7d`) combined
 	// with AND, OR, NOT and parentheses.
@@ -31,7 +35,7 @@ type QueryRequest struct {
 	//
 	// THE HIDING IS CONDITIONAL, and the condition is part of this contract
 	// because both front doors have always applied it: closed rows are
-	// excluded UNLESS this is set, or unless the expression itself compares
+	// excluded UNLESS this is set, Unscoped is set, or unless the expression itself compares
 	// `status`. So `status=closed` answers with closed rows on its own, and
 	// `NOT status=open` does too — an expression that has an opinion about
 	// status keeps it, and only an expression with none gets the default. The

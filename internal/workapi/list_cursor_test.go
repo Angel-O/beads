@@ -1,6 +1,11 @@
 package workapi
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -42,10 +47,53 @@ func TestListCursorBindsSelectionButNotLimitOrProjection(t *testing.T) {
 	if err := ApplyListCursor(changedReady, &types.IssueFilter{}); err == nil || !strings.Contains(err.Error(), "current list filters") {
 		t.Fatalf("changed ready selection error = %v", err)
 	}
+	changedUnscoped := resumed
+	changedUnscoped.Unscoped = true
+	if err := ApplyListCursor(changedUnscoped, &types.IssueFilter{}); err == nil || !strings.Contains(err.Error(), "current list filters") {
+		t.Fatalf("changed unscoped selection error = %v", err)
+	}
 	changedSort := resumed
 	changedSort.SortBy = "created"
 	if err := ApplyListCursor(changedSort, &types.IssueFilter{}); err == nil || !strings.Contains(err.Error(), "created for sort") {
 		t.Fatalf("changed sort error = %v", err)
+	}
+}
+
+func TestListCursorAcceptsLegacySelectionWithoutUnscopedFalse(t *testing.T) {
+	limit := 2
+	req := issueops.ListRequest{Paginate: true, SortBy: "updated", Limit: &limit, Labels: []string{"api"}}
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	// Recreate the v1 selection hash from before ListRequest gained Unscoped.
+	selection := req
+	selection.Paginate = false
+	selection.Cursor = ""
+	selection.Limit = nil
+	selection.Offset = 0
+	selection.Brief = false
+	selection.SkipLabels = false
+	selection.SkipCounts = false
+	selection.MaxRows = 0
+	selection.MaxRowsSource = ""
+	blob, err := json.Marshal(selection)
+	if err != nil {
+		t.Fatalf("marshal legacy selection: %v", err)
+	}
+	// Keep the struct field order intact while removing the field if a future
+	// edit drops omitempty again.
+	blob = bytes.Replace(blob, []byte(`{"Unscoped":false,`), []byte(`{`), 1)
+	sum := sha256.Sum256(blob)
+	state := listCursorState{Sort: req.SortBy, Selection: hex.EncodeToString(sum[:]), At: &at, ID: "bd-b"}
+	payload, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal legacy cursor: %v", err)
+	}
+	legacy := listCursorVersion + "." + base64.RawURLEncoding.EncodeToString(payload)
+
+	resumed := req
+	resumed.Cursor = legacy
+	if err := ApplyListCursor(resumed, &types.IssueFilter{}); err != nil {
+		t.Fatalf("legacy cursor rejected: %v", err)
 	}
 }
 
