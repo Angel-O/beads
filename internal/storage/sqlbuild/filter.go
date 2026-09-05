@@ -89,6 +89,9 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 		whereClauses = append(whereClauses, "status = ?")
 		args = append(args, *filter.Status)
 	}
+	if filter.Unscoped {
+		whereClauses = append(whereClauses, "NOT EXISTS (SELECT 1 FROM scope_members sm WHERE sm.issue_id = id)")
+	}
 	if len(filter.Statuses) > 0 {
 		placeholders := make([]string, len(filter.Statuses))
 		for i, s := range filter.Statuses {

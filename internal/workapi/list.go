@@ -188,10 +188,13 @@ func LoadUOWListConfig(ctx context.Context, uw UnitOfWork) (ListConfig, error) {
 // the single definition of what `bd list` means: the closed/done/frozen status
 // exclusions, the pinned and template defaults, and the gate, infra-type, and
 // wisp suppression that make the default listing show durable work only.
+// Unscoped is the explicit no-scope selection and leaves the lifecycle rows in
+// that selection visible.
 func BuildListFilter(in issueops.ListRequest, cfg ListConfig) (types.IssueFilter, error) {
 	filter := types.IssueFilter{
-		Ready: in.ReadyFlag,
-		Limit: SQLLimit(in),
+		Unscoped: in.Unscoped,
+		Ready:    in.ReadyFlag,
+		Limit:    SQLLimit(in),
 		// The offset is carried for the callers that consume this filter as a
 		// VALUE and run their own query — `bd list --watch` and the proxied
 		// hierarchical --parent walk — where the seam beneath them renders it.
@@ -231,7 +234,7 @@ func BuildListFilter(in issueops.ListRequest, cfg ListConfig) (types.IssueFilter
 		}
 	}
 
-	if len(statusParts) == 0 && !in.AllFlag && !in.ReadyFlag && !in.PinnedFlag {
+	if len(statusParts) == 0 && !in.AllFlag && !in.Unscoped && !in.ReadyFlag && !in.PinnedFlag {
 		excludeStatuses := []types.Status{types.StatusClosed, types.StatusPinned}
 		for _, cs := range cfg.CustomStatuses {
 			if cs.Category == types.CategoryDone || cs.Category == types.CategoryFrozen {

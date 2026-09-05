@@ -172,15 +172,16 @@ func formatSkipLabelsConflictError(conflicts []string) string {
 // knownListFlags maps bare words that users might pass as positional args
 // but are actually flag names. Each maps to a hint for the error message.
 var knownListFlags = map[string]string{
-	"ready":   "--ready",
-	"tree":    "--tree",
-	"flat":    "--flat",
-	"all":     "--all",
-	"long":    "--long",
-	"watch":   "--watch",
-	"pretty":  "--pretty",
-	"pinned":  "--pinned",
-	"overdue": "--overdue",
+	"ready":    "--ready",
+	"tree":     "--tree",
+	"flat":     "--flat",
+	"all":      "--all",
+	"long":     "--long",
+	"watch":    "--watch",
+	"pretty":   "--pretty",
+	"pinned":   "--pinned",
+	"overdue":  "--overdue",
+	"unscoped": "--unscoped",
 }
 
 var listCmd = &cobra.Command{
@@ -443,6 +444,7 @@ func init() {
 	listCmd.Flags().Int("offset", 0, "Skip the first N matching results (0-based). Only supported under --proxied-server.")
 	listCmd.Flags().String("format", "", "Output format: 'digraph' (for golang.org/x/tools/cmd/digraph), 'dot' (Graphviz), or Go template")
 	listCmd.Flags().Bool("all", false, "Show all issues including closed (overrides default filter)")
+	listCmd.Flags().Bool("unscoped", false, "Show only issues that are not members of a scope")
 	listCmd.Flags().Bool("long", false, "Show detailed multi-line output for each issue")
 	listCmd.Flags().String("sort", "", "Sort by field: priority, created, updated, closed, status, id, title, type, assignee")
 	listCmd.Flags().BoolP("reverse", "r", false, "Reverse sort order")

@@ -94,6 +94,7 @@ func BuildQueryPlan(in issueops.QueryRequest) (QueryPlan, error) {
 		SortBy:  in.SortBy,
 		Reverse: in.Reverse,
 	}
+	plan.Filter.Unscoped = in.Unscoped
 	if result.RequiresPredicate {
 		plan.Predicate = result.Predicate
 	} else {
@@ -118,7 +119,7 @@ func BuildQueryPlan(in issueops.QueryRequest) (QueryPlan, error) {
 
 	// The default closed exclusion, applied only to an expression that has no
 	// opinion of its own about status (issueops/querier.go:29-41).
-	if !in.IncludeClosed && plan.Filter.Status == nil && !mentionsStatus(node) {
+	if !in.Unscoped && !in.IncludeClosed && plan.Filter.Status == nil && !mentionsStatus(node) {
 		plan.Filter.ExcludeStatus = append(plan.Filter.ExcludeStatus, types.StatusClosed)
 	}
 	return plan, nil

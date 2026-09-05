@@ -117,6 +117,8 @@ func TestNotifyingUOWWrapsEveryMutatingUseCase(t *testing.T) {
 				"already committed — the delete changes no bead, and the journal itself is written " +
 				"at the issueops seam inside the mutation's own transaction, so everything it " +
 				"records is already covered by the use case that made the change",
+			"ScopeUseCase": "scope identity and membership changes are not issue mutations and " +
+				"have no hook vocabulary, so the notifying wrapper passes this surface through",
 		})
 }
 

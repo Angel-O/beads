@@ -85,6 +85,10 @@ func TestDeleteCascadeTablesCoversSchema(t *testing.T) {
 	if !slices.Contains(listed, "issues") {
 		t.Errorf("DeleteCascadeTables(false) = %v, want it to include the deleted row's own table", listed)
 	}
+	// Keep the scope-schema membership cascade pinned to the non-wisp path.
+	if !slices.Contains(listed, "scope_members") {
+		t.Errorf("DeleteCascadeTables(false) = %v, want it to include scope_members", listed)
+	}
 }
 
 // TestDeleteCascadeTablesWispCoversSchema is the same derivation for the wisp

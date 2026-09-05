@@ -84,6 +84,7 @@ type DoltStorage = storage.DoltStorage
 // organized (and documented) per capability.
 type (
 	Storage              = storage.Storage
+	ScopeStore           = storage.ScopeStore
 	IssueLifecycleStore  = storage.IssueLifecycleStore
 	VersionControl       = storage.VersionControl
 	HistoryViewer        = storage.HistoryViewer
@@ -133,9 +134,14 @@ type (
 	UpdateIssueOptions      = storage.UpdateIssueOptions
 )
 
+type ScopeMembershipConflictError = storage.ScopeMembershipConflictError
+type ScopeCapacityError = storage.ScopeCapacityError
+type ScopeSourceMembershipError = storage.ScopeSourceMembershipError
+
 const (
 	MaxBulkHistoryIDs      = storage.MaxBulkHistoryIDs
 	MaxBulkHistoryIDLength = storage.MaxBulkHistoryIDLength
+	MaxScopeMembers        = storage.MaxScopeMembers
 )
 
 // VCStatus is the version-control status report (storage.Status). Named
