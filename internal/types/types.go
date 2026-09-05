@@ -2051,6 +2051,9 @@ type IssueFilter struct {
 	// no body, so the gap costs bytes off the wire and no correctness.
 	// See engdocs/EXTENDING.md.
 	Lite bool
+
+	// Filter is a case-insensitive literal substring match on id or title.
+	Filter string `json:",omitempty"`
 }
 
 // SortPolicy determines how ready work is ordered
