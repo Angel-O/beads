@@ -148,9 +148,16 @@ type ListRequest struct {
 	// IDFilter is a comma-separated id set.
 	IDFilter string
 
-	Labels           []string
-	LabelsAny        []string
-	ExcludeLabels    []string
+	Labels        []string
+	LabelsAny     []string
+	ExcludeLabels []string
+	// NoLabelPrefix excludes issues carrying any label that starts with this
+	// literal prefix. The match is server-side and does not treat the prefix as
+	// a glob.
+	NoLabelPrefix string
+	// Label is one exact label name. Unlike the other label fields it is a
+	// scalar so callers can request an exact match without prefix semantics.
+	Label            *string
 	LabelPattern     string
 	LabelRegex       string
 	TitleContains    string
@@ -382,6 +389,9 @@ type ListRequest struct {
 	// transport concern and never reaches this contract.
 	AfterCreatedAt *time.Time
 	AfterID        string
+	// AfterPriority is the priority component of the priority/created_at/id
+	// keyset position. AfterCreatedAt and AfterID carry the other components.
+	AfterPriority *int
 
 	// MaxRows is a DEFENSIVE CAP rather than a page. It bounds how many rows
 	// the query may match before the whole answer is refused; 0 disables it.

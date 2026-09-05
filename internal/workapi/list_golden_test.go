@@ -77,8 +77,31 @@ func TestBuildListFilterGolden(t *testing.T) {
 			if err := json.Compact(&want, c.Filter); err != nil {
 				t.Fatalf("compact golden filter: %v", err)
 			}
-			if !bytes.Equal(got, want.Bytes()) {
-				t.Errorf("filter differs from the recorded pre-extraction filter\n got: %s\nwant: %s", got, want.Bytes())
+			// Keep older recorded cases useful as the shared filter gains fields;
+			// a case that predates one of them does not assert its zero value. New
+			// cases can still record and assert a non-zero exact label or cursor.
+			var gotFields, wantFields map[string]json.RawMessage
+			if err := json.Unmarshal(got, &gotFields); err != nil {
+				t.Fatalf("decode generated filter: %v", err)
+			}
+			if err := json.Unmarshal(want.Bytes(), &wantFields); err != nil {
+				t.Fatalf("decode golden filter: %v", err)
+			}
+			for _, field := range []string{"Label", "NoLabelPrefix", "AfterPriority"} {
+				if _, recorded := wantFields[field]; !recorded {
+					delete(gotFields, field)
+				}
+			}
+			wantBytes, err := json.Marshal(wantFields)
+			if err != nil {
+				t.Fatalf("normalize golden filter: %v", err)
+			}
+			got, err = json.Marshal(gotFields)
+			if err != nil {
+				t.Fatalf("normalize generated filter: %v", err)
+			}
+			if !bytes.Equal(got, wantBytes) {
+				t.Errorf("filter differs from the recorded pre-extraction filter\n got: %s\nwant: %s", got, wantBytes)
 			}
 		})
 	}

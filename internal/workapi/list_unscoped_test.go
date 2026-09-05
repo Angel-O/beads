@@ -31,3 +31,31 @@ func TestBuildListFilterUnscopedIsExplicitAndLiftsDefaultStatusExclusions(t *tes
 		t.Fatalf("unscoped list excludes closed issues: %v", unscoped.ExcludeStatus)
 	}
 }
+
+func TestBuildListFilterCarriesExactLabelAndPriorityCursor(t *testing.T) {
+	priority := 2
+	label := "backend"
+	filter, err := BuildListFilter(issueops.ListRequest{
+		Label:         &label,
+		AfterPriority: &priority,
+	}, ListConfig{})
+	if err != nil {
+		t.Fatalf("BuildListFilter: %v", err)
+	}
+	if filter.Label == nil || *filter.Label != label {
+		t.Fatalf("exact label = %v, want %q", filter.Label, label)
+	}
+	if filter.AfterPriority == nil || *filter.AfterPriority != priority {
+		t.Fatalf("after priority = %v, want %d", filter.AfterPriority, priority)
+	}
+}
+
+func TestBuildListFilterCarriesNoLabelPrefix(t *testing.T) {
+	filter, err := BuildListFilter(issueops.ListRequest{NoLabelPrefix: "team:"}, ListConfig{})
+	if err != nil {
+		t.Fatalf("BuildListFilter: %v", err)
+	}
+	if filter.NoLabelPrefix != "team:" {
+		t.Fatalf("no label prefix = %q, want %q", filter.NoLabelPrefix, "team:")
+	}
+}

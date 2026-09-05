@@ -21,6 +21,7 @@ type listCursorState struct {
 	At        *time.Time `json:"t,omitempty"`
 	Null      bool       `json:"n,omitempty"`
 	ID        string     `json:"i"`
+	Priority  *int       `json:"p,omitempty"`
 }
 
 // ApplyListCursor validates and decodes backend-owned list pagination state
@@ -36,8 +37,8 @@ func ApplyListCursor(req issueops.ListRequest, filter *types.IssueFilter) error 
 	if *req.Limit > MaxListPageLimit {
 		return fmt.Errorf("%w: paginated list limit must not exceed %d", issueops.ErrValidation, MaxListPageLimit)
 	}
-	if req.SortBy != "created" && req.SortBy != "updated" && req.SortBy != "closed" {
-		return fmt.Errorf("%w: paginated list requires sort created, updated, or closed", issueops.ErrValidation)
+	if req.SortBy != "created" && req.SortBy != "updated" && req.SortBy != "closed" && req.SortBy != "priority" {
+		return fmt.Errorf("%w: paginated list requires sort priority, created, updated, or closed", issueops.ErrValidation)
 	}
 	if req.Reverse {
 		return fmt.Errorf("%w: paginated list does not support reverse order", issueops.ErrValidation)
@@ -69,9 +70,18 @@ func ApplyListCursor(req issueops.ListRequest, filter *types.IssueFilter) error 
 	if state.Null && req.SortBy != "closed" {
 		return fmt.Errorf("%w: malformed list cursor position for sort %q; restart pagination with no --cursor", issueops.ErrValidation, req.SortBy)
 	}
-	filter.AfterSortAtSet = true
-	filter.AfterSortAt = state.At
-	filter.AfterSortID = state.ID
+	if req.SortBy == "priority" {
+		if state.Priority == nil || state.At == nil {
+			return fmt.Errorf("%w: malformed priority list cursor position; restart pagination with no --cursor", issueops.ErrValidation)
+		}
+		filter.AfterPriority = state.Priority
+		filter.AfterPriorityCreatedAt = state.At
+		filter.AfterPriorityID = state.ID
+	} else {
+		filter.AfterSortAtSet = true
+		filter.AfterSortAt = state.At
+		filter.AfterSortID = state.ID
+	}
 	return nil
 }
 
@@ -99,6 +109,11 @@ func NextListCursor(req issueops.ListRequest, items []*types.IssueWithCounts, ha
 			at := *last.ClosedAt
 			state.At = &at
 		}
+	case "priority":
+		priority := last.Priority
+		state.Priority = &priority
+		at := last.CreatedAt
+		state.At = &at
 	default:
 		return "", fmt.Errorf("cannot create list cursor for sort %q", req.SortBy)
 	}

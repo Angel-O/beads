@@ -218,6 +218,116 @@ func TestBuildIssueFilterClauses_LabelsAny(t *testing.T) {
 	}
 }
 
+func TestBuildIssueFilterClauses_LabelExact(t *testing.T) {
+	t.Parallel()
+
+	label := "backend"
+	clauses, args, err := BuildIssueFilterClauses("", types.IssueFilter{Label: &label}, IssuesFilterTables)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := "id IN (SELECT issue_id FROM labels WHERE label = ?)"; len(clauses) != 1 || clauses[0] != want {
+		t.Fatalf("clauses = %v, want [%q]", clauses, want)
+	}
+	if !reflect.DeepEqual(args, []any{label}) {
+		t.Fatalf("args = %#v, want [%q]", args, label)
+	}
+}
+
+func TestBuildIssueFilterClauses_LabelExactOrNoLabelPrefixComposesBeforePagination(t *testing.T) {
+	t.Parallel()
+
+	label := "backend"
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	clauses, args, err := BuildIssueFilterClauses("", types.IssueFilter{
+		Label:          &label,
+		NoLabelPrefix:  "team:",
+		AfterCreatedAt: &at,
+		AfterID:        "cursor-id",
+	}, IssuesFilterTables)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	wantLabel := "(id IN (SELECT issue_id FROM labels WHERE label = ?) OR id NOT IN (SELECT issue_id FROM labels WHERE label LIKE ? ESCAPE '|'))"
+	if len(clauses) != 2 || clauses[0] != wantLabel || clauses[1] != sqlbuild.KeysetCreatedAtIDPredicate {
+		t.Fatalf("clauses = %v, want combined label predicate before keyset", clauses)
+	}
+	if !reflect.DeepEqual(args, []any{"backend", "team:%", at, at, "cursor-id"}) {
+		t.Fatalf("args = %#v, want combined-label args followed by cursor args", args)
+	}
+}
+
+func TestBuildIssueFilterClauses_LabelsAnyOrNoLabelPrefixComposesBeforePagination(t *testing.T) {
+	t.Parallel()
+
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	clauses, args, err := BuildIssueFilterClauses("", types.IssueFilter{
+		LabelsAny:      []string{"backend", "frontend"},
+		NoLabelPrefix:  "team:",
+		AfterCreatedAt: &at,
+		AfterID:        "cursor-id",
+	}, IssuesFilterTables)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	wantLabel := "(id IN (SELECT issue_id FROM labels WHERE label IN (?, ?)) OR id NOT IN (SELECT issue_id FROM labels WHERE label LIKE ? ESCAPE '|'))"
+	if len(clauses) != 2 || clauses[0] != wantLabel || clauses[1] != sqlbuild.KeysetCreatedAtIDPredicate {
+		t.Fatalf("clauses = %v, want combined label predicate before keyset", clauses)
+	}
+	if !reflect.DeepEqual(args, []any{"backend", "frontend", "team:%", at, at, "cursor-id"}) {
+		t.Fatalf("args = %#v, want combined-label args followed by cursor args", args)
+	}
+	plan := sqlbuild.BuildLabelDrivenSearch(types.IssueFilter{
+		LabelsAny:     []string{"backend", "frontend"},
+		NoLabelPrefix: "team:",
+	}, IssuesFilterTables)
+	if strings.Contains(plan.FromSQL, "JOIN labels") {
+		t.Fatalf("NoLabelPrefix must keep LabelsAny out of mandatory joins: %s", plan.FromSQL)
+	}
+	if !reflect.DeepEqual(plan.Filter.LabelsAny, []string{"backend", "frontend"}) {
+		t.Fatalf("residual LabelsAny = %v, want exact-label OR set", plan.Filter.LabelsAny)
+	}
+}
+
+func TestBuildIssueFilterClauses_NoLabelPrefix(t *testing.T) {
+	t.Parallel()
+
+	clauses, args, err := BuildIssueFilterClauses("", types.IssueFilter{NoLabelPrefix: "team:"}, IssuesFilterTables)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := "id NOT IN (SELECT issue_id FROM labels WHERE label LIKE ? ESCAPE '|')"; len(clauses) != 1 || clauses[0] != want {
+		t.Fatalf("clauses = %v, want [%q]", clauses, want)
+	}
+	if !reflect.DeepEqual(args, []any{"team:%"}) {
+		t.Fatalf("args = %#v, want [team:%%]", args)
+	}
+}
+
+func TestBuildIssueFilterClauses_NoLabelPrefixUsesWispLabelsTable(t *testing.T) {
+	t.Parallel()
+
+	clauses, _, err := BuildIssueFilterClauses("", types.IssueFilter{NoLabelPrefix: "team:"}, WispsFilterTables)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(clauses) != 1 || !strings.Contains(clauses[0], "FROM wisp_labels") {
+		t.Fatalf("clauses = %v, want negative predicate against wisp_labels", clauses)
+	}
+}
+
+func TestBuildIssueFilterClauses_NoLabelPrefixEscapesLikeCharacters(t *testing.T) {
+	t.Parallel()
+
+	_, args, err := BuildIssueFilterClauses("", types.IssueFilter{NoLabelPrefix: "team_%"}, IssuesFilterTables)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(args, []any{"team|_|%%"}) {
+		t.Fatalf("args = %#v, want escaped literal prefix", args)
+	}
+}
+
 func TestBuildLabelDrivenSearchUsesLabelJoins(t *testing.T) {
 	t.Parallel()
 
