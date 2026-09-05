@@ -21,6 +21,7 @@ func TestSkipLabelsConflicts(t *testing.T) {
 		labelRegex    string
 		excludeLabels []string
 		noLabels      bool
+		noLabelPrefix string
 		want          []string
 	}{
 		{name: "no conflict — no label filters set", want: nil},
@@ -29,20 +30,22 @@ func TestSkipLabelsConflicts(t *testing.T) {
 		{name: "label-pattern", labelPattern: "tech-*", want: []string{"--label-pattern"}},
 		{name: "label-regex", labelRegex: "tech-.*", want: []string{"--label-regex"}},
 		{name: "exclude-label", excludeLabels: []string{"urgent"}, want: []string{"--exclude-label"}},
+		{name: "or-no-label-prefix", noLabelPrefix: "team:", want: []string{"--or-no-label-prefix"}},
 		{name: "no-labels (the filter)", noLabels: true, want: []string{"--no-labels"}},
 		{
-			name:         "multiple at once preserves stable order",
-			labels:       []string{"x"},
-			labelsAny:    []string{"y"},
-			labelPattern: "z*",
-			noLabels:     true,
-			want:         []string{"--label", "--label-any", "--label-pattern", "--no-labels"},
+			name:          "multiple at once preserves stable order",
+			labels:        []string{"x"},
+			labelsAny:     []string{"y"},
+			labelPattern:  "z*",
+			noLabels:      true,
+			noLabelPrefix: "team:",
+			want:          []string{"--label", "--label-any", "--label-pattern", "--or-no-label-prefix", "--no-labels"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := skipLabelsConflicts(tt.labels, tt.labelsAny, tt.labelPattern, tt.labelRegex, tt.excludeLabels, tt.noLabels)
+			got := skipLabelsConflicts(tt.labels, tt.labelsAny, tt.labelPattern, tt.labelRegex, tt.excludeLabels, tt.noLabels, tt.noLabelPrefix)
 			if len(got) != len(tt.want) {
 				t.Fatalf("len mismatch: got %v, want %v", got, tt.want)
 			}

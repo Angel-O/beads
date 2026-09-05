@@ -96,12 +96,14 @@ func TestKeysetComposesWithCreatedBefore(t *testing.T) {
 func TestGeneralizedDateKeysetPredicates(t *testing.T) {
 	t.Parallel()
 	at := time.Date(2025, 4, 3, 2, 1, 0, 0, time.UTC)
+	priority := 2
 	tests := []struct {
 		name   string
 		filter types.IssueFilter
 		clause string
 		args   []any
 	}{
+		{"priority", types.IssueFilter{SortBy: "priority", AfterPriority: &priority, AfterCreatedAt: &at, AfterID: "b"}, KeysetPriorityCreatedAtIDPredicate, []any{2, 2, at, at, "b"}},
 		{"created", types.IssueFilter{SortBy: "created", AfterSortAtSet: true, AfterSortAt: &at, AfterSortID: "b"}, KeysetCreatedAtIDPredicate, []any{at, at, "b"}},
 		{"updated", types.IssueFilter{SortBy: "updated", AfterSortAtSet: true, AfterSortAt: &at, AfterSortID: "b"}, keysetUpdatedAtIDPredicate, []any{at, at, "b"}},
 		{"closed timestamp includes null group", types.IssueFilter{SortBy: "closed", AfterSortAtSet: true, AfterSortAt: &at, AfterSortID: "b"}, keysetClosedAtIDPredicate, []any{at, at, "b"}},
@@ -120,6 +122,32 @@ func TestGeneralizedDateKeysetPredicates(t *testing.T) {
 				t.Fatalf("args = %#v, want %#v", args, tt.args)
 			}
 		})
+	}
+}
+
+func TestPriorityKeysetComposesWithLegacyCreatedBoundary(t *testing.T) {
+	t.Parallel()
+
+	legacyAt := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	cursorAt := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+	priority := 2
+	clauses, args, err := BuildIssueFilterClauses("", types.IssueFilter{
+		AfterCreatedAt:         &legacyAt,
+		AfterID:                "legacy-id",
+		AfterPriority:          &priority,
+		AfterPriorityCreatedAt: &cursorAt,
+		AfterPriorityID:        "cursor-id",
+		SortBy:                 "priority",
+	}, IssuesFilterTables)
+	if err != nil {
+		t.Fatalf("BuildIssueFilterClauses: %v", err)
+	}
+	if !slices.Contains(clauses, KeysetCreatedAtIDPredicate) || !slices.Contains(clauses, KeysetPriorityCreatedAtIDPredicate) {
+		t.Fatalf("clauses = %v, want both created and priority keysets", clauses)
+	}
+	want := []any{legacyAt, legacyAt, "legacy-id", 2, 2, cursorAt, cursorAt, "cursor-id"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("args = %#v, want %#v", args, want)
 	}
 }
 

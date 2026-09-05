@@ -33,6 +33,12 @@ const (
 	keysetClosedAtNullIDPredicate = "(closed_at IS NULL AND id > ?)"
 )
 
+// KeysetPriorityCreatedAtIDPredicate is the SARGABLE (priority ASC,
+// created_at DESC, id ASC) keyset predicate. Its five placeholders bind, in
+// order: priority (the sargable lower bound), priority (the strict bound), and
+// created_at, created_at, id for the tie-break group.
+const KeysetPriorityCreatedAtIDPredicate = "(priority >= ? AND ((priority > ?) OR (created_at <= ? AND ((created_at < ?) OR (id > ?)))))"
+
 // BuildIssueFilterClauses builds WHERE clause fragments and args from a query
 // string and IssueFilter. The tables parameter controls which table names are
 // referenced in subqueries (issues vs wisps).
@@ -83,6 +89,18 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 	if filter.ExternalRef != nil {
 		whereClauses = append(whereClauses, "external_ref = ?")
 		args = append(args, *filter.ExternalRef)
+	}
+	if filter.Label != nil && filter.NoLabelPrefix != "" {
+		prefix := strings.NewReplacer("|", "||", "%", "|%", "_", "|_").Replace(filter.NoLabelPrefix)
+		whereClauses = append(whereClauses, fmt.Sprintf("(id IN (SELECT issue_id FROM %s WHERE label = ?) OR id NOT IN (SELECT issue_id FROM %s WHERE label LIKE ? ESCAPE '|'))", tables.Labels, tables.Labels))
+		args = append(args, *filter.Label, prefix+"%")
+	} else if filter.Label != nil {
+		whereClauses = append(whereClauses, fmt.Sprintf("id IN (SELECT issue_id FROM %s WHERE label = ?)", tables.Labels))
+		args = append(args, *filter.Label)
+	} else if filter.NoLabelPrefix != "" && len(filter.LabelsAny) == 0 {
+		whereClauses = append(whereClauses, fmt.Sprintf("id NOT IN (SELECT issue_id FROM %s WHERE label LIKE ? ESCAPE '|')", tables.Labels))
+		prefix := strings.NewReplacer("|", "||", "%", "|%", "_", "|_").Replace(filter.NoLabelPrefix)
+		args = append(args, prefix+"%")
 	}
 
 	if filter.Status != nil {
@@ -193,7 +211,16 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 			args = append(args, label)
 		}
 	}
-	if len(filter.LabelsAny) > 0 {
+	if len(filter.LabelsAny) > 0 && filter.NoLabelPrefix != "" {
+		placeholders := make([]string, len(filter.LabelsAny))
+		for i, label := range filter.LabelsAny {
+			placeholders[i] = "?"
+			args = append(args, label)
+		}
+		prefix := strings.NewReplacer("|", "||", "%", "|%", "_", "|_").Replace(filter.NoLabelPrefix)
+		whereClauses = append(whereClauses, fmt.Sprintf("(id IN (SELECT issue_id FROM %s WHERE label IN (%s)) OR id NOT IN (SELECT issue_id FROM %s WHERE label LIKE ? ESCAPE '|'))", tables.Labels, strings.Join(placeholders, ", "), tables.Labels))
+		args = append(args, prefix+"%")
+	} else if len(filter.LabelsAny) > 0 {
 		placeholders := make([]string, len(filter.LabelsAny))
 		for i, label := range filter.LabelsAny {
 			placeholders[i] = "?"
@@ -290,7 +317,7 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 		}
 	}
 
-	if filter.AfterCreatedAt != nil {
+	if filter.AfterCreatedAt != nil && (filter.AfterPriority == nil || filter.AfterPriorityCreatedAt != nil) {
 		// Bind the cursor time as time.Time, not a formatted string: the issues/
 		// wisps created_at columns are DATETIME (NUMERIC affinity), so an RFC3339
 		// string parameter mis-compares on the SQLite backend, while a time.Time
@@ -300,6 +327,23 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 		ac := *filter.AfterCreatedAt
 		whereClauses = append(whereClauses, KeysetCreatedAtIDPredicate)
 		args = append(args, ac, ac, filter.AfterID)
+	}
+
+	if filter.AfterPriority != nil {
+		priority := *filter.AfterPriority
+		at := filter.AfterPriorityCreatedAt
+		id := filter.AfterPriorityID
+		if at == nil {
+			// Keep the original direct IssueFilter form working for callers that
+			// supply a priority position without a separate legacy boundary.
+			at = filter.AfterCreatedAt
+			id = filter.AfterID
+		}
+		if at == nil {
+			return nil, nil, fmt.Errorf("priority keyset position requires a created_at timestamp")
+		}
+		whereClauses = append(whereClauses, KeysetPriorityCreatedAtIDPredicate)
+		args = append(args, priority, priority, *at, *at, id)
 	}
 
 	if filter.AfterSortAtSet {

@@ -114,7 +114,7 @@ func emitListJSONPage(items []*types.IssueWithCounts, in listInput, hasMore bool
 
 // skipLabelsConflicts returns the names of label-filter flags that conflict
 // with --skip-labels. Empty result means no conflict. AD-02 Wireframe 5.
-func skipLabelsConflicts(labels, labelsAny []string, labelPattern, labelRegex string, excludeLabels []string, noLabels bool) []string {
+func skipLabelsConflicts(labels, labelsAny []string, labelPattern, labelRegex string, excludeLabels []string, noLabels bool, noLabelPrefix string) []string {
 	var conflicts []string
 	if len(labels) > 0 {
 		conflicts = append(conflicts, "--label")
@@ -130,6 +130,9 @@ func skipLabelsConflicts(labels, labelsAny []string, labelPattern, labelRegex st
 	}
 	if len(excludeLabels) > 0 {
 		conflicts = append(conflicts, "--exclude-label")
+	}
+	if noLabelPrefix != "" {
+		conflicts = append(conflicts, "--or-no-label-prefix")
 	}
 	if noLabels {
 		conflicts = append(conflicts, "--no-labels")
@@ -160,7 +163,7 @@ func formatSkipLabelsConflictError(conflicts []string) string {
 	return fmt.Sprintf(
 		"error: --skip-labels cannot be combined with --label,\n"+
 			"       --label-any, --label-pattern, --label-regex,\n"+
-			"       --exclude-label, or --no-labels (the filter).\n"+
+			"       --exclude-label, --or-no-label-prefix, or --no-labels (the filter).\n"+
 			"       (got: --skip-labels %s)\n"+
 			"reason: --skip-labels suppresses the labels JOIN that those\n"+
 			"        filters depend on.\n\n"+
@@ -432,6 +435,7 @@ func init() {
 	listCmd.Flags().StringP("type", "t", "", "Filter by type (bug, feature, task, epic, chore, decision, merge-request, molecule, gate, convoy). Aliases: mr→merge-request, feat→feature, mol→molecule, dec/adr→decision")
 	listCmd.Flags().StringSliceP("label", "l", []string{}, "Filter by labels (AND: must have ALL). Can combine with --label-any")
 	listCmd.Flags().StringSlice("label-any", []string{}, "Filter by labels (OR: must have AT LEAST ONE). Can combine with --label")
+	listCmd.Flags().String("or-no-label-prefix", "", "OR-match issues with no label starting with this prefix; use with --label-any")
 	listCmd.Flags().StringSlice("exclude-label", []string{}, "Exclude issues that have ANY of these labels")
 	listCmd.Flags().String("label-pattern", "", "Filter by label glob pattern (e.g., 'tech-*' matches tech-debt, tech-legacy)")
 	listCmd.Flags().String("label-regex", "", "Filter by label regex pattern (e.g., 'tech-(debt|legacy)')")
@@ -474,7 +478,7 @@ func init() {
 		"Skip label hydration. The labels field in output will be empty regardless "+
 			"of actual labels. Use only when the caller does not depend on label data. "+
 			"Cannot combine with --label, --label-any, --label-pattern, --label-regex, "+
-			"--exclude-label, or --no-labels.")
+			"--exclude-label, --or-no-label-prefix, or --no-labels.")
 
 	// Projection toggle. Like --skip-labels it trades data for bytes, and
 	// unlike it the dropped fields leave a mark on the row (IsLitePartial).

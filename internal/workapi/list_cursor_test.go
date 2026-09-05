@@ -119,6 +119,39 @@ func TestListCursorClosedNullAndTerminalPages(t *testing.T) {
 	}
 }
 
+func TestListCursorPriorityKeyset(t *testing.T) {
+	limit := 2
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	legacyAt := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+	req := issueops.ListRequest{
+		Paginate:       true,
+		SortBy:         "priority",
+		Limit:          &limit,
+		AfterCreatedAt: &legacyAt,
+		AfterID:        "legacy-id",
+	}
+	token, err := NextListCursor(req, []*types.IssueWithCounts{{Issue: &types.Issue{
+		ID: "bd-priority", Priority: 1, CreatedAt: at,
+	}}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resumed := req
+	resumed.Cursor = token
+	filter := types.IssueFilter{AfterCreatedAt: req.AfterCreatedAt, AfterID: req.AfterID}
+	if err := ApplyListCursor(resumed, &filter); err != nil {
+		t.Fatalf("priority cursor should resume: %v", err)
+	}
+	if filter.AfterPriority == nil || *filter.AfterPriority != 1 || filter.AfterPriorityCreatedAt == nil ||
+		!filter.AfterPriorityCreatedAt.Equal(at) || filter.AfterPriorityID != "bd-priority" {
+		t.Fatalf("priority cursor position = %+v", filter)
+	}
+	if filter.AfterCreatedAt == nil || !filter.AfterCreatedAt.Equal(legacyAt) || filter.AfterID != "legacy-id" {
+		t.Fatalf("legacy created boundary was overwritten: %+v", filter)
+	}
+}
+
 func TestListCursorComposesWithLegacyCreatedSelection(t *testing.T) {
 	legacyAt := time.Date(2025, 5, 6, 7, 8, 9, 0, time.UTC)
 	pageAt := time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)

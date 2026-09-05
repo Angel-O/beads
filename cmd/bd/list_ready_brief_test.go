@@ -176,6 +176,22 @@ func TestListBriefReachesTheRequest(t *testing.T) {
 	})
 }
 
+func TestListOrNoLabelPrefixReachesThePaginatedRequest(t *testing.T) {
+	pinJSONOutput(t, true)
+	in, err := gatherListInput(newListFlagsCommand(t,
+		"--paginate", "--limit", "2", "--sort", "created",
+		"--label-any", "backend,frontend", "--or-no-label-prefix", "team:"))
+	if err != nil {
+		t.Fatalf("gatherListInput: %v", err)
+	}
+	if in.NoLabelPrefix != "team:" {
+		t.Fatalf("NoLabelPrefix = %q, want team:", in.NoLabelPrefix)
+	}
+	if !slices.Equal(in.LabelsAny, []string{"backend", "frontend"}) {
+		t.Fatalf("LabelsAny = %v, want [backend frontend]", in.LabelsAny)
+	}
+}
+
 // runGatherListInput captures both streams around gatherListInput, the way
 // runGatherReadyInput does for `bd ready`: these usage errors are printed by
 // HandleError rather than returned as text, so a test that only inspects the

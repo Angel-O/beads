@@ -74,6 +74,7 @@ func gatherListInput(cmd *cobra.Command) (listInput, error) {
 
 	in.Labels, _ = cmd.Flags().GetStringSlice("label")
 	in.LabelsAny, _ = cmd.Flags().GetStringSlice("label-any")
+	in.NoLabelPrefix, _ = cmd.Flags().GetString("or-no-label-prefix")
 	in.ExcludeLabels, _ = cmd.Flags().GetStringSlice("exclude-label")
 	in.LabelPattern, _ = cmd.Flags().GetString("label-pattern")
 	in.LabelRegex, _ = cmd.Flags().GetString("label-regex")
@@ -102,7 +103,7 @@ func gatherListInput(cmd *cobra.Command) (listInput, error) {
 	in.Brief, _ = cmd.Flags().GetBool("brief")
 	in.SkipLabels, _ = cmd.Flags().GetBool("skip-labels")
 	if in.SkipLabels {
-		conflicts := skipLabelsConflicts(in.Labels, in.LabelsAny, in.LabelPattern, in.LabelRegex, in.ExcludeLabels, in.NoLabels)
+		conflicts := skipLabelsConflicts(in.Labels, in.LabelsAny, in.LabelPattern, in.LabelRegex, in.ExcludeLabels, in.NoLabels, in.NoLabelPrefix)
 		if len(conflicts) > 0 {
 			fmt.Fprint(os.Stderr, formatSkipLabelsConflictError(conflicts))
 			return in, &exitError{Code: 2}
