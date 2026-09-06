@@ -86,6 +86,9 @@ func TestListExposesIncludeAllTypesFlag(t *testing.T) {
 	if flag.DefValue != "false" {
 		t.Fatalf("--include-all-types default = %q, want false", flag.DefValue)
 	}
+	if filter := listCmd.Flags().Lookup("filter"); filter == nil {
+		t.Fatal("bd list must expose --filter")
+	}
 }
 
 func parseListPaginatedJSON(t *testing.T, raw []byte) bdListPaginatedJSON {

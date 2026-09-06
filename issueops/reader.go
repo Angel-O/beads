@@ -422,6 +422,10 @@ type ListRequest struct {
 	// what the refusal text reads back. It decides no answer: a request is
 	// refused on MaxRows alone, and this only decides how the refusal reads.
 	MaxRowsSource string
+
+	// Filter is a case-insensitive literal substring match on the issue ID or
+	// title. It is intentionally separate from TitleSearch, which is title-only.
+	Filter string `json:",omitempty"`
 }
 
 // GetRequest describes one issue-detail lookup.

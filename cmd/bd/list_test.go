@@ -12,9 +12,12 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
+	"github.com/steveyegge/beads/internal/workapi"
+	"github.com/steveyegge/beads/issueops"
 )
 
 // listTestHelper provides test setup and assertion methods
@@ -155,6 +158,34 @@ func TestListCommandSuite(t *testing.T) {
 			}
 		})
 
+		t.Run("filter matches id or title literally and case insensitively", func(t *testing.T) {
+			literal := &types.Issue{
+				Title:     "Viewer 100% _ marker",
+				IssueType: types.TypeTask,
+				Status:    types.StatusOpen,
+			}
+			decoy := &types.Issue{
+				Title:     "Viewer 100x z marker",
+				IssueType: types.TypeTask,
+				Status:    types.StatusOpen,
+			}
+			for _, issue := range []*types.Issue{literal, decoy} {
+				if err := h.store.CreateIssue(h.ctx, issue, "test-user"); err != nil {
+					t.Fatalf("create filter test issue: %v", err)
+				}
+			}
+
+			results := h.search(types.IssueFilter{Filter: "VIEWER 100% _ MARKER"})
+			if len(results) != 1 || results[0].ID != literal.ID {
+				t.Fatalf("literal title filter = %v, want only %s", issueIDs(results), literal.ID)
+			}
+			idPart := strings.ToUpper(literal.ID[3:])
+			results = h.search(types.IssueFilter{Filter: idPart})
+			if len(results) != 1 || results[0].ID != literal.ID {
+				t.Fatalf("case-insensitive ID filter = %v, want only %s", issueIDs(results), literal.ID)
+			}
+		})
+
 		t.Run("limit results", func(t *testing.T) {
 			results := h.search(types.IssueFilter{Limit: 2})
 			h.assertAtMost(len(results), 2, "issues")
@@ -235,6 +266,44 @@ func TestListCommandSuite(t *testing.T) {
 			}
 		})
 	})
+}
+
+func TestListFilterUsesLiteralIDOrTitleBeforeKeyset(t *testing.T) {
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	clauses, args, err := sqlbuild.BuildIssueFilterClauses("", types.IssueFilter{
+		Filter:         "100%_",
+		AfterSortAtSet: true,
+		AfterSortAt:    &at,
+		AfterSortID:    "bd-cursor",
+		SortBy:         "created",
+	}, sqlbuild.IssuesFilterTables)
+	if err != nil {
+		t.Fatalf("BuildIssueFilterClauses: %v", err)
+	}
+	if len(clauses) < 2 || clauses[0] != "(LOWER(id) LIKE ? ESCAPE '|' OR LOWER(title) LIKE ? ESCAPE '|')" {
+		t.Fatalf("clauses = %v, want literal ID/title selection before keyset", clauses)
+	}
+	if got, want := args[0], "%100|%|_%"; got != want {
+		t.Fatalf("literal LIKE argument = %q, want %q", got, want)
+	}
+	if got, want := args[1], args[0]; got != want {
+		t.Fatalf("title LIKE argument = %q, want %q", got, want)
+	}
+
+	limit := 1
+	req := issueops.ListRequest{Filter: "needle", Paginate: true, SortBy: "created", Limit: &limit}
+	token, err := workapi.NextListCursor(req, []*types.IssueWithCounts{{Issue: &types.Issue{
+		ID: "bd-last", CreatedAt: at,
+	}}}, true)
+	if err != nil {
+		t.Fatalf("NextListCursor: %v", err)
+	}
+	resumed := req
+	resumed.Cursor = token
+	resumed.Filter = "other"
+	if err := workapi.ApplyListCursor(resumed, &types.IssueFilter{}); err == nil || !strings.Contains(err.Error(), "current list filters") {
+		t.Fatalf("changed filter cursor validation error = %v", err)
+	}
 }
 
 func TestListQueryCapabilitiesSuite(t *testing.T) {

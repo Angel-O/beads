@@ -79,6 +79,7 @@ func gatherListInput(cmd *cobra.Command) (listInput, error) {
 	in.LabelPattern, _ = cmd.Flags().GetString("label-pattern")
 	in.LabelRegex, _ = cmd.Flags().GetString("label-regex")
 	in.TitleSearch, _ = cmd.Flags().GetString("title")
+	in.Filter, _ = cmd.Flags().GetString("filter")
 	in.SpecPrefix, _ = cmd.Flags().GetString("spec")
 	in.IDFilter, _ = cmd.Flags().GetString("id")
 	in.longFormat, _ = cmd.Flags().GetBool("long")

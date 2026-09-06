@@ -289,6 +289,9 @@ func BuildListFilter(in issueops.ListRequest, cfg ListConfig) (types.IssueFilter
 	if in.TitleSearch != "" {
 		filter.TitleSearch = in.TitleSearch
 	}
+	if in.Filter != "" {
+		filter.Filter = in.Filter
+	}
 	if in.IDFilter != "" {
 		ids := utils.NormalizeLabels(strings.Split(in.IDFilter, ","))
 		if len(ids) > 0 {

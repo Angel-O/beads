@@ -74,6 +74,11 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 		whereClauses = append(whereClauses, "LOWER(title) LIKE ?")
 		args = append(args, "%"+strings.ToLower(filter.TitleContains)+"%")
 	}
+	if filter.Filter != "" {
+		pattern := "%" + literalLikePattern(strings.ToLower(filter.Filter)) + "%"
+		whereClauses = append(whereClauses, "(LOWER(id) LIKE ? ESCAPE '|' OR LOWER(title) LIKE ? ESCAPE '|')")
+		args = append(args, pattern, pattern)
+	}
 	if filter.DescriptionContains != "" {
 		whereClauses = append(whereClauses, "LOWER(description) LIKE ?")
 		args = append(args, "%"+strings.ToLower(filter.DescriptionContains)+"%")
@@ -419,6 +424,12 @@ func AppendMetadataClauses(where []string, args []any, hasKey string, fields map
 		}
 	}
 	return where, args, nil
+}
+
+// literalLikePattern escapes LIKE metacharacters so Filter remains a literal
+// substring match rather than accepting a pattern language.
+func literalLikePattern(value string) string {
+	return strings.NewReplacer("|", "||", "%", "|%", "_", "|_").Replace(value)
 }
 
 // globToLikePattern converts a shell-style glob (* and ?) to a SQL LIKE
