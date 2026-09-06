@@ -40,7 +40,13 @@ type (
 	ReclaimedLease              = types.ReclaimedLease
 	SortPolicy                  = types.SortPolicy
 	Scope                       = types.Scope
+	ScopeCatalogPage            = types.ScopeCatalogPage
+	ScopeCatalogRequest         = types.ScopeCatalogRequest
+	ScopeCatalogRow             = types.ScopeCatalogRow
 	ScopeDetails                = types.ScopeDetails
+	ScopeMemberPage             = types.ScopeMemberPage
+	ScopeMemberPageRequest      = types.ScopeMemberPageRequest
+	ScopeMemberStatus           = types.ScopeMemberStatus
 	StaleFilter                 = types.StaleFilter
 	Statistics                  = types.Statistics
 	Status                      = types.Status
@@ -55,6 +61,10 @@ type (
 
 // Status values.
 const (
+	ScopeMemberStatusOpen      = types.ScopeMemberStatusOpen
+	ScopeMemberStatusCompleted = types.ScopeMemberStatusCompleted
+	ScopeMemberStatusReady     = types.ScopeMemberStatusReady
+
 	StatusOpen       = types.StatusOpen
 	StatusInProgress = types.StatusInProgress
 	StatusBlocked    = types.StatusBlocked

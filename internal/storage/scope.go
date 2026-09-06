@@ -6,13 +6,28 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
+type ScopeCatalogRequest = types.ScopeCatalogRequest
+type ScopeCatalogRow = types.ScopeCatalogRow
+type ScopeCatalogPage = types.ScopeCatalogPage
+type ScopeMemberStatus = types.ScopeMemberStatus
+type ScopeMemberPageRequest = types.ScopeMemberPageRequest
+type ScopeMemberPage = types.ScopeMemberPage
+
+const (
+	ScopeMemberStatusOpen      = types.ScopeMemberStatusOpen
+	ScopeMemberStatusCompleted = types.ScopeMemberStatusCompleted
+	ScopeMemberStatusReady     = types.ScopeMemberStatusReady
+)
+
 // ScopeStore is the storage-level scope capability. Scope membership is
 // durable state, not a list-filter concern: every mutation is atomic and the
 // membership methods enforce the one-scope-per-issue and 100-member rules.
 type ScopeStore interface {
 	CreateScope(ctx context.Context, scope *types.Scope, activate bool) error
 	ListScopes(ctx context.Context) ([]*types.Scope, error)
+	ListScopeCatalog(ctx context.Context, req ScopeCatalogRequest) (*ScopeCatalogPage, error)
 	GetScope(ctx context.Context, id string) (*types.ScopeDetails, error)
+	ListScopeMembers(ctx context.Context, scopeID string, req ScopeMemberPageRequest) (*ScopeMemberPage, error)
 	GetActiveScope(ctx context.Context) (*types.Scope, error)
 	ActivateScope(ctx context.Context, id string) error
 	DeactivateScope(ctx context.Context) error
@@ -31,6 +46,7 @@ var (
 	ErrScopeMembershipConflict = newStorageError("scope membership conflict")
 	ErrScopeCapacityExceeded   = newStorageError("scope capacity exceeded")
 	ErrScopeSourceMembership   = newStorageError("scope source membership required")
+	ErrScopeCursorInvalid      = newStorageError("invalid scope cursor")
 )
 
 type storageError string

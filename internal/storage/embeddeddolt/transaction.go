@@ -84,8 +84,16 @@ func (t *embeddedTransaction) ListScopes(ctx context.Context) ([]*types.Scope, e
 	return scopeops.List(ctx, t.tx)
 }
 
+func (t *embeddedTransaction) ListScopeCatalog(ctx context.Context, req storage.ScopeCatalogRequest) (*storage.ScopeCatalogPage, error) {
+	return scopeops.ListCatalog(ctx, t.tx, req)
+}
+
 func (t *embeddedTransaction) GetScope(ctx context.Context, id string) (*types.ScopeDetails, error) {
 	return scopeops.Get(ctx, t.tx, id)
+}
+
+func (t *embeddedTransaction) ListScopeMembers(ctx context.Context, scopeID string, req storage.ScopeMemberPageRequest) (*storage.ScopeMemberPage, error) {
+	return scopeops.ListMembers(ctx, t.tx, scopeID, req)
 }
 
 func (t *embeddedTransaction) GetActiveScope(ctx context.Context) (*types.Scope, error) {

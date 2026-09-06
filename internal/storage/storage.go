@@ -931,7 +931,9 @@ type Transaction interface {
 	// with any other work in the callback.
 	CreateScope(ctx context.Context, scope *types.Scope, activate bool) error
 	ListScopes(ctx context.Context) ([]*types.Scope, error)
+	ListScopeCatalog(ctx context.Context, req ScopeCatalogRequest) (*ScopeCatalogPage, error)
 	GetScope(ctx context.Context, id string) (*types.ScopeDetails, error)
+	ListScopeMembers(ctx context.Context, scopeID string, req ScopeMemberPageRequest) (*ScopeMemberPage, error)
 	GetActiveScope(ctx context.Context) (*types.Scope, error)
 	ActivateScope(ctx context.Context, id string) error
 	DeactivateScope(ctx context.Context) error
