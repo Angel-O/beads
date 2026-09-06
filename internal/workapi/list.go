@@ -206,6 +206,7 @@ func BuildListFilter(in issueops.ListRequest, cfg ListConfig) (types.IssueFilter
 		SortDesc:       in.Reverse,
 		AfterCreatedAt: in.AfterCreatedAt,
 		AfterID:        in.AfterID,
+		AfterPriority:  in.AfterPriority,
 		// The defensive cap travels ON the request, so this builder is the
 		// only writer of the filter's two cap fields. `bd list` used to stamp
 		// them onto the filter after the builder returned, which is the
@@ -273,6 +274,12 @@ func BuildListFilter(in issueops.ListRequest, cfg ListConfig) (types.IssueFilter
 	if len(in.ExcludeLabels) > 0 {
 		filter.ExcludeLabels = in.ExcludeLabels
 	}
+	if in.NoLabelPrefix != "" {
+		filter.NoLabelPrefix = in.NoLabelPrefix
+	}
+	if in.Label != nil {
+		filter.Label = in.Label
+	}
 	if in.LabelPattern != "" {
 		filter.LabelPattern = in.LabelPattern
 	}
@@ -281,6 +288,9 @@ func BuildListFilter(in issueops.ListRequest, cfg ListConfig) (types.IssueFilter
 	}
 	if in.TitleSearch != "" {
 		filter.TitleSearch = in.TitleSearch
+	}
+	if in.Filter != "" {
+		filter.Filter = in.Filter
 	}
 	if in.IDFilter != "" {
 		ids := utils.NormalizeLabels(strings.Split(in.IDFilter, ","))

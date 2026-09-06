@@ -1869,6 +1869,7 @@ type IssueFilter struct {
 	Labels                []string // AND semantics: issue must have ALL these labels
 	LabelsAny             []string // OR semantics: issue must have AT LEAST ONE of these labels
 	ExcludeLabels         []string // Exclusion: issue must NOT have ANY of these labels
+	NoLabelPrefix         string   // Exclude issues carrying a label with this literal prefix
 	LabelPattern          string   // Glob pattern for label matching (e.g., "tech-*")
 	LabelRegex            string   // Regex pattern for label matching (e.g., "tech-(debt|legacy)")
 	TitleSearch           string
@@ -1883,6 +1884,7 @@ type IssueFilter struct {
 	NotesContains       string
 	ExternalRefContains string
 	ExternalRef         *string // exact match on external_ref
+	Label               *string // exact single-label match (server-side subquery)
 
 	// Date ranges
 	CreatedAfter  *time.Time
@@ -1910,6 +1912,17 @@ type IssueFilter struct {
 	// ORDER BY is created_at DESC, id ASC — the order the predicate assumes.
 	AfterCreatedAt *time.Time
 	AfterID        string
+
+	// AfterPriority carries the priority component of a keyset position in the
+	// (priority ASC, created_at DESC, id ASC) order. AfterCreatedAt and AfterID
+	// carry the remaining components. Pair it with SortBy="priority" and
+	// SortDesc=false so the predicate and ORDER BY describe the same order.
+	AfterPriority *int
+	// These fields are the created_at/id components of the decoded priority
+	// cursor. They stay separate from AfterCreatedAt/AfterID, which may carry a
+	// caller-supplied legacy created-order boundary that must still be applied.
+	AfterPriorityCreatedAt *time.Time `json:"-"`
+	AfterPriorityID        string     `json:"-"`
 
 	// AfterSortAtSet carries the generalized date-sort keyset position used by
 	// bounded list pagination. AfterSortAt is nil only for the nullable closed_at
@@ -2038,6 +2051,9 @@ type IssueFilter struct {
 	// no body, so the gap costs bytes off the wire and no correctness.
 	// See engdocs/EXTENDING.md.
 	Lite bool
+
+	// Filter is a case-insensitive literal substring match on id or title.
+	Filter string `json:",omitempty"`
 }
 
 // SortPolicy determines how ready work is ordered

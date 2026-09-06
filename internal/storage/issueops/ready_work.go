@@ -146,6 +146,53 @@ func GetReadyWorkInTx(
 	return ordered, nil
 }
 
+// GetReadyIssueIDsInTx applies the canonical ready-work predicates to a
+// bounded set of durable issue IDs. It is useful to callers that already own
+// a candidate set, without making them reproduce deferred-parent, pinned, or
+// blocked-state rules in Go.
+func GetReadyIssueIDsInTx(ctx context.Context, tx DBTX, filter types.WorkFilter, issueIDs []string) (map[string]struct{}, error) {
+	ready := make(map[string]struct{})
+	if len(issueIDs) == 0 {
+		return ready, nil
+	}
+	preds, err := buildReadyWorkPredicates(ctx, tx, filter, IssuesFilterTables)
+	if err != nil {
+		return nil, err
+	}
+	for start := 0; start < len(issueIDs); start += queryBatchSize {
+		end := start + queryBatchSize
+		if end > len(issueIDs) {
+			end = len(issueIDs)
+		}
+		placeholders, args := buildSQLInClause(issueIDs[start:end])
+		queryArgs := append([]interface{}{}, preds.whereArgs...)
+		queryArgs = append(queryArgs, args...)
+		//nolint:gosec // G201: fragments are hardcoded; only ? placeholders carry user input.
+		rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+			SELECT id FROM issues
+			%s AND id IN (%s)
+		`, preds.whereSQL, placeholders), queryArgs...)
+		if err != nil {
+			return nil, fmt.Errorf("get ready issue IDs: %w", err)
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("get ready issue IDs: scan: %w", err)
+			}
+			ready[id] = struct{}{}
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("get ready issue IDs: close: %w", err)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("get ready issue IDs: rows: %w", err)
+		}
+	}
+	return ready, nil
+}
+
 func mergeReadyWisps(ordered []*types.Issue, wisps []*types.Issue, filter types.WorkFilter) []*types.Issue {
 	// Prefer the canonical wisp record when an ID exists in both tables (be-iabdi).
 	wispByID := make(map[string]*types.Issue, len(wisps))

@@ -36,13 +36,15 @@ func (p LabelSearchPlan) MergeInto(where []string, args []any) ([]string, []any)
 func BuildLabelDrivenSearch(filter types.IssueFilter, tables FilterTables) LabelSearchPlan {
 	labels := CompactNonEmptyStrings(filter.Labels)
 	labelsAny := CompactNonEmptyStrings(filter.LabelsAny)
-	if len(labels) == 0 && len(labelsAny) == 0 {
+	if len(labels) == 0 && (len(labelsAny) == 0 || filter.NoLabelPrefix != "") {
 		return LabelSearchPlan{FromSQL: tables.Main, Filter: filter}
 	}
 
 	filterForClauses := filter
 	filterForClauses.Labels = nil
-	filterForClauses.LabelsAny = nil
+	if filter.NoLabelPrefix == "" {
+		filterForClauses.LabelsAny = nil
+	}
 
 	var joins, where []string
 	var args []any

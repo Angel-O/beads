@@ -11,7 +11,9 @@ import (
 type ScopeSQLRepository interface {
 	Create(ctx context.Context, scope *types.Scope, activate bool) error
 	List(ctx context.Context) ([]*types.Scope, error)
+	ListCatalog(ctx context.Context, req types.ScopeCatalogRequest) (*types.ScopeCatalogPage, error)
 	Get(ctx context.Context, id string) (*types.ScopeDetails, error)
+	ListMembers(ctx context.Context, scopeID string, req types.ScopeMemberPageRequest) (*types.ScopeMemberPage, error)
 	Active(ctx context.Context) (*types.Scope, error)
 	Activate(ctx context.Context, id string) error
 	Deactivate(ctx context.Context) error
@@ -25,7 +27,9 @@ type ScopeSQLRepository interface {
 type ScopeUseCase interface {
 	CreateScope(ctx context.Context, scope *types.Scope, activate bool) error
 	ListScopes(ctx context.Context) ([]*types.Scope, error)
+	ListScopeCatalog(ctx context.Context, req types.ScopeCatalogRequest) (*types.ScopeCatalogPage, error)
 	GetScope(ctx context.Context, id string) (*types.ScopeDetails, error)
+	ListScopeMembers(ctx context.Context, scopeID string, req types.ScopeMemberPageRequest) (*types.ScopeMemberPage, error)
 	GetActiveScope(ctx context.Context) (*types.Scope, error)
 	ActivateScope(ctx context.Context, id string) error
 	DeactivateScope(ctx context.Context) error
@@ -48,8 +52,14 @@ func (u *scopeUseCaseImpl) CreateScope(ctx context.Context, scope *types.Scope, 
 func (u *scopeUseCaseImpl) ListScopes(ctx context.Context) ([]*types.Scope, error) {
 	return u.repo.List(ctx)
 }
+func (u *scopeUseCaseImpl) ListScopeCatalog(ctx context.Context, req types.ScopeCatalogRequest) (*types.ScopeCatalogPage, error) {
+	return u.repo.ListCatalog(ctx, req)
+}
 func (u *scopeUseCaseImpl) GetScope(ctx context.Context, id string) (*types.ScopeDetails, error) {
 	return u.repo.Get(ctx, id)
+}
+func (u *scopeUseCaseImpl) ListScopeMembers(ctx context.Context, scopeID string, req types.ScopeMemberPageRequest) (*types.ScopeMemberPage, error) {
+	return u.repo.ListMembers(ctx, scopeID, req)
 }
 func (u *scopeUseCaseImpl) GetActiveScope(ctx context.Context) (*types.Scope, error) {
 	return u.repo.Active(ctx)

@@ -29,11 +29,31 @@ func (s *EmbeddedDoltStore) ListScopes(ctx context.Context) ([]*types.Scope, err
 	return result, err
 }
 
+func (s *EmbeddedDoltStore) ListScopeCatalog(ctx context.Context, req storage.ScopeCatalogRequest) (*storage.ScopeCatalogPage, error) {
+	var result *storage.ScopeCatalogPage
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		var err error
+		result, err = scopeops.ListCatalog(ctx, tx, req)
+		return err
+	})
+	return result, err
+}
+
 func (s *EmbeddedDoltStore) GetScope(ctx context.Context, id string) (*types.ScopeDetails, error) {
 	var result *types.ScopeDetails
 	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
 		var err error
 		result, err = scopeops.Get(ctx, tx, id)
+		return err
+	})
+	return result, err
+}
+
+func (s *EmbeddedDoltStore) ListScopeMembers(ctx context.Context, scopeID string, req storage.ScopeMemberPageRequest) (*storage.ScopeMemberPage, error) {
+	var result *storage.ScopeMemberPage
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		var err error
+		result, err = scopeops.ListMembers(ctx, tx, scopeID, req)
 		return err
 	})
 	return result, err

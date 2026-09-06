@@ -5,10 +5,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -22,6 +24,24 @@ func TestScopeCommandsDelegateAndEmitJSON(t *testing.T) {
 	rootCtx = context.Background()
 	jsonOutput = true
 	proxiedServerMode = false
+	oldListPaginate, _ := scopeListCmd.Flags().GetBool("paginate")
+	oldListLimit, _ := scopeListCmd.Flags().GetInt("limit")
+	oldListCursor, _ := scopeListCmd.Flags().GetString("cursor")
+	oldShowPaginate, _ := scopeShowCmd.Flags().GetBool("paginate")
+	oldShowLimit, _ := scopeShowCmd.Flags().GetInt("limit")
+	oldShowCursor, _ := scopeShowCmd.Flags().GetString("cursor")
+	oldShowStatus, _ := scopeShowCmd.Flags().GetString("status")
+	oldShowType, _ := scopeShowCmd.Flags().GetString("type")
+	t.Cleanup(func() {
+		_ = scopeListCmd.Flags().Set("paginate", fmt.Sprint(oldListPaginate))
+		_ = scopeListCmd.Flags().Set("limit", fmt.Sprint(oldListLimit))
+		_ = scopeListCmd.Flags().Set("cursor", oldListCursor)
+		_ = scopeShowCmd.Flags().Set("paginate", fmt.Sprint(oldShowPaginate))
+		_ = scopeShowCmd.Flags().Set("limit", fmt.Sprint(oldShowLimit))
+		_ = scopeShowCmd.Flags().Set("cursor", oldShowCursor)
+		_ = scopeShowCmd.Flags().Set("status", oldShowStatus)
+		_ = scopeShowCmd.Flags().Set("type", oldShowType)
+	})
 
 	issueA := &types.Issue{ID: "test-scope-a", Title: "Scope A issue", Status: types.StatusOpen, IssueType: types.TypeTask}
 	issueB := &types.Issue{ID: "test-scope-b", Title: "Scope B issue", Status: types.StatusOpen, IssueType: types.TypeTask}
@@ -94,6 +114,40 @@ func TestScopeCommandsDelegateAndEmitJSON(t *testing.T) {
 	}), &mutation)
 	if mutation["status"] != "activated" || mutation["scope_id"] != "scope-b" {
 		t.Fatalf("activate output = %#v", mutation)
+	}
+
+	if err := scopeListCmd.Flags().Set("paginate", "true"); err != nil {
+		t.Fatalf("set list --paginate: %v", err)
+	}
+	if err := scopeListCmd.Flags().Set("limit", "1"); err != nil {
+		t.Fatalf("set list --limit: %v", err)
+	}
+	var catalog storage.ScopeCatalogPage
+	decodeScopeJSON(t, captureStdout(t, func() error {
+		return scopeListCmd.RunE(scopeListCmd, nil)
+	}), &catalog)
+	if len(catalog.Items) != 1 || catalog.Limit != 1 || !catalog.HasMore {
+		t.Fatalf("catalog page = %#v, want first bounded page", catalog)
+	}
+
+	if err := scopeShowCmd.Flags().Set("paginate", "true"); err != nil {
+		t.Fatalf("set show --paginate: %v", err)
+	}
+	if err := scopeShowCmd.Flags().Set("limit", "1"); err != nil {
+		t.Fatalf("set show --limit: %v", err)
+	}
+	if err := scopeShowCmd.Flags().Set("status", "open"); err != nil {
+		t.Fatalf("set show --status: %v", err)
+	}
+	if err := scopeShowCmd.Flags().Set("type", "task"); err != nil {
+		t.Fatalf("set show --type: %v", err)
+	}
+	var members storage.ScopeMemberPage
+	decodeScopeJSON(t, captureStdout(t, func() error {
+		return scopeShowCmd.RunE(scopeShowCmd, []string{"scope-b"})
+	}), &members)
+	if members.Scope.ID != "scope-b" || members.TotalMatching != 1 || len(members.Members) != 1 || members.Members[0].ID != issueB.ID {
+		t.Fatalf("member page = %#v, want filtered scope-b member", members)
 	}
 }
 

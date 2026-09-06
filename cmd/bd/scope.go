@@ -18,7 +18,9 @@ import (
 type scopeOperations interface {
 	CreateScope(context.Context, *types.Scope, bool) error
 	ListScopes(context.Context) ([]*types.Scope, error)
+	ListScopeCatalog(context.Context, storage.ScopeCatalogRequest) (*storage.ScopeCatalogPage, error)
 	GetScope(context.Context, string) (*types.ScopeDetails, error)
+	ListScopeMembers(context.Context, string, storage.ScopeMemberPageRequest) (*storage.ScopeMemberPage, error)
 	GetActiveScope(context.Context) (*types.Scope, error)
 	ActivateScope(context.Context, string) error
 	DeactivateScope(context.Context) error
@@ -98,6 +100,8 @@ var scopeCreateCmd = &cobra.Command{
 	},
 }
 
+// Paged scope reads are an additive JSON contract; the unflagged branches below
+// intentionally keep the legacy slice and ScopeDetails responses unchanged.
 var scopeListCmd = &cobra.Command{
 	Use:           "list",
 	Short:         "List scopes",
@@ -106,6 +110,27 @@ var scopeListCmd = &cobra.Command{
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runScopeCommand("scope-list", func() error {
+			paginate, _ := cmd.Flags().GetBool("paginate")
+			limit, _ := cmd.Flags().GetInt("limit")
+			cursor, _ := cmd.Flags().GetString("cursor")
+			if cursor != "" {
+				paginate = true
+			}
+			if paginate {
+				if !jsonOutput {
+					return HandleErrorRespectJSON("scope pagination requires --json")
+				}
+				page, err := runScopeRead(rootCtx, func(ops scopeOperations) (*storage.ScopeCatalogPage, error) {
+					return ops.ListScopeCatalog(rootCtx, storage.ScopeCatalogRequest{Limit: limit, Cursor: cursor})
+				})
+				if err != nil {
+					return HandleErrorRespectJSON("%v", err)
+				}
+				return outputJSON(page)
+			}
+			if limit != 0 {
+				return HandleErrorRespectJSON("--limit requires --paginate")
+			}
 			scopes, err := runScopeRead(rootCtx, func(ops scopeOperations) ([]*types.Scope, error) {
 				return ops.ListScopes(rootCtx)
 			})
@@ -134,6 +159,41 @@ var scopeShowCmd = &cobra.Command{
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runScopeCommand("scope-show", func() error {
+			paginate, _ := cmd.Flags().GetBool("paginate")
+			limit, _ := cmd.Flags().GetInt("limit")
+			cursor, _ := cmd.Flags().GetString("cursor")
+			status, _ := cmd.Flags().GetString("status")
+			issueType, _ := cmd.Flags().GetString("type")
+			contexts, _ := cmd.Flags().GetStringArray("context")
+			if cursor != "" {
+				paginate = true
+			}
+			if status != "" || issueType != "" || len(contexts) > 0 {
+				if !paginate {
+					return HandleErrorRespectJSON("scope member filters require --paginate")
+				}
+			}
+			if paginate {
+				if !jsonOutput {
+					return HandleErrorRespectJSON("scope pagination requires --json")
+				}
+				page, err := runScopeRead(rootCtx, func(ops scopeOperations) (*storage.ScopeMemberPage, error) {
+					return ops.ListScopeMembers(rootCtx, args[0], storage.ScopeMemberPageRequest{
+						Status:   types.ScopeMemberStatus(status),
+						Type:     types.IssueType(issueType),
+						Contexts: contexts,
+						Limit:    limit,
+						Cursor:   cursor,
+					})
+				})
+				if err != nil {
+					return HandleErrorRespectJSON("%v", err)
+				}
+				return outputJSON(page)
+			}
+			if limit != 0 {
+				return HandleErrorRespectJSON("--limit requires --paginate")
+			}
 			details, err := runScopeRead(rootCtx, func(ops scopeOperations) (*types.ScopeDetails, error) {
 				return ops.GetScope(rootCtx, args[0])
 			})
@@ -307,6 +367,15 @@ func outputScopeMutation(status string, fields map[string]any) error {
 
 func init() {
 	scopeCreateCmd.Flags().Bool("activate", false, "Activate the new scope")
+	scopeListCmd.Flags().Bool("paginate", false, "Return a bounded JSON page")
+	scopeListCmd.Flags().Int("limit", 0, "Maximum scopes to return in the page")
+	scopeListCmd.Flags().String("cursor", "", "Opaque catalog page cursor")
+	scopeShowCmd.Flags().Bool("paginate", false, "Return a bounded JSON page")
+	scopeShowCmd.Flags().Int("limit", 0, "Maximum members to return in the page")
+	scopeShowCmd.Flags().String("cursor", "", "Opaque member page cursor")
+	scopeShowCmd.Flags().String("status", "", "Filter members by open, completed, or ready")
+	scopeShowCmd.Flags().String("type", "", "Filter members by exact issue type")
+	scopeShowCmd.Flags().StringArray("context", nil, "Filter members by exact context membership (repeatable)")
 	scopeCmd.AddCommand(scopeCreateCmd, scopeListCmd, scopeShowCmd, scopeActiveCmd, scopeActivateCmd, scopeDeactivateCmd, scopeAddCmd, scopeRemoveCmd, scopeMoveCmd)
 	rootCmd.AddCommand(scopeCmd)
 }

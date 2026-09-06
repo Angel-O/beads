@@ -7,6 +7,8 @@ package scopeops
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -19,6 +21,14 @@ import (
 )
 
 type Runner = issueops.DBTX
+
+const (
+	defaultScopePageLimit = 50
+	maxScopePageLimit     = 1000
+	scopeCursorVersion    = 1
+	scopeCatalogCursor    = "scope-catalog.v1."
+	scopeMembersCursor    = "scope-members.v1."
+)
 
 func Create(ctx context.Context, r Runner, scope *types.Scope, activate bool) error {
 	if scope == nil {
@@ -66,6 +76,77 @@ func List(ctx context.Context, r Runner) ([]*types.Scope, error) {
 	return scopes, rows.Err()
 }
 
+// ListCatalog returns scope identity and aggregate counts in creation order.
+// Pagination is keyset-based so a catalog walk does not shift when rows are
+// added ahead of the current page.
+func ListCatalog(ctx context.Context, r Runner, req storage.ScopeCatalogRequest) (*storage.ScopeCatalogPage, error) {
+	limit := scopePageLimit(req.Limit)
+	cursor, err := decodeCursor(req.Cursor, scopeCatalogCursor, "", "", "")
+	if err != nil {
+		return nil, err
+	}
+
+	var total int
+	if err := r.QueryRowContext(ctx, `SELECT COUNT(*) FROM scopes`).Scan(&total); err != nil {
+		return nil, fmt.Errorf("count scopes: %w", err)
+	}
+
+	completed, err := completedStatuses(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	statusPlaceholders, statusArgs := inArgs(sortedStrings(completed))
+	where := ""
+	args := make([]any, 0, len(statusArgs)+4)
+	args = append(args, statusArgs...)
+	if cursor != nil {
+		where = "WHERE (s.created_on > ? OR (s.created_on = ? AND s.id > ?))"
+		args = append(args, cursor.CreatedOn, cursor.CreatedOn, cursor.ID)
+	}
+	args = append(args, limit+1)
+	rows, err := r.QueryContext(ctx, fmt.Sprintf(`
+		SELECT s.id, s.name, s.normalized_name, s.created_on,
+		       COUNT(sm.issue_id),
+		       COALESCE(SUM(CASE WHEN i.status IN (%s) THEN 1 ELSE 0 END), 0)
+		FROM scopes s
+		LEFT JOIN scope_members sm ON sm.scope_id = s.id
+		LEFT JOIN issues i ON i.id = sm.issue_id
+		%s
+		GROUP BY s.id, s.name, s.normalized_name, s.created_on
+		ORDER BY s.created_on ASC, s.id ASC
+		LIMIT ?`, statusPlaceholders, where), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list scope catalog: %w", err)
+	}
+	defer rows.Close()
+	items := make([]*storage.ScopeCatalogRow, 0, limit)
+	for rows.Next() {
+		var row storage.ScopeCatalogRow
+		if err := rows.Scan(&row.ID, &row.Name, &row.NormalizedName, &row.CreatedOn, &row.MemberCount, &row.CompletedCount); err != nil {
+			return nil, fmt.Errorf("scan scope catalog: %w", err)
+		}
+		items = append(items, &row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read scope catalog: %w", err)
+	}
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	page := &storage.ScopeCatalogPage{
+		Items: items, Limit: limit, ReturnedCount: len(items), TotalMatching: total, HasMore: hasMore,
+	}
+	if hasMore {
+		last := items[len(items)-1]
+		page.NextCursor, err = encodeCursor(scopeCatalogCursor, "", "", "", last.CreatedOn, last.ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return page, nil
+}
+
 func Get(ctx context.Context, r Runner, id string) (*types.ScopeDetails, error) {
 	if id == "" {
 		return nil, storage.ErrScopeNotFound
@@ -91,6 +172,269 @@ func Get(ctx context.Context, r Runner, id string) (*types.ScopeDetails, error) 
 		return nil, err
 	}
 	return details, nil
+}
+
+// ListMembers returns full issue rows after applying every member predicate.
+// The scope has a deliberate 100-row ceiling, so filtering in Go keeps the
+// status/category and global-readiness rules identical on both SQL backends.
+func ListMembers(ctx context.Context, r Runner, scopeID string, req storage.ScopeMemberPageRequest) (*storage.ScopeMemberPage, error) {
+	if scopeID == "" {
+		return nil, storage.ErrScopeNotFound
+	}
+	scope, err := getScope(ctx, r, scopeID)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateMemberStatus(req.Status); err != nil {
+		return nil, err
+	}
+	contexts := normalizeScopeContexts(req.Contexts)
+	cursor, err := decodeCursor(req.Cursor, scopeMembersCursor, scopeID, string(req.Status), string(req.Type), contexts)
+	if err != nil {
+		return nil, err
+	}
+	completed, err := completedStatuses(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := r.QueryContext(ctx, `
+		SELECT issue_id FROM scope_members WHERE scope_id = ? ORDER BY issue_id`, scopeID)
+	if err != nil {
+		return nil, fmt.Errorf("list scope members: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan scope member: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close scope members: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read scope members: %w", err)
+	}
+	if len(contexts) > 0 {
+		labels, err := issueops.GetLabelsForIssuesInTx(ctx, r, ids)
+		if err != nil {
+			return nil, fmt.Errorf("read scope member contexts: %w", err)
+		}
+		filtered := ids[:0]
+		for _, id := range ids {
+			if matchesScopeContext(labels[id], contexts) {
+				filtered = append(filtered, id)
+			}
+		}
+		ids = filtered
+	}
+	readyIDs := map[string]struct{}{}
+	if req.Status == storage.ScopeMemberStatusReady {
+		readyIDs, err = issueops.GetReadyIssueIDsInTx(ctx, r, types.WorkFilter{Type: string(req.Type)}, ids)
+		if err != nil {
+			return nil, fmt.Errorf("read ready scope members: %w", err)
+		}
+	}
+	var members []*types.Issue
+	for _, id := range ids {
+		issue, err := issueops.GetIssueInTx(ctx, r, id)
+		if err != nil {
+			return nil, fmt.Errorf("read scope %s member %s: %w", scopeID, id, err)
+		}
+		if req.Type != "" && issue.IssueType != req.Type {
+			continue
+		}
+		isCompleted := completed[string(issue.Status)]
+		matches := true
+		switch req.Status {
+		case storage.ScopeMemberStatusOpen:
+			matches = !isCompleted
+		case storage.ScopeMemberStatusCompleted:
+			matches = isCompleted
+		case storage.ScopeMemberStatusReady:
+			_, matches = readyIDs[issue.ID]
+		}
+		if matches {
+			members = append(members, issue)
+		}
+	}
+	memberCount, completedCount, err := countScopeMembers(ctx, r, scopeID, completed)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(members, func(i, j int) bool { return members[i].ID < members[j].ID })
+	total := len(members)
+	if cursor != nil {
+		start := sort.Search(len(members), func(i int) bool { return members[i].ID > cursor.ID })
+		members = members[start:]
+	}
+	limit := scopePageLimit(req.Limit)
+	hasMore := len(members) > limit
+	if hasMore {
+		members = members[:limit]
+	}
+	page := &storage.ScopeMemberPage{
+		Scope: *scope, Members: members, MemberCount: memberCount, CompletedCount: completedCount,
+		TotalMatching: total, Limit: limit, ReturnedCount: len(members), HasMore: hasMore,
+	}
+	if hasMore {
+		last := members[len(members)-1]
+		page.NextCursor, err = encodeCursor(scopeMembersCursor, scopeID, string(req.Status), string(req.Type), time.Time{}, last.ID, contexts)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return page, nil
+}
+
+type scopeCursor struct {
+	Version   int       `json:"v"`
+	Kind      string    `json:"k"`
+	ScopeID   string    `json:"s,omitempty"`
+	Status    string    `json:"st,omitempty"`
+	IssueType string    `json:"t,omitempty"`
+	Contexts  []string  `json:"cx,omitempty"`
+	CreatedOn time.Time `json:"c,omitempty"`
+	ID        string    `json:"i"`
+}
+
+func encodeCursor(kind, scopeID, status, issueType string, createdOn time.Time, id string, contexts ...[]string) (string, error) {
+	payload, err := json.Marshal(scopeCursor{
+		Version: scopeCursorVersion, Kind: kind, ScopeID: scopeID, Status: status,
+		IssueType: issueType, Contexts: cursorContexts(contexts...), CreatedOn: createdOn, ID: id,
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode scope cursor: %w", err)
+	}
+	return kind + base64.RawURLEncoding.EncodeToString(payload), nil
+}
+
+func decodeCursor(token, kind, scopeID, status, issueType string, contexts ...[]string) (*scopeCursor, error) {
+	if token == "" {
+		return nil, nil
+	}
+	if !strings.HasPrefix(token, kind) {
+		return nil, storage.ErrScopeCursorInvalid
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(token, kind))
+	if err != nil {
+		return nil, storage.ErrScopeCursorInvalid
+	}
+	var cursor scopeCursor
+	if err := json.Unmarshal(payload, &cursor); err != nil || cursor.Version != scopeCursorVersion || cursor.Kind != kind || cursor.ID == "" {
+		return nil, storage.ErrScopeCursorInvalid
+	}
+	if cursor.ScopeID != scopeID || cursor.Status != status || cursor.IssueType != issueType || !sameStrings(cursor.Contexts, cursorContexts(contexts...)) {
+		return nil, storage.ErrScopeCursorInvalid
+	}
+	return &cursor, nil
+}
+
+func cursorContexts(contexts ...[]string) []string {
+	if len(contexts) == 0 {
+		return nil
+	}
+	return normalizeScopeContexts(contexts[0])
+}
+
+func normalizeScopeContexts(contexts []string) []string {
+	if len(contexts) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(contexts))
+	result := make([]string, 0, len(contexts))
+	for _, context := range contexts {
+		if _, ok := seen[context]; ok {
+			continue
+		}
+		seen[context] = struct{}{}
+		result = append(result, context)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesScopeContext(labels, contexts []string) bool {
+	for _, context := range contexts {
+		if !strings.HasPrefix(context, "ctx:") {
+			context = "ctx:" + context
+		}
+		for _, label := range labels {
+			if label == context {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func scopePageLimit(limit int) int {
+	if limit <= 0 {
+		return defaultScopePageLimit
+	}
+	if limit > maxScopePageLimit {
+		return maxScopePageLimit
+	}
+	return limit
+}
+
+func validateMemberStatus(status storage.ScopeMemberStatus) error {
+	switch status {
+	case "", storage.ScopeMemberStatusOpen, storage.ScopeMemberStatusCompleted, storage.ScopeMemberStatusReady:
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown scope member status %q", storage.ErrScopeInvalid, status)
+	}
+}
+
+func completedStatuses(ctx context.Context, r Runner) (map[string]bool, error) {
+	statuses, err := issueops.ResolveCustomStatusesDetailedInTx(ctx, r)
+	if err != nil {
+		return nil, fmt.Errorf("resolve scope completion statuses: %w", err)
+	}
+	completed := map[string]bool{string(types.StatusClosed): true}
+	for _, status := range statuses {
+		if status.Category == types.CategoryDone {
+			completed[status.Name] = true
+		}
+	}
+	return completed, nil
+}
+
+func sortedStrings(values map[string]bool) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func countScopeMembers(ctx context.Context, r Runner, scopeID string, completed map[string]bool) (int, int, error) {
+	placeholders, args := inArgs(sortedStrings(completed))
+	var memberCount, completedCount int
+	err := r.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT COUNT(*), COALESCE(SUM(CASE WHEN i.status IN (%s) THEN 1 ELSE 0 END), 0)
+		FROM scope_members sm JOIN issues i ON i.id = sm.issue_id
+		WHERE sm.scope_id = ?`, placeholders), append(args, scopeID)...).Scan(&memberCount, &completedCount)
+	if err != nil {
+		return 0, 0, fmt.Errorf("count scope members: %w", err)
+	}
+	return memberCount, completedCount, nil
 }
 
 func Active(ctx context.Context, r Runner) (*types.Scope, error) {
