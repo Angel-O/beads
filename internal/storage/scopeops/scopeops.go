@@ -188,7 +188,8 @@ func ListMembers(ctx context.Context, r Runner, scopeID string, req storage.Scop
 	if err := validateMemberStatus(req.Status); err != nil {
 		return nil, err
 	}
-	cursor, err := decodeCursor(req.Cursor, scopeMembersCursor, scopeID, string(req.Status), string(req.Type))
+	contexts := normalizeScopeContexts(req.Contexts)
+	cursor, err := decodeCursor(req.Cursor, scopeMembersCursor, scopeID, string(req.Status), string(req.Type), contexts)
 	if err != nil {
 		return nil, err
 	}
@@ -215,6 +216,19 @@ func ListMembers(ctx context.Context, r Runner, scopeID string, req storage.Scop
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("read scope members: %w", err)
+	}
+	if len(contexts) > 0 {
+		labels, err := issueops.GetLabelsForIssuesInTx(ctx, r, ids)
+		if err != nil {
+			return nil, fmt.Errorf("read scope member contexts: %w", err)
+		}
+		filtered := ids[:0]
+		for _, id := range ids {
+			if matchesScopeContext(labels[id], contexts) {
+				filtered = append(filtered, id)
+			}
+		}
+		ids = filtered
 	}
 	readyIDs := map[string]struct{}{}
 	if req.Status == storage.ScopeMemberStatusReady {
@@ -267,7 +281,7 @@ func ListMembers(ctx context.Context, r Runner, scopeID string, req storage.Scop
 	}
 	if hasMore {
 		last := members[len(members)-1]
-		page.NextCursor, err = encodeCursor(scopeMembersCursor, scopeID, string(req.Status), string(req.Type), time.Time{}, last.ID)
+		page.NextCursor, err = encodeCursor(scopeMembersCursor, scopeID, string(req.Status), string(req.Type), time.Time{}, last.ID, contexts)
 		if err != nil {
 			return nil, err
 		}
@@ -281,14 +295,15 @@ type scopeCursor struct {
 	ScopeID   string    `json:"s,omitempty"`
 	Status    string    `json:"st,omitempty"`
 	IssueType string    `json:"t,omitempty"`
+	Contexts  []string  `json:"cx,omitempty"`
 	CreatedOn time.Time `json:"c,omitempty"`
 	ID        string    `json:"i"`
 }
 
-func encodeCursor(kind, scopeID, status, issueType string, createdOn time.Time, id string) (string, error) {
+func encodeCursor(kind, scopeID, status, issueType string, createdOn time.Time, id string, contexts ...[]string) (string, error) {
 	payload, err := json.Marshal(scopeCursor{
 		Version: scopeCursorVersion, Kind: kind, ScopeID: scopeID, Status: status,
-		IssueType: issueType, CreatedOn: createdOn, ID: id,
+		IssueType: issueType, Contexts: cursorContexts(contexts...), CreatedOn: createdOn, ID: id,
 	})
 	if err != nil {
 		return "", fmt.Errorf("encode scope cursor: %w", err)
@@ -296,7 +311,7 @@ func encodeCursor(kind, scopeID, status, issueType string, createdOn time.Time, 
 	return kind + base64.RawURLEncoding.EncodeToString(payload), nil
 }
 
-func decodeCursor(token, kind, scopeID, status, issueType string) (*scopeCursor, error) {
+func decodeCursor(token, kind, scopeID, status, issueType string, contexts ...[]string) (*scopeCursor, error) {
 	if token == "" {
 		return nil, nil
 	}
@@ -311,10 +326,60 @@ func decodeCursor(token, kind, scopeID, status, issueType string) (*scopeCursor,
 	if err := json.Unmarshal(payload, &cursor); err != nil || cursor.Version != scopeCursorVersion || cursor.Kind != kind || cursor.ID == "" {
 		return nil, storage.ErrScopeCursorInvalid
 	}
-	if cursor.ScopeID != scopeID || cursor.Status != status || cursor.IssueType != issueType {
+	if cursor.ScopeID != scopeID || cursor.Status != status || cursor.IssueType != issueType || !sameStrings(cursor.Contexts, cursorContexts(contexts...)) {
 		return nil, storage.ErrScopeCursorInvalid
 	}
 	return &cursor, nil
+}
+
+func cursorContexts(contexts ...[]string) []string {
+	if len(contexts) == 0 {
+		return nil
+	}
+	return normalizeScopeContexts(contexts[0])
+}
+
+func normalizeScopeContexts(contexts []string) []string {
+	if len(contexts) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(contexts))
+	result := make([]string, 0, len(contexts))
+	for _, context := range contexts {
+		if _, ok := seen[context]; ok {
+			continue
+		}
+		seen[context] = struct{}{}
+		result = append(result, context)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesScopeContext(labels, contexts []string) bool {
+	for _, context := range contexts {
+		if !strings.HasPrefix(context, "ctx:") {
+			context = "ctx:" + context
+		}
+		for _, label := range labels {
+			if label == context {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func scopePageLimit(limit int) int {

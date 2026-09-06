@@ -64,8 +64,11 @@ const (
 type ScopeMemberPageRequest struct {
 	Status ScopeMemberStatus `json:"status,omitempty"`
 	Type   IssueType         `json:"type,omitempty"`
-	Limit  int               `json:"limit,omitempty"`
-	Cursor string            `json:"cursor,omitempty"`
+	// Contexts are exact registered context IDs; matching is against ctx:<id>
+	// labels and repeat values have OR semantics.
+	Contexts []string `json:"contexts,omitempty"`
+	Limit    int      `json:"limit,omitempty"`
+	Cursor   string   `json:"cursor,omitempty"`
 }
 
 // ScopeMemberPage is a scope identity plus a page of full issue rows. Member

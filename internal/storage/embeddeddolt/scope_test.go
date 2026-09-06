@@ -226,6 +226,9 @@ func TestEmbeddedScopePagedCatalogAndMembers(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AddScopeMembers: %v", err)
 	}
+	if err := te.store.AddLabel(ctx, "scope-page-open", "ctx:team-a", "tester"); err != nil {
+		t.Fatalf("AddLabel: %v", err)
+	}
 	if err := te.store.AddDependency(ctx, &types.Dependency{
 		IssueID: "scope-page-open", DependsOnID: "scope-page-blocker", Type: types.DepBlocks,
 	}, "tester"); err != nil {
@@ -282,6 +285,13 @@ func TestEmbeddedScopePagedCatalogAndMembers(t *testing.T) {
 	if task.TotalMatching != 6 {
 		t.Fatalf("exact type total = %d, want 6", task.TotalMatching)
 	}
+	contextPage, err := te.store.ListScopeMembers(ctx, "scope-page", storage.ScopeMemberPageRequest{Contexts: []string{"team-a"}})
+	if err != nil {
+		t.Fatalf("ListScopeMembers(context): %v", err)
+	}
+	if contextPage.TotalMatching != 1 || len(contextPage.Members) != 1 || contextPage.Members[0].ID != "scope-page-open" {
+		t.Fatalf("context page = %#v, want only the exact ctx:team-a member", contextPage)
+	}
 	ready, err := te.store.ListScopeMembers(ctx, "scope-page", storage.ScopeMemberPageRequest{Status: storage.ScopeMemberStatusReady})
 	if err != nil {
 		t.Fatalf("ListScopeMembers(ready): %v", err)
@@ -291,6 +301,12 @@ func TestEmbeddedScopePagedCatalogAndMembers(t *testing.T) {
 	}
 	if _, err := te.store.ListScopeMembers(ctx, "scope-page", storage.ScopeMemberPageRequest{Status: storage.ScopeMemberStatusCompleted, Cursor: page.NextCursor}); !errors.Is(err, storage.ErrScopeCursorInvalid) {
 		t.Fatalf("mismatched member cursor error = %v, want ErrScopeCursorInvalid", err)
+	}
+	if _, err := te.store.ListScopeMembers(ctx, "scope-page", storage.ScopeMemberPageRequest{Status: storage.ScopeMemberStatus("unknown")}); !errors.Is(err, storage.ErrScopeInvalid) {
+		t.Fatalf("invalid member status error = %v, want ErrScopeInvalid", err)
+	}
+	if _, err := te.store.ListScopeMembers(ctx, "scope-page", storage.ScopeMemberPageRequest{Cursor: "not-a-scope-cursor"}); !errors.Is(err, storage.ErrScopeCursorInvalid) {
+		t.Fatalf("invalid member cursor error = %v, want ErrScopeCursorInvalid", err)
 	}
 }
 

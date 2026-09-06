@@ -42,6 +42,25 @@ func TestScopeCursorIsVersionedAndBoundToReadShape(t *testing.T) {
 	if _, err := decodeCursor(member, scopeMembersCursor, "scope-1", "open", "task"); err != nil {
 		t.Fatalf("decode member cursor: %v", err)
 	}
+	memberWithContexts, err := encodeCursor(scopeMembersCursor, "scope-1", "open", "task", time.Time{}, "issue-2", []string{"ctx-b", "ctx-a"})
+	if err != nil {
+		t.Fatalf("encode member context cursor: %v", err)
+	}
+	if _, err := decodeCursor(memberWithContexts, scopeMembersCursor, "scope-1", "open", "task", []string{"ctx-a", "ctx-b"}); err != nil {
+		t.Fatalf("decode member context cursor: %v", err)
+	}
+	if _, err := decodeCursor(memberWithContexts, scopeMembersCursor, "scope-1", "open", "task", []string{"ctx-a"}); !errors.Is(err, storage.ErrScopeCursorInvalid) {
+		t.Fatalf("decode context mismatch error = %v, want ErrScopeCursorInvalid", err)
+	}
+}
+
+func TestScopeContextMatchesExactContextLabels(t *testing.T) {
+	if !matchesScopeContext([]string{"ctx:team-a", "label"}, []string{"team-a"}) {
+		t.Fatal("context ID did not match its exact ctx: label")
+	}
+	if matchesScopeContext([]string{"ctx:team-ab"}, []string{"team-a"}) {
+		t.Fatal("context filter matched a non-exact ctx: label")
+	}
 }
 
 func TestScopePageLimitDefaultsAndCaps(t *testing.T) {
