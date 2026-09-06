@@ -270,6 +270,30 @@ func TestGetReadyWorkInTxStatusesSingleQuery(t *testing.T) {
 	}
 }
 
+func TestGetReadyIssueIDsInTxUsesCanonicalPredicates(t *testing.T) {
+	t.Parallel()
+
+	_, mock, tx := beginMockTx(t)
+	mock.ExpectQuery(deferredParentProbeRegex("issues")).WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(deferredParentProbeRegex("wisps")).WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`(?s)SELECT id FROM issues\s+WHERE .*pinned = 0.*is_blocked = 0.*id IN \(\?,\?\)`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("ready-1"))
+
+	got, err := GetReadyIssueIDsInTx(context.Background(), tx, types.WorkFilter{Type: string(types.TypeTask)}, []string{"ready-1", "not-ready"})
+	if err != nil {
+		t.Fatalf("GetReadyIssueIDsInTx: %v", err)
+	}
+	if _, ok := got["ready-1"]; !ok {
+		t.Fatalf("ready IDs = %v, want ready-1", got)
+	}
+	if _, ok := got["not-ready"]; ok {
+		t.Fatalf("ready IDs = %v, unexpectedly included not-ready", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
 func TestReadyWorkWispIssueFilterPropagatesStatuses(t *testing.T) {
 	t.Parallel()
 

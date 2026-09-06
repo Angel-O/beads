@@ -55,8 +55,16 @@ func (t *doltTransaction) ListScopes(ctx context.Context) ([]*types.Scope, error
 	return scopeops.List(ctx, t.regularTx)
 }
 
+func (t *doltTransaction) ListScopeCatalog(ctx context.Context, req storage.ScopeCatalogRequest) (*storage.ScopeCatalogPage, error) {
+	return scopeops.ListCatalog(ctx, t.regularTx, req)
+}
+
 func (t *doltTransaction) GetScope(ctx context.Context, id string) (*types.ScopeDetails, error) {
 	return scopeops.Get(ctx, t.regularTx, id)
+}
+
+func (t *doltTransaction) ListScopeMembers(ctx context.Context, scopeID string, req storage.ScopeMemberPageRequest) (*storage.ScopeMemberPage, error) {
+	return scopeops.ListMembers(ctx, t.regularTx, scopeID, req)
 }
 
 func (t *doltTransaction) GetActiveScope(ctx context.Context) (*types.Scope, error) {

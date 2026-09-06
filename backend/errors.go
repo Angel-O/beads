@@ -44,6 +44,7 @@ var ErrScopeIssueNotFound = storage.ErrScopeIssueNotFound
 var ErrScopeMembershipConflict = storage.ErrScopeMembershipConflict
 var ErrScopeCapacityExceeded = storage.ErrScopeCapacityExceeded
 var ErrScopeSourceMembership = storage.ErrScopeSourceMembership
+var ErrScopeCursorInvalid = storage.ErrScopeCursorInvalid
 
 // ClaimedByFragment and NotClaimableStatusFragment are the exact message
 // fragments the claim path appends after ErrAlreadyClaimed / ErrNotClaimable

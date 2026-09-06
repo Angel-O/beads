@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
@@ -197,6 +198,118 @@ func TestEmbeddedScopeReadOnlyIncludesInternalRelationships(t *testing.T) {
 	}
 }
 
+func TestEmbeddedScopePagedCatalogAndMembers(t *testing.T) {
+	te := newTestEnv(t, "scope_pages")
+	ctx := t.Context()
+	createScope(t, te, "scope-page", "Paged")
+	createScope(t, te, "scope-page-empty", "Empty")
+	if err := te.store.SetConfig(ctx, "status.custom", "archived:done"); err != nil {
+		t.Fatalf("SetConfig(status.custom): %v", err)
+	}
+	issues := []*types.Issue{
+		{ID: "scope-page-open", Title: "open", Description: "full", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask},
+		{ID: "scope-page-progress", Title: "progress", Status: types.StatusInProgress, Priority: 2, IssueType: types.TypeTask},
+		{ID: "scope-page-closed", Title: "closed", Status: types.StatusClosed, Priority: 2, IssueType: types.TypeTask},
+		{ID: "scope-page-archived", Title: "archived", Status: types.Status("archived"), Priority: 2, IssueType: types.TypeTask},
+		{ID: "scope-page-bug", Title: "bug", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeBug},
+		{ID: "scope-page-blocker", Title: "blocker", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask},
+		{ID: "scope-page-pinned-blocker", Title: "pinned blocker", Status: types.StatusPinned, Priority: 2, IssueType: types.TypeTask},
+		{ID: "scope-page-pinned-dependent", Title: "pinned dependent", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask},
+		{ID: "scope-page-deferred-parent", Title: "deferred parent", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeEpic, DeferUntil: timePtr(time.Now().UTC().Add(time.Hour))},
+		{ID: "scope-page-deferred-child", Title: "deferred child", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask},
+	}
+	if err := te.store.CreateIssues(ctx, issues, "tester"); err != nil {
+		t.Fatalf("CreateIssues: %v", err)
+	}
+	if err := te.store.AddScopeMembers(ctx, "scope-page", []string{
+		"scope-page-open", "scope-page-progress", "scope-page-closed", "scope-page-archived", "scope-page-bug", "scope-page-pinned-dependent", "scope-page-deferred-child",
+	}); err != nil {
+		t.Fatalf("AddScopeMembers: %v", err)
+	}
+	if err := te.store.AddLabel(ctx, "scope-page-open", "ctx:team-a", "tester"); err != nil {
+		t.Fatalf("AddLabel: %v", err)
+	}
+	if err := te.store.AddDependency(ctx, &types.Dependency{
+		IssueID: "scope-page-open", DependsOnID: "scope-page-blocker", Type: types.DepBlocks,
+	}, "tester"); err != nil {
+		t.Fatalf("AddDependency: %v", err)
+	}
+	if err := te.store.AddDependency(ctx, &types.Dependency{
+		IssueID: "scope-page-pinned-dependent", DependsOnID: "scope-page-pinned-blocker", Type: types.DepBlocks,
+	}, "tester"); err != nil {
+		t.Fatalf("AddDependency(pinned): %v", err)
+	}
+	if err := te.store.AddDependency(ctx, &types.Dependency{
+		IssueID: "scope-page-deferred-child", DependsOnID: "scope-page-deferred-parent", Type: types.DepParentChild,
+	}, "tester"); err != nil {
+		t.Fatalf("AddDependency(deferred parent): %v", err)
+	}
+
+	catalog, err := te.store.ListScopeCatalog(ctx, storage.ScopeCatalogRequest{Limit: 1})
+	if err != nil {
+		t.Fatalf("ListScopeCatalog: %v", err)
+	}
+	if len(catalog.Items) != 1 || catalog.Items[0].ID != "scope-page" || catalog.Items[0].MemberCount != 7 || catalog.Items[0].CompletedCount != 2 {
+		t.Fatalf("catalog = %#v, want first scope with 7 members and 2 completed", catalog)
+	}
+	if catalog.TotalMatching != 2 || !catalog.HasMore || catalog.NextCursor == "" {
+		t.Fatalf("catalog pagination = %#v, want total 2 and next cursor", catalog)
+	}
+
+	page, err := te.store.ListScopeMembers(ctx, "scope-page", storage.ScopeMemberPageRequest{Limit: 2})
+	if err != nil {
+		t.Fatalf("ListScopeMembers: %v", err)
+	}
+	if page.Scope.ID != "scope-page" || page.MemberCount != 7 || page.CompletedCount != 2 || page.TotalMatching != 7 || len(page.Members) != 2 || !page.HasMore {
+		t.Fatalf("member page = %#v, want unfiltered counts and first page", page)
+	}
+	next, err := te.store.ListScopeMembers(ctx, "scope-page", storage.ScopeMemberPageRequest{Limit: 2, Cursor: page.NextCursor})
+	if err != nil {
+		t.Fatalf("ListScopeMembers(next): %v", err)
+	}
+	if next.TotalMatching != 7 || len(next.Members) != 2 || next.Members[0].ID <= page.Members[len(page.Members)-1].ID {
+		t.Fatalf("next member page = %#v, want deterministic issue_id order", next)
+	}
+
+	completed, err := te.store.ListScopeMembers(ctx, "scope-page", storage.ScopeMemberPageRequest{Status: storage.ScopeMemberStatusCompleted})
+	if err != nil {
+		t.Fatalf("ListScopeMembers(completed): %v", err)
+	}
+	if completed.TotalMatching != 2 || len(completed.Members) != 2 {
+		t.Fatalf("completed page = %#v, want closed and custom done rows", completed)
+	}
+	task, err := te.store.ListScopeMembers(ctx, "scope-page", storage.ScopeMemberPageRequest{Type: types.TypeTask})
+	if err != nil {
+		t.Fatalf("ListScopeMembers(type): %v", err)
+	}
+	if task.TotalMatching != 6 {
+		t.Fatalf("exact type total = %d, want 6", task.TotalMatching)
+	}
+	contextPage, err := te.store.ListScopeMembers(ctx, "scope-page", storage.ScopeMemberPageRequest{Contexts: []string{"team-a"}})
+	if err != nil {
+		t.Fatalf("ListScopeMembers(context): %v", err)
+	}
+	if contextPage.TotalMatching != 1 || len(contextPage.Members) != 1 || contextPage.Members[0].ID != "scope-page-open" {
+		t.Fatalf("context page = %#v, want only the exact ctx:team-a member", contextPage)
+	}
+	ready, err := te.store.ListScopeMembers(ctx, "scope-page", storage.ScopeMemberPageRequest{Status: storage.ScopeMemberStatusReady})
+	if err != nil {
+		t.Fatalf("ListScopeMembers(ready): %v", err)
+	}
+	if ready.TotalMatching != 2 || len(ready.Members) != 2 || ready.Members[0].ID != "scope-page-pinned-dependent" || ready.Members[1].ID != "scope-page-progress" {
+		t.Fatalf("ready page = %#v, want progress and pinned-dependent only", ready)
+	}
+	if _, err := te.store.ListScopeMembers(ctx, "scope-page", storage.ScopeMemberPageRequest{Status: storage.ScopeMemberStatusCompleted, Cursor: page.NextCursor}); !errors.Is(err, storage.ErrScopeCursorInvalid) {
+		t.Fatalf("mismatched member cursor error = %v, want ErrScopeCursorInvalid", err)
+	}
+	if _, err := te.store.ListScopeMembers(ctx, "scope-page", storage.ScopeMemberPageRequest{Status: storage.ScopeMemberStatus("unknown")}); !errors.Is(err, storage.ErrScopeInvalid) {
+		t.Fatalf("invalid member status error = %v, want ErrScopeInvalid", err)
+	}
+	if _, err := te.store.ListScopeMembers(ctx, "scope-page", storage.ScopeMemberPageRequest{Cursor: "not-a-scope-cursor"}); !errors.Is(err, storage.ErrScopeCursorInvalid) {
+		t.Fatalf("invalid member cursor error = %v, want ErrScopeCursorInvalid", err)
+	}
+}
+
 func createScope(t *testing.T, te *testEnv, id, name string) {
 	t.Helper()
 	if err := te.store.CreateScope(t.Context(), &types.Scope{ID: id, Name: name}, false); err != nil {
@@ -239,3 +352,5 @@ func scopeMemberIDs(t *testing.T, te *testEnv, scopeID string) []string {
 func threeDigits(i int) string {
 	return string([]byte{'0' + byte(i/100), '0' + byte((i/10)%10), '0' + byte(i%10)})
 }
+
+func timePtr(value time.Time) *time.Time { return &value }
