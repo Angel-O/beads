@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -55,11 +56,13 @@ func TestScopeCommandsDelegateAndEmitJSON(t *testing.T) {
 		t.Fatalf("set --activate: %v", err)
 	}
 	t.Cleanup(func() { _ = scopeCreateCmd.Flags().Set("activate", "false") })
-	var created types.Scope
-	decodeScopeJSON(t, captureStdout(t, func() error {
+	createdRaw := captureStdout(t, func() error {
 		return scopeCreateCmd.RunE(scopeCreateCmd, []string{"scope-a", "Scope A"})
-	}), &created)
-	if created.ID != "scope-a" || created.NormalizedName != "scope a" {
+	})
+	assertMemberLimit(t, createdRaw)
+	var created types.Scope
+	decodeScopeJSON(t, createdRaw, &created)
+	if created.ID != "scope-a" || created.NormalizedName != "scope a" || created.MemberLimit != storage.MaxScopeMembers {
 		t.Fatalf("created scope = %#v", created)
 	}
 
@@ -71,9 +74,12 @@ func TestScopeCommandsDelegateAndEmitJSON(t *testing.T) {
 	}
 	run(scopeCreateCmd, "scope-b", "Scope B")
 	var scopes []*types.Scope
-	decodeScopeJSON(t, captureStdout(t, func() error {
+	listRaw := captureStdout(t, func() error {
 		return scopeListCmd.RunE(scopeListCmd, nil)
-	}), &scopes)
+	})
+	assertMemberLimit(t, listRaw, "0")
+	assertMemberLimit(t, listRaw, "1")
+	decodeScopeJSON(t, listRaw, &scopes)
 	if len(scopes) != 2 {
 		t.Fatalf("listed scopes = %d, want 2", len(scopes))
 	}
@@ -82,17 +88,21 @@ func TestScopeCommandsDelegateAndEmitJSON(t *testing.T) {
 	run(scopeRemoveCmd, "scope-a", issueA.ID)
 
 	var details types.ScopeDetails
-	decodeScopeJSON(t, captureStdout(t, func() error {
+	detailsRaw := captureStdout(t, func() error {
 		return scopeShowCmd.RunE(scopeShowCmd, []string{"scope-a"})
-	}), &details)
+	})
+	assertMemberLimit(t, detailsRaw)
+	decodeScopeJSON(t, detailsRaw, &details)
 	if len(details.Members) != 0 {
 		t.Fatalf("scope-a members = %d, want 0", len(details.Members))
 	}
 
 	var active types.Scope
-	decodeScopeJSON(t, captureStdout(t, func() error {
+	activeRaw := captureStdout(t, func() error {
 		return scopeActiveCmd.RunE(scopeActiveCmd, nil)
-	}), &active)
+	})
+	assertMemberLimit(t, activeRaw)
+	decodeScopeJSON(t, activeRaw, &active)
 	if active.ID != "scope-a" {
 		t.Fatalf("active scope = %#v", active)
 	}
@@ -123,10 +133,12 @@ func TestScopeCommandsDelegateAndEmitJSON(t *testing.T) {
 		t.Fatalf("set list --limit: %v", err)
 	}
 	var catalog storage.ScopeCatalogPage
-	decodeScopeJSON(t, captureStdout(t, func() error {
+	catalogRaw := captureStdout(t, func() error {
 		return scopeListCmd.RunE(scopeListCmd, nil)
-	}), &catalog)
-	if len(catalog.Items) != 1 || catalog.Limit != 1 || !catalog.HasMore {
+	})
+	assertMemberLimit(t, catalogRaw, "items", "0")
+	decodeScopeJSON(t, catalogRaw, &catalog)
+	if len(catalog.Items) != 1 || catalog.Items[0].MemberLimit != storage.MaxScopeMembers || catalog.Limit != 1 || !catalog.HasMore {
 		t.Fatalf("catalog page = %#v, want first bounded page", catalog)
 	}
 
@@ -143,10 +155,12 @@ func TestScopeCommandsDelegateAndEmitJSON(t *testing.T) {
 		t.Fatalf("set show --type: %v", err)
 	}
 	var members storage.ScopeMemberPage
-	decodeScopeJSON(t, captureStdout(t, func() error {
+	membersRaw := captureStdout(t, func() error {
 		return scopeShowCmd.RunE(scopeShowCmd, []string{"scope-b"})
-	}), &members)
-	if members.Scope.ID != "scope-b" || members.TotalMatching != 1 || len(members.Members) != 1 || members.Members[0].ID != issueB.ID {
+	})
+	assertMemberLimit(t, membersRaw, "scope")
+	decodeScopeJSON(t, membersRaw, &members)
+	if members.Scope.ID != "scope-b" || members.Scope.MemberLimit != storage.MaxScopeMembers || members.TotalMatching != 1 || len(members.Members) != 1 || members.Members[0].ID != issueB.ID {
 		t.Fatalf("member page = %#v, want filtered scope-b member", members)
 	}
 }
@@ -155,5 +169,39 @@ func decodeScopeJSON(t *testing.T, raw string, dst any) {
 	t.Helper()
 	if err := json.Unmarshal([]byte(raw), dst); err != nil {
 		t.Fatalf("decode scope JSON: %v\n%s", err, raw)
+	}
+}
+
+func assertMemberLimit(t *testing.T, raw string, path ...string) {
+	t.Helper()
+	path = append(path, "member_limit")
+	var value any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		t.Fatalf("decode scope JSON for member_limit: %v\n%s", err, raw)
+	}
+	for _, part := range path {
+		switch current := value.(type) {
+		case map[string]any:
+			next, ok := current[part]
+			if !ok {
+				t.Fatalf("scope JSON missing %q\n%s", part, raw)
+			}
+			value = next
+		case []any:
+			index, err := strconv.Atoi(part)
+			if err != nil || index < 0 || index >= len(current) {
+				t.Fatalf("invalid scope JSON array path %q\n%s", part, raw)
+			}
+			value = current[index]
+		default:
+			t.Fatalf("scope JSON path %q reached %T\n%s", part, value, raw)
+		}
+	}
+	got, ok := value.(float64)
+	if !ok {
+		t.Fatalf("scope JSON member_limit has type %T\n%s", value, raw)
+	}
+	if int(got) != storage.MaxScopeMembers || got != float64(storage.MaxScopeMembers) {
+		t.Fatalf("scope JSON member_limit = %v, want %d\n%s", got, storage.MaxScopeMembers, raw)
 	}
 }

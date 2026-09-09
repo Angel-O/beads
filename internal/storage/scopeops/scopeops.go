@@ -43,6 +43,7 @@ func Create(ctx context.Context, r Runner, scope *types.Scope, activate bool) er
 		scope.CreatedOn = scope.CreatedOn.UTC().Truncate(time.Second)
 	}
 	scope.NormalizedName = normalizeName(scope.Name)
+	scope.MemberLimit = storage.MaxScopeMembers
 	if _, err := r.ExecContext(ctx, `
 		INSERT INTO scopes (id, name, normalized_name, created_on)
 		VALUES (?, ?, ?, ?)`, scope.ID, scope.Name, scope.NormalizedName, scope.CreatedOn); err != nil {
@@ -125,6 +126,7 @@ func ListCatalog(ctx context.Context, r Runner, req storage.ScopeCatalogRequest)
 		if err := rows.Scan(&row.ID, &row.Name, &row.NormalizedName, &row.CreatedOn, &row.MemberCount, &row.CompletedCount); err != nil {
 			return nil, fmt.Errorf("scan scope catalog: %w", err)
 		}
+		row.MemberLimit = storage.MaxScopeMembers
 		items = append(items, &row)
 	}
 	if err := rows.Err(); err != nil {
@@ -750,6 +752,7 @@ func scanScope(row scanner) (*types.Scope, error) {
 	if err := row.Scan(&scope.ID, &scope.Name, &scope.NormalizedName, &scope.CreatedOn); err != nil {
 		return nil, err
 	}
+	scope.MemberLimit = storage.MaxScopeMembers
 	return &scope, nil
 }
 

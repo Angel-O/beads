@@ -10,6 +10,9 @@ type Scope struct {
 	Name           string    `json:"name"`
 	NormalizedName string    `json:"normalized_name"`
 	CreatedOn      time.Time `json:"created_on"`
+	// MemberLimit is the enforced maximum number of issues in this scope. It is
+	// reported by the API but is not stored as a separate schema value.
+	MemberLimit int `json:"member_limit"`
 }
 
 // ScopeDetails is the snapshot returned by a scope read. Members are complete
@@ -35,6 +38,7 @@ type ScopeCatalogRow struct {
 	Name           string    `json:"name"`
 	NormalizedName string    `json:"normalized_name"`
 	CreatedOn      time.Time `json:"created_on"`
+	MemberLimit    int       `json:"member_limit"`
 	MemberCount    int       `json:"member_count"`
 	CompletedCount int       `json:"completed_count"`
 }
