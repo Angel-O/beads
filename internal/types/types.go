@@ -2251,6 +2251,17 @@ type EpicStatus struct {
 	EligibleForClose bool   `json:"eligible_for_close"`
 }
 
+// EpicChild is one direct parent-child record considered by the close gate.
+// StoragePlane identifies the dependency table that supplied the record, not
+// the issue's create-selected StorageClass marker. The query includes closed
+// children and never applies scope or visibility filtering.
+type EpicChild struct {
+	ID           string    `json:"id"`
+	Status       Status    `json:"status"`
+	IssueType    IssueType `json:"issue_type,omitempty"`
+	StoragePlane string    `json:"storage_plane"`
+}
+
 // BondRef tracks compound molecule lineage.
 // When protos or molecules are bonded together, BondRefs record
 // which sources were combined and how they were attached.

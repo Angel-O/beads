@@ -664,6 +664,16 @@ type DoltStorage interface {
 	FastStatisticsStore
 }
 
+// EpicChildQueryStore is the additive capability behind `bd epic child-closure`.
+// It is intentionally separate from Storage so existing Storage implementers do
+// not acquire a relationship method they cannot answer. The query includes
+// closed children, spans durable and wisp dependency tables, and applies no
+// scope or visibility filtering. StoragePlane is the source plane ("durable"
+// or "wisp").
+type EpicChildQueryStore interface {
+	GetEpicChildren(ctx context.Context, parentID string) ([]*types.EpicChild, error)
+}
+
 // RawDBAccessor provides raw *sql.DB access for diagnostics and migrations.
 // Callers that need raw SQL should type-assert to this interface.
 type RawDBAccessor interface {

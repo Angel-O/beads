@@ -68,6 +68,16 @@ func WrapStorage(s storage.DoltStorage) storage.DoltStorage {
 	}
 }
 
+// GetEpicChildren forwards the read-only authoritative child query through the
+// telemetry decorator without changing its result or adding a second surface.
+func (s *InstrumentedStorage) GetEpicChildren(ctx context.Context, parentID string) ([]*types.EpicChild, error) {
+	query, ok := s.inner.(storage.EpicChildQueryStore)
+	if !ok {
+		return nil, &publicops.ErrUnsupported{Op: "GetEpicChildren", Backend: "instrumented storage"}
+	}
+	return query.GetEpicChildren(ctx, parentID)
+}
+
 // Unwrap satisfies storage.Unwrapper so storage.UnwrapStore can peel the
 // instrumentation layer for optional-interface type assertions.
 func (s *InstrumentedStorage) Unwrap() storage.DoltStorage { return s.inner }
