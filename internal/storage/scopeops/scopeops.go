@@ -177,8 +177,8 @@ func Get(ctx context.Context, r Runner, id string) (*types.ScopeDetails, error) 
 }
 
 // Snapshot reads the bounded scope membership and all of its relational data
-// through one transaction. The membership ceiling makes the deliberately
-// bounded per-member comment read safe for both embedded and proxied callers.
+// through one transaction. Scope membership has a foreign key to issues, so
+// the durable routing set is known without probing each member.
 func Snapshot(ctx context.Context, r Runner, id string) (*types.ScopeSnapshot, error) {
 	if id == "" {
 		return nil, storage.ErrScopeNotFound
@@ -192,20 +192,36 @@ func Snapshot(ctx context.Context, r Runner, id string) (*types.ScopeSnapshot, e
 		return nil, err
 	}
 
+	// scope_members.issue_id references issues.id; an empty wisp set keeps the
+	// batched helpers on the durable tables without a per-member routing probe.
+	durableWispSet := map[string]struct{}{}
+	hydrated, err := issueops.GetIssuesByIDsInTx(ctx, r, memberIDs, durableWispSet)
+	if err != nil {
+		return nil, fmt.Errorf("read scope %s members: %w", id, err)
+	}
+	hydratedByID := make(map[string]*types.Issue, len(hydrated))
+	for _, issue := range hydrated {
+		hydratedByID[issue.ID] = issue
+	}
+
 	members := make([]*types.Issue, 0, len(memberIDs))
 	memberSet := make(map[string]struct{}, len(memberIDs))
 	for _, issueID := range memberIDs {
-		issue, err := issueops.GetIssueInTx(ctx, r, issueID)
-		if err != nil {
-			return nil, fmt.Errorf("read scope %s member %s: %w", id, issueID, err)
+		issue, ok := hydratedByID[issueID]
+		if !ok {
+			return nil, fmt.Errorf("read scope %s member %s: %w", id, issueID, storage.ErrNotFound)
 		}
 		members = append(members, issue)
 		memberSet[issueID] = struct{}{}
 	}
 
-	dependencies, err := issueops.GetDependencyRecordsForIssuesInTx(ctx, r, memberIDs)
+	dependencies, err := issueops.GetDependencyRecordsForIssuesFromTableInTx(ctx, r, "dependencies", memberIDs)
 	if err != nil {
 		return nil, fmt.Errorf("read scope %s dependencies: %w", id, err)
+	}
+	comments, err := issueops.GetCommentsForIssuesInTx(ctx, r, memberIDs, durableWispSet)
+	if err != nil {
+		return nil, fmt.Errorf("read scope %s comments: %w", id, err)
 	}
 	for _, issue := range members {
 		for _, dependency := range dependencies[issue.ID] {
@@ -232,10 +248,7 @@ func Snapshot(ctx context.Context, r Runner, id string) (*types.ScopeSnapshot, e
 			}
 			return left.ThreadID < right.ThreadID
 		})
-		issue.Comments, err = issueops.GetIssueCommentsInTx(ctx, r, issue.ID)
-		if err != nil {
-			return nil, fmt.Errorf("read scope %s member %s comments: %w", id, issue.ID, err)
-		}
+		issue.Comments = comments[issue.ID]
 	}
 
 	return &types.ScopeSnapshot{
