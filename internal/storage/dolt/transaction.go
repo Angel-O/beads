@@ -63,6 +63,10 @@ func (t *doltTransaction) GetScope(ctx context.Context, id string) (*types.Scope
 	return scopeops.Get(ctx, t.regularTx, id)
 }
 
+func (t *doltTransaction) GetScopeSnapshot(ctx context.Context, id string) (*types.ScopeSnapshot, error) {
+	return scopeops.Snapshot(ctx, t.regularTx, id)
+}
+
 func (t *doltTransaction) ListScopeMembers(ctx context.Context, scopeID string, req storage.ScopeMemberPageRequest) (*storage.ScopeMemberPage, error) {
 	return scopeops.ListMembers(ctx, t.regularTx, scopeID, req)
 }

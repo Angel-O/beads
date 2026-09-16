@@ -53,6 +53,16 @@ func (s *DoltStore) GetScope(ctx context.Context, id string) (*types.ScopeDetail
 	return result, err
 }
 
+func (s *DoltStore) GetScopeSnapshot(ctx context.Context, id string) (*types.ScopeSnapshot, error) {
+	var result *types.ScopeSnapshot
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = scopeops.Snapshot(ctx, tx, id)
+		return err
+	})
+	return result, err
+}
+
 func (s *DoltStore) ListScopeMembers(ctx context.Context, scopeID string, req storage.ScopeMemberPageRequest) (*storage.ScopeMemberPage, error) {
 	var result *storage.ScopeMemberPage
 	err := s.withReadTx(ctx, func(tx *sql.Tx) error {

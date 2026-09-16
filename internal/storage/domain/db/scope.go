@@ -28,6 +28,9 @@ func (r *scopeSQLRepositoryImpl) ListCatalog(ctx context.Context, req types.Scop
 func (r *scopeSQLRepositoryImpl) Get(ctx context.Context, id string) (*types.ScopeDetails, error) {
 	return scopeops.Get(ctx, r.runner, id)
 }
+func (r *scopeSQLRepositoryImpl) GetSnapshot(ctx context.Context, id string) (*types.ScopeSnapshot, error) {
+	return scopeops.Snapshot(ctx, r.runner, id)
+}
 func (r *scopeSQLRepositoryImpl) ListMembers(ctx context.Context, scopeID string, req types.ScopeMemberPageRequest) (*types.ScopeMemberPage, error) {
 	return scopeops.ListMembers(ctx, r.runner, scopeID, req)
 }

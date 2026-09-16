@@ -176,6 +176,89 @@ func Get(ctx context.Context, r Runner, id string) (*types.ScopeDetails, error) 
 	return details, nil
 }
 
+// Snapshot reads the bounded scope membership and all of its relational data
+// through one transaction. Scope membership has a foreign key to issues, so
+// the durable routing set is known without probing each member.
+func Snapshot(ctx context.Context, r Runner, id string) (*types.ScopeSnapshot, error) {
+	if id == "" {
+		return nil, storage.ErrScopeNotFound
+	}
+	scope, err := getScope(ctx, r, id)
+	if err != nil {
+		return nil, err
+	}
+	memberIDs, err := memberIDs(ctx, r, id)
+	if err != nil {
+		return nil, err
+	}
+
+	// scope_members.issue_id references issues.id; an empty wisp set keeps the
+	// batched helpers on the durable tables without a per-member routing probe.
+	durableWispSet := map[string]struct{}{}
+	hydrated, err := issueops.GetIssuesByIDsInTx(ctx, r, memberIDs, durableWispSet)
+	if err != nil {
+		return nil, fmt.Errorf("read scope %s members: %w", id, err)
+	}
+	hydratedByID := make(map[string]*types.Issue, len(hydrated))
+	for _, issue := range hydrated {
+		hydratedByID[issue.ID] = issue
+	}
+
+	members := make([]*types.Issue, 0, len(memberIDs))
+	memberSet := make(map[string]struct{}, len(memberIDs))
+	for _, issueID := range memberIDs {
+		issue, ok := hydratedByID[issueID]
+		if !ok {
+			return nil, fmt.Errorf("read scope %s member %s: %w", id, issueID, storage.ErrNotFound)
+		}
+		members = append(members, issue)
+		memberSet[issueID] = struct{}{}
+	}
+
+	dependencies, err := issueops.GetDependencyRecordsForIssuesFromTableInTx(ctx, r, "dependencies", memberIDs)
+	if err != nil {
+		return nil, fmt.Errorf("read scope %s dependencies: %w", id, err)
+	}
+	comments, err := issueops.GetCommentsForIssuesInTx(ctx, r, memberIDs, durableWispSet)
+	if err != nil {
+		return nil, fmt.Errorf("read scope %s comments: %w", id, err)
+	}
+	for _, issue := range members {
+		for _, dependency := range dependencies[issue.ID] {
+			if _, ok := memberSet[dependency.DependsOnID]; ok {
+				issue.Dependencies = append(issue.Dependencies, dependency)
+			}
+		}
+		sort.SliceStable(issue.Dependencies, func(i, j int) bool {
+			left, right := issue.Dependencies[i], issue.Dependencies[j]
+			if left.DependsOnID != right.DependsOnID {
+				return left.DependsOnID < right.DependsOnID
+			}
+			if left.Type != right.Type {
+				return left.Type < right.Type
+			}
+			if !left.CreatedAt.Equal(right.CreatedAt) {
+				return left.CreatedAt.Before(right.CreatedAt)
+			}
+			if left.CreatedBy != right.CreatedBy {
+				return left.CreatedBy < right.CreatedBy
+			}
+			if left.Metadata != right.Metadata {
+				return left.Metadata < right.Metadata
+			}
+			return left.ThreadID < right.ThreadID
+		})
+		issue.Comments = comments[issue.ID]
+	}
+
+	return &types.ScopeSnapshot{
+		Scope:       *scope,
+		MemberCount: len(members),
+		MemberLimit: scope.MemberLimit,
+		Members:     members,
+	}, nil
+}
+
 // ListMembers returns full issue rows after applying every member predicate.
 // The scope has a deliberate 100-row ceiling, so filtering in Go keeps the
 // status/category and global-readiness rules identical on both SQL backends.

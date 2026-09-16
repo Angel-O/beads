@@ -33,6 +33,7 @@ func TestScopeCommandsDelegateAndEmitJSON(t *testing.T) {
 	oldShowCursor, _ := scopeShowCmd.Flags().GetString("cursor")
 	oldShowStatus, _ := scopeShowCmd.Flags().GetString("status")
 	oldShowType, _ := scopeShowCmd.Flags().GetString("type")
+	oldShowSnapshot, _ := scopeShowCmd.Flags().GetBool("snapshot")
 	t.Cleanup(func() {
 		_ = scopeListCmd.Flags().Set("paginate", fmt.Sprint(oldListPaginate))
 		_ = scopeListCmd.Flags().Set("limit", fmt.Sprint(oldListLimit))
@@ -42,6 +43,7 @@ func TestScopeCommandsDelegateAndEmitJSON(t *testing.T) {
 		_ = scopeShowCmd.Flags().Set("cursor", oldShowCursor)
 		_ = scopeShowCmd.Flags().Set("status", oldShowStatus)
 		_ = scopeShowCmd.Flags().Set("type", oldShowType)
+		_ = scopeShowCmd.Flags().Set("snapshot", fmt.Sprint(oldShowSnapshot))
 	})
 
 	issueA := &types.Issue{ID: "test-scope-a", Title: "Scope A issue", Status: types.StatusOpen, IssueType: types.TypeTask}
@@ -162,6 +164,30 @@ func TestScopeCommandsDelegateAndEmitJSON(t *testing.T) {
 	decodeScopeJSON(t, membersRaw, &members)
 	if members.Scope.ID != "scope-b" || members.Scope.MemberLimit != storage.MaxScopeMembers || members.TotalMatching != 1 || len(members.Members) != 1 || members.Members[0].ID != issueB.ID {
 		t.Fatalf("member page = %#v, want filtered scope-b member", members)
+	}
+
+	if err := scopeShowCmd.Flags().Set("paginate", "false"); err != nil {
+		t.Fatalf("clear show --paginate: %v", err)
+	}
+	if err := scopeShowCmd.Flags().Set("limit", "0"); err != nil {
+		t.Fatalf("clear show --limit: %v", err)
+	}
+	if err := scopeShowCmd.Flags().Set("status", ""); err != nil {
+		t.Fatalf("clear show --status: %v", err)
+	}
+	if err := scopeShowCmd.Flags().Set("type", ""); err != nil {
+		t.Fatalf("clear show --type: %v", err)
+	}
+	if err := scopeShowCmd.Flags().Set("snapshot", "true"); err != nil {
+		t.Fatalf("set show --snapshot: %v", err)
+	}
+	var snapshot types.ScopeSnapshot
+	snapshotRaw := captureStdout(t, func() error {
+		return scopeShowCmd.RunE(scopeShowCmd, []string{"scope-b"})
+	})
+	decodeScopeJSON(t, snapshotRaw, &snapshot)
+	if snapshot.Scope.ID != "scope-b" || snapshot.MemberCount != 1 || len(snapshot.Members) != 1 || snapshot.Members[0].ID != issueB.ID {
+		t.Fatalf("snapshot = %#v, want scope-b member", snapshot)
 	}
 }
 

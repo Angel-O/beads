@@ -99,21 +99,28 @@ func DeleteConfigInTx(ctx context.Context, tx *sql.Tx, key string) error {
 }
 
 // GetCommentsForIssuesInTx retrieves comments for multiple issues, partitioning
-// between comments and wisp_comments tables.
+// between comments and wisp_comments tables. An optional wisp set lets callers
+// reuse routing already established for the same bounded read.
 //
 //nolint:gosec // G201: table is hardcoded
-func GetCommentsForIssuesInTx(ctx context.Context, tx *sql.Tx, issueIDs []string) (map[string][]*types.Comment, error) {
+func GetCommentsForIssuesInTx(ctx context.Context, tx DBTX, issueIDs []string, wispSetOpt ...map[string]struct{}) (map[string][]*types.Comment, error) {
 	if len(issueIDs) == 0 {
 		return make(map[string][]*types.Comment), nil
 	}
 
 	result := make(map[string][]*types.Comment)
 
-	// Partition IDs by wisp status in a single batched query, to avoid N
-	// round-trips on remote backends (GH#3414).
-	wispIDs, permIDs, err := PartitionWispIDsInTx(ctx, tx, issueIDs)
-	if err != nil {
-		return nil, err
+	var wispIDs, permIDs []string
+	if len(wispSetOpt) > 0 && wispSetOpt[0] != nil {
+		wispIDs, permIDs = partitionByWispSet(issueIDs, wispSetOpt[0])
+	} else {
+		// Partition IDs by wisp status in a single batched query, to avoid N
+		// round-trips on remote backends (GH#3414).
+		var err error
+		wispIDs, permIDs, err = PartitionWispIDsInTx(ctx, tx, issueIDs)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if len(permIDs) > 0 {
@@ -131,7 +138,7 @@ func GetCommentsForIssuesInTx(ctx context.Context, tx *sql.Tx, issueIDs []string
 }
 
 //nolint:gosec // G201: table is hardcoded
-func getCommentsForIDsInto(ctx context.Context, tx *sql.Tx, table string, ids []string, result map[string][]*types.Comment) error {
+func getCommentsForIDsInto(ctx context.Context, tx DBTX, table string, ids []string, result map[string][]*types.Comment) error {
 	for start := 0; start < len(ids); start += queryBatchSize {
 		end := start + queryBatchSize
 		if end > len(ids) {

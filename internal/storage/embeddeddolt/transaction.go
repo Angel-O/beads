@@ -92,6 +92,10 @@ func (t *embeddedTransaction) GetScope(ctx context.Context, id string) (*types.S
 	return scopeops.Get(ctx, t.tx, id)
 }
 
+func (t *embeddedTransaction) GetScopeSnapshot(ctx context.Context, id string) (*types.ScopeSnapshot, error) {
+	return scopeops.Snapshot(ctx, t.tx, id)
+}
+
 func (t *embeddedTransaction) ListScopeMembers(ctx context.Context, scopeID string, req storage.ScopeMemberPageRequest) (*storage.ScopeMemberPage, error) {
 	return scopeops.ListMembers(ctx, t.tx, scopeID, req)
 }

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -96,6 +98,9 @@ func TestScopePagedFlagsAreAdditiveAndContextIsRepeatable(t *testing.T) {
 			t.Errorf("scope show is missing --%s", name)
 		}
 	}
+	if usage := scopeShowCmd.Flags().Lookup("snapshot").Usage; !strings.Contains(usage, "fully hydrated") {
+		t.Fatalf("scope show --snapshot help = %q, want hydration contract", usage)
+	}
 
 	command := &cobra.Command{}
 	command.Flags().StringArray("context", nil, "")
@@ -134,6 +139,8 @@ type scopeReadUseCaseStub struct {
 	domain.ScopeUseCase
 	catalogRequest storage.ScopeCatalogRequest
 	membersRequest storage.ScopeMemberPageRequest
+	snapshotCalls  int
+	snapshotResult *types.ScopeSnapshot
 }
 
 func (s *scopeReadUseCaseStub) ListScopeCatalog(_ context.Context, request types.ScopeCatalogRequest) (*types.ScopeCatalogPage, error) {
@@ -144,6 +151,14 @@ func (s *scopeReadUseCaseStub) ListScopeCatalog(_ context.Context, request types
 func (s *scopeReadUseCaseStub) ListScopeMembers(_ context.Context, _ string, request types.ScopeMemberPageRequest) (*types.ScopeMemberPage, error) {
 	s.membersRequest = request
 	return &types.ScopeMemberPage{}, nil
+}
+
+func (s *scopeReadUseCaseStub) GetScopeSnapshot(context.Context, string) (*types.ScopeSnapshot, error) {
+	s.snapshotCalls++
+	if s.snapshotResult != nil {
+		return s.snapshotResult, nil
+	}
+	return &types.ScopeSnapshot{Scope: types.Scope{ID: "scope-a"}, Members: []*types.Issue{}}, nil
 }
 
 type scopeReadUOW struct {
@@ -160,6 +175,7 @@ func (p scopeReadProvider) NewUOW(context.Context) (uow.UnitOfWork, error) { ret
 func (scopeReadProvider) Close(context.Context) error                      { return nil }
 
 func TestScopePagedCommandsUseProxiedScopeContract(t *testing.T) {
+	t.Setenv("BD_JSON_ENVELOPE", "1")
 	stub := &scopeReadUseCaseStub{}
 	oldProvider, oldMode, oldJSON, oldRoot := uowProvider, proxiedServerMode, jsonOutput, rootCtx
 	t.Cleanup(func() {
@@ -178,6 +194,7 @@ func TestScopePagedCommandsUseProxiedScopeContract(t *testing.T) {
 	oldShowStatus, _ := scopeShowCmd.Flags().GetString("status")
 	oldShowType, _ := scopeShowCmd.Flags().GetString("type")
 	oldShowContexts, _ := scopeShowCmd.Flags().GetStringArray("context")
+	oldShowSnapshot, _ := scopeShowCmd.Flags().GetBool("snapshot")
 	contextFlag := scopeShowCmd.Flags().Lookup("context")
 	oldContextChanged, oldContextDefValue := contextFlag.Changed, contextFlag.DefValue
 	t.Cleanup(func() {
@@ -188,6 +205,7 @@ func TestScopePagedCommandsUseProxiedScopeContract(t *testing.T) {
 		_ = scopeShowCmd.Flags().Set("cursor", oldShowCursor)
 		_ = scopeShowCmd.Flags().Set("status", oldShowStatus)
 		_ = scopeShowCmd.Flags().Set("type", oldShowType)
+		_ = scopeShowCmd.Flags().Set("snapshot", fmt.Sprint(oldShowSnapshot))
 		_ = contextFlag.Value.(pflag.SliceValue).Replace(oldShowContexts)
 		contextFlag.Changed, contextFlag.DefValue = oldContextChanged, oldContextDefValue
 	})
@@ -220,5 +238,95 @@ func TestScopePagedCommandsUseProxiedScopeContract(t *testing.T) {
 	}
 	if stub.membersRequest.Cursor != "opaque" {
 		t.Fatalf("proxied cursor request = %#v, want cursor-driven page", stub.membersRequest)
+	}
+
+	_ = scopeShowCmd.Flags().Set("cursor", "")
+	_ = scopeShowCmd.Flags().Set("paginate", "false")
+	_ = scopeShowCmd.Flags().Set("limit", "0")
+	_ = scopeShowCmd.Flags().Set("status", "")
+	_ = scopeShowCmd.Flags().Set("type", "")
+	if err := scopeShowCmd.Flags().Lookup("context").Value.(pflag.SliceValue).Replace(nil); err != nil {
+		t.Fatalf("clear proxied context: %v", err)
+	}
+	_ = scopeShowCmd.Flags().Set("snapshot", "true")
+	stub.snapshotResult = &types.ScopeSnapshot{
+		Scope:   types.Scope{ID: "scope-a"},
+		Members: []*types.Issue{{ID: "scope-a-member", Metadata: []byte(`{"large":9007199254740993123456789}`)}},
+	}
+	raw := captureStdout(t, func() error { return scopeShowCmd.RunE(scopeShowCmd, []string{"scope-a"}) })
+	if stub.snapshotCalls != 1 {
+		t.Fatalf("proxied snapshot calls = %d, want 1", stub.snapshotCalls)
+	}
+	var output map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &output); err != nil {
+		t.Fatalf("decode proxied snapshot JSON: %v", err)
+	}
+	for _, key := range []string{"schema_version", "scope", "member_count", "member_limit", "members"} {
+		if _, ok := output[key]; !ok {
+			t.Errorf("proxied snapshot JSON missing %q: %s", key, raw)
+		}
+	}
+	if len(output) != 5 {
+		t.Fatalf("proxied snapshot JSON keys = %v, want exact contract", output)
+	}
+	if strings.Contains(raw, "\"data\"") || !strings.Contains(raw, "9007199254740993123456789") {
+		t.Fatalf("proxied snapshot JSON changed envelope or metadata: %s", raw)
+	}
+}
+
+func TestScopeSnapshotRejectsUnboundedFiltersAndTextOutput(t *testing.T) {
+	oldProvider, oldMode, oldJSON, oldRoot := uowProvider, proxiedServerMode, jsonOutput, rootCtx
+	t.Cleanup(func() { uowProvider, proxiedServerMode, jsonOutput, rootCtx = oldProvider, oldMode, oldJSON, oldRoot })
+	uowProvider = scopeReadProvider{unit: scopeReadUOW{scope: &scopeReadUseCaseStub{}}}
+	proxiedServerMode = true
+	rootCtx = context.Background()
+
+	flagValues := map[string]string{"paginate": "false", "limit": "0", "cursor": "", "status": "", "type": "", "snapshot": "true"}
+	old := make(map[string]string, len(flagValues))
+	for name := range flagValues {
+		flag := scopeShowCmd.Flags().Lookup(name)
+		old[name] = flag.Value.String()
+		t.Cleanup(func() { _ = scopeShowCmd.Flags().Set(name, old[name]) })
+		_ = scopeShowCmd.Flags().Set(name, flagValues[name])
+	}
+	contextFlag := scopeShowCmd.Flags().Lookup("context")
+	oldContexts, oldContextChanged, oldContextDefValue := contextFlag.Value.(pflag.SliceValue).GetSlice(), contextFlag.Changed, contextFlag.DefValue
+	t.Cleanup(func() {
+		_ = contextFlag.Value.(pflag.SliceValue).Replace(oldContexts)
+		contextFlag.Changed, contextFlag.DefValue = oldContextChanged, oldContextDefValue
+	})
+	jsonOutput = true
+	for _, tc := range []struct {
+		name  string
+		flag  string
+		value string
+	}{
+		{"paginate", "paginate", "true"},
+		{"limit", "limit", "1"},
+		{"cursor", "cursor", "cursor"},
+		{"status", "status", "open"},
+		{"type", "type", "task"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = scopeShowCmd.Flags().Set(tc.flag, tc.value)
+			if err := scopeShowCmd.RunE(scopeShowCmd, []string{"scope-a"}); err == nil {
+				t.Fatalf("snapshot with --%s succeeded", tc.flag)
+			}
+			_ = scopeShowCmd.Flags().Set(tc.flag, flagValues[tc.flag])
+		})
+	}
+	if err := contextFlag.Value.(pflag.SliceValue).Replace([]string{"team-a"}); err != nil {
+		t.Fatalf("set context filter: %v", err)
+	}
+	if err := scopeShowCmd.RunE(scopeShowCmd, []string{"scope-a"}); err == nil {
+		t.Fatal("snapshot with --context succeeded")
+	}
+	if err := contextFlag.Value.(pflag.SliceValue).Replace(nil); err != nil {
+		t.Fatalf("clear context filter: %v", err)
+	}
+
+	jsonOutput = false
+	if err := scopeShowCmd.RunE(scopeShowCmd, []string{"scope-a"}); err == nil {
+		t.Fatal("snapshot without --json succeeded")
 	}
 }

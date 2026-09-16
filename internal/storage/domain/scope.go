@@ -13,6 +13,7 @@ type ScopeSQLRepository interface {
 	List(ctx context.Context) ([]*types.Scope, error)
 	ListCatalog(ctx context.Context, req types.ScopeCatalogRequest) (*types.ScopeCatalogPage, error)
 	Get(ctx context.Context, id string) (*types.ScopeDetails, error)
+	GetSnapshot(ctx context.Context, id string) (*types.ScopeSnapshot, error)
 	ListMembers(ctx context.Context, scopeID string, req types.ScopeMemberPageRequest) (*types.ScopeMemberPage, error)
 	Active(ctx context.Context) (*types.Scope, error)
 	Activate(ctx context.Context, id string) error
@@ -29,6 +30,7 @@ type ScopeUseCase interface {
 	ListScopes(ctx context.Context) ([]*types.Scope, error)
 	ListScopeCatalog(ctx context.Context, req types.ScopeCatalogRequest) (*types.ScopeCatalogPage, error)
 	GetScope(ctx context.Context, id string) (*types.ScopeDetails, error)
+	GetScopeSnapshot(ctx context.Context, id string) (*types.ScopeSnapshot, error)
 	ListScopeMembers(ctx context.Context, scopeID string, req types.ScopeMemberPageRequest) (*types.ScopeMemberPage, error)
 	GetActiveScope(ctx context.Context) (*types.Scope, error)
 	ActivateScope(ctx context.Context, id string) error
@@ -57,6 +59,9 @@ func (u *scopeUseCaseImpl) ListScopeCatalog(ctx context.Context, req types.Scope
 }
 func (u *scopeUseCaseImpl) GetScope(ctx context.Context, id string) (*types.ScopeDetails, error) {
 	return u.repo.Get(ctx, id)
+}
+func (u *scopeUseCaseImpl) GetScopeSnapshot(ctx context.Context, id string) (*types.ScopeSnapshot, error) {
+	return u.repo.GetSnapshot(ctx, id)
 }
 func (u *scopeUseCaseImpl) ListScopeMembers(ctx context.Context, scopeID string, req types.ScopeMemberPageRequest) (*types.ScopeMemberPage, error) {
 	return u.repo.ListMembers(ctx, scopeID, req)

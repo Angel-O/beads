@@ -3,6 +3,7 @@
 package embeddeddolt_test
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
 	"sync"
@@ -195,6 +196,87 @@ func TestEmbeddedScopeReadOnlyIncludesInternalRelationships(t *testing.T) {
 	}
 	if len(details.Relationships) != 1 || details.Relationships[0].DependsOnID != "scope-read-b" {
 		t.Fatalf("relationships = %#v, want only the internal edge", details.Relationships)
+	}
+}
+
+func TestEmbeddedScopeSnapshotHydratesAndFiltersMembers(t *testing.T) {
+	te := newTestEnv(t, "scope_snapshot")
+	ctx := t.Context()
+	createScope(t, te, "scope-snapshot", "Snapshot")
+	issues := []*types.Issue{
+		{
+			ID: "scope_snapshot-a", Title: "A", Description: "description", Design: "design",
+			AcceptanceCriteria: "acceptance", Notes: "notes", Payload: "payload", Waiters: []string{"waiter"},
+			Status: types.StatusOpen, Priority: 1, IssueType: types.TypeTask,
+		},
+		{ID: "scope_snapshot-b", Title: "B", Status: types.StatusClosed, Priority: 2, IssueType: types.TypeBug},
+		{ID: "scope_snapshot-out", Title: "out", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask},
+	}
+	if err := te.store.CreateIssues(ctx, issues, "tester"); err != nil {
+		t.Fatalf("CreateIssues: %v", err)
+	}
+	for _, label := range []string{"z-label", "a-label"} {
+		if err := te.store.AddLabel(ctx, "scope_snapshot-a", label, "tester"); err != nil {
+			t.Fatalf("AddLabel(%s): %v", label, err)
+		}
+	}
+	for _, dependency := range []*types.Dependency{
+		{IssueID: "scope_snapshot-a", DependsOnID: "scope_snapshot-b", Type: types.DepRelated},
+		{IssueID: "scope_snapshot-a", DependsOnID: "scope_snapshot-out", Type: types.DepBlocks},
+		{IssueID: "scope_snapshot-b", DependsOnID: "scope_snapshot-a", Type: types.DepBlocks},
+	} {
+		if err := te.store.AddDependency(ctx, dependency, "tester"); err != nil {
+			t.Fatalf("AddDependency(%s -> %s): %v", dependency.IssueID, dependency.DependsOnID, err)
+		}
+	}
+	if _, err := te.store.AddIssueComment(ctx, "scope_snapshot-a", "alice", "first"); err != nil {
+		t.Fatalf("AddIssueComment(first): %v", err)
+	}
+	if _, err := te.store.AddIssueComment(ctx, "scope_snapshot-a", "bob", "second"); err != nil {
+		t.Fatalf("AddIssueComment(second): %v", err)
+	}
+	if err := te.store.AddScopeMembers(ctx, "scope-snapshot", []string{"scope_snapshot-b", "scope_snapshot-a"}); err != nil {
+		t.Fatalf("AddScopeMembers: %v", err)
+	}
+
+	snapshot, err := te.store.GetScopeSnapshot(ctx, "scope-snapshot")
+	if err != nil {
+		t.Fatalf("GetScopeSnapshot: %v", err)
+	}
+	if snapshot.Scope.ID != "scope-snapshot" || snapshot.MemberCount != 2 || snapshot.MemberLimit != storage.MaxScopeMembers {
+		t.Fatalf("snapshot identity/counts = %#v", snapshot)
+	}
+	if got := []string{snapshot.Members[0].ID, snapshot.Members[1].ID}; !reflect.DeepEqual(got, []string{"scope_snapshot-a", "scope_snapshot-b"}) {
+		t.Fatalf("snapshot members = %v, want deterministic order", got)
+	}
+	a, b := snapshot.Members[0], snapshot.Members[1]
+	if a.Description != "description" || a.Design != "design" || a.AcceptanceCriteria != "acceptance" || a.Notes != "notes" || a.Payload != "payload" || !reflect.DeepEqual(a.Waiters, []string{"waiter"}) {
+		t.Fatalf("snapshot rich fields were not hydrated: %#v", a)
+	}
+	if !reflect.DeepEqual(a.Labels, []string{"a-label", "z-label"}) || len(a.Comments) != 2 || a.Comments[0].Text != "first" || a.Comments[1].Text != "second" {
+		t.Fatalf("snapshot labels/comments = %#v, %#v", a.Labels, a.Comments)
+	}
+	if len(a.Dependencies) != 1 || a.Dependencies[0].DependsOnID != b.ID {
+		t.Fatalf("snapshot dependencies = %#v, want only in-scope edge", a.Dependencies)
+	}
+	if b.Status != types.StatusClosed || len(b.Dependencies) != 1 || b.Dependencies[0].DependsOnID != a.ID {
+		t.Fatalf("snapshot closed member/dependencies = %#v", b)
+	}
+
+	firstJSON, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal first snapshot: %v", err)
+	}
+	second, err := te.store.GetScopeSnapshot(ctx, "scope-snapshot")
+	if err != nil {
+		t.Fatalf("GetScopeSnapshot second read: %v", err)
+	}
+	secondJSON, err := json.Marshal(second)
+	if err != nil {
+		t.Fatalf("marshal second snapshot: %v", err)
+	}
+	if !reflect.DeepEqual(firstJSON, secondJSON) {
+		t.Fatalf("snapshot JSON is not deterministic:\n%s\n%s", firstJSON, secondJSON)
 	}
 }
 
