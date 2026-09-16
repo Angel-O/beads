@@ -24,6 +24,16 @@ type ScopeDetails struct {
 	Relationships []*Dependency `json:"relationships"`
 }
 
+// ScopeSnapshot is the versioned, fully hydrated scope projection. Members are
+// complete issues; each member carries only dependency records whose target is
+// also in the scope.
+type ScopeSnapshot struct {
+	Scope       Scope    `json:"scope"`
+	MemberCount int      `json:"member_count"`
+	MemberLimit int      `json:"member_limit"`
+	Members     []*Issue `json:"members"`
+}
+
 // ScopeCatalogRequest selects one keyset page of the scope catalog. Cursor is
 // opaque and may only be reused with this request shape.
 type ScopeCatalogRequest struct {

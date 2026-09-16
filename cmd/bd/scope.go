@@ -20,6 +20,7 @@ type scopeOperations interface {
 	ListScopes(context.Context) ([]*types.Scope, error)
 	ListScopeCatalog(context.Context, storage.ScopeCatalogRequest) (*storage.ScopeCatalogPage, error)
 	GetScope(context.Context, string) (*types.ScopeDetails, error)
+	GetScopeSnapshot(context.Context, string) (*types.ScopeSnapshot, error)
 	ListScopeMembers(context.Context, string, storage.ScopeMemberPageRequest) (*storage.ScopeMemberPage, error)
 	GetActiveScope(context.Context) (*types.Scope, error)
 	ActivateScope(context.Context, string) error
@@ -165,8 +166,24 @@ var scopeShowCmd = &cobra.Command{
 			status, _ := cmd.Flags().GetString("status")
 			issueType, _ := cmd.Flags().GetString("type")
 			contexts, _ := cmd.Flags().GetStringArray("context")
+			snapshot, _ := cmd.Flags().GetBool("snapshot")
 			if cursor != "" {
 				paginate = true
+			}
+			if snapshot {
+				if !jsonOutput {
+					return HandleErrorRespectJSON("scope snapshots require --json")
+				}
+				if paginate || limit != 0 || cursor != "" || status != "" || issueType != "" || len(contexts) > 0 {
+					return HandleErrorRespectJSON("--snapshot cannot be combined with --paginate, --limit, --cursor, --status, --type, or --context")
+				}
+				snapshotResult, err := runScopeRead(rootCtx, func(ops scopeOperations) (*types.ScopeSnapshot, error) {
+					return ops.GetScopeSnapshot(rootCtx, args[0])
+				})
+				if err != nil {
+					return HandleErrorRespectJSON("%v", err)
+				}
+				return outputScopeSnapshotJSON(snapshotResult)
 			}
 			if status != "" || issueType != "" || len(contexts) > 0 {
 				if !paginate {
@@ -365,6 +382,29 @@ func outputScopeMutation(status string, fields map[string]any) error {
 	return nil
 }
 
+// outputScopeSnapshotJSON keeps the v1 snapshot contract stable even when the
+// optional legacy JSON envelope is enabled. Direct encoding also preserves
+// json.RawMessage issue metadata without converting numbers through float64.
+func outputScopeSnapshotJSON(snapshot *types.ScopeSnapshot) error {
+	type response struct {
+		SchemaVersion int            `json:"schema_version"`
+		Scope         types.Scope    `json:"scope"`
+		MemberCount   int            `json:"member_count"`
+		MemberLimit   int            `json:"member_limit"`
+		Members       []*types.Issue `json:"members"`
+	}
+	if snapshot == nil {
+		return outputJSONRaw(response{SchemaVersion: JSONSchemaVersion})
+	}
+	return outputJSONRaw(response{
+		SchemaVersion: JSONSchemaVersion,
+		Scope:         snapshot.Scope,
+		MemberCount:   snapshot.MemberCount,
+		MemberLimit:   snapshot.MemberLimit,
+		Members:       snapshot.Members,
+	})
+}
+
 func init() {
 	scopeCreateCmd.Flags().Bool("activate", false, "Activate the new scope")
 	scopeListCmd.Flags().Bool("paginate", false, "Return a bounded JSON page")
@@ -376,6 +416,7 @@ func init() {
 	scopeShowCmd.Flags().String("status", "", "Filter members by open, completed, or ready")
 	scopeShowCmd.Flags().String("type", "", "Filter members by exact issue type")
 	scopeShowCmd.Flags().StringArray("context", nil, "Filter members by exact context membership (repeatable)")
+	scopeShowCmd.Flags().Bool("snapshot", false, "Return a fully hydrated versioned scope snapshot (requires --json)")
 	scopeCmd.AddCommand(scopeCreateCmd, scopeListCmd, scopeShowCmd, scopeActiveCmd, scopeActivateCmd, scopeDeactivateCmd, scopeAddCmd, scopeRemoveCmd, scopeMoveCmd)
 	rootCmd.AddCommand(scopeCmd)
 }

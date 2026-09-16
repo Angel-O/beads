@@ -12,6 +12,7 @@ type ScopeCatalogPage = types.ScopeCatalogPage
 type ScopeMemberStatus = types.ScopeMemberStatus
 type ScopeMemberPageRequest = types.ScopeMemberPageRequest
 type ScopeMemberPage = types.ScopeMemberPage
+type ScopeSnapshot = types.ScopeSnapshot
 
 const (
 	ScopeMemberStatusOpen      = types.ScopeMemberStatusOpen
@@ -27,6 +28,7 @@ type ScopeStore interface {
 	ListScopes(ctx context.Context) ([]*types.Scope, error)
 	ListScopeCatalog(ctx context.Context, req ScopeCatalogRequest) (*ScopeCatalogPage, error)
 	GetScope(ctx context.Context, id string) (*types.ScopeDetails, error)
+	GetScopeSnapshot(ctx context.Context, id string) (*types.ScopeSnapshot, error)
 	ListScopeMembers(ctx context.Context, scopeID string, req ScopeMemberPageRequest) (*ScopeMemberPage, error)
 	GetActiveScope(ctx context.Context) (*types.Scope, error)
 	ActivateScope(ctx context.Context, id string) error
