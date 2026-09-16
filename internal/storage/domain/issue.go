@@ -97,6 +97,7 @@ type IssueSQLRepository interface {
 	IterEvents(ctx context.Context, id string, limit int) (storage.Iter[types.Event], error)
 	GetStaleIssues(ctx context.Context, filter types.StaleFilter) ([]*types.Issue, error)
 	GetEpicsEligibleForClosure(ctx context.Context) ([]*types.EpicStatus, error)
+	GetEpicChildren(ctx context.Context, parentID string) ([]*types.EpicChild, error)
 	UnclaimIssue(ctx context.Context, id, actor string, force bool) error
 	UnclaimIssueIfAssignee(ctx context.Context, id, actor, expectedAssignee string) error
 	HeartbeatIssue(ctx context.Context, id, actor string) error
@@ -318,6 +319,7 @@ type IssueUseCase interface {
 	IterEvents(ctx context.Context, id string, limit int) (storage.Iter[types.Event], error)
 	GetStaleIssues(ctx context.Context, filter types.StaleFilter) ([]*types.Issue, error)
 	GetEpicsEligibleForClosure(ctx context.Context) ([]*types.EpicStatus, error)
+	GetEpicChildren(ctx context.Context, parentID string) ([]*types.EpicChild, error)
 	Unclaim(ctx context.Context, id, actor string, force bool) error
 	UnclaimIfAssignee(ctx context.Context, id, actor, expectedAssignee string) error
 	Heartbeat(ctx context.Context, id, actor string) error
@@ -1881,6 +1883,14 @@ func (u *issueUseCaseImpl) GetEpicsEligibleForClosure(ctx context.Context) ([]*t
 	out, err := u.issueRepo.GetEpicsEligibleForClosure(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("GetEpicsEligibleForClosure: %w", err)
+	}
+	return out, nil
+}
+
+func (u *issueUseCaseImpl) GetEpicChildren(ctx context.Context, parentID string) ([]*types.EpicChild, error) {
+	out, err := u.issueRepo.GetEpicChildren(ctx, parentID)
+	if err != nil {
+		return nil, fmt.Errorf("GetEpicChildren: %w", err)
 	}
 	return out, nil
 }

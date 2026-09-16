@@ -157,6 +157,18 @@ func (s *DoltStore) GetEpicsEligibleForClosure(ctx context.Context) ([]*types.Ep
 	return result, err
 }
 
+// GetEpicChildren returns the exact direct child rows evaluated by the close
+// gate, including closed durable and wisp children.
+func (s *DoltStore) GetEpicChildren(ctx context.Context, parentID string) ([]*types.EpicChild, error) {
+	var result []*types.EpicChild
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetEpicChildrenInTx(ctx, tx, parentID)
+		return err
+	})
+	return result, err
+}
+
 // GetStaleIssues returns issues that haven't been updated recently
 func (s *DoltStore) GetStaleIssues(ctx context.Context, filter types.StaleFilter) ([]*types.Issue, error) {
 	var result []*types.Issue

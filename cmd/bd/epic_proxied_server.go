@@ -9,6 +9,19 @@ import (
 	"github.com/steveyegge/beads/internal/storage/uow"
 )
 
+func runEpicChildrenProxiedServer(ctx context.Context, parentID string) error {
+	uw, err := openProxiedListUOW(ctx)
+	if err != nil {
+		return err
+	}
+	defer uw.Close(ctx)
+	children, err := uw.IssueUseCase().GetEpicChildren(ctx, parentID)
+	if err != nil {
+		return HandleErrorRespectJSON("getting epic children: %v", err)
+	}
+	return renderEpicChildren(parentID, children)
+}
+
 func runEpicStatusProxiedServer(ctx context.Context, eligibleOnly bool) error {
 	uw, err := openProxiedListUOW(ctx)
 	if err != nil {

@@ -186,6 +186,16 @@ func UnwrapStore(s DoltStorage) DoltStorage {
 	}
 }
 
+// GetEpicChildren forwards the read-only authoritative child query through the
+// hook decorator without adding a hook to a read.
+func (h *HookFiringStore) GetEpicChildren(ctx context.Context, parentID string) ([]*types.EpicChild, error) {
+	query, ok := h.inner.(EpicChildQueryStore)
+	if !ok {
+		return nil, &publicops.ErrUnsupported{Op: "GetEpicChildren", Backend: "wrapped storage"}
+	}
+	return query.GetEpicChildren(ctx, parentID)
+}
+
 // ── Issue mutations ─────────────────────────────────────────────────
 
 // CreateIssue creates an issue and fires on_create plus synthetic on_update

@@ -1219,6 +1219,14 @@ func (r *issueSQLRepositoryImpl) GetEpicsEligibleForClosure(ctx context.Context)
 	return out, nil
 }
 
+func (r *issueSQLRepositoryImpl) GetEpicChildren(ctx context.Context, parentID string) ([]*types.EpicChild, error) {
+	out, err := issueops.GetEpicChildrenInTx(ctx, r.runner, parentID)
+	if err != nil {
+		return nil, fmt.Errorf("db: IssueSQLRepository.GetEpicChildren: %w", err)
+	}
+	return out, nil
+}
+
 func (r *issueSQLRepositoryImpl) UnclaimIssue(ctx context.Context, id, actor string, force bool) error {
 	if err := issueops.UnclaimIssueInTx(ctx, r.runner, id, actor, force); err != nil {
 		return fmt.Errorf("db: IssueSQLRepository.UnclaimIssue: %w", err)
