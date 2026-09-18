@@ -58,6 +58,38 @@ func Create(ctx context.Context, r Runner, scope *types.Scope, activate bool) er
 	return nil
 }
 
+// Rename updates the display and normalized names while leaving all other
+// scope state untouched. The target row is locked before checking collisions.
+func Rename(ctx context.Context, r Runner, id, name string) error {
+	if id == "" {
+		return storage.ErrScopeNotFound
+	}
+	if err := validateScope(&types.Scope{ID: id, Name: name}); err != nil {
+		return err
+	}
+	if _, err := lockScope(ctx, r, id); err != nil {
+		return err
+	}
+	normalized := normalizeName(name)
+	var collisionID string
+	err := r.QueryRowContext(ctx,
+		`SELECT id FROM scopes WHERE normalized_name = ? AND id <> ? FOR UPDATE`, normalized, id).Scan(&collisionID)
+	if err == nil {
+		return fmt.Errorf("%w: %s", storage.ErrScopeAlreadyExists, collisionID)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("rename scope: check name collision: %w", err)
+	}
+	if _, err := r.ExecContext(ctx,
+		`UPDATE scopes SET name = ?, normalized_name = ? WHERE id = ?`, name, normalized, id); err != nil {
+		if isDuplicateError(err) {
+			return fmt.Errorf("%w: %s", storage.ErrScopeAlreadyExists, normalized)
+		}
+		return fmt.Errorf("rename scope: %w", err)
+	}
+	return nil
+}
+
 func List(ctx context.Context, r Runner) ([]*types.Scope, error) {
 	rows, err := r.QueryContext(ctx, `
 		SELECT id, name, normalized_name, created_on

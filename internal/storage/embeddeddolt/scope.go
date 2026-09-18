@@ -19,6 +19,12 @@ func (s *EmbeddedDoltStore) CreateScope(ctx context.Context, scope *types.Scope,
 	})
 }
 
+func (s *EmbeddedDoltStore) RenameScope(ctx context.Context, id, name string) error {
+	return s.runScopeWrite(ctx, "bd: rename scope", func(tx *embeddedTransaction) error {
+		return tx.RenameScope(ctx, id, name)
+	})
+}
+
 func (s *EmbeddedDoltStore) ListScopes(ctx context.Context) ([]*types.Scope, error) {
 	var result []*types.Scope
 	err := s.withConn(ctx, false, func(tx *sql.Tx) error {

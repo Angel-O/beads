@@ -25,6 +25,8 @@ const (
 // membership methods enforce the one-scope-per-issue and 100-member rules.
 type ScopeStore interface {
 	CreateScope(ctx context.Context, scope *types.Scope, activate bool) error
+	// RenameScope changes only a scope's display name and normalized name.
+	RenameScope(ctx context.Context, id, name string) error
 	ListScopes(ctx context.Context) ([]*types.Scope, error)
 	ListScopeCatalog(ctx context.Context, req ScopeCatalogRequest) (*ScopeCatalogPage, error)
 	GetScope(ctx context.Context, id string) (*types.ScopeDetails, error)

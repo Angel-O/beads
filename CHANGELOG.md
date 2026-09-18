@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Named scopes can be renamed with `bd scope rename <scope-id> <new-name>`.**
+  The stable scope ID, creation time, active selection, and memberships are
+  preserved; only the display and normalized names change. Normalized-name
+  collisions and invalid names are rejected atomically. The public
+  `ScopeStore`, transaction, and domain surfaces gain `RenameScope`.
+
 - **The events journal records WHO performed each mutation.** `bd_events_journal`
   gains an `actor` column (migration 0066 plus its ignored-series twin 0025, so
   upgraded workspaces and fresh clones converge on the same shape), stamped

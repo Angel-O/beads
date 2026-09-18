@@ -940,6 +940,7 @@ type Transaction interface {
 	// Scope operations. These use the transaction's snapshot and are atomic
 	// with any other work in the callback.
 	CreateScope(ctx context.Context, scope *types.Scope, activate bool) error
+	RenameScope(ctx context.Context, id, name string) error
 	ListScopes(ctx context.Context) ([]*types.Scope, error)
 	ListScopeCatalog(ctx context.Context, req ScopeCatalogRequest) (*ScopeCatalogPage, error)
 	GetScope(ctx context.Context, id string) (*types.ScopeDetails, error)

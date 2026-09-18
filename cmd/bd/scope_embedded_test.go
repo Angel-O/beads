@@ -67,6 +67,14 @@ func TestScopeCommandsDelegateAndEmitJSON(t *testing.T) {
 	if created.ID != "scope-a" || created.NormalizedName != "scope a" || created.MemberLimit != storage.MaxScopeMembers {
 		t.Fatalf("created scope = %#v", created)
 	}
+	var renamed map[string]any
+	renameRaw := captureStdout(t, func() error {
+		return scopeRenameCmd.RunE(scopeRenameCmd, []string{"scope-a", " Renamed A "})
+	})
+	decodeScopeJSON(t, renameRaw, &renamed)
+	if renamed["status"] != "renamed" || renamed["scope_id"] != "scope-a" || renamed["name"] != " Renamed A " || renamed["normalized_name"] != "renamed a" {
+		t.Fatalf("rename output = %#v, want direct JSON mutation contract", renamed)
+	}
 
 	if err := scopeCreateCmd.Flags().Set("activate", "false"); err != nil {
 		t.Fatalf("clear --activate: %v", err)
