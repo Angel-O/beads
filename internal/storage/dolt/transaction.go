@@ -51,6 +51,14 @@ func (t *doltTransaction) CreateScope(ctx context.Context, scope *types.Scope, a
 	return nil
 }
 
+func (t *doltTransaction) RenameScope(ctx context.Context, id, name string) error {
+	if err := scopeops.Rename(ctx, t.regularTx, id, name); err != nil {
+		return err
+	}
+	t.markScopeTables()
+	return nil
+}
+
 func (t *doltTransaction) ListScopes(ctx context.Context) ([]*types.Scope, error) {
 	return scopeops.List(ctx, t.regularTx)
 }

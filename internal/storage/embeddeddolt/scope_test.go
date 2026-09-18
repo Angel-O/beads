@@ -15,9 +15,6 @@ import (
 )
 
 func TestEmbeddedScopesLifecycleAndRead(t *testing.T) {
-	if testing.Short() {
-		t.Skip("scope persistence test uses the embedded engine")
-	}
 	te := newTestEnv(t, "scope_life")
 	ctx := t.Context()
 
@@ -56,6 +53,59 @@ func TestEmbeddedScopesLifecycleAndRead(t *testing.T) {
 
 	if got, err := te.store.ListScopes(ctx); err != nil || len(got) != 2 || got[0].ID != first.ID || got[1].ID != second.ID {
 		t.Fatalf("ListScopes = %#v, %v; want creation order", got, err)
+	}
+}
+
+func TestEmbeddedScopeRenamePreservesIdentityMembershipAndActiveState(t *testing.T) {
+	te := newTestEnv(t, "scope_rename")
+	ctx := t.Context()
+	source := &types.Scope{ID: "scope-rename-source", Name: "Original"}
+	if err := te.store.CreateScope(ctx, source, true); err != nil {
+		t.Fatalf("CreateScope(source): %v", err)
+	}
+	createScope(t, te, "scope-rename-target", "Target")
+	createScopeIssue(t, te, "scope-rename-issue")
+	if err := te.store.AddScopeMembers(ctx, source.ID, []string{"scope-rename-issue"}); err != nil {
+		t.Fatalf("AddScopeMembers: %v", err)
+	}
+	createdOn := source.CreatedOn
+
+	if err := te.store.RenameScope(ctx, source.ID, " Renamed Scope "); err != nil {
+		t.Fatalf("RenameScope: %v", err)
+	}
+	if err := te.store.RenameScope(ctx, source.ID, "RENAMED SCOPE"); err != nil {
+		t.Fatalf("case-only RenameScope: %v", err)
+	}
+	renamed, err := te.store.GetScope(ctx, source.ID)
+	if err != nil {
+		t.Fatalf("GetScope after rename: %v", err)
+	}
+	if renamed.ID != source.ID || renamed.Name != "RENAMED SCOPE" || renamed.NormalizedName != "renamed scope" || !renamed.CreatedOn.Equal(createdOn) {
+		t.Fatalf("renamed scope = %#v, want only names changed", renamed.Scope)
+	}
+	if len(renamed.Members) != 1 || renamed.Members[0].ID != "scope-rename-issue" {
+		t.Fatalf("renamed members = %#v, want membership preserved", renamed.Members)
+	}
+	active, err := te.store.GetActiveScope(ctx)
+	if err != nil || active == nil || active.ID != source.ID || active.Name != renamed.Name {
+		t.Fatalf("active scope after rename = %#v, %v, want renamed source", active, err)
+	}
+
+	if err := te.store.RenameScope(ctx, source.ID, " TARGET "); !errors.Is(err, storage.ErrScopeAlreadyExists) {
+		t.Fatalf("colliding RenameScope error = %v, want ErrScopeAlreadyExists", err)
+	}
+	if err := te.store.RenameScope(ctx, source.ID, "   "); !errors.Is(err, storage.ErrScopeInvalid) {
+		t.Fatalf("invalid RenameScope error = %v, want ErrScopeInvalid", err)
+	}
+	if err := te.store.RenameScope(ctx, "missing-scope", "New"); !errors.Is(err, storage.ErrScopeNotFound) {
+		t.Fatalf("missing RenameScope error = %v, want ErrScopeNotFound", err)
+	}
+	unchanged, err := te.store.GetScope(ctx, source.ID)
+	if err != nil {
+		t.Fatalf("GetScope after rejected renames: %v", err)
+	}
+	if unchanged.Name != renamed.Name || unchanged.NormalizedName != renamed.NormalizedName || len(unchanged.Members) != 1 {
+		t.Fatalf("scope changed after rejected rename = %#v", unchanged)
 	}
 }
 
@@ -281,7 +331,7 @@ func TestEmbeddedScopeSnapshotHydratesAndFiltersMembers(t *testing.T) {
 }
 
 func TestEmbeddedScopePagedCatalogAndMembers(t *testing.T) {
-	te := newTestEnv(t, "scope_pages")
+	te := newTestEnv(t, "scope")
 	ctx := t.Context()
 	createScope(t, te, "scope-page", "Paged")
 	createScope(t, te, "scope-page-empty", "Empty")

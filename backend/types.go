@@ -47,6 +47,7 @@ type (
 	ScopeMemberPage             = types.ScopeMemberPage
 	ScopeMemberPageRequest      = types.ScopeMemberPageRequest
 	ScopeMemberStatus           = types.ScopeMemberStatus
+	ScopeSnapshot               = types.ScopeSnapshot
 	StaleFilter                 = types.StaleFilter
 	Statistics                  = types.Statistics
 	Status                      = types.Status

@@ -80,6 +80,14 @@ func (t *embeddedTransaction) CreateScope(ctx context.Context, scope *types.Scop
 	return nil
 }
 
+func (t *embeddedTransaction) RenameScope(ctx context.Context, id, name string) error {
+	if err := scopeops.Rename(ctx, t.tx, id, name); err != nil {
+		return err
+	}
+	t.markScopeTables()
+	return nil
+}
+
 func (t *embeddedTransaction) ListScopes(ctx context.Context) ([]*types.Scope, error) {
 	return scopeops.List(ctx, t.tx)
 }

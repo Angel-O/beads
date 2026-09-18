@@ -20,6 +20,7 @@ func TestScopeCommandsAreRegisteredWithRequiredArguments(t *testing.T) {
 		args []string
 	}{
 		"create":     {args: []string{"scope-id", "Scope name"}},
+		"rename":     {args: []string{"scope-id", "New name"}},
 		"list":       {args: nil},
 		"show":       {args: []string{"scope-id"}},
 		"active":     {args: nil},
@@ -137,10 +138,18 @@ func TestScopePaginationIsJSONOnly(t *testing.T) {
 
 type scopeReadUseCaseStub struct {
 	domain.ScopeUseCase
+	renameID       string
+	renameName     string
+	renameErr      error
 	catalogRequest storage.ScopeCatalogRequest
 	membersRequest storage.ScopeMemberPageRequest
 	snapshotCalls  int
 	snapshotResult *types.ScopeSnapshot
+}
+
+func (s *scopeReadUseCaseStub) RenameScope(_ context.Context, id, name string) error {
+	s.renameID, s.renameName = id, name
+	return s.renameErr
 }
 
 func (s *scopeReadUseCaseStub) ListScopeCatalog(_ context.Context, request types.ScopeCatalogRequest) (*types.ScopeCatalogPage, error) {
@@ -166,8 +175,9 @@ type scopeReadUOW struct {
 	scope domain.ScopeUseCase
 }
 
-func (s scopeReadUOW) Close(context.Context)             {}
-func (s scopeReadUOW) ScopeUseCase() domain.ScopeUseCase { return s.scope }
+func (s scopeReadUOW) Close(context.Context)                {}
+func (s scopeReadUOW) Commit(context.Context, string) error { return nil }
+func (s scopeReadUOW) ScopeUseCase() domain.ScopeUseCase    { return s.scope }
 
 type scopeReadProvider struct{ unit uow.UnitOfWork }
 
@@ -271,6 +281,38 @@ func TestScopePagedCommandsUseProxiedScopeContract(t *testing.T) {
 	}
 	if strings.Contains(raw, "\"data\"") || !strings.Contains(raw, "9007199254740993123456789") {
 		t.Fatalf("proxied snapshot JSON changed envelope or metadata: %s", raw)
+	}
+}
+
+func TestScopeRenameCommandUsesProxiedContractAndMutationOutput(t *testing.T) {
+	stub := &scopeReadUseCaseStub{}
+	oldProvider, oldMode, oldJSON, oldRoot := uowProvider, proxiedServerMode, jsonOutput, rootCtx
+	t.Cleanup(func() { uowProvider, proxiedServerMode, jsonOutput, rootCtx = oldProvider, oldMode, oldJSON, oldRoot })
+	uowProvider = scopeReadProvider{unit: scopeReadUOW{scope: stub}}
+	proxiedServerMode = true
+	rootCtx = context.Background()
+
+	jsonOutput = true
+	raw := captureStdout(t, func() error {
+		return scopeRenameCmd.RunE(scopeRenameCmd, []string{"scope-a", " New Name "})
+	})
+	if stub.renameID != "scope-a" || stub.renameName != " New Name " {
+		t.Fatalf("rename request = (%q, %q), want proxied scope id and display name", stub.renameID, stub.renameName)
+	}
+	var output map[string]any
+	if err := json.Unmarshal([]byte(raw), &output); err != nil {
+		t.Fatalf("decode rename JSON: %v\n%s", err, raw)
+	}
+	if output["status"] != "renamed" || output["scope_id"] != "scope-a" || output["name"] != " New Name " || output["normalized_name"] != "new name" {
+		t.Fatalf("rename JSON = %#v, want mutation contract", output)
+	}
+
+	jsonOutput = false
+	human := captureStdout(t, func() error {
+		return scopeRenameCmd.RunE(scopeRenameCmd, []string{"scope-a", "Another"})
+	})
+	if human != "✓ Renamed scope\n" {
+		t.Fatalf("rename human output = %q, want existing mutation style", human)
 	}
 }
 

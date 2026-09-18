@@ -1,6 +1,7 @@
 package scopeops
 
 import (
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -67,6 +68,78 @@ func TestScopeContextMatchesExactContextLabels(t *testing.T) {
 	}
 	if matchesScopeContext([]string{"ctx:team-ab"}, []string{"team-a"}) {
 		t.Fatal("context filter matched a non-exact ctx: label")
+	}
+}
+
+func TestRenameScopeUpdatesNamesAndExcludesTargetFromCollision(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectBegin()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM scopes WHERE id = ? FOR UPDATE")).
+		WithArgs("scope-id").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("scope-id"))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM scopes WHERE normalized_name = ? AND id <> ? FOR UPDATE")).
+		WithArgs("new name", "scope-id").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE scopes SET name = ?, normalized_name = ? WHERE id = ?")).
+		WithArgs(" New Name ", "new name", "scope-id").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := Rename(t.Context(), tx, "scope-id", " New Name "); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit transaction: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected rename query shape: %v", err)
+	}
+}
+
+func TestRenameScopeRejectsInvalidNamesAndCollisionsWithoutWriting(t *testing.T) {
+	for _, name := range []string{"", "   "} {
+		if err := Rename(t.Context(), nil, "scope-id", name); !errors.Is(err, storage.ErrScopeInvalid) {
+			t.Errorf("Rename(%q) error = %v, want ErrScopeInvalid", name, err)
+		}
+	}
+	if err := Rename(t.Context(), nil, "", "valid"); !errors.Is(err, storage.ErrScopeNotFound) {
+		t.Fatalf("Rename(empty id) error = %v, want ErrScopeNotFound", err)
+	}
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectBegin()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM scopes WHERE id = ? FOR UPDATE")).
+		WithArgs("scope-id").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("scope-id"))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM scopes WHERE normalized_name = ? AND id <> ? FOR UPDATE")).
+		WithArgs("taken", "scope-id").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("other-scope"))
+	mock.ExpectRollback()
+	if err := Rename(t.Context(), tx, "scope-id", "taken"); !errors.Is(err, storage.ErrScopeAlreadyExists) {
+		t.Fatalf("colliding Rename error = %v, want ErrScopeAlreadyExists", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback transaction: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected collision query shape: %v", err)
 	}
 }
 

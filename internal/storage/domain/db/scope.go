@@ -19,6 +19,9 @@ var _ domain.ScopeSQLRepository = (*scopeSQLRepositoryImpl)(nil)
 func (r *scopeSQLRepositoryImpl) Create(ctx context.Context, scope *types.Scope, activate bool) error {
 	return scopeops.Create(ctx, r.runner, scope, activate)
 }
+func (r *scopeSQLRepositoryImpl) Rename(ctx context.Context, id, name string) error {
+	return scopeops.Rename(ctx, r.runner, id, name)
+}
 func (r *scopeSQLRepositoryImpl) List(ctx context.Context) ([]*types.Scope, error) {
 	return scopeops.List(ctx, r.runner)
 }

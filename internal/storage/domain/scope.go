@@ -10,6 +10,7 @@ import (
 // Implementations delegate invariant enforcement to the shared scope SQL body.
 type ScopeSQLRepository interface {
 	Create(ctx context.Context, scope *types.Scope, activate bool) error
+	Rename(ctx context.Context, id, name string) error
 	List(ctx context.Context) ([]*types.Scope, error)
 	ListCatalog(ctx context.Context, req types.ScopeCatalogRequest) (*types.ScopeCatalogPage, error)
 	Get(ctx context.Context, id string) (*types.ScopeDetails, error)
@@ -27,6 +28,7 @@ type ScopeSQLRepository interface {
 // mirrors ScopeSQLRepository: the surrounding transaction owns atomicity.
 type ScopeUseCase interface {
 	CreateScope(ctx context.Context, scope *types.Scope, activate bool) error
+	RenameScope(ctx context.Context, id, name string) error
 	ListScopes(ctx context.Context) ([]*types.Scope, error)
 	ListScopeCatalog(ctx context.Context, req types.ScopeCatalogRequest) (*types.ScopeCatalogPage, error)
 	GetScope(ctx context.Context, id string) (*types.ScopeDetails, error)
@@ -50,6 +52,9 @@ var _ ScopeUseCase = (*scopeUseCaseImpl)(nil)
 
 func (u *scopeUseCaseImpl) CreateScope(ctx context.Context, scope *types.Scope, activate bool) error {
 	return u.repo.Create(ctx, scope, activate)
+}
+func (u *scopeUseCaseImpl) RenameScope(ctx context.Context, id, name string) error {
+	return u.repo.Rename(ctx, id, name)
 }
 func (u *scopeUseCaseImpl) ListScopes(ctx context.Context) ([]*types.Scope, error) {
 	return u.repo.List(ctx)

@@ -23,6 +23,17 @@ func (s *DoltStore) CreateScope(ctx context.Context, scope *types.Scope, activat
 	})
 }
 
+func (s *DoltStore) RenameScope(ctx context.Context, id, name string) error {
+	return s.withCircuitWrite(ctx, func(ctx context.Context) error {
+		return s.runIssueOperationTx(ctx, "bd: rename scope", func(tx *sql.Tx) (storageissueops.ChangedTables, error) {
+			if err := scopeops.Rename(ctx, tx, id, name); err != nil {
+				return nil, err
+			}
+			return scopeTables(), nil
+		})
+	})
+}
+
 func (s *DoltStore) ListScopes(ctx context.Context) ([]*types.Scope, error) {
 	var result []*types.Scope
 	err := s.withReadTx(ctx, func(tx *sql.Tx) error {

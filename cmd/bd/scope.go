@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/metrics"
@@ -17,6 +18,7 @@ import (
 // use case. Keeping the command on this surface avoids duplicating scope rules.
 type scopeOperations interface {
 	CreateScope(context.Context, *types.Scope, bool) error
+	RenameScope(context.Context, string, string) error
 	ListScopes(context.Context) ([]*types.Scope, error)
 	ListScopeCatalog(context.Context, storage.ScopeCatalogRequest) (*storage.ScopeCatalogPage, error)
 	GetScope(context.Context, string) (*types.ScopeDetails, error)
@@ -97,6 +99,29 @@ var scopeCreateCmd = &cobra.Command{
 			}
 			fmt.Printf("%s Created scope: %s (%s)\n", ui.RenderPass("✓"), scope.ID, scope.Name)
 			return nil
+		})
+	},
+}
+
+var scopeRenameCmd = &cobra.Command{
+	Use:           "rename <scope-id> <new-name>",
+	Short:         "Rename a scope",
+	Args:          cobra.ExactArgs(2),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runScopeCommand("scope-rename", func() error {
+			CheckReadonly("scope rename")
+			if err := runScopeWrite(rootCtx, "bd: rename scope", func(ops scopeOperations) error {
+				return ops.RenameScope(rootCtx, args[0], args[1])
+			}); err != nil {
+				return HandleErrorRespectJSON("%v", err)
+			}
+			return outputScopeMutation("renamed", map[string]any{
+				"scope_id":        args[0],
+				"name":            args[1],
+				"normalized_name": strings.ToLower(strings.TrimSpace(args[1])),
+			})
 		})
 	},
 }
@@ -417,6 +442,6 @@ func init() {
 	scopeShowCmd.Flags().String("type", "", "Filter members by exact issue type")
 	scopeShowCmd.Flags().StringArray("context", nil, "Filter members by exact context membership (repeatable)")
 	scopeShowCmd.Flags().Bool("snapshot", false, "Return a fully hydrated versioned scope snapshot (requires --json)")
-	scopeCmd.AddCommand(scopeCreateCmd, scopeListCmd, scopeShowCmd, scopeActiveCmd, scopeActivateCmd, scopeDeactivateCmd, scopeAddCmd, scopeRemoveCmd, scopeMoveCmd)
+	scopeCmd.AddCommand(scopeCreateCmd, scopeRenameCmd, scopeListCmd, scopeShowCmd, scopeActiveCmd, scopeActivateCmd, scopeDeactivateCmd, scopeAddCmd, scopeRemoveCmd, scopeMoveCmd)
 	rootCmd.AddCommand(scopeCmd)
 }
