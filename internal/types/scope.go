@@ -16,8 +16,6 @@ type Scope struct {
 }
 
 // NamedScope is the minimal scope identity projected onto an issue detail.
-// Detail responses use a slice so the wire shape remains stable if an issue
-// can belong to more than one named scope later.
 type NamedScope struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`

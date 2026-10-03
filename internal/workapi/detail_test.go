@@ -21,7 +21,7 @@ import (
 type detailFixture struct {
 	issues     map[string]*types.Issue
 	wisps      map[string]*types.Issue
-	scopes     map[string][]types.NamedScope
+	scopes     map[string]*types.NamedScope
 	labels     map[string][]string
 	deps       map[string][]*types.IssueWithDependencyMetadata
 	dependents map[string][]*types.IssueWithDependencyMetadata
@@ -40,11 +40,8 @@ func newDetailFixture() *detailFixture {
 		wisps: map[string]*types.Issue{
 			"bd-w1": {ID: "bd-w1", Title: "Ephemeral wisp", IssueType: types.TypeTask, Status: types.StatusOpen},
 		},
-		scopes: map[string][]types.NamedScope{
-			"bd-1": {
-				{ID: "scope-a", Name: "Alpha"},
-				{ID: "scope-b", Name: "Beta"},
-			},
+		scopes: map[string]*types.NamedScope{
+			"bd-1": {ID: "scope-a", Name: "Alpha"},
 		},
 		labels: map[string][]string{
 			"bd-1":  {"alpha", "beta"},
@@ -124,11 +121,12 @@ func (f fakeStoreReader) GetLabels(_ context.Context, id string) ([]string, erro
 	return f.fx.labels[id], nil
 }
 
-func (f fakeStoreReader) ListScopesForIssue(_ context.Context, id string) ([]types.NamedScope, error) {
-	if scopes := f.fx.scopes[id]; scopes != nil {
-		return append([]types.NamedScope(nil), scopes...), nil
+func (f fakeStoreReader) GetNamedScopeForIssue(_ context.Context, id string) (*types.NamedScope, error) {
+	if scope := f.fx.scopes[id]; scope != nil {
+		copy := *scope
+		return &copy, nil
 	}
-	return []types.NamedScope{}, nil
+	return nil, nil
 }
 
 func (f fakeStoreReader) GetDependenciesWithMetadata(_ context.Context, id string) ([]*types.IssueWithDependencyMetadata, error) {
@@ -212,11 +210,12 @@ func (f fakeLabelUC) GetLabels(_ context.Context, id string) ([]string, error) {
 
 type fakeScopeReader struct{ fx *detailFixture }
 
-func (f fakeScopeReader) ListScopesForIssue(_ context.Context, id string) ([]types.NamedScope, error) {
-	if scopes := f.fx.scopes[id]; scopes != nil {
-		return append([]types.NamedScope(nil), scopes...), nil
+func (f fakeScopeReader) GetNamedScopeForIssue(_ context.Context, id string) (*types.NamedScope, error) {
+	if scope := f.fx.scopes[id]; scope != nil {
+		copy := *scope
+		return &copy, nil
 	}
-	return []types.NamedScope{}, nil
+	return nil, nil
 }
 
 func (f fakeLabelUC) GetWispLabels(_ context.Context, id string) ([]string, error) {
@@ -532,34 +531,31 @@ func TestBuildIssueDetailsCountsAndParent(t *testing.T) {
 	}
 }
 
-func TestBuildIssueDetailsProjectsNamedScopesAndEmptyArrays(t *testing.T) {
+func TestBuildIssueDetailsProjectsNamedScopeOrNull(t *testing.T) {
 	ctx := context.Background()
 	fx := newDetailFixture()
 	store, useCase := fixtureSources(fx)
-	want := []types.NamedScope{{ID: "scope-a", Name: "Alpha"}, {ID: "scope-b", Name: "Beta"}}
+	want := &types.NamedScope{ID: "scope-a", Name: "Alpha"}
 
 	for _, tc := range []struct {
 		name  string
 		src   DetailSource
 		issue *types.Issue
 		wisp  bool
-		want  []types.NamedScope
+		want  *types.NamedScope
 	}{
 		{"store scoped durable", store, fx.issues["bd-1"], false, want},
 		{"use case scoped durable", useCase, fx.issues["bd-1"], false, want},
-		{"store unscoped durable", store, fx.issues["bd-chat"], false, []types.NamedScope{}},
-		{"use case wisp", useCase, fx.wisps["bd-w1"], true, []types.NamedScope{}},
+		{"store unscoped durable", store, fx.issues["bd-chat"], false, nil},
+		{"use case wisp", useCase, fx.wisps["bd-w1"], true, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			details, err := BuildIssueDetails(ctx, tc.src, tc.issue, tc.wisp, DetailOptions{})
 			if err != nil {
 				t.Fatalf("BuildIssueDetails: %v", err)
 			}
-			if !reflect.DeepEqual(details.NamedScopes, tc.want) {
-				t.Errorf("NamedScopes = %#v, want %#v", details.NamedScopes, tc.want)
-			}
-			if details.NamedScopes == nil {
-				t.Error("NamedScopes is nil, want an explicit empty or populated array")
+			if !reflect.DeepEqual(details.NamedScope, tc.want) {
+				t.Errorf("NamedScope = %#v, want %#v", details.NamedScope, tc.want)
 			}
 		})
 	}

@@ -109,33 +109,23 @@ func List(ctx context.Context, r Runner) ([]*types.Scope, error) {
 	return scopes, rows.Err()
 }
 
-// ListForIssue returns the small reverse-membership projection used by issue
-// detail reads. Keep the list form even while the schema enforces one scope per
-// issue, and order it explicitly so every backend answers identically.
-func ListForIssue(ctx context.Context, r Runner, issueID string) ([]types.NamedScope, error) {
-	rows, err := r.QueryContext(ctx, `
+// GetNamedScopeForIssue returns the small reverse-membership projection used by
+// issue detail reads. The scope_members primary key enforces one-or-none
+// membership, so an absent row is the explicit null result.
+func GetNamedScopeForIssue(ctx context.Context, r Runner, issueID string) (*types.NamedScope, error) {
+	var scope types.NamedScope
+	err := r.QueryRowContext(ctx, `
 		SELECT s.id, s.name
 		FROM scope_members sm
 		JOIN scopes s ON s.id = sm.scope_id
-		WHERE sm.issue_id = ?
-		ORDER BY s.id ASC, s.name ASC`, issueID)
+		WHERE sm.issue_id = ?`, issueID).Scan(&scope.ID, &scope.Name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil, fmt.Errorf("list issue scopes: %w", err)
+		return nil, fmt.Errorf("get issue scope: %w", err)
 	}
-	defer rows.Close()
-
-	result := make([]types.NamedScope, 0)
-	for rows.Next() {
-		var scope types.NamedScope
-		if err := rows.Scan(&scope.ID, &scope.Name); err != nil {
-			return nil, fmt.Errorf("scan issue scope: %w", err)
-		}
-		result = append(result, scope)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read issue scopes: %w", err)
-	}
-	return result, nil
+	return &scope, nil
 }
 
 // ListCatalog returns scope identity and aggregate counts in creation order.

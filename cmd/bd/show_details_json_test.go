@@ -53,9 +53,9 @@ func TestIssueDetailsCountOnlyJSON(t *testing.T) {
 	}
 }
 
-func TestIssueDetailsJSONProjectsNamedScopesAsIDAndName(t *testing.T) {
+func TestIssueDetailsJSONProjectsNamedScopeOrNull(t *testing.T) {
 	details := types.NewIssueDetails(types.Issue{ID: "be-scoped", Title: "Scoped"})
-	details.NamedScopes = []types.NamedScope{{ID: "scope-a", Name: "Alpha"}}
+	details.NamedScope = &types.NamedScope{ID: "scope-a", Name: "Alpha"}
 
 	data, err := json.Marshal(details)
 	if err != nil {
@@ -65,23 +65,23 @@ func TestIssueDetailsJSONProjectsNamedScopesAsIDAndName(t *testing.T) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	var scopes []map[string]json.RawMessage
-	if err := json.Unmarshal(raw["named_scopes"], &scopes); err != nil {
-		t.Fatalf("decode named_scopes: %v", err)
+	var scope map[string]json.RawMessage
+	if err := json.Unmarshal(raw["named_scope"], &scope); err != nil {
+		t.Fatalf("decode named_scope: %v", err)
 	}
-	if len(scopes) != 1 || string(scopes[0]["id"]) != `"scope-a"` || string(scopes[0]["name"]) != `"Alpha"` {
-		t.Fatalf("named_scopes = %s, want [{id: scope-a, name: Alpha}]", raw["named_scopes"])
+	if string(scope["id"]) != `"scope-a"` || string(scope["name"]) != `"Alpha"` {
+		t.Fatalf("named_scope = %s, want {id: scope-a, name: Alpha}", raw["named_scope"])
 	}
-	if len(scopes[0]) != 2 {
-		t.Fatalf("named_scopes entry has %d fields, want only id and name", len(scopes[0]))
+	if len(scope) != 2 {
+		t.Fatalf("named_scope has %d fields, want only id and name", len(scope))
 	}
 
 	empty, err := json.Marshal(types.NewIssueDetails(types.Issue{ID: "be-unscoped"}))
 	if err != nil {
 		t.Fatalf("marshal unscoped: %v", err)
 	}
-	if !strings.Contains(string(empty), `"named_scopes":[]`) {
-		t.Fatalf("unscoped detail = %s, want an explicit empty named_scopes array", empty)
+	if !strings.Contains(string(empty), `"named_scope":null`) {
+		t.Fatalf("unscoped detail = %s, want an explicit null named_scope", empty)
 	}
 }
 

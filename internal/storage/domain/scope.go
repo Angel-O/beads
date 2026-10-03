@@ -12,7 +12,7 @@ type ScopeSQLRepository interface {
 	Create(ctx context.Context, scope *types.Scope, activate bool) error
 	Rename(ctx context.Context, id, name string) error
 	List(ctx context.Context) ([]*types.Scope, error)
-	ListScopesForIssue(ctx context.Context, issueID string) ([]types.NamedScope, error)
+	GetNamedScopeForIssue(ctx context.Context, issueID string) (*types.NamedScope, error)
 	ListCatalog(ctx context.Context, req types.ScopeCatalogRequest) (*types.ScopeCatalogPage, error)
 	Get(ctx context.Context, id string) (*types.ScopeDetails, error)
 	GetSnapshot(ctx context.Context, id string) (*types.ScopeSnapshot, error)
@@ -31,7 +31,7 @@ type ScopeUseCase interface {
 	CreateScope(ctx context.Context, scope *types.Scope, activate bool) error
 	RenameScope(ctx context.Context, id, name string) error
 	ListScopes(ctx context.Context) ([]*types.Scope, error)
-	ListScopesForIssue(ctx context.Context, issueID string) ([]types.NamedScope, error)
+	GetNamedScopeForIssue(ctx context.Context, issueID string) (*types.NamedScope, error)
 	ListScopeCatalog(ctx context.Context, req types.ScopeCatalogRequest) (*types.ScopeCatalogPage, error)
 	GetScope(ctx context.Context, id string) (*types.ScopeDetails, error)
 	GetScopeSnapshot(ctx context.Context, id string) (*types.ScopeSnapshot, error)
@@ -61,8 +61,8 @@ func (u *scopeUseCaseImpl) RenameScope(ctx context.Context, id, name string) err
 func (u *scopeUseCaseImpl) ListScopes(ctx context.Context) ([]*types.Scope, error) {
 	return u.repo.List(ctx)
 }
-func (u *scopeUseCaseImpl) ListScopesForIssue(ctx context.Context, issueID string) ([]types.NamedScope, error) {
-	return u.repo.ListScopesForIssue(ctx, issueID)
+func (u *scopeUseCaseImpl) GetNamedScopeForIssue(ctx context.Context, issueID string) (*types.NamedScope, error) {
+	return u.repo.GetNamedScopeForIssue(ctx, issueID)
 }
 func (u *scopeUseCaseImpl) ListScopeCatalog(ctx context.Context, req types.ScopeCatalogRequest) (*types.ScopeCatalogPage, error) {
 	return u.repo.ListCatalog(ctx, req)

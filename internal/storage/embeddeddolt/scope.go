@@ -35,11 +35,11 @@ func (s *EmbeddedDoltStore) ListScopes(ctx context.Context) ([]*types.Scope, err
 	return result, err
 }
 
-func (s *EmbeddedDoltStore) ListScopesForIssue(ctx context.Context, issueID string) ([]types.NamedScope, error) {
-	var result []types.NamedScope
+func (s *EmbeddedDoltStore) GetNamedScopeForIssue(ctx context.Context, issueID string) (*types.NamedScope, error) {
+	var result *types.NamedScope
 	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
 		var err error
-		result, err = scopeops.ListForIssue(ctx, tx, issueID)
+		result, err = scopeops.GetNamedScopeForIssue(ctx, tx, issueID)
 		return err
 	})
 	return result, err

@@ -942,7 +942,7 @@ type Transaction interface {
 	CreateScope(ctx context.Context, scope *types.Scope, activate bool) error
 	RenameScope(ctx context.Context, id, name string) error
 	ListScopes(ctx context.Context) ([]*types.Scope, error)
-	ListScopesForIssue(ctx context.Context, issueID string) ([]types.NamedScope, error)
+	GetNamedScopeForIssue(ctx context.Context, issueID string) (*types.NamedScope, error)
 	ListScopeCatalog(ctx context.Context, req ScopeCatalogRequest) (*ScopeCatalogPage, error)
 	GetScope(ctx context.Context, id string) (*types.ScopeDetails, error)
 	GetScopeSnapshot(ctx context.Context, id string) (*types.ScopeSnapshot, error)

@@ -6466,12 +6466,17 @@ components:
         labels:
           type: array
           items: { type: string }
-        named_scopes:
-          type: array
+        named_scope:
+          type: object
+          nullable: true
           description: >-
-            Named scopes containing this issue. Each entry is the minimal
-            id/name projection; unscoped issues and wisps return an empty array.
-          items: { $ref: '#/components/schemas/NamedScope' }
+            The named scope containing this issue. It is the minimal id/name
+            projection, or null for unscoped issues and wisps.
+          required: [id, name]
+          additionalProperties: false
+          properties:
+            id: { type: string }
+            name: { type: string }
         dependencies:
           type: array
           description: Issues this one depends on, each carrying its edge type.

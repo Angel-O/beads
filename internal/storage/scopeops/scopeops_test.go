@@ -73,7 +73,7 @@ func TestScopeContextMatchesExactContextLabels(t *testing.T) {
 	}
 }
 
-func TestListForIssueReturnsMinimalDeterministicProjection(t *testing.T) {
+func TestGetNamedScopeForIssueReturnsMinimalProjection(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -84,27 +84,24 @@ func TestListForIssueReturnsMinimalDeterministicProjection(t *testing.T) {
 		SELECT s.id, s.name
 		FROM scope_members sm
 		JOIN scopes s ON s.id = sm.scope_id
-		WHERE sm.issue_id = ?
-		ORDER BY s.id ASC, s.name ASC`)).
+		WHERE sm.issue_id = ?`)).
 		WithArgs("issue-1").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).
-			AddRow("scope-a", "Alpha").
-			AddRow("scope-b", "Beta"))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).AddRow("scope-a", "Alpha"))
 
-	got, err := ListForIssue(t.Context(), db, "issue-1")
+	got, err := GetNamedScopeForIssue(t.Context(), db, "issue-1")
 	if err != nil {
-		t.Fatalf("ListForIssue: %v", err)
+		t.Fatalf("GetNamedScopeForIssue: %v", err)
 	}
-	want := []types.NamedScope{{ID: "scope-a", Name: "Alpha"}, {ID: "scope-b", Name: "Beta"}}
+	want := &types.NamedScope{ID: "scope-a", Name: "Alpha"}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("ListForIssue = %#v, want %#v", got, want)
+		t.Fatalf("GetNamedScopeForIssue = %#v, want %#v", got, want)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unexpected reverse membership query: %v", err)
 	}
 }
 
-func TestListForIssueReturnsNonNilEmptyProjection(t *testing.T) {
+func TestGetNamedScopeForIssueReturnsNilWhenUnscoped(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -114,17 +111,16 @@ func TestListForIssueReturnsNonNilEmptyProjection(t *testing.T) {
 		SELECT s.id, s.name
 		FROM scope_members sm
 		JOIN scopes s ON s.id = sm.scope_id
-		WHERE sm.issue_id = ?
-		ORDER BY s.id ASC, s.name ASC`)).
+		WHERE sm.issue_id = ?`)).
 		WithArgs("unscoped").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}))
 
-	got, err := ListForIssue(t.Context(), db, "unscoped")
+	got, err := GetNamedScopeForIssue(t.Context(), db, "unscoped")
 	if err != nil {
-		t.Fatalf("ListForIssue: %v", err)
+		t.Fatalf("GetNamedScopeForIssue: %v", err)
 	}
-	if got == nil || len(got) != 0 {
-		t.Fatalf("ListForIssue = %#v, want non-nil empty list", got)
+	if got != nil {
+		t.Fatalf("GetNamedScopeForIssue = %#v, want nil", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unexpected empty reverse membership query: %v", err)

@@ -63,8 +63,8 @@ func (t *doltTransaction) ListScopes(ctx context.Context) ([]*types.Scope, error
 	return scopeops.List(ctx, t.regularTx)
 }
 
-func (t *doltTransaction) ListScopesForIssue(ctx context.Context, issueID string) ([]types.NamedScope, error) {
-	return scopeops.ListForIssue(ctx, t.regularTx, issueID)
+func (t *doltTransaction) GetNamedScopeForIssue(ctx context.Context, issueID string) (*types.NamedScope, error) {
+	return scopeops.GetNamedScopeForIssue(ctx, t.regularTx, issueID)
 }
 
 func (t *doltTransaction) ListScopeCatalog(ctx context.Context, req storage.ScopeCatalogRequest) (*storage.ScopeCatalogPage, error) {

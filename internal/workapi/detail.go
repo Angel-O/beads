@@ -37,7 +37,7 @@ type DetailSource interface {
 	GetWisp(ctx context.Context, id string) (*types.Issue, error)
 
 	Labels(ctx context.Context, id string, isWisp bool) ([]string, error)
-	NamedScopes(ctx context.Context, id string, isWisp bool) ([]types.NamedScope, error)
+	NamedScope(ctx context.Context, id string, isWisp bool) (*types.NamedScope, error)
 	Dependencies(ctx context.Context, id string, isWisp bool) ([]*types.IssueWithDependencyMetadata, error)
 
 	CountDependencies(ctx context.Context, id string, isWisp bool) (int64, error)
@@ -119,8 +119,8 @@ func BuildIssueDetails(ctx context.Context, src DetailSource, issue *types.Issue
 	details := types.NewIssueDetails(*issue)
 
 	details.Labels, _ = src.Labels(ctx, id, isWisp)
-	if namedScopes, err := src.NamedScopes(ctx, id, isWisp); err == nil && namedScopes != nil {
-		details.NamedScopes = namedScopes
+	if namedScope, err := src.NamedScope(ctx, id, isWisp); err == nil {
+		details.NamedScope = namedScope
 	}
 	details.Dependencies, _ = src.Dependencies(ctx, id, isWisp)
 
@@ -278,7 +278,7 @@ func applyEpicProgress(details *types.IssueDetails, dependents []*types.IssueWit
 type StoreDetailReader interface {
 	GetIssue(ctx context.Context, id string) (*types.Issue, error)
 	GetLabels(ctx context.Context, issueID string) ([]string, error)
-	ListScopesForIssue(ctx context.Context, issueID string) ([]types.NamedScope, error)
+	GetNamedScopeForIssue(ctx context.Context, issueID string) (*types.NamedScope, error)
 	GetDependenciesWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error)
 	CountDependencies(ctx context.Context, issueID string) (int64, error)
 	CountDependents(ctx context.Context, issueID string) (int64, error)
@@ -312,11 +312,11 @@ func (s storeDetailSource) Labels(ctx context.Context, id string, _ bool) ([]str
 	return s.store.GetLabels(ctx, id)
 }
 
-func (s storeDetailSource) NamedScopes(ctx context.Context, id string, isWisp bool) ([]types.NamedScope, error) {
+func (s storeDetailSource) NamedScope(ctx context.Context, id string, isWisp bool) (*types.NamedScope, error) {
 	if isWisp {
-		return []types.NamedScope{}, nil
+		return nil, nil
 	}
-	return s.store.ListScopesForIssue(ctx, id)
+	return s.store.GetNamedScopeForIssue(ctx, id)
 }
 
 func (s storeDetailSource) Dependencies(ctx context.Context, id string, _ bool) ([]*types.IssueWithDependencyMetadata, error) {
@@ -358,7 +358,7 @@ type (
 	}
 
 	detailScopeReader interface {
-		ListScopesForIssue(ctx context.Context, issueID string) ([]types.NamedScope, error)
+		GetNamedScopeForIssue(ctx context.Context, issueID string) (*types.NamedScope, error)
 	}
 
 	detailDepReader interface {
@@ -410,11 +410,11 @@ func (u useCaseDetailSource) Labels(ctx context.Context, id string, isWisp bool)
 	return u.labels.GetLabels(ctx, id)
 }
 
-func (u useCaseDetailSource) NamedScopes(ctx context.Context, id string, isWisp bool) ([]types.NamedScope, error) {
+func (u useCaseDetailSource) NamedScope(ctx context.Context, id string, isWisp bool) (*types.NamedScope, error) {
 	if isWisp {
-		return []types.NamedScope{}, nil
+		return nil, nil
 	}
-	return u.scopes.ListScopesForIssue(ctx, id)
+	return u.scopes.GetNamedScopeForIssue(ctx, id)
 }
 
 func (u useCaseDetailSource) Dependencies(ctx context.Context, id string, isWisp bool) ([]*types.IssueWithDependencyMetadata, error) {
