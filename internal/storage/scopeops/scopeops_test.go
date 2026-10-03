@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/sqlbuild"
+	"github.com/steveyegge/beads/internal/types"
 )
 
 func TestScopeCursorIsVersionedAndBoundToReadShape(t *testing.T) {
@@ -68,6 +70,60 @@ func TestScopeContextMatchesExactContextLabels(t *testing.T) {
 	}
 	if matchesScopeContext([]string{"ctx:team-ab"}, []string{"team-a"}) {
 		t.Fatal("context filter matched a non-exact ctx: label")
+	}
+}
+
+func TestGetNamedScopeForIssueReturnsMinimalProjection(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(regexp.QuoteMeta(`
+		SELECT s.id, s.name
+		FROM scope_members sm
+		JOIN scopes s ON s.id = sm.scope_id
+		WHERE sm.issue_id = ?`)).
+		WithArgs("issue-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).AddRow("scope-a", "Alpha"))
+
+	got, err := GetNamedScopeForIssue(t.Context(), db, "issue-1")
+	if err != nil {
+		t.Fatalf("GetNamedScopeForIssue: %v", err)
+	}
+	want := &types.NamedScope{ID: "scope-a", Name: "Alpha"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("GetNamedScopeForIssue = %#v, want %#v", got, want)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected reverse membership query: %v", err)
+	}
+}
+
+func TestGetNamedScopeForIssueReturnsNilWhenUnscoped(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery(regexp.QuoteMeta(`
+		SELECT s.id, s.name
+		FROM scope_members sm
+		JOIN scopes s ON s.id = sm.scope_id
+		WHERE sm.issue_id = ?`)).
+		WithArgs("unscoped").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}))
+
+	got, err := GetNamedScopeForIssue(t.Context(), db, "unscoped")
+	if err != nil {
+		t.Fatalf("GetNamedScopeForIssue: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("GetNamedScopeForIssue = %#v, want nil", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected empty reverse membership query: %v", err)
 	}
 }
 

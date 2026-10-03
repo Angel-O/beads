@@ -109,6 +109,25 @@ func List(ctx context.Context, r Runner) ([]*types.Scope, error) {
 	return scopes, rows.Err()
 }
 
+// GetNamedScopeForIssue returns the small reverse-membership projection used by
+// issue detail reads. The scope_members primary key enforces one-or-none
+// membership, so an absent row is the explicit null result.
+func GetNamedScopeForIssue(ctx context.Context, r Runner, issueID string) (*types.NamedScope, error) {
+	var scope types.NamedScope
+	err := r.QueryRowContext(ctx, `
+		SELECT s.id, s.name
+		FROM scope_members sm
+		JOIN scopes s ON s.id = sm.scope_id
+		WHERE sm.issue_id = ?`, issueID).Scan(&scope.ID, &scope.Name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get issue scope: %w", err)
+	}
+	return &scope, nil
+}
+
 // ListCatalog returns scope identity and aggregate counts in creation order.
 // Pagination is keyset-based so a catalog walk does not shift when rows are
 // added ahead of the current page.

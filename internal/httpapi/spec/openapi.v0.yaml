@@ -6466,6 +6466,17 @@ components:
         labels:
           type: array
           items: { type: string }
+        named_scope:
+          type: object
+          nullable: true
+          description: >-
+            The named scope containing this issue. It is the minimal id/name
+            projection, or null for unscoped issues and wisps.
+          required: [id, name]
+          additionalProperties: false
+          properties:
+            id: { type: string }
+            name: { type: string }
         dependencies:
           type: array
           description: Issues this one depends on, each carrying its edge type.
@@ -6858,6 +6869,18 @@ components:
         source_id: { type: string }
         bond_type: { type: string }
         bond_point: { type: string }
+
+    NamedScope:
+      type: object
+      description: Minimal named-scope identity projected onto an issue detail.
+      x-go-type: types.NamedScope
+      x-go-type-import:
+        name: types
+        path: github.com/steveyegge/beads/internal/types
+      required: [id, name]
+      properties:
+        id: { type: string }
+        name: { type: string }
 
     Statistics:
       type: object

@@ -1150,6 +1150,10 @@ type IssueDetails struct {
 	Dependents   []*IssueWithDependencyMetadata `json:"dependents,omitempty"`
 	Comments     []*Comment                     `json:"comments,omitempty"`
 	Parent       *string                        `json:"parent,omitempty"`
+	// NamedScope contains only the id and display name of the scope containing
+	// this issue. It is nil, and therefore JSON null, for unscoped issues and
+	// wisps.
+	NamedScope *NamedScope `json:"named_scope"`
 
 	// Cardinality fields — emitted by default (count-only mode).
 	// Slice fields (Dependents, Comments) are nil when count-only is active.

@@ -25,6 +25,9 @@ func (r *scopeSQLRepositoryImpl) Rename(ctx context.Context, id, name string) er
 func (r *scopeSQLRepositoryImpl) List(ctx context.Context) ([]*types.Scope, error) {
 	return scopeops.List(ctx, r.runner)
 }
+func (r *scopeSQLRepositoryImpl) GetNamedScopeForIssue(ctx context.Context, issueID string) (*types.NamedScope, error) {
+	return scopeops.GetNamedScopeForIssue(ctx, r.runner, issueID)
+}
 func (r *scopeSQLRepositoryImpl) ListCatalog(ctx context.Context, req types.ScopeCatalogRequest) (*types.ScopeCatalogPage, error) {
 	return scopeops.ListCatalog(ctx, r.runner, req)
 }

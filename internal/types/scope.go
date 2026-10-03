@@ -15,6 +15,12 @@ type Scope struct {
 	MemberLimit int `json:"member_limit"`
 }
 
+// NamedScope is the minimal scope identity projected onto an issue detail.
+type NamedScope struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 // ScopeDetails is the snapshot returned by a scope read. Members are complete
 // issue rows, and Relationships contains only dependency edges whose source
 // and target are both members of the scope.

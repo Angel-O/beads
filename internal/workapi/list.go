@@ -119,6 +119,7 @@ type UnitOfWork interface {
 	DependencyUseCase() domain.DependencyUseCase
 	LabelUseCase() domain.LabelUseCase
 	CommentUseCase() domain.CommentUseCase
+	ScopeUseCase() domain.ScopeUseCase
 }
 
 type uowConfigSource struct{ uw UnitOfWork }

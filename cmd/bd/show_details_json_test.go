@@ -53,6 +53,38 @@ func TestIssueDetailsCountOnlyJSON(t *testing.T) {
 	}
 }
 
+func TestIssueDetailsJSONProjectsNamedScopeOrNull(t *testing.T) {
+	details := types.NewIssueDetails(types.Issue{ID: "be-scoped", Title: "Scoped"})
+	details.NamedScope = &types.NamedScope{ID: "scope-a", Name: "Alpha"}
+
+	data, err := json.Marshal(details)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var scope map[string]json.RawMessage
+	if err := json.Unmarshal(raw["named_scope"], &scope); err != nil {
+		t.Fatalf("decode named_scope: %v", err)
+	}
+	if string(scope["id"]) != `"scope-a"` || string(scope["name"]) != `"Alpha"` {
+		t.Fatalf("named_scope = %s, want {id: scope-a, name: Alpha}", raw["named_scope"])
+	}
+	if len(scope) != 2 {
+		t.Fatalf("named_scope has %d fields, want only id and name", len(scope))
+	}
+
+	empty, err := json.Marshal(types.NewIssueDetails(types.Issue{ID: "be-unscoped"}))
+	if err != nil {
+		t.Fatalf("marshal unscoped: %v", err)
+	}
+	if !strings.Contains(string(empty), `"named_scope":null`) {
+		t.Fatalf("unscoped detail = %s, want an explicit null named_scope", empty)
+	}
+}
+
 // TestShowJSONDetailsCarryTheRevisionToken pins what `bd show --json` puts on
 // the wire, from the type the command now marshals directly.
 //

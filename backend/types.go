@@ -33,6 +33,7 @@ type (
 	MolType                     = types.MolType
 	MoleculeLastActivity        = types.MoleculeLastActivity
 	MoleculeProgressStats       = types.MoleculeProgressStats
+	NamedScope                  = types.NamedScope
 	PersistenceMode             = types.PersistenceMode
 	ProvKind                    = types.ProvKind
 	ProvenanceEvent             = types.ProvenanceEvent
