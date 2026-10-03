@@ -37,6 +37,7 @@ type DetailSource interface {
 	GetWisp(ctx context.Context, id string) (*types.Issue, error)
 
 	Labels(ctx context.Context, id string, isWisp bool) ([]string, error)
+	NamedScopes(ctx context.Context, id string, isWisp bool) ([]types.NamedScope, error)
 	Dependencies(ctx context.Context, id string, isWisp bool) ([]*types.IssueWithDependencyMetadata, error)
 
 	CountDependencies(ctx context.Context, id string, isWisp bool) (int64, error)
@@ -101,8 +102,9 @@ func GetIssueOrWisp(ctx context.Context, src DetailSource, id string) (*types.Is
 }
 
 // BuildIssueDetails assembles the detail view of an already-resolved issue:
-// labels, outgoing dependencies with their metadata, the three cardinality
-// counts, and - under DetailOptions - the dependent and comment rows.
+// labels, reverse named-scope membership, outgoing dependencies with their
+// metadata, the three cardinality counts, and - under DetailOptions - the
+// dependent and comment rows.
 //
 // Labels, dependencies, and counts are best effort, matching what both CLI
 // paths have always shipped: a detail view missing an edge list still beats
@@ -117,6 +119,9 @@ func BuildIssueDetails(ctx context.Context, src DetailSource, issue *types.Issue
 	details := types.NewIssueDetails(*issue)
 
 	details.Labels, _ = src.Labels(ctx, id, isWisp)
+	if namedScopes, err := src.NamedScopes(ctx, id, isWisp); err == nil && namedScopes != nil {
+		details.NamedScopes = namedScopes
+	}
 	details.Dependencies, _ = src.Dependencies(ctx, id, isWisp)
 
 	// Aggregate counts - O(1) queries, no row materialization.
@@ -273,6 +278,7 @@ func applyEpicProgress(details *types.IssueDetails, dependents []*types.IssueWit
 type StoreDetailReader interface {
 	GetIssue(ctx context.Context, id string) (*types.Issue, error)
 	GetLabels(ctx context.Context, issueID string) ([]string, error)
+	ListScopesForIssue(ctx context.Context, issueID string) ([]types.NamedScope, error)
 	GetDependenciesWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error)
 	CountDependencies(ctx context.Context, issueID string) (int64, error)
 	CountDependents(ctx context.Context, issueID string) (int64, error)
@@ -304,6 +310,13 @@ func (s storeDetailSource) GetWisp(_ context.Context, id string) (*types.Issue, 
 
 func (s storeDetailSource) Labels(ctx context.Context, id string, _ bool) ([]string, error) {
 	return s.store.GetLabels(ctx, id)
+}
+
+func (s storeDetailSource) NamedScopes(ctx context.Context, id string, isWisp bool) ([]types.NamedScope, error) {
+	if isWisp {
+		return []types.NamedScope{}, nil
+	}
+	return s.store.ListScopesForIssue(ctx, id)
 }
 
 func (s storeDetailSource) Dependencies(ctx context.Context, id string, _ bool) ([]*types.IssueWithDependencyMetadata, error) {
@@ -344,6 +357,10 @@ type (
 		GetWispLabels(ctx context.Context, wispID string) ([]string, error)
 	}
 
+	detailScopeReader interface {
+		ListScopesForIssue(ctx context.Context, issueID string) ([]types.NamedScope, error)
+	}
+
 	detailDepReader interface {
 		ListWithIssueMetadata(ctx context.Context, issueID string, filter domain.DepListFilter) ([]*types.IssueWithDependencyMetadata, error)
 		ListWispWithIssueMetadata(ctx context.Context, wispID string, filter domain.DepListFilter) ([]*types.IssueWithDependencyMetadata, error)
@@ -364,17 +381,18 @@ type (
 type useCaseDetailSource struct {
 	issues   detailIssueReader
 	labels   detailLabelReader
+	scopes   detailScopeReader
 	deps     detailDepReader
 	comments detailCommentReader
 }
 
 // NewUOWDetailSource reads detail through an open unit of work.
 func NewUOWDetailSource(uw UnitOfWork) DetailSource {
-	return newUseCaseDetailSource(uw.IssueUseCase(), uw.LabelUseCase(), uw.DependencyUseCase(), uw.CommentUseCase())
+	return newUseCaseDetailSource(uw.IssueUseCase(), uw.LabelUseCase(), uw.ScopeUseCase(), uw.DependencyUseCase(), uw.CommentUseCase())
 }
 
-func newUseCaseDetailSource(issues detailIssueReader, labels detailLabelReader, deps detailDepReader, comments detailCommentReader) DetailSource {
-	return useCaseDetailSource{issues: issues, labels: labels, deps: deps, comments: comments}
+func newUseCaseDetailSource(issues detailIssueReader, labels detailLabelReader, scopes detailScopeReader, deps detailDepReader, comments detailCommentReader) DetailSource {
+	return useCaseDetailSource{issues: issues, labels: labels, scopes: scopes, deps: deps, comments: comments}
 }
 
 func (u useCaseDetailSource) GetIssue(ctx context.Context, id string) (*types.Issue, error) {
@@ -390,6 +408,13 @@ func (u useCaseDetailSource) Labels(ctx context.Context, id string, isWisp bool)
 		return u.labels.GetWispLabels(ctx, id)
 	}
 	return u.labels.GetLabels(ctx, id)
+}
+
+func (u useCaseDetailSource) NamedScopes(ctx context.Context, id string, isWisp bool) ([]types.NamedScope, error) {
+	if isWisp {
+		return []types.NamedScope{}, nil
+	}
+	return u.scopes.ListScopesForIssue(ctx, id)
 }
 
 func (u useCaseDetailSource) Dependencies(ctx context.Context, id string, isWisp bool) ([]*types.IssueWithDependencyMetadata, error) {

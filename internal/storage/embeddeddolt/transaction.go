@@ -92,6 +92,10 @@ func (t *embeddedTransaction) ListScopes(ctx context.Context) ([]*types.Scope, e
 	return scopeops.List(ctx, t.tx)
 }
 
+func (t *embeddedTransaction) ListScopesForIssue(ctx context.Context, issueID string) ([]types.NamedScope, error) {
+	return scopeops.ListForIssue(ctx, t.tx, issueID)
+}
+
 func (t *embeddedTransaction) ListScopeCatalog(ctx context.Context, req storage.ScopeCatalogRequest) (*storage.ScopeCatalogPage, error) {
 	return scopeops.ListCatalog(ctx, t.tx, req)
 }

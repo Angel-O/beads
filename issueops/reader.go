@@ -14,6 +14,9 @@ type IssueWithCounts = types.IssueWithCounts
 // IssueDetails is one issue with its labels, edges and cardinalities.
 type IssueDetails = types.IssueDetails
 
+// NamedScope is the minimal id/name scope projection carried by IssueDetails.
+type NamedScope = types.NamedScope
+
 // MolType classifies a molecule.
 type MolType = types.MolType
 

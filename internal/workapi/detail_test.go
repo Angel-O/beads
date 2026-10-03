@@ -21,6 +21,7 @@ import (
 type detailFixture struct {
 	issues     map[string]*types.Issue
 	wisps      map[string]*types.Issue
+	scopes     map[string][]types.NamedScope
 	labels     map[string][]string
 	deps       map[string][]*types.IssueWithDependencyMetadata
 	dependents map[string][]*types.IssueWithDependencyMetadata
@@ -38,6 +39,12 @@ func newDetailFixture() *detailFixture {
 		},
 		wisps: map[string]*types.Issue{
 			"bd-w1": {ID: "bd-w1", Title: "Ephemeral wisp", IssueType: types.TypeTask, Status: types.StatusOpen},
+		},
+		scopes: map[string][]types.NamedScope{
+			"bd-1": {
+				{ID: "scope-a", Name: "Alpha"},
+				{ID: "scope-b", Name: "Beta"},
+			},
 		},
 		labels: map[string][]string{
 			"bd-1":  {"alpha", "beta"},
@@ -117,6 +124,13 @@ func (f fakeStoreReader) GetLabels(_ context.Context, id string) ([]string, erro
 	return f.fx.labels[id], nil
 }
 
+func (f fakeStoreReader) ListScopesForIssue(_ context.Context, id string) ([]types.NamedScope, error) {
+	if scopes := f.fx.scopes[id]; scopes != nil {
+		return append([]types.NamedScope(nil), scopes...), nil
+	}
+	return []types.NamedScope{}, nil
+}
+
 func (f fakeStoreReader) GetDependenciesWithMetadata(_ context.Context, id string) ([]*types.IssueWithDependencyMetadata, error) {
 	return f.fx.deps[id], nil
 }
@@ -194,6 +208,15 @@ func (f fakeLabelUC) GetLabels(_ context.Context, id string) ([]string, error) {
 		return nil, fmt.Errorf("GetLabels called for wisp %s", id)
 	}
 	return f.fx.labels[id], nil
+}
+
+type fakeScopeReader struct{ fx *detailFixture }
+
+func (f fakeScopeReader) ListScopesForIssue(_ context.Context, id string) ([]types.NamedScope, error) {
+	if scopes := f.fx.scopes[id]; scopes != nil {
+		return append([]types.NamedScope(nil), scopes...), nil
+	}
+	return []types.NamedScope{}, nil
 }
 
 func (f fakeLabelUC) GetWispLabels(_ context.Context, id string) ([]string, error) {
@@ -284,7 +307,7 @@ func (f fakeCommentUC) IterCommentsForWisp(ctx context.Context, id string) (stor
 
 func fixtureSources(fx *detailFixture) (store, useCase DetailSource) {
 	return NewStoreDetailSource(fakeStoreReader{fx: fx}),
-		newUseCaseDetailSource(fakeIssueUC{fx: fx}, fakeLabelUC{fx: fx}, fakeDepUC{fx: fx}, fakeCommentUC{fx: fx})
+		newUseCaseDetailSource(fakeIssueUC{fx: fx}, fakeLabelUC{fx: fx}, fakeScopeReader{fx: fx}, fakeDepUC{fx: fx}, fakeCommentUC{fx: fx})
 }
 
 // ---------------------------------------------------------------------------
@@ -306,8 +329,8 @@ func TestGetIssueOrWispNormalizesNotFound(t *testing.T) {
 		src  DetailSource
 	}{
 		{"store seam wraps storage.ErrNotFound", NewStoreDetailSource(fakeStoreReader{fx: fx})},
-		{"domain seam wraps sql.ErrNoRows", newUseCaseDetailSource(fakeIssueUC{fx: fx}, fakeLabelUC{fx: fx}, fakeDepUC{fx: fx}, fakeCommentUC{fx: fx})},
-		{"domain seam returns nil issue with nil error", newUseCaseDetailSource(fakeIssueUC{fx: fx, nilNil: true}, fakeLabelUC{fx: fx}, fakeDepUC{fx: fx}, fakeCommentUC{fx: fx})},
+		{"domain seam wraps sql.ErrNoRows", newUseCaseDetailSource(fakeIssueUC{fx: fx}, fakeLabelUC{fx: fx}, fakeScopeReader{fx: fx}, fakeDepUC{fx: fx}, fakeCommentUC{fx: fx})},
+		{"domain seam returns nil issue with nil error", newUseCaseDetailSource(fakeIssueUC{fx: fx, nilNil: true}, fakeLabelUC{fx: fx}, fakeScopeReader{fx: fx}, fakeDepUC{fx: fx}, fakeCommentUC{fx: fx})},
 	}
 
 	for _, tc := range cases {
@@ -355,9 +378,9 @@ func TestGetIssueOrWispKeepsHardErrors(t *testing.T) {
 		// reaches the caller unwrapped, not to test ordering.
 		{"store", "bd-1", NewStoreDetailSource(fakeStoreReader{fx: fx, hardErr: boom})},
 		{"use case, whole backend down", "bd-1",
-			newUseCaseDetailSource(fakeIssueUC{fx: fx, hardErr: boom}, fakeLabelUC{fx: fx}, fakeDepUC{fx: fx}, fakeCommentUC{fx: fx})},
+			newUseCaseDetailSource(fakeIssueUC{fx: fx, hardErr: boom}, fakeLabelUC{fx: fx}, fakeScopeReader{fx: fx}, fakeDepUC{fx: fx}, fakeCommentUC{fx: fx})},
 		{"use case, issue lookup fails while the id exists as a wisp", "bd-w1",
-			newUseCaseDetailSource(fakeIssueUC{fx: fx, issueErr: boom}, fakeLabelUC{fx: fx}, fakeDepUC{fx: fx}, fakeCommentUC{fx: fx})},
+			newUseCaseDetailSource(fakeIssueUC{fx: fx, issueErr: boom}, fakeLabelUC{fx: fx}, fakeScopeReader{fx: fx}, fakeDepUC{fx: fx}, fakeCommentUC{fx: fx})},
 	}
 
 	for _, tc := range cases {
@@ -506,6 +529,39 @@ func TestBuildIssueDetailsCountsAndParent(t *testing.T) {
 	}
 	if details.CommentsOmitted != nil {
 		t.Errorf("comments_omitted set with a zero count: %v", *details.CommentsOmitted)
+	}
+}
+
+func TestBuildIssueDetailsProjectsNamedScopesAndEmptyArrays(t *testing.T) {
+	ctx := context.Background()
+	fx := newDetailFixture()
+	store, useCase := fixtureSources(fx)
+	want := []types.NamedScope{{ID: "scope-a", Name: "Alpha"}, {ID: "scope-b", Name: "Beta"}}
+
+	for _, tc := range []struct {
+		name  string
+		src   DetailSource
+		issue *types.Issue
+		wisp  bool
+		want  []types.NamedScope
+	}{
+		{"store scoped durable", store, fx.issues["bd-1"], false, want},
+		{"use case scoped durable", useCase, fx.issues["bd-1"], false, want},
+		{"store unscoped durable", store, fx.issues["bd-chat"], false, []types.NamedScope{}},
+		{"use case wisp", useCase, fx.wisps["bd-w1"], true, []types.NamedScope{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			details, err := BuildIssueDetails(ctx, tc.src, tc.issue, tc.wisp, DetailOptions{})
+			if err != nil {
+				t.Fatalf("BuildIssueDetails: %v", err)
+			}
+			if !reflect.DeepEqual(details.NamedScopes, tc.want) {
+				t.Errorf("NamedScopes = %#v, want %#v", details.NamedScopes, tc.want)
+			}
+			if details.NamedScopes == nil {
+				t.Error("NamedScopes is nil, want an explicit empty or populated array")
+			}
+		})
 	}
 }
 

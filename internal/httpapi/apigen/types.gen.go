@@ -1432,6 +1432,9 @@ type Memory struct {
 // Where a member of this type is OMITTED, the key is absent; where it is present holding `null`, the key exists and holds null. Those are different states and this surface reports both.
 type MetadataValue = json.RawMessage
 
+// NamedScope Minimal named-scope identity projected onto an issue detail.
+type NamedScope = types.NamedScope
+
 // Problem RFC 9457 problem detail. This is the only error shape on this surface. The core declares `type`; this server never emits it, so `about:blank` is implied throughout.
 type Problem struct {
 	// ActualAssignee With `precondition_failed`: the assignee the row was found holding. Present under `actual_version`'s rule.

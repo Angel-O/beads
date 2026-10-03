@@ -1150,6 +1150,10 @@ type IssueDetails struct {
 	Dependents   []*IssueWithDependencyMetadata `json:"dependents,omitempty"`
 	Comments     []*Comment                     `json:"comments,omitempty"`
 	Parent       *string                        `json:"parent,omitempty"`
+	// NamedScopes contains only the id and display name of each scope that
+	// contains this issue. It is always an array, including for unscoped issues
+	// and wisps; NewIssueDetails is the constructor that establishes that shape.
+	NamedScopes []NamedScope `json:"named_scopes"`
 
 	// Cardinality fields — emitted by default (count-only mode).
 	// Slice fields (Dependents, Comments) are nil when count-only is active.
@@ -1202,7 +1206,7 @@ type IssueDetails struct {
 // literal would publish a silently wrong token that nothing can distinguish
 // from a right one. The caller fills in labels, edges and counts afterwards.
 func NewIssueDetails(issue Issue) *IssueDetails {
-	return &IssueDetails{Issue: issue, Revision: issue.RowVersion}
+	return &IssueDetails{Issue: issue, NamedScopes: []NamedScope{}, Revision: issue.RowVersion}
 }
 
 // DependencyType categorizes the relationship

@@ -44,6 +44,16 @@ func (s *DoltStore) ListScopes(ctx context.Context) ([]*types.Scope, error) {
 	return result, err
 }
 
+func (s *DoltStore) ListScopesForIssue(ctx context.Context, issueID string) ([]types.NamedScope, error) {
+	var result []types.NamedScope
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = scopeops.ListForIssue(ctx, tx, issueID)
+		return err
+	})
+	return result, err
+}
+
 func (s *DoltStore) ListScopeCatalog(ctx context.Context, req storage.ScopeCatalogRequest) (*storage.ScopeCatalogPage, error) {
 	var result *storage.ScopeCatalogPage
 	err := s.withReadTx(ctx, func(tx *sql.Tx) error {

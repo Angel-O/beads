@@ -9,6 +9,7 @@ import (
 type ScopeCatalogRequest = types.ScopeCatalogRequest
 type ScopeCatalogRow = types.ScopeCatalogRow
 type ScopeCatalogPage = types.ScopeCatalogPage
+type NamedScope = types.NamedScope
 type ScopeMemberStatus = types.ScopeMemberStatus
 type ScopeMemberPageRequest = types.ScopeMemberPageRequest
 type ScopeMemberPage = types.ScopeMemberPage
@@ -28,6 +29,9 @@ type ScopeStore interface {
 	// RenameScope changes only a scope's display name and normalized name.
 	RenameScope(ctx context.Context, id, name string) error
 	ListScopes(ctx context.Context) ([]*types.Scope, error)
+	// ListScopesForIssue returns the minimal named-scope identities containing
+	// one durable issue, in deterministic order. Wisps cannot be scope members.
+	ListScopesForIssue(ctx context.Context, issueID string) ([]types.NamedScope, error)
 	ListScopeCatalog(ctx context.Context, req ScopeCatalogRequest) (*ScopeCatalogPage, error)
 	GetScope(ctx context.Context, id string) (*types.ScopeDetails, error)
 	GetScopeSnapshot(ctx context.Context, id string) (*types.ScopeSnapshot, error)
