@@ -1,11 +1,203 @@
 package dolt
 
 import (
+	"context"
+	"database/sql"
+	"errors"
+	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/storage"
+	storageissueops "github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 	publicops "github.com/steveyegge/beads/issueops"
 )
+
+func TestDoltDependencyEditorReconcilesEpicContextsAtomically(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	epic := &types.Issue{ID: "test-context-epic", Title: "epic", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeEpic}
+	childA := &types.Issue{ID: "test-context-child-a", Title: "child a", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+	childB := &types.Issue{ID: "test-context-child-b", Title: "child b", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+	childDuplicate := &types.Issue{ID: "test-context-child-duplicate", Title: "duplicate context child", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+	grandchild := &types.Issue{ID: "test-context-grandchild", Title: "grandchild", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+	invalid := &types.Issue{ID: "test-context-invalid", Title: "invalid", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeEpic}
+	if err := store.CreateIssues(ctx, []*types.Issue{epic, childA, childB, childDuplicate, grandchild, invalid}, "seed"); err != nil {
+		t.Fatalf("CreateIssues: %v", err)
+	}
+	for id, label := range map[string]string{
+		epic.ID:           "ordinary",
+		childA.ID:         "ctx:z",
+		childB.ID:         "ctx:a",
+		childDuplicate.ID: "ctx:a",
+		grandchild.ID:     "ctx:grandchild",
+		invalid.ID:        "ctx:invalid",
+	} {
+		if err := store.AddLabel(ctx, id, label, "seed"); err != nil {
+			t.Fatalf("AddLabel(%s, %s): %v", id, label, err)
+		}
+	}
+	editor, err := store.DependencyEditor()
+	if err != nil {
+		t.Fatalf("DependencyEditor: %v", err)
+	}
+	add := func(edges ...publicops.DependencyEdge) {
+		t.Helper()
+		if _, err := editor.AddDependencies(ctx, publicops.AddDependenciesRequest{
+			Actor:                 "writer",
+			Edges:                 edges,
+			ReconcileEpicContexts: true,
+		}); err != nil {
+			t.Fatalf("AddDependencies: %v", err)
+		}
+	}
+	addWithoutReconcile := func(edges ...publicops.DependencyEdge) {
+		t.Helper()
+		if _, err := editor.AddDependencies(ctx, publicops.AddDependenciesRequest{Actor: "writer", Edges: edges}); err != nil {
+			t.Fatalf("AddDependencies without reconciliation: %v", err)
+		}
+	}
+	addWithoutReconcile(publicops.DependencyEdge{IssueID: grandchild.ID, DependsOnID: childA.ID, Type: publicops.DepParentChild})
+	add(
+		publicops.DependencyEdge{IssueID: childA.ID, DependsOnID: epic.ID, Type: publicops.DepParentChild},
+		publicops.DependencyEdge{IssueID: childB.ID, DependsOnID: epic.ID, Type: publicops.DepParentChild},
+	)
+
+	assertLabels := func(id string, want []string) {
+		t.Helper()
+		got, err := store.GetLabels(ctx, id)
+		if err != nil {
+			t.Fatalf("GetLabels(%s): %v", id, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("labels(%s) = %v, want %v", id, got, want)
+		}
+	}
+	assertLabels(epic.ID, []string{"ctx:a", "ctx:z", "ordinary"})
+
+	// Re-adding is idempotent and re-derives the same direct-child union. A
+	// duplicate direct-child context is materialized once, and the grandchild's
+	// context never reaches the epic.
+	add(publicops.DependencyEdge{IssueID: childA.ID, DependsOnID: epic.ID, Type: publicops.DepParentChild})
+	assertLabels(epic.ID, []string{"ctx:a", "ctx:z", "ordinary"})
+	add(publicops.DependencyEdge{IssueID: childDuplicate.ID, DependsOnID: epic.ID, Type: publicops.DepParentChild})
+	assertLabels(epic.ID, []string{"ctx:a", "ctx:z", "ordinary"})
+
+	if _, err := editor.RemoveDependency(ctx, publicops.RemoveDependencyRequest{
+		Actor: "writer", IssueID: childA.ID, DependsOnID: epic.ID, ReconcileEpicContexts: true,
+	}); err != nil {
+		t.Fatalf("RemoveDependency child A: %v", err)
+	}
+	assertLabels(epic.ID, []string{"ctx:a", "ordinary"})
+	if _, err := editor.RemoveDependency(ctx, publicops.RemoveDependencyRequest{
+		Actor: "writer", IssueID: childB.ID, DependsOnID: epic.ID, ReconcileEpicContexts: true,
+	}); err != nil {
+		t.Fatalf("RemoveDependency first duplicate-context child: %v", err)
+	}
+	assertLabels(epic.ID, []string{"ctx:a", "ordinary"})
+	if _, err := editor.RemoveDependency(ctx, publicops.RemoveDependencyRequest{
+		Actor: "writer", IssueID: childB.ID, DependsOnID: epic.ID, ReconcileEpicContexts: true,
+	}); err != nil {
+		t.Fatalf("idempotent RemoveDependency first duplicate-context child: %v", err)
+	}
+	assertLabels(epic.ID, []string{"ctx:a", "ordinary"})
+	if _, err := editor.RemoveDependency(ctx, publicops.RemoveDependencyRequest{
+		Actor: "writer", IssueID: childDuplicate.ID, DependsOnID: epic.ID, ReconcileEpicContexts: true,
+	}); err != nil {
+		t.Fatalf("RemoveDependency final duplicate-context child: %v", err)
+	}
+	assertLabels(epic.ID, []string{"ordinary"})
+
+	before, err := store.GetDependencyRecords(ctx, invalid.ID)
+	if err != nil {
+		t.Fatalf("GetDependencyRecords before rollback: %v", err)
+	}
+	_, err = editor.AddDependencies(ctx, publicops.AddDependenciesRequest{
+		Actor: "writer", Edges: []publicops.DependencyEdge{{IssueID: invalid.ID, DependsOnID: epic.ID, Type: publicops.DepParentChild}}, ReconcileEpicContexts: true,
+	})
+	if !errors.Is(err, storage.ErrValidation) {
+		t.Fatalf("invalid child add error = %v, want validation error", err)
+	}
+	after, err := store.GetDependencyRecords(ctx, invalid.ID)
+	if err != nil {
+		t.Fatalf("GetDependencyRecords after rollback: %v", err)
+	}
+	if len(before) != len(after) {
+		t.Fatalf("invalid child edge count = %d, want rollback to %d", len(after), len(before))
+	}
+	assertLabels(epic.ID, []string{"ordinary"})
+}
+
+type failEpicContextLabelInsertTx struct {
+	*sql.Tx
+}
+
+func (tx *failEpicContextLabelInsertTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if strings.Contains(query, "INSERT IGNORE INTO labels") {
+		return nil, errors.New("injected epic context label write failure")
+	}
+	return tx.Tx.ExecContext(ctx, query, args...)
+}
+
+func TestDoltDependencyEditorReconciliationRollsBackOnLabelWriteFailure(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	epic := &types.Issue{ID: "test-context-failure-epic", Title: "epic", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeEpic}
+	child := &types.Issue{ID: "test-context-failure-child", Title: "child", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+	if err := store.CreateIssues(ctx, []*types.Issue{epic, child}, "seed"); err != nil {
+		t.Fatalf("CreateIssues: %v", err)
+	}
+	for id, label := range map[string]string{epic.ID: "ctx:stale", child.ID: "ctx:one"} {
+		if err := store.AddLabel(ctx, id, label, "seed"); err != nil {
+			t.Fatalf("AddLabel(%s): %v", id, err)
+		}
+	}
+	if err := store.AddLabel(ctx, epic.ID, "ordinary", "seed"); err != nil {
+		t.Fatalf("AddLabel(%s): %v", epic.ID, err)
+	}
+
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO dependencies (id, issue_id, depends_on_issue_id, type, created_at, created_by)
+		VALUES (UUID(), ?, ?, ?, NOW(), ?)`, child.ID, epic.ID, types.DepParentChild, "writer")
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("seed edge in transaction: %v", err)
+	}
+	_, err = storageissueops.ReconcileEpicContextsInTx(ctx, &failEpicContextLabelInsertTx{Tx: tx}, epic.ID, "writer")
+	if err == nil || !strings.Contains(err.Error(), "injected epic context label write failure") {
+		_ = tx.Rollback()
+		t.Fatalf("reconcile error = %v, want injected label write failure", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+
+	deps, err := store.GetDependencyRecords(ctx, child.ID)
+	if err != nil {
+		t.Fatalf("GetDependencyRecords after rollback: %v", err)
+	}
+	if len(deps) != 0 {
+		t.Fatalf("dependency count after rollback = %d, want 0", len(deps))
+	}
+	labels, err := store.GetLabels(ctx, epic.ID)
+	if err != nil {
+		t.Fatalf("GetLabels after rollback: %v", err)
+	}
+	if want := []string{"ctx:stale", "ordinary"}; !reflect.DeepEqual(labels, want) {
+		t.Fatalf("epic labels after rollback = %v, want %v", labels, want)
+	}
+}
 
 // What is left here is the DependencyEditor's PERSISTENCE tier: how a history
 // entry lands and what it says. The role's semantics — result shape,

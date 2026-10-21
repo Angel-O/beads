@@ -3,7 +3,10 @@ package issueops
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/domain"
@@ -139,6 +142,27 @@ func ExecuteAddDependencies(ctx context.Context, tx *sql.Tx, request publicops.A
 	if err := checkAddedEdgesForCycles(ctx, tx, request.Edges); err != nil {
 		return publicops.AddDependenciesResult{}, nil, err
 	}
+	if request.ReconcileEpicContexts {
+		parents := make(map[string]struct{})
+		for _, edge := range request.Edges {
+			if edge.Type != types.DepParentChild {
+				return publicops.AddDependenciesResult{}, nil, fmt.Errorf("%w: epic context reconciliation requires parent-child edges", storage.ErrValidation)
+			}
+			parents[edge.DependsOnID] = struct{}{}
+		}
+		parentIDs := make([]string, 0, len(parents))
+		for parentID := range parents {
+			parentIDs = append(parentIDs, parentID)
+		}
+		sort.Strings(parentIDs)
+		for _, parentID := range parentIDs {
+			reconciled, err := ReconcileEpicContextsInTx(ctx, tx, parentID, request.Actor)
+			if err != nil {
+				return publicops.AddDependenciesResult{}, nil, err
+			}
+			tables.Merge(reconciled)
+		}
+	}
 	added := make([]publicops.DependencyEdge, len(request.Edges))
 	copy(added, request.Edges)
 	return publicops.AddDependenciesResult{Added: added}, tables, nil
@@ -240,6 +264,11 @@ func checkAddedEdgesForCycles(ctx context.Context, tx *sql.Tx, edges []publicops
 // the graph it already had, and a history entry for it would be a commit with
 // nothing in it.
 func ExecuteRemoveDependency(ctx context.Context, tx *sql.Tx, request publicops.RemoveDependencyRequest) (publicops.RemoveDependencyResult, ChangedTables, error) {
+	if request.ReconcileEpicContexts {
+		if err := ValidateEpicContextRemovalInTx(ctx, tx, request); err != nil {
+			return publicops.RemoveDependencyResult{}, nil, err
+		}
+	}
 	// Routing is READ here rather than pinned, unlike the add. A removal
 	// cannot put an edge anywhere, so pinning it would only mean failing to
 	// remove an edge the caller named — and the staging has to name the tables
@@ -256,9 +285,150 @@ func ExecuteRemoveDependency(ctx context.Context, tx *sql.Tx, request publicops.
 		return publicops.RemoveDependencyResult{}, nil, err
 	}
 	if !eventWritten {
-		return publicops.RemoveDependencyResult{Removed: false}, nil, nil
+		if !request.ReconcileEpicContexts {
+			return publicops.RemoveDependencyResult{Removed: false}, nil, nil
+		}
+		tables, err := ReconcileEpicContextsInTx(ctx, tx, request.DependsOnID, request.Actor)
+		if err != nil {
+			return publicops.RemoveDependencyResult{}, nil, err
+		}
+		return publicops.RemoveDependencyResult{Removed: false}, tables, nil
 	}
 	tables := ChangedTables{}
 	tables.Add(depTable, eventTable)
+	if request.ReconcileEpicContexts {
+		reconciled, err := ReconcileEpicContextsInTx(ctx, tx, request.DependsOnID, request.Actor)
+		if err != nil {
+			return publicops.RemoveDependencyResult{}, nil, err
+		}
+		tables.Merge(reconciled)
+	}
 	return publicops.RemoveDependencyResult{Removed: true}, tables, nil
+}
+
+const epicContextLabelPrefix = "ctx:"
+
+// ReconcileEpicContextsInTx makes one epic's reserved context labels equal the
+// contexts on its direct parent-child children. Ordinary labels are untouched.
+// The caller owns the surrounding transaction, so a rejected child or label
+// write rolls the relationship mutation back with the derived state.
+func ReconcileEpicContextsInTx(ctx context.Context, tx DBTX, epicID, actor string) (ChangedTables, error) {
+	if err := validateEpicTargetInTx(ctx, tx, epicID); err != nil {
+		return nil, err
+	}
+	children, err := GetEpicChildrenInTx(ctx, tx, epicID)
+	if err != nil {
+		return nil, fmt.Errorf("reconcile epic contexts: read children: %w", err)
+	}
+	childIDs := make([]string, 0, len(children))
+	for _, child := range children {
+		childIDs = append(childIDs, child.ID)
+	}
+	labelsByChild, err := GetLabelsForIssuesInTx(ctx, tx, childIDs)
+	if err != nil {
+		return nil, fmt.Errorf("reconcile epic contexts: read child labels: %w", err)
+	}
+
+	contexts := make(map[string]struct{}, len(childIDs))
+	for _, child := range children {
+		if !eligibleEpicContextChildType(child.IssueType) {
+			return nil, fmt.Errorf("%w: child %s has ineligible issue type %q", storage.ErrValidation, child.ID, child.IssueType)
+		}
+		var contextLabel string
+		for _, label := range labelsByChild[child.ID] {
+			if strings.HasPrefix(label, epicContextLabelPrefix) {
+				if len(label) == len(epicContextLabelPrefix) || contextLabel != "" {
+					return nil, fmt.Errorf("%w: child %s must have exactly one valid context label", storage.ErrValidation, child.ID)
+				}
+				contextLabel = label
+			}
+		}
+		if contextLabel == "" {
+			return nil, fmt.Errorf("%w: child %s must have exactly one valid context label", storage.ErrValidation, child.ID)
+		}
+		contexts[contextLabel] = struct{}{}
+	}
+
+	derived := make([]string, 0, len(contexts))
+	for label := range contexts {
+		derived = append(derived, label)
+	}
+	sort.Strings(derived)
+	current, err := GetLabelsInTx(ctx, tx, "labels", epicID)
+	if err != nil {
+		return nil, fmt.Errorf("reconcile epic contexts: read epic labels: %w", err)
+	}
+	desired := make(map[string]struct{}, len(derived))
+	for _, label := range derived {
+		desired[label] = struct{}{}
+	}
+	tables := ChangedTables{}
+	for _, label := range current {
+		if strings.HasPrefix(label, epicContextLabelPrefix) {
+			if _, ok := desired[label]; !ok {
+				if err := RemoveLabelInTx(ctx, tx, "labels", "events", epicID, label, actor); err != nil {
+					return nil, fmt.Errorf("reconcile epic contexts: remove %s: %w", label, err)
+				}
+				tables.Add("labels", "events")
+			}
+		}
+	}
+	currentSet := make(map[string]struct{}, len(current))
+	for _, label := range current {
+		currentSet[label] = struct{}{}
+	}
+	for _, label := range derived {
+		if _, ok := currentSet[label]; !ok {
+			if err := AddLabelInTx(ctx, tx, "labels", "events", epicID, label, actor); err != nil {
+				return nil, fmt.Errorf("reconcile epic contexts: add %s: %w", label, err)
+			}
+			tables.Add("labels", "events")
+		}
+	}
+	return tables, nil
+}
+
+// eligibleEpicContextChildType is the established concrete-child rule: only
+// ordinary work beads may supply a context to an epic.
+func eligibleEpicContextChildType(issueType types.IssueType) bool {
+	switch issueType {
+	case types.TypeBug, types.TypeFeature, types.TypeTask, types.TypeChore, types.TypeDecision:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateEpicTargetInTx(ctx context.Context, tx DBTX, epicID string) error {
+	var issueType string
+	if err := tx.QueryRowContext(ctx, "SELECT issue_type FROM issues WHERE id = ?", epicID).Scan(&issueType); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: epic %s", storage.ErrValidation, epicID)
+		}
+		return fmt.Errorf("validate epic context target: %w", err)
+	}
+	if types.IssueType(issueType) != types.TypeEpic {
+		return fmt.Errorf("%w: context reconciliation requires an epic parent", storage.ErrValidation)
+	}
+	return nil
+}
+
+// ValidateEpicContextRemovalInTx checks the target and any existing edge before
+// a transactional removal is applied. Missing edges remain idempotent.
+func ValidateEpicContextRemovalInTx(ctx context.Context, tx DBTX, request publicops.RemoveDependencyRequest) error {
+	if err := validateEpicTargetInTx(ctx, tx, request.DependsOnID); err != nil {
+		return err
+	}
+	sourceIsWisp := IsActiveWispInTx(ctx, tx, request.IssueID)
+	_, _, _, depTable := WispTableRouting(sourceIsWisp)
+	var depType string
+	//nolint:gosec // depTable is selected by WispTableRouting.
+	err := tx.QueryRowContext(ctx, fmt.Sprintf("SELECT type FROM %s WHERE issue_id = ? AND %s", depTable, depTargetEquals("")), request.IssueID, request.DependsOnID).Scan(&depType)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("validate epic context removal: %w", err)
+	}
+	if err == nil && types.DependencyType(depType) != types.DepParentChild {
+		return fmt.Errorf("%w: context reconciliation requires a parent-child edge", storage.ErrValidation)
+	}
+	return nil
 }
