@@ -70,7 +70,7 @@ func proxiedEdgeReader() (issueops.EdgeReader, error) {
 // edge on either route — it turns off the whole-graph sweep this command
 // prints warnings from. Only the bulk path trades the per-edge probe away, and
 // only because it always has.
-func addDependencyEdgesProxied(ctx context.Context, edges []issueops.DependencyEdge, skipPerEdgeCycleCheck bool) error {
+func addDependencyEdgesProxied(ctx context.Context, edges []issueops.DependencyEdge, skipPerEdgeCycleCheck, reconcileEpicContexts bool) error {
 	editor, err := proxiedDependencyEditor()
 	if err != nil {
 		return err
@@ -79,6 +79,7 @@ func addDependencyEdgesProxied(ctx context.Context, edges []issueops.DependencyE
 		Actor:                 actor,
 		Edges:                 edges,
 		SkipPerEdgeCycleCheck: skipPerEdgeCycleCheck,
+		ReconcileEpicContexts: reconcileEpicContexts,
 	})
 	return err
 }
@@ -167,7 +168,7 @@ func runDepBlocksProxiedServer(cmd *cobra.Command, ctx context.Context, blockerI
 	noCycleCheck, _ := cmd.Flags().GetBool("no-cycle-check")
 
 	edge := issueops.DependencyEdge{IssueID: blockedID, DependsOnID: blockerID, Type: types.DepBlocks}
-	if err := addDependencyEdgesProxied(ctx, []issueops.DependencyEdge{edge}, false); err != nil {
+	if err := addDependencyEdgesProxied(ctx, []issueops.DependencyEdge{edge}, false, false); err != nil {
 		return HandleErrorRespectJSON("%v", err)
 	}
 	res := depEdgeFeedback(ctx, blockedID, blockerID, !noCycleCheck)
@@ -234,9 +235,10 @@ func runDepAddProxiedServer(cmd *cobra.Command, ctx context.Context, args []stri
 	}
 
 	noCycleCheck, _ := cmd.Flags().GetBool("no-cycle-check")
+	reconcileEpicContexts, _ := cmd.Flags().GetBool("reconcile-epic-contexts")
 
 	edge := issueops.DependencyEdge{IssueID: fromID, DependsOnID: toID, Type: dt}
-	if err := addDependencyEdgesProxied(ctx, []issueops.DependencyEdge{edge}, false); err != nil {
+	if err := addDependencyEdgesProxied(ctx, []issueops.DependencyEdge{edge}, false, reconcileEpicContexts); err != nil {
 		return HandleErrorRespectJSON("%v", err)
 	}
 	res := depEdgeFeedback(ctx, fromID, toID, !noCycleCheck)
@@ -293,8 +295,9 @@ func runDepAddBulkProxied(cmd *cobra.Command, ctx context.Context, file, default
 	}
 
 	noCycleCheck, _ := cmd.Flags().GetBool("no-cycle-check")
+	reconcileEpicContexts, _ := cmd.Flags().GetBool("reconcile-epic-contexts")
 
-	if err := addDependencyEdgesProxied(ctx, depEdges, noCycleCheck); err != nil {
+	if err := addDependencyEdgesProxied(ctx, depEdges, noCycleCheck, reconcileEpicContexts); err != nil {
 		return HandleErrorRespectJSON("%v", err)
 	}
 	res := depEdgeFeedback(ctx, "", "", !noCycleCheck)
@@ -332,7 +335,7 @@ func runDepAddBulkProxied(cmd *cobra.Command, ctx context.Context, file, default
 	return nil
 }
 
-func runDepRemoveProxiedServer(_ *cobra.Command, ctx context.Context, args []string) error {
+func runDepRemoveProxiedServer(cmd *cobra.Command, ctx context.Context, args []string) error {
 	fromID := args[0]
 	toID := args[1]
 	if strings.HasPrefix(toID, "external:") {
@@ -348,10 +351,12 @@ func runDepRemoveProxiedServer(_ *cobra.Command, ctx context.Context, args []str
 	// The role's Removed verdict is not printed. `bd dep remove` has always
 	// confirmed the same way whether or not an edge was there, and reporting
 	// the difference now would change what every existing script reads.
+	reconcileEpicContexts, _ := cmd.Flags().GetBool("reconcile-epic-contexts")
 	if _, err := editor.RemoveDependency(ctx, issueops.RemoveDependencyRequest{
-		Actor:       actor,
-		IssueID:     fromID,
-		DependsOnID: toID,
+		Actor:                 actor,
+		IssueID:               fromID,
+		DependsOnID:           toID,
+		ReconcileEpicContexts: reconcileEpicContexts,
 	}); err != nil {
 		return HandleErrorRespectJSON("%v", err)
 	}

@@ -3,7 +3,9 @@ package uow
 import (
 	"context"
 	"fmt"
+	"sort"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/domain"
 	storageissueops "github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
@@ -69,6 +71,29 @@ func (e *dependencyEditor) AddDependencies(ctx context.Context, request publicop
 		}); err != nil {
 			return publicops.AddDependenciesResult{}, "", err
 		}
+		if request.ReconcileEpicContexts {
+			runner, ok := unitOfWorkDBTX(uw)
+			if !ok {
+				return publicops.AddDependenciesResult{}, "", fmt.Errorf("epic context reconciliation is unavailable for this unit of work")
+			}
+			parents := make(map[string]struct{})
+			for _, edge := range request.Edges {
+				if edge.Type != publicops.DepParentChild {
+					return publicops.AddDependenciesResult{}, "", fmt.Errorf("%w: epic context reconciliation requires parent-child edges", storage.ErrValidation)
+				}
+				parents[edge.DependsOnID] = struct{}{}
+			}
+			parentIDs := make([]string, 0, len(parents))
+			for parentID := range parents {
+				parentIDs = append(parentIDs, parentID)
+			}
+			sort.Strings(parentIDs)
+			for _, parentID := range parentIDs {
+				if _, err := storageissueops.ReconcileEpicContextsInTx(ctx, runner, parentID, request.Actor); err != nil {
+					return publicops.AddDependenciesResult{}, "", err
+				}
+			}
+		}
 		return publicops.AddDependenciesResult{Added: added},
 			storageissueops.AddDependenciesCommitMessage(request), nil
 	})
@@ -90,19 +115,60 @@ func (e *dependencyEditor) RemoveDependency(ctx context.Context, request publico
 		return publicops.RemoveDependencyResult{}, err
 	}
 	return RunTxResult(ctx, e.provider, func(ctx context.Context, uw UnitOfWork) (publicops.RemoveDependencyResult, string, error) {
+		if request.ReconcileEpicContexts {
+			runner, ok := unitOfWorkDBTX(uw)
+			if !ok {
+				return publicops.RemoveDependencyResult{}, "", fmt.Errorf("epic context reconciliation is unavailable for this unit of work")
+			}
+			if err := storageissueops.ValidateEpicContextRemovalInTx(ctx, runner, request); err != nil {
+				return publicops.RemoveDependencyResult{}, "", err
+			}
+		}
 		removed, err := uw.DependencyUseCase().RemoveDependencyBySource(ctx, request.IssueID, request.DependsOnID, request.Actor)
 		if err != nil {
 			return publicops.RemoveDependencyResult{}, "", err
 		}
 		if !removed {
+			commitMessage := ""
+			if request.ReconcileEpicContexts {
+				runner, _ := unitOfWorkDBTX(uw)
+				tables, err := storageissueops.ReconcileEpicContextsInTx(ctx, runner, request.DependsOnID, request.Actor)
+				if err != nil {
+					return publicops.RemoveDependencyResult{}, "", err
+				}
+				if len(tables) > 0 {
+					commitMessage = storageissueops.RemoveDependencyCommitMessage(request.IssueID, request.DependsOnID)
+				}
+			}
 			// Nothing to write, so nothing to version: an empty commit message
-			// is how RunTxResult is told to commit nothing.
-			return publicops.RemoveDependencyResult{Removed: false}, "", nil
+			// is how RunTxResult is told to commit nothing. A repair that changed
+			// labels needs the same transaction committed.
+			return publicops.RemoveDependencyResult{Removed: false}, commitMessage, nil
 		}
 		// A wisp-plane removal touched no versioned table, so the commit this
 		// asks for finds nothing to commit and RunTxResult absorbs that — the
 		// same way the all-ephemeral add records no history entry.
+		if request.ReconcileEpicContexts {
+			runner, _ := unitOfWorkDBTX(uw)
+			if _, err := storageissueops.ReconcileEpicContextsInTx(ctx, runner, request.DependsOnID, request.Actor); err != nil {
+				return publicops.RemoveDependencyResult{}, "", err
+			}
+		}
 		return publicops.RemoveDependencyResult{Removed: true},
 			storageissueops.RemoveDependencyCommitMessage(request.IssueID, request.DependsOnID), nil
 	})
+}
+
+func unitOfWorkDBTX(uw UnitOfWork) (storageissueops.DBTX, bool) {
+	for uw != nil {
+		if provider, ok := uw.(interface{ DBTX() storageissueops.DBTX }); ok {
+			return provider.DBTX(), true
+		}
+		unwrapper, ok := uw.(interface{ Unwrap() UnitOfWork })
+		if !ok {
+			return nil, false
+		}
+		uw = unwrapper.Unwrap()
+	}
+	return nil, false
 }

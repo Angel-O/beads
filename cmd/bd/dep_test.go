@@ -474,6 +474,12 @@ func TestDepAddFlagAliases(t *testing.T) {
 	if !strings.Contains(longDesc, "--file") {
 		t.Error("Expected Long description to mention --file flag")
 	}
+	if flag := depAddCmd.Flags().Lookup("reconcile-epic-contexts"); flag == nil || flag.DefValue != "false" {
+		t.Fatal("depAddCmd should expose --reconcile-epic-contexts=false")
+	}
+	if flag := depRemoveCmd.Flags().Lookup("reconcile-epic-contexts"); flag == nil || flag.DefValue != "false" {
+		t.Fatal("depRemoveCmd should expose --reconcile-epic-contexts=false")
+	}
 }
 
 func TestDepBlocksFlag(t *testing.T) {

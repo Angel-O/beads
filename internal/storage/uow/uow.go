@@ -5,6 +5,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/storage/domain/db"
+	storageissueops "github.com/steveyegge/beads/internal/storage/issueops"
 )
 
 type UnitOfWork interface {
@@ -52,6 +53,11 @@ type baseUOW struct {
 	eventsJournalUseCase domain.EventsJournalUseCase
 	scopeUseCase         domain.ScopeUseCase
 }
+
+// DBTX exposes the transaction runner to the few shared issueops bodies that
+// must run identically on the embedded and unit-of-work paths. It is intentionally
+// not part of UnitOfWork's public role surface.
+func (u *baseUOW) DBTX() storageissueops.DBTX { return u.tx.Runner() }
 
 func (u *baseUOW) Commit(ctx context.Context, message string) error {
 	return u.tx.Commit(ctx, message)

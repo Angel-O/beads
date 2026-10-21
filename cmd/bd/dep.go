@@ -31,7 +31,7 @@ import (
 // skipPerEdgeCycleCheck is a separate argument from the --no-cycle-check flag
 // for the reason the proxied twin states: only the bulk path trades the
 // per-edge probe away.
-func addDependencyEdgesDirect(ctx context.Context, st storage.DoltStorage, edges []issueops.DependencyEdge, skipPerEdgeCycleCheck bool) error {
+func addDependencyEdgesDirect(ctx context.Context, st storage.DoltStorage, edges []issueops.DependencyEdge, skipPerEdgeCycleCheck, reconcileEpicContexts bool) error {
 	editor, err := st.DependencyEditor()
 	if err != nil {
 		return err
@@ -40,6 +40,7 @@ func addDependencyEdgesDirect(ctx context.Context, st storage.DoltStorage, edges
 		Actor:                 actor,
 		Edges:                 edges,
 		SkipPerEdgeCycleCheck: skipPerEdgeCycleCheck,
+		ReconcileEpicContexts: reconcileEpicContexts,
 	})
 	return err
 }
@@ -215,7 +216,7 @@ Examples:
 				return HandleErrorRespectJSON("%v", err)
 			}
 			edge := issueops.DependencyEdge{IssueID: fromID, DependsOnID: toID, Type: types.DependencyType(depType)}
-			if err := addDependencyEdgesDirect(opsCtx, fromStore, []issueops.DependencyEdge{edge}, false); err != nil {
+			if err := addDependencyEdgesDirect(opsCtx, fromStore, []issueops.DependencyEdge{edge}, false, false); err != nil {
 				return HandleErrorRespectJSON("%v", err)
 			}
 
@@ -337,6 +338,7 @@ Examples:
 
 		depType, _ := cmd.Flags().GetString("type")
 		file, _ := cmd.Flags().GetString("file")
+		reconcileEpicContexts, _ := cmd.Flags().GetBool("reconcile-epic-contexts")
 
 		if file != "" {
 			if err := addBulkDependencies(cmd, file, depType); err != nil {
@@ -408,7 +410,7 @@ Examples:
 			return HandleErrorRespectJSON("%v", err)
 		}
 		edge := issueops.DependencyEdge{IssueID: fromID, DependsOnID: toID, Type: dt}
-		if err := addDependencyEdgesDirect(opsCtx, fromStore, []issueops.DependencyEdge{edge}, false); err != nil {
+		if err := addDependencyEdgesDirect(opsCtx, fromStore, []issueops.DependencyEdge{edge}, false, reconcileEpicContexts); err != nil {
 			return HandleErrorRespectJSON("%v", err)
 		}
 
@@ -563,7 +565,8 @@ func addBulkDependencies(cmd *cobra.Command, file string, defaultType string) er
 	if err != nil {
 		return err
 	}
-	if err := addDependencyEdgesDirect(opsCtx, targetStore, depEdges, noCycleCheck); err != nil {
+	reconcileEpicContexts, _ := cmd.Flags().GetBool("reconcile-epic-contexts")
+	if err := addDependencyEdgesDirect(opsCtx, targetStore, depEdges, noCycleCheck, reconcileEpicContexts); err != nil {
 		return err
 	}
 
@@ -1169,10 +1172,12 @@ var depRemoveCmd = &cobra.Command{
 		if err != nil {
 			return HandleErrorRespectJSON("%v", err)
 		}
+		reconcileEpicContexts, _ := cmd.Flags().GetBool("reconcile-epic-contexts")
 		if _, err := editor.RemoveDependency(opsCtx, issueops.RemoveDependencyRequest{
-			Actor:       actor,
-			IssueID:     fullFromID,
-			DependsOnID: fullToID,
+			Actor:                 actor,
+			IssueID:               fullFromID,
+			DependsOnID:           fullToID,
+			ReconcileEpicContexts: reconcileEpicContexts,
 		}); err != nil {
 			return HandleErrorRespectJSON("%v", err)
 		}
@@ -1536,6 +1541,8 @@ func init() {
 	depAddCmd.Flags().String("depends-on", "", "Issue ID that the first issue depends on (alias for --blocked-by)")
 	depAddCmd.Flags().String("file", "", "Read dependency edges from JSONL file, or '-' for stdin")
 	depAddCmd.Flags().Bool("no-cycle-check", false, "Skip per-edge cycle checks for speed (bulk wiring); bulk --file adds still run one final whole-graph check before commit")
+	depAddCmd.Flags().Bool("reconcile-epic-contexts", false, "Atomically reconcile an epic's ctx: labels for parent-child edges")
+	depRemoveCmd.Flags().Bool("reconcile-epic-contexts", false, "Atomically reconcile an epic's ctx: labels for a parent-child edge")
 
 	// DEPRECATED NO-OP, and it always was one: nothing has ever read this flag,
 	// so a diamond has always been rendered under one parent only. The role's

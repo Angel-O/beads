@@ -69,6 +69,9 @@ type AddDependenciesRequest struct {
 	// self-dependency refusal: an edge that points an issue at itself is
 	// refused with or without it.
 	SkipPerEdgeCycleCheck bool
+	// ReconcileEpicContexts atomically derives the reserved ctx: labels for
+	// eligible epic parent-child edges. It is rejected for other edge shapes.
+	ReconcileEpicContexts bool
 }
 
 // AddDependenciesResult reports the edges that landed.
@@ -90,6 +93,9 @@ type RemoveDependencyRequest struct {
 	// IssueID and DependsOnID name the edge exactly. Neither may be empty.
 	IssueID     string
 	DependsOnID string
+	// ReconcileEpicContexts atomically derives the reserved ctx: labels for an
+	// epic parent-child removal. It is rejected for other edge shapes.
+	ReconcileEpicContexts bool
 }
 
 // RemoveDependencyResult reports what the removal found.
