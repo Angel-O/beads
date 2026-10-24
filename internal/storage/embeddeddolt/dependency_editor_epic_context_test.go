@@ -61,3 +61,39 @@ func TestEmbeddedDependencyEditorReconcilesEpicContexts(t *testing.T) {
 		t.Fatalf("epic labels after remove = %v, want %v", labels, want)
 	}
 }
+
+func TestEmbeddedIssueLifecycleReplacesContextAndReconcilesParent(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	te := newTestEnv(t, "context-replacement")
+	ctx := t.Context()
+	ep := &types.Issue{ID: "embedded-replace-epic", Title: "epic", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeEpic, Labels: []string{"ctx:old", "ordinary"}}
+	child := &types.Issue{ID: "embedded-replace-child", Title: "child", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask, Labels: []string{"ctx:one"}}
+	if err := te.store.CreateIssues(ctx, []*types.Issue{ep, child}, "seed"); err != nil {
+		t.Fatalf("CreateIssues: %v", err)
+	}
+	if err := te.store.AddDependency(ctx, &types.Dependency{IssueID: child.ID, DependsOnID: ep.ID, Type: types.DepParentChild}, "seed"); err != nil {
+		t.Fatalf("AddDependency: %v", err)
+	}
+	lifecycle, err := te.store.IssueLifecycle()
+	if err != nil {
+		t.Fatalf("IssueLifecycle: %v", err)
+	}
+	if _, err := lifecycle.Update(ctx, publicops.UpdateRequest{
+		Actor: "writer", IssueID: child.ID,
+		Patch: publicops.IssuePatch{Contexts: publicops.Field[[]string]{Set: true, Value: []string{"two"}}},
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	for id, want := range map[string][]string{
+		child.ID: {"ctx:two"},
+		ep.ID:    {"ctx:two", "ordinary"},
+	} {
+		labels, err := te.store.GetLabels(ctx, id)
+		if err != nil {
+			t.Fatalf("GetLabels(%s): %v", id, err)
+		}
+		if !reflect.DeepEqual(labels, want) {
+			t.Fatalf("labels(%s) = %v, want %v", id, labels, want)
+		}
+	}
+}

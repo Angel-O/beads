@@ -77,6 +77,12 @@ func ValidateUpdateRequest(request publicops.UpdateRequest) error {
 		return fmt.Errorf("%w: invalid forced assignee transfer", storage.ErrValidation)
 	}
 	patch := request.Patch
+	if patch.Contexts.Set && (len(patch.Labels.Add) > 0 || len(patch.Labels.Remove) > 0 || patch.Labels.Replace.Set) {
+		return fmt.Errorf("%w: context replacement cannot be combined with generic label edits", storage.ErrValidation)
+	}
+	if patch.Contexts.Set && patch.ParentID.Set {
+		return fmt.Errorf("%w: context replacement cannot be combined with parent replacement", storage.ErrValidation)
+	}
 	if patch.Title.Set {
 		if err := types.ValidateIssueTitle(patch.Title.Value); err != nil {
 			return fmt.Errorf("%w: update title: %w", storage.ErrValidation, err)

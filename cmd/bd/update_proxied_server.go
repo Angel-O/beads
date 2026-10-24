@@ -291,6 +291,9 @@ func proxiedUpdatePatch(in *updateInput, before *types.Issue) (issueops.IssuePat
 	if in.setLabels != nil {
 		patch.Labels.Replace = setField(*in.setLabels)
 	}
+	if in.contextsSet {
+		patch.Contexts = setField(in.contexts)
+	}
 	if in.reparent != nil {
 		patch.ParentID = setField(*in.reparent)
 	}

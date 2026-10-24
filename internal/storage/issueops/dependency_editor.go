@@ -331,22 +331,19 @@ func ReconcileEpicContextsInTx(ctx context.Context, tx DBTX, epicID, actor strin
 
 	contexts := make(map[string]struct{}, len(childIDs))
 	for _, child := range children {
-		if !eligibleEpicContextChildType(child.IssueType) {
-			return nil, fmt.Errorf("%w: child %s has ineligible issue type %q", storage.ErrValidation, child.ID, child.IssueType)
-		}
-		var contextLabel string
+		contextCount := 0
 		for _, label := range labelsByChild[child.ID] {
 			if strings.HasPrefix(label, epicContextLabelPrefix) {
-				if len(label) == len(epicContextLabelPrefix) || contextLabel != "" {
-					return nil, fmt.Errorf("%w: child %s must have exactly one valid context label", storage.ErrValidation, child.ID)
+				if len(label) == len(epicContextLabelPrefix) {
+					return nil, fmt.Errorf("%w: child %s has an empty context label", storage.ErrValidation, child.ID)
 				}
-				contextLabel = label
+				contextCount++
+				contexts[label] = struct{}{}
 			}
 		}
-		if contextLabel == "" {
+		if child.IssueType != todoIssueType && contextCount != 1 {
 			return nil, fmt.Errorf("%w: child %s must have exactly one valid context label", storage.ErrValidation, child.ID)
 		}
-		contexts[contextLabel] = struct{}{}
 	}
 
 	derived := make([]string, 0, len(contexts))
@@ -386,17 +383,6 @@ func ReconcileEpicContextsInTx(ctx context.Context, tx DBTX, epicID, actor strin
 		}
 	}
 	return tables, nil
-}
-
-// eligibleEpicContextChildType is the established concrete-child rule: only
-// ordinary work beads may supply a context to an epic.
-func eligibleEpicContextChildType(issueType types.IssueType) bool {
-	switch issueType {
-	case types.TypeBug, types.TypeFeature, types.TypeTask, types.TypeChore, types.TypeDecision:
-		return true
-	default:
-		return false
-	}
 }
 
 func validateEpicTargetInTx(ctx context.Context, tx DBTX, epicID string) error {

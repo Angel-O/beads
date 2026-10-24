@@ -144,6 +144,11 @@ func ExecuteUpdate(ctx context.Context, tx *sql.Tx, request publicops.UpdateRequ
 	if err != nil {
 		return publicops.UpdateResult{}, nil, err
 	}
+	if attempt.Patch.Contexts.Set {
+		if err := ValidateContextReplacementTarget(before); err != nil {
+			return publicops.UpdateResult{}, nil, err
+		}
+	}
 	if attempt.ExpectedVersion != nil {
 		if err := CheckVersionInTx(ctx, tx, attempt.IssueID, *attempt.ExpectedVersion); err != nil {
 			return publicops.UpdateResult{}, nil, err
@@ -214,7 +219,19 @@ func ExecuteUpdate(ctx context.Context, tx *sql.Tx, request publicops.UpdateRequ
 			}
 		}
 	}
-	labelsChanged, err := ApplyLabelPatch(ctx, tx, current, attempt.Patch.Labels, attempt.Actor)
+	labelPatch := attempt.Patch.Labels
+	if attempt.Patch.Contexts.Set {
+		contextIssue := *current
+		if attempt.Patch.IssueType.Set {
+			contextIssue.IssueType = attempt.Patch.IssueType.Value
+		}
+		labels, err := ContextReplacementLabels(&contextIssue, attempt.Patch.Contexts.Value)
+		if err != nil {
+			return publicops.UpdateResult{}, nil, err
+		}
+		labelPatch.Replace = publicops.Field[[]string]{Set: true, Value: labels}
+	}
+	labelsChanged, err := ApplyLabelPatch(ctx, tx, current, labelPatch, attempt.Actor)
 	if err != nil {
 		return publicops.UpdateResult{}, nil, err
 	}
@@ -234,6 +251,16 @@ func ExecuteUpdate(ctx context.Context, tx *sql.Tx, request publicops.UpdateRequ
 		if parentResult.IssueRowsChanged {
 			tables.Add("issues")
 		}
+	}
+	if attempt.Patch.Contexts.Set {
+		reconciled, err := ReconcileDirectEpicParentsInTx(ctx, tx, attempt.IssueID, attempt.Actor)
+		if err != nil {
+			return publicops.UpdateResult{}, nil, err
+		}
+		if len(reconciled) > 0 {
+			changedAny = true
+		}
+		tables.Merge(reconciled)
 	}
 	if attempt.Patch.Persistence.Set {
 		current, err := GetIssueInTx(ctx, tx, attempt.IssueID)

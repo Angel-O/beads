@@ -275,6 +275,21 @@ func (r *uowApplyRun) runUpdate(ctx context.Context, request publicops.UpdateReq
 	if err != nil {
 		return publicops.UpdateResult{}, err
 	}
+	if request.Patch.Contexts.Set {
+		if err := storageissueops.ValidateContextReplacementTarget(before); err != nil {
+			return publicops.UpdateResult{}, err
+		}
+		contextIssue := *before
+		if request.Patch.IssueType.Set {
+			contextIssue.IssueType = request.Patch.IssueType.Value
+		}
+		labels, err := storageissueops.ContextReplacementLabels(&contextIssue, request.Patch.Contexts.Value)
+		if err != nil {
+			return publicops.UpdateResult{}, err
+		}
+		labelsCopy := labels
+		spec.SetLabels = &labelsCopy
+	}
 	if updatePreconditionsHold(request, before) {
 		if err := authorizeAssigneeTransfer(ctx, r.uw, before, request); err != nil {
 			return publicops.UpdateResult{}, err
@@ -293,7 +308,19 @@ func (r *uowApplyRun) runUpdate(ctx context.Context, request publicops.UpdateReq
 	if err != nil {
 		return publicops.UpdateResult{}, err
 	}
-	return publicops.UpdateResult{Issue: issue, Changed: claimChanged || !semanticIssueEqual(before, issue)}, nil
+	changed := claimChanged || !semanticIssueEqual(before, issue)
+	if request.Patch.Contexts.Set {
+		runner, ok := unitOfWorkDBTX(r.uw)
+		if !ok {
+			return publicops.UpdateResult{}, fmt.Errorf("context replacement is unavailable for this unit of work")
+		}
+		reconciled, err := storageissueops.ReconcileDirectEpicParentsInTx(ctx, runner, request.IssueID, request.Actor)
+		if err != nil {
+			return publicops.UpdateResult{}, err
+		}
+		changed = changed || len(reconciled) > 0
+	}
+	return publicops.UpdateResult{Issue: issue, Changed: changed}, nil
 }
 
 // applyClose closes one row through the same use case the single close runs, so
