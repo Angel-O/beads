@@ -128,7 +128,9 @@ plane"), you MUST complete ALL steps below. Work is NOT complete until
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
 2. **Run quality gates** (if code changed):
    - `make ci-pr-lint` (required zero-finding formatting and lint wrapper)
-   - `make test` (and `make test-icu-path` only if you intentionally need the ICU regex path)
+   - Run focused tests for changed behavior and relevant integration checks for
+     affected boundaries, following [engdocs/TESTING.md](engdocs/TESTING.md).
+     Broad suites are CI-owned unless explicitly requested.
    - File a P0 issue if quality gates are broken
 3. **Update issue status** - Close finished work, update in-progress items
 4. **PUSH TO REMOTE** - This is MANDATORY:

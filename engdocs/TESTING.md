@@ -17,15 +17,16 @@ a unit test: use the real boundary when the defect could live there.
 
 | Need | Run | When |
 |---|---|---|
-| Docs-only validation | `git diff --check`, `go test -tags=gms_pure_go ./test/docsync`, and `./scripts/check-doc-freshness.sh` | For prose-only changes; add any generated-doc or surface-specific link check the changed paths require. Do not run the full Go suite merely because a Markdown file changed. |
-| Focused red/green loop | `./scripts/test.sh -run '^TestExactName$' ./path/to/package/...` | While writing or fixing one behavior. |
-| Affected-package confidence | `./scripts/test.sh ./path/to/package/...` | After the focused test passes; include directly affected neighbors when their contract changed. |
-| Final Go baseline | `make test` | Once after focused work on Go code is green. It applies the normal local build flags, coverage, and local skip handling. |
+| Docs-only validation | `git diff --check` plus applicable Markdown, link, generated-doc, or freshness checks | For prose-only changes. Do not run Go suites merely because a Markdown file changed. |
+| Focused red/green loop | `./scripts/test.sh -run '^TestExactName$' ./path/to/package/...` | While writing or fixing one behavior; select only tests that exercise the changed behavior. |
+| Affected-boundary confidence | Focused tests for the changed behavior and any relevant integration test for an affected boundary | Before handoff for Go changes. Include an integration check when it covers a distinct changed risk, not as a blanket package sweep. |
 | Named CI wrapper | `make ci-pr-core`, `make ci-pr-policy`, or `make ci-pr-lint` | Run the wrapper whose risk or surface is affected, or use it to reproduce that CI check. Do not run all three routinely for every edit. |
 
-Do not replace the focused loop with repeated full-suite runs. Run the final
-`make test` once the affected Go tests are green. For docs-only changes, use
-the docs, link, and diff checks instead.
+Use focused local checks for routine agent validation. Unfiltered `cmd/bd`
+tests, broad multi-package sweeps, and `make test` are reserved for CI or an
+explicit user request; they are not an automatic final step. Keep relevant
+integration checks when a changed boundary needs them. CI coverage remains
+authoritative for broad suites.
 
 ## Commands and Local Environment
 
@@ -42,7 +43,13 @@ TEST_RUN='^TestExactName$' ./scripts/test.sh ./cmd/bd/...
 # Equivalent command-line options.
 ./scripts/test.sh -v -run '^TestExactName$' ./cmd/bd/...
 ./scripts/test.sh -timeout 30m ./cmd/bd/...
+
+# Run one matching test in a narrowly selected package.
+./scripts/test.sh -run '^TestBulkHistoryInTxInputBounds$' ./internal/storage/issueops/...
 ```
+
+The `-run` selector limits which tests execute; Go may still compile test
+packages and perform runner setup for the selected package.
 
 Use the opt-in ICU regex path only when the change requires it:
 
@@ -182,8 +189,9 @@ Before opening a PR:
 
 1. For docs-only changes, run the applicable docs, link, freshness, and diff
    checks; do not run the full Go suite by default.
-2. For Go code, keep the focused and affected-package tests green, then run one
-   final `make test`.
+2. For Go code, run focused tests for the affected behavior and relevant
+   integration checks for changed boundaries. Broad suites remain CI-owned
+   unless the user explicitly requests them.
 3. Run only the named CI wrapper, specialized target, or risk gate required by
    the changed surface, or the one needed to reproduce a CI result.
 
