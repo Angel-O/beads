@@ -151,6 +151,15 @@ type IssuePatch struct {
 	// parent-child edges. A set nonempty value atomically replaces all parents
 	// with exactly that target and does not inherit labels.
 	ParentID Field[string]
+	// Contexts replaces the reserved context set without replacing ordinary
+	// labels. Values are context IDs; a leading "ctx:" is accepted for
+	// callers that already have the stored spelling. Todos may have zero or
+	// more contexts; every other non-epic issue requires exactly one. It cannot
+	// be combined with generic Labels edits or ParentID replacement. Before
+	// calling this field, callers must perform the external-history preflight and
+	// must not invoke context replacement for a Bead with any external-history
+	// correlation.
+	Contexts Field[[]string]
 	Labels   LabelPatch
 	Metadata MetadataPatch
 }

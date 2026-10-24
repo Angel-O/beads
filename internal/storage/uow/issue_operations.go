@@ -216,6 +216,21 @@ func (o *issueOperations) Update(ctx context.Context, request publicops.UpdateRe
 		if err != nil {
 			return publicops.UpdateResult{}, "", err
 		}
+		if attempt.Patch.Contexts.Set {
+			if err := storageissueops.ValidateContextReplacementTarget(before); err != nil {
+				return publicops.UpdateResult{}, "", err
+			}
+			contextIssue := *before
+			if attempt.Patch.IssueType.Set {
+				contextIssue.IssueType = attempt.Patch.IssueType.Value
+			}
+			labels, err := storageissueops.ContextReplacementLabels(&contextIssue, attempt.Patch.Contexts.Value)
+			if err != nil {
+				return publicops.UpdateResult{}, "", err
+			}
+			labelsCopy := labels
+			spec.SetLabels = &labelsCopy
+		}
 		// The assignee fence belongs here, over the same-transaction row the
 		// update is about to mutate, and not in ApplyUpdate: callers build their
 		// own UpdateSpec, which carries no override, so a fence down there
@@ -242,6 +257,17 @@ func (o *issueOperations) Update(ctx context.Context, request publicops.UpdateRe
 			return publicops.UpdateResult{}, "", err
 		}
 		changed := claimChanged || !semanticIssueEqual(before, issue)
+		if attempt.Patch.Contexts.Set {
+			runner, ok := unitOfWorkDBTX(uw)
+			if !ok {
+				return publicops.UpdateResult{}, "", fmt.Errorf("context replacement is unavailable for this unit of work")
+			}
+			reconciled, err := storageissueops.ReconcileDirectEpicParentsInTx(ctx, runner, attempt.IssueID, attempt.Actor)
+			if err != nil {
+				return publicops.UpdateResult{}, "", err
+			}
+			changed = changed || len(reconciled) > 0
+		}
 		return publicops.UpdateResult{Issue: issue, Changed: changed}, updateHistoryEntry(attempt, changed), nil
 	})
 }

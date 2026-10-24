@@ -267,6 +267,10 @@ pointless).`,
 			warnLabelsContainingWhitespace(set)
 			updates["set_labels"] = set
 		}
+		contexts, contextsSet, err := contextReplacementFlags(cmd)
+		if err != nil {
+			return err
+		}
 		if cmd.Flags().Changed("parent") {
 			parent, _ := cmd.Flags().GetString("parent")
 			updates["parent"] = parent
@@ -393,7 +397,7 @@ pointless).`,
 		// exclusive with --if-assignee at the flag-group level.
 		forceFlag, _ := cmd.Flags().GetBool("force")
 
-		if len(updates) == 0 && !claimFlag {
+		if len(updates) == 0 && !claimFlag && !contextsSet {
 			fmt.Println("No updates specified")
 			return nil
 		}
@@ -418,6 +422,9 @@ pointless).`,
 		basePatch, err := buildUpdatePatch(updates)
 		if err != nil {
 			return HandleErrorRespectJSON("%v", err)
+		}
+		if contextsSet {
+			basePatch.Contexts = setField(contexts)
 		}
 		ctx := rootCtx
 		opsCtx, err := issueOpsContext(ctx)
@@ -987,6 +994,8 @@ func init() {
 	updateCmd.Flags().StringSlice("add-label", nil, "Add labels (repeatable)")
 	updateCmd.Flags().StringSlice("remove-label", nil, "Remove labels (repeatable)")
 	updateCmd.Flags().StringSlice("set-labels", nil, "Set labels, replacing all existing (repeatable)")
+	updateCmd.Flags().StringArray("context", nil, "Replace contexts (repeatable; use --contextless to clear; caller must complete external-history preflight and must not use for Beads with external-history correlation)")
+	updateCmd.Flags().Bool("contextless", false, "Clear all contexts (caller must complete external-history preflight and must not use for Beads with external-history correlation)")
 	updateCmd.Flags().String("parent", "", "New parent issue ID (reparents the issue, use empty string to remove parent)")
 	updateCmd.Flags().Bool("claim", false, "Atomically claim the issue (sets assignee to you, status to in_progress; idempotent if already claimed by you; issues assigned to a pool alias listed in the claim.pools config are claimable too)")
 	// Overrides the live-claim reassign fence (bd-98s5c) and close policy.

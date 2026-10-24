@@ -22,6 +22,8 @@ type updateInput struct {
 	addLabels        []string
 	removeLabels     []string
 	setLabels        *[]string
+	contexts         []string
+	contextsSet      bool
 	reparent         *string
 	claim            bool
 	appendNotes      string
@@ -160,6 +162,10 @@ func gatherUpdateInput(ctx context.Context, cmd *cobra.Command) (*updateInput, e
 		labels = utils.NormalizeLabels(labels)
 		warnLabelsContainingWhitespace(labels)
 		in.setLabels = &labels
+	}
+	in.contexts, in.contextsSet, err = contextReplacementFlags(cmd)
+	if err != nil {
+		return nil, err
 	}
 	if cmd.Flags().Changed("parent") {
 		parent, _ := cmd.Flags().GetString("parent")
@@ -311,7 +317,7 @@ func isUpdateInputNoop(in *updateInput) bool {
 	if in.claim {
 		return false
 	}
-	if len(in.fields) > 0 || in.hasAppendNotes || in.setLabels != nil || in.reparent != nil {
+	if len(in.fields) > 0 || in.hasAppendNotes || in.setLabels != nil || in.reparent != nil || in.contextsSet {
 		return false
 	}
 	if len(in.addLabels) > 0 || len(in.removeLabels) > 0 {
@@ -321,4 +327,21 @@ func isUpdateInputNoop(in *updateInput) bool {
 		return false
 	}
 	return true
+}
+
+// contextReplacementFlags only parses the structured context request. The
+// caller must complete external-history preflight and must not use it for a
+// Bead with any external-history correlation.
+func contextReplacementFlags(cmd *cobra.Command) ([]string, bool, error) {
+	if !cmd.Flags().Changed("context") && !cmd.Flags().Changed("contextless") {
+		return nil, false, nil
+	}
+	if cmd.Flags().Changed("context") && cmd.Flags().Changed("contextless") {
+		return nil, false, HandleErrorRespectJSON("cannot specify both --context and --contextless")
+	}
+	if cmd.Flags().Changed("contextless") {
+		return nil, true, nil
+	}
+	contexts, _ := cmd.Flags().GetStringArray("context")
+	return contexts, true, nil
 }
