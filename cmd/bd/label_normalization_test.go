@@ -83,6 +83,7 @@ func TestGatherUpdateInputNormalizesLabels(t *testing.T) {
 	cmd.Flags().StringSlice("add-label", nil, "Add labels (repeatable)")
 	cmd.Flags().StringSlice("remove-label", nil, "Remove labels (repeatable)")
 	cmd.Flags().StringSlice("set-labels", nil, "Set labels, replacing all existing (repeatable)")
+	cmd.Flags().StringSlice("set-ordinary-labels", nil, "Replace ordinary labels")
 
 	args := []string{
 		"--add-label", "theme:a, theme:b",
@@ -104,6 +105,19 @@ func TestGatherUpdateInputNormalizesLabels(t *testing.T) {
 		t.Fatal("expected --set-labels to be captured")
 	}
 	assertLabels(t, *in.setLabels, []string{"theme:d"})
+
+	emptyCmd := &cobra.Command{Use: "update"}
+	emptyCmd.Flags().StringSlice("set-ordinary-labels", nil, "Replace ordinary labels")
+	if err := emptyCmd.ParseFlags([]string{"--set-ordinary-labels="}); err != nil {
+		t.Fatalf("parse empty ordinary replacement: %v", err)
+	}
+	emptyInput, err := gatherUpdateInput(context.Background(), emptyCmd)
+	if err != nil {
+		t.Fatalf("gather empty ordinary replacement: %v", err)
+	}
+	if emptyInput.setOrdinaryLabels == nil || len(*emptyInput.setOrdinaryLabels) != 0 {
+		t.Fatalf("empty ordinary replacement = %v, want explicitly set empty slice", emptyInput.setOrdinaryLabels)
+	}
 }
 
 // `bd tag` calls itself "Shorthand for 'bd update <id> --add-label <label>'",

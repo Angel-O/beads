@@ -376,6 +376,33 @@ func TestCLI_UpdateLabels(t *testing.T) {
 			t.Errorf("Unexpected label: %v", l)
 		}
 	}
+
+	// Ordinary replacement retains transaction-current context labels and an
+	// explicit empty value clears only ordinary labels.
+	runBDInProcess(t, tmpDir, "update", id, "--add-label", "ctx:synthetic")
+	runBDInProcess(t, tmpDir, "update", id, "--set-ordinary-labels", "ordinary")
+	out = runBDInProcess(t, tmpDir, "show", id, "--json")
+	json.Unmarshal([]byte(out), &updated)
+	labels = updated[0]["labels"].([]interface{})
+	if len(labels) != 2 || !containsStringValue(labels, "ctx:synthetic") || !containsStringValue(labels, "ordinary") {
+		t.Fatalf("ordinary replacement labels = %v, want context plus ordinary", labels)
+	}
+	runBDInProcess(t, tmpDir, "update", id, "--set-ordinary-labels=")
+	out = runBDInProcess(t, tmpDir, "show", id, "--json")
+	json.Unmarshal([]byte(out), &updated)
+	labels = updated[0]["labels"].([]interface{})
+	if len(labels) != 1 || labels[0] != "ctx:synthetic" {
+		t.Fatalf("empty ordinary replacement labels = %v, want context only", labels)
+	}
+}
+
+func containsStringValue(values []interface{}, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCLI_UpdateEphemeral(t *testing.T) {

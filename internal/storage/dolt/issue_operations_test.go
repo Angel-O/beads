@@ -105,6 +105,7 @@ func TestHasNonCoordinationPatchNestedAndCoordinationCases(t *testing.T) {
 		{"labels add", issueops.IssuePatch{Labels: issueops.LabelPatch{Add: []string{"x"}}}, true},
 		{"labels remove", issueops.IssuePatch{Labels: issueops.LabelPatch{Remove: []string{"x"}}}, true},
 		{"labels replace", issueops.IssuePatch{Labels: issueops.LabelPatch{Replace: issueops.Field[[]string]{Set: true}}}, true},
+		{"ordinary labels replace", issueops.IssuePatch{Labels: issueops.LabelPatch{ReplaceOrdinary: issueops.Field[[]string]{Set: true}}}, true},
 		{"metadata set", issueops.IssuePatch{Metadata: issueops.MetadataPatch{Set: map[string]json.RawMessage{"k": raw}}}, true},
 		{"metadata unset", issueops.IssuePatch{Metadata: issueops.MetadataPatch{Unset: []string{"k"}}}, true},
 		{"metadata replace", issueops.IssuePatch{Metadata: issueops.MetadataPatch{Replace: issueops.Field[json.RawMessage]{Set: true}}}, true},

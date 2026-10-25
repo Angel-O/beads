@@ -78,6 +78,9 @@ type LabelPatch struct {
 	Remove []string
 	// Replace supplies the starting complete label set when Set is true.
 	Replace Field[[]string]
+	// ReplaceOrdinary replaces ordinary labels while preserving the current
+	// context labels when Set is true.
+	ReplaceOrdinary Field[[]string]
 }
 
 // MetadataPatch describes metadata replacement or ordered incremental edits.

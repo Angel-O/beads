@@ -267,6 +267,10 @@ pointless).`,
 			warnLabelsContainingWhitespace(set)
 			updates["set_labels"] = set
 		}
+		if cmd.Flags().Changed("set-ordinary-labels") {
+			labels, _ := cmd.Flags().GetStringSlice("set-ordinary-labels")
+			updates["set_ordinary_labels"] = utils.NormalizeLabels(labels)
+		}
 		contexts, contextsSet, err := contextReplacementFlags(cmd)
 		if err != nil {
 			return err
@@ -728,6 +732,11 @@ func buildUpdatePatch(updates map[string]interface{}) (issueops.IssuePatch, erro
 			if labels, ok = value.([]string); ok {
 				patch.Labels.Replace = setField(labels)
 			}
+		case "set_ordinary_labels":
+			var labels []string
+			if labels, ok = value.([]string); ok {
+				patch.Labels.ReplaceOrdinary = setField(labels)
+			}
 		case storageissueops.OpMergeMetadata:
 			var merge json.RawMessage
 			if merge, ok = value.(json.RawMessage); ok {
@@ -994,6 +1003,7 @@ func init() {
 	updateCmd.Flags().StringSlice("add-label", nil, "Add labels (repeatable)")
 	updateCmd.Flags().StringSlice("remove-label", nil, "Remove labels (repeatable)")
 	updateCmd.Flags().StringSlice("set-labels", nil, "Set labels, replacing all existing (repeatable)")
+	updateCmd.Flags().StringSlice("set-ordinary-labels", nil, "Replace ordinary labels, preserving context labels (repeatable; pass empty to clear ordinary labels)")
 	updateCmd.Flags().StringArray("context", nil, "Replace contexts (repeatable; use --contextless to clear; caller must complete external-history preflight and must not use for Beads with external-history correlation)")
 	updateCmd.Flags().Bool("contextless", false, "Clear all contexts (caller must complete external-history preflight and must not use for Beads with external-history correlation)")
 	updateCmd.Flags().String("parent", "", "New parent issue ID (reparents the issue, use empty string to remove parent)")

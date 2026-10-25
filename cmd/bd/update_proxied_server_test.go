@@ -162,6 +162,17 @@ func TestProxiedUpdatePatchRoutesMergeOpsAsOperations(t *testing.T) {
 	})
 }
 
+func TestProxiedUpdatePatchPreservesExplicitEmptyOrdinaryReplacement(t *testing.T) {
+	labels := []string{}
+	patch := mustProxiedUpdatePatch(t, &updateInput{fields: map[string]any{}, setOrdinaryLabels: &labels}, &types.Issue{ID: "bd-spec-ordinary"})
+	if !patch.Labels.ReplaceOrdinary.Set || len(patch.Labels.ReplaceOrdinary.Value) != 0 {
+		t.Fatalf("ReplaceOrdinary = %+v, want explicit empty replacement", patch.Labels.ReplaceOrdinary)
+	}
+	if patch.Labels.Replace.Set {
+		t.Fatalf("generic replacement unexpectedly set: %+v", patch.Labels.Replace)
+	}
+}
+
 func mustProxiedUpdatePatch(t *testing.T, in *updateInput, before *types.Issue) issueops.IssuePatch {
 	t.Helper()
 	patch, err := proxiedUpdatePatch(in, before)
