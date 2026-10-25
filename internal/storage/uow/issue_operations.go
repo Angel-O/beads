@@ -373,17 +373,23 @@ func updateSpec(request publicops.UpdateRequest) (domain.UpdateSpec, error) {
 		labels := append([]string(nil), patch.Labels.Replace.Value...)
 		setLabels = &labels
 	}
+	var setOrdinaryLabels *([]string)
+	if patch.Labels.ReplaceOrdinary.Set {
+		labels := append([]string(nil), patch.Labels.ReplaceOrdinary.Value...)
+		setOrdinaryLabels = &labels
+	}
 	return domain.UpdateSpec{
-		Fields:           fields,
-		Claim:            request.Claim,
-		ExpectedVersion:  request.ExpectedVersion,
-		ExpectedAssignee: request.ExpectedAssignee,
-		ExpectedStatus:   statusPointer(request.ExpectedStatus),
-		Persistence:      persistence,
-		AddLabels:        append([]string(nil), patch.Labels.Add...),
-		RemoveLabels:     append([]string(nil), patch.Labels.Remove...),
-		SetLabels:        setLabels,
-		Reparent:         fieldStringPointer(patch.ParentID),
+		Fields:            fields,
+		Claim:             request.Claim,
+		ExpectedVersion:   request.ExpectedVersion,
+		ExpectedAssignee:  request.ExpectedAssignee,
+		ExpectedStatus:    statusPointer(request.ExpectedStatus),
+		Persistence:       persistence,
+		AddLabels:         append([]string(nil), patch.Labels.Add...),
+		RemoveLabels:      append([]string(nil), patch.Labels.Remove...),
+		SetLabels:         setLabels,
+		SetOrdinaryLabels: setOrdinaryLabels,
+		Reparent:          fieldStringPointer(patch.ParentID),
 	}, nil
 }
 

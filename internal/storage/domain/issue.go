@@ -279,12 +279,13 @@ type UpdateSpec struct {
 	Claim  bool
 	// ExpectedVersion requires the current row version to match before any
 	// claim or field writes.
-	ExpectedVersion *int64
-	Persistence     *types.PersistenceMode
-	AddLabels       []string
-	RemoveLabels    []string
-	SetLabels       *[]string
-	Reparent        *string
+	ExpectedVersion   *int64
+	Persistence       *types.PersistenceMode
+	AddLabels         []string
+	RemoveLabels      []string
+	SetLabels         *[]string
+	SetOrdinaryLabels *[]string
+	Reparent          *string
 
 	// ExpectedAssignee and ExpectedStatus are the bd-wsqvw compare-and-set
 	// guards (`bd update --if-assignee/--if-status`): when non-nil, the whole
@@ -753,6 +754,32 @@ func (u *issueUseCaseImpl) ApplyUpdate(ctx context.Context, id string, spec Upda
 			if err := u.labelUC.SetLabels(ctx, id, *spec.SetLabels, actor); err != nil {
 				return nil, err
 			}
+		}
+	}
+	if spec.SetOrdinaryLabels != nil {
+		var currentLabels []string
+		if useWisp {
+			currentLabels, err = u.labelUC.GetWispLabels(ctx, id)
+		} else {
+			currentLabels, err = u.labelUC.GetLabels(ctx, id)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("ApplyUpdate: read labels for ordinary replacement: %w", err)
+		}
+		labels := make([]string, 0, len(currentLabels)+len(*spec.SetOrdinaryLabels))
+		for _, label := range currentLabels {
+			if strings.HasPrefix(label, "ctx:") {
+				labels = append(labels, label)
+			}
+		}
+		labels = append(labels, (*spec.SetOrdinaryLabels)...)
+		if useWisp {
+			err = u.labelUC.SetWispLabels(ctx, id, labels, actor)
+		} else {
+			err = u.labelUC.SetLabels(ctx, id, labels, actor)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("ApplyUpdate: replace ordinary labels: %w", err)
 		}
 	}
 	if len(spec.AddLabels) > 0 {

@@ -346,3 +346,75 @@ func TestEmbeddedIssueOperationsPersistenceRollbackWispAndDetachedResults(t *tes
 		t.Fatalf("lifecycle result aliases store %#v, %v", stored, err)
 	}
 }
+
+func TestEmbeddedIssueOperationsReplaceOrdinaryLabelsPreservesCurrentContext(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	te := newTestEnv(t, "ops_ordinary_labels")
+	ctx := t.Context()
+	ops, err := embeddeddolt.NewIssueOperations(te.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ephemeral := range []bool{false, true} {
+		id := "ops-ordinary-labels-"
+		if ephemeral {
+			id += "wisp"
+		} else {
+			id += "durable"
+		}
+		issue := &types.Issue{ID: id, Title: "unchanged", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask, Ephemeral: ephemeral, Labels: []string{"ctx:old", "remove-me", "keep-unrelated"}}
+		if err := te.store.CreateIssue(ctx, issue, "seed"); err != nil {
+			t.Fatal(err)
+		}
+		staleTitle, staleContext := issue.Title, issue.Labels[0]
+		if _, err := ops.Update(ctx, publicops.UpdateRequest{Actor: "writer", IssueID: id, Patch: publicops.IssuePatch{Contexts: publicops.Field[[]string]{Set: true, Value: []string{"current"}}}}); err != nil {
+			t.Fatalf("change context for %s: %v", id, err)
+		}
+		request := publicops.UpdateRequest{Actor: "writer", IssueID: id, Patch: publicops.IssuePatch{Labels: publicops.LabelPatch{ReplaceOrdinary: publicops.Field[[]string]{Set: true, Value: []string{"replacement"}}}}}
+		updated, err := ops.Update(ctx, request)
+		if err != nil || !updated.Changed || !sameEmbeddedStringSet(updated.Issue.Labels, []string{"ctx:current", "replacement"}) || containsEmbeddedLabel(updated.Issue.Labels, staleContext) || updated.Issue.Title != staleTitle || updated.Issue.Ephemeral != ephemeral {
+			t.Fatalf("ordinary replacement for %s = %#v, %v", id, updated, err)
+		}
+		noOp, err := ops.Update(ctx, request)
+		if err != nil || noOp.Changed {
+			t.Fatalf("equivalent replacement for %s = %#v, %v; want no-op", id, noOp, err)
+		}
+	}
+	rollback := &types.Issue{ID: "ops-ordinary-labels-rollback", Title: "original", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask, StorageClass: types.StorageClassUnversioned, Labels: []string{"ctx:preserve", "before"}}
+	if err := te.store.CreateIssue(ctx, rollback, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = ops.Update(ctx, publicops.UpdateRequest{Actor: "writer", IssueID: rollback.ID, Patch: publicops.IssuePatch{Title: publicops.Field[string]{Set: true, Value: "must rollback"}, Labels: publicops.LabelPatch{ReplaceOrdinary: publicops.Field[[]string]{Set: true, Value: []string{"after"}}}, Persistence: publicops.Field[publicops.PersistenceMode]{Set: true, Value: publicops.PersistenceModeEphemeral}}})
+	if err == nil {
+		t.Fatal("unversioned demotion succeeded")
+	}
+	stored, err := te.store.GetIssue(ctx, rollback.ID)
+	if err != nil || stored.Title != "original" || !sameEmbeddedStringSet(stored.Labels, []string{"ctx:preserve", "before"}) || stored.Ephemeral {
+		t.Fatalf("failed replacement left state %#v, %v", stored, err)
+	}
+}
+
+func containsEmbeddedLabel(labels []string, want string) bool {
+	for _, label := range labels {
+		if label == want {
+			return true
+		}
+	}
+	return false
+}
+
+func sameEmbeddedStringSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	seen := make(map[string]bool, len(got))
+	for _, value := range got {
+		seen[value] = true
+	}
+	for _, value := range want {
+		if !seen[value] {
+			return false
+		}
+	}
+	return true
+}

@@ -77,8 +77,18 @@ func ValidateUpdateRequest(request publicops.UpdateRequest) error {
 		return fmt.Errorf("%w: invalid forced assignee transfer", storage.ErrValidation)
 	}
 	patch := request.Patch
-	if patch.Contexts.Set && (len(patch.Labels.Add) > 0 || len(patch.Labels.Remove) > 0 || patch.Labels.Replace.Set) {
+	if patch.Contexts.Set && (len(patch.Labels.Add) > 0 || len(patch.Labels.Remove) > 0 || patch.Labels.Replace.Set || patch.Labels.ReplaceOrdinary.Set) {
 		return fmt.Errorf("%w: context replacement cannot be combined with generic label edits", storage.ErrValidation)
+	}
+	if patch.Labels.ReplaceOrdinary.Set {
+		if patch.Labels.Replace.Set || len(patch.Labels.Add) > 0 || len(patch.Labels.Remove) > 0 {
+			return fmt.Errorf("%w: ordinary label replacement cannot be combined with other label edits", storage.ErrValidation)
+		}
+		for _, label := range patch.Labels.ReplaceOrdinary.Value {
+			if strings.HasPrefix(label, "ctx:") {
+				return fmt.Errorf("%w: ordinary label replacement cannot set context labels", storage.ErrValidation)
+			}
+		}
 	}
 	if patch.Contexts.Set && patch.ParentID.Set {
 		return fmt.Errorf("%w: context replacement cannot be combined with parent replacement", storage.ErrValidation)
@@ -293,12 +303,18 @@ func metadataChanged(current, next json.RawMessage) (bool, error) {
 
 // ApplyLabelPatch applies ordered label edits and reports whether rows changed.
 func ApplyLabelPatch(ctx context.Context, tx DBTX, current *types.Issue, patch publicops.LabelPatch, actor string) (bool, error) {
-	if !patch.Replace.Set && len(patch.Add) == 0 && len(patch.Remove) == 0 {
+	if !patch.Replace.Set && !patch.ReplaceOrdinary.Set && len(patch.Add) == 0 && len(patch.Remove) == 0 {
 		return false, nil
 	}
 	existing := stringSet(current.Labels)
 	target := make(map[string]struct{}, len(existing)+len(patch.Add))
-	if !patch.Replace.Set {
+	if patch.ReplaceOrdinary.Set {
+		for label := range existing {
+			if strings.HasPrefix(label, "ctx:") {
+				target[label] = struct{}{}
+			}
+		}
+	} else if !patch.Replace.Set {
 		for label := range existing {
 			target[label] = struct{}{}
 		}
@@ -322,6 +338,11 @@ func ApplyLabelPatch(ctx context.Context, tx DBTX, current *types.Issue, patch p
 			continue
 		}
 		target[label] = struct{}{}
+	}
+	for _, label := range patch.ReplaceOrdinary.Value {
+		if label != "" {
+			target[label] = struct{}{}
+		}
 	}
 	for _, label := range patch.Add {
 		if label == "" {

@@ -18,20 +18,21 @@ import (
 )
 
 type updateInput struct {
-	fields           map[string]any
-	addLabels        []string
-	removeLabels     []string
-	setLabels        *[]string
-	contexts         []string
-	contextsSet      bool
-	reparent         *string
-	claim            bool
-	appendNotes      string
-	hasAppendNotes   bool
-	setMetadata      []string
-	unsetMetadata    []string
-	mergeMetadataIn  json.RawMessage
-	clearDeferStatus bool
+	fields            map[string]any
+	addLabels         []string
+	removeLabels      []string
+	setLabels         *[]string
+	setOrdinaryLabels *[]string
+	contexts          []string
+	contextsSet       bool
+	reparent          *string
+	claim             bool
+	appendNotes       string
+	hasAppendNotes    bool
+	setMetadata       []string
+	unsetMetadata     []string
+	mergeMetadataIn   json.RawMessage
+	clearDeferStatus  bool
 	// bd-wsqvw conditional-update guards; non-nil only when the flag was
 	// explicitly passed (a pointer to "" is the real "expected unassigned"
 	// guard).
@@ -162,6 +163,11 @@ func gatherUpdateInput(ctx context.Context, cmd *cobra.Command) (*updateInput, e
 		labels = utils.NormalizeLabels(labels)
 		warnLabelsContainingWhitespace(labels)
 		in.setLabels = &labels
+	}
+	if cmd.Flags().Changed("set-ordinary-labels") {
+		labels, _ := cmd.Flags().GetStringSlice("set-ordinary-labels")
+		labels = utils.NormalizeLabels(labels)
+		in.setOrdinaryLabels = &labels
 	}
 	in.contexts, in.contextsSet, err = contextReplacementFlags(cmd)
 	if err != nil {
@@ -317,7 +323,7 @@ func isUpdateInputNoop(in *updateInput) bool {
 	if in.claim {
 		return false
 	}
-	if len(in.fields) > 0 || in.hasAppendNotes || in.setLabels != nil || in.reparent != nil || in.contextsSet {
+	if len(in.fields) > 0 || in.hasAppendNotes || in.setLabels != nil || in.setOrdinaryLabels != nil || in.reparent != nil || in.contextsSet {
 		return false
 	}
 	if len(in.addLabels) > 0 || len(in.removeLabels) > 0 {

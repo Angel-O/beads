@@ -730,6 +730,18 @@ func TestUpdateSpecLowersPersistenceMode(t *testing.T) {
 		t.Fatalf("updateSpec().Persistence = %v, want ephemeral", spec.Persistence)
 	}
 }
+
+func TestUpdateSpecCarriesOrdinaryLabelReplacementIncludingEmpty(t *testing.T) {
+	labels := []string{}
+	spec, err := updateSpec(issueops.UpdateRequest{Patch: issueops.IssuePatch{Labels: issueops.LabelPatch{ReplaceOrdinary: issueops.Field[[]string]{Set: true, Value: labels}}}})
+	if err != nil {
+		t.Fatalf("updateSpec() error = %v", err)
+	}
+	if spec.SetOrdinaryLabels == nil || len(*spec.SetOrdinaryLabels) != 0 {
+		t.Fatalf("SetOrdinaryLabels = %v, want explicit empty replacement", spec.SetOrdinaryLabels)
+	}
+}
+
 func (s createIssueUseCaseStub) CreateIssue(ctx context.Context, params domain.CreateIssueParams, actor string) (domain.CreateIssueResult, error) {
 	return s.create(ctx, params, actor)
 }

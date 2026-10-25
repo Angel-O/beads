@@ -10,6 +10,7 @@ import (
 	"github.com/steveyegge/beads/backend/conformance"
 	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/types"
+	publicops "github.com/steveyegge/beads/issueops"
 )
 
 func TestIssueOperationsCreateRoutesInfraTypesToWisps(t *testing.T) {
@@ -55,6 +56,46 @@ func TestIssueOperationsUpdateLabelPatchOrdering(t *testing.T) {
 func TestIssueOperationsUpdateLabelPatchValueRules(t *testing.T) {
 	ctx := context.Background()
 	conformance.RunIssueOperationsUpdateLabelPatchValueRules(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsUpdateOrdinaryLabelsPreservesCurrentContext(t *testing.T) {
+	ctx := context.Background()
+	fixture := newUOWIssueOperationsFixture(t, ctx)
+	for _, ephemeral := range []bool{false, true} {
+		id := fmt.Sprintf("bd-ordinary-%t", ephemeral)
+		issue := &types.Issue{ID: id, Title: id, Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask, Ephemeral: ephemeral, Labels: []string{"ctx:old", "remove-me"}}
+		if err := fixture.CreateIssue(ctx, issue, "seed"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.Operations.Update(ctx, publicops.UpdateRequest{Actor: "writer", IssueID: id, Patch: publicops.IssuePatch{Contexts: publicops.Field[[]string]{Set: true, Value: []string{"current"}}}}); err != nil {
+			t.Fatalf("context update %s: %v", id, err)
+		}
+		request := publicops.UpdateRequest{Actor: "writer", IssueID: id, Patch: publicops.IssuePatch{Labels: publicops.LabelPatch{ReplaceOrdinary: publicops.Field[[]string]{Set: true, Value: []string{"replacement"}}}}}
+		updated, err := fixture.Operations.Update(ctx, request)
+		if err != nil || updated.Issue == nil || !sameUOWStringSet(updated.Issue.Labels, []string{"ctx:current", "replacement"}) {
+			t.Fatalf("ordinary replacement %s = %#v, %v", id, updated, err)
+		}
+		noOp, err := fixture.Operations.Update(ctx, request)
+		if err != nil || noOp.Changed {
+			t.Fatalf("equivalent replacement %s = %#v, %v; want no-op", id, noOp, err)
+		}
+	}
+}
+
+func sameUOWStringSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	set := make(map[string]bool, len(got))
+	for _, item := range got {
+		set[item] = true
+	}
+	for _, item := range want {
+		if !set[item] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestIssueOperationsUpdateMetadataReplaceClearsAndValidates(t *testing.T) {

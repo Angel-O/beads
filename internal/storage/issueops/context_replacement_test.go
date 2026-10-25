@@ -61,3 +61,22 @@ func TestValidateUpdateRequestRejectsGenericLabelBypass(t *testing.T) {
 		t.Fatalf("error = %v, want ErrValidation", err)
 	}
 }
+
+func TestValidateUpdateRequestOrdinaryLabelReplacement(t *testing.T) {
+	for name, patch := range map[string]publicops.IssuePatch{
+		"protected context label": {Labels: publicops.LabelPatch{ReplaceOrdinary: publicops.Field[[]string]{Set: true, Value: []string{"ordinary", "ctx:protected"}}}},
+		"generic replacement":     {Labels: publicops.LabelPatch{Replace: publicops.Field[[]string]{Set: true}, ReplaceOrdinary: publicops.Field[[]string]{Set: true}}},
+		"add":                     {Labels: publicops.LabelPatch{Add: []string{"ordinary"}, ReplaceOrdinary: publicops.Field[[]string]{Set: true}}},
+		"remove":                  {Labels: publicops.LabelPatch{Remove: []string{"ordinary"}, ReplaceOrdinary: publicops.Field[[]string]{Set: true}}},
+		"context replacement":     {Contexts: publicops.Field[[]string]{Set: true}, Labels: publicops.LabelPatch{ReplaceOrdinary: publicops.Field[[]string]{Set: true}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := ValidateUpdateRequest(publicops.UpdateRequest{Patch: patch}); !errors.Is(err, storage.ErrValidation) {
+				t.Fatalf("ValidateUpdateRequest() = %v, want ErrValidation", err)
+			}
+		})
+	}
+	if err := ValidateUpdateRequest(publicops.UpdateRequest{Patch: publicops.IssuePatch{Labels: publicops.LabelPatch{ReplaceOrdinary: publicops.Field[[]string]{Set: true}}}}); err != nil {
+		t.Fatalf("explicit empty replacement rejected: %v", err)
+	}
+}
