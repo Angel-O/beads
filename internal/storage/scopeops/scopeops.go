@@ -67,7 +67,7 @@ func Rename(ctx context.Context, r Runner, id, name string) error {
 	if err := validateScope(&types.Scope{ID: id, Name: name}); err != nil {
 		return err
 	}
-	if _, err := lockScope(ctx, r, id); err != nil {
+	if err := lockScope(ctx, r, id); err != nil {
 		return err
 	}
 	normalized := normalizeName(name)
@@ -589,7 +589,7 @@ func Activate(ctx context.Context, r Runner, id string) error {
 	if id == "" {
 		return storage.ErrScopeNotFound
 	}
-	if _, err := lockScope(ctx, r, id); err != nil {
+	if err := lockScope(ctx, r, id); err != nil {
 		return err
 	}
 	if err := r.QueryRowContext(ctx,
@@ -616,7 +616,7 @@ func Deactivate(ctx context.Context, r Runner) error {
 }
 
 func AddMembers(ctx context.Context, r Runner, scopeID string, requested []string) error {
-	if _, err := lockScope(ctx, r, scopeID); err != nil {
+	if err := lockScope(ctx, r, scopeID); err != nil {
 		return err
 	}
 	ids := uniqueSorted(requested)
@@ -657,7 +657,7 @@ func AddMembers(ctx context.Context, r Runner, scopeID string, requested []strin
 }
 
 func RemoveMembers(ctx context.Context, r Runner, scopeID string, requested []string) error {
-	if _, err := lockScope(ctx, r, scopeID); err != nil {
+	if err := lockScope(ctx, r, scopeID); err != nil {
 		return err
 	}
 	ids := uniqueSorted(requested)
@@ -673,7 +673,7 @@ func RemoveMembers(ctx context.Context, r Runner, scopeID string, requested []st
 func MoveMembers(ctx context.Context, r Runner, sourceID, targetID string, requested []string) error {
 	ids := uniqueSorted(requested)
 	if sourceID == targetID {
-		if _, err := lockScope(ctx, r, sourceID); err != nil {
+		if err := lockScope(ctx, r, sourceID); err != nil {
 			return err
 		}
 		members, err := lockedMemberships(ctx, r, ids)
@@ -743,24 +743,24 @@ func getScope(ctx context.Context, r Runner, id string) (*types.Scope, error) {
 	return scope, nil
 }
 
-func lockScope(ctx context.Context, r Runner, id string) (bool, error) {
+func lockScope(ctx context.Context, r Runner, id string) error {
 	if id == "" {
-		return false, storage.ErrScopeNotFound
+		return storage.ErrScopeNotFound
 	}
 	var found string
 	if err := r.QueryRowContext(ctx,
 		`SELECT id FROM scopes WHERE id = ? FOR UPDATE`, id).Scan(&found); errors.Is(err, sql.ErrNoRows) {
-		return false, fmt.Errorf("%w: %s", storage.ErrScopeNotFound, id)
+		return fmt.Errorf("%w: %s", storage.ErrScopeNotFound, id)
 	} else if err != nil {
-		return false, fmt.Errorf("lock scope %s: %w", id, err)
+		return fmt.Errorf("lock scope %s: %w", id, err)
 	}
-	return true, nil
+	return nil
 }
 
 func lockScopes(ctx context.Context, r Runner, ids ...string) error {
 	ordered := uniqueSorted(ids)
 	for _, id := range ordered {
-		if _, err := lockScope(ctx, r, id); err != nil {
+		if err := lockScope(ctx, r, id); err != nil {
 			return err
 		}
 	}

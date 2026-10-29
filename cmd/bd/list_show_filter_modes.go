@@ -44,6 +44,24 @@ import (
 //
 // Widening the hole is an edit in the config and a diff a reviewer sees.
 
+// storeCopySearcher is here because its full-snapshot filter is an intentional
+// exception to the command's usual builder-only filter construction.
+type storeCopySearcher interface {
+	SearchIssues(context.Context, string, types.IssueFilter) ([]*types.Issue, error)
+}
+
+// searchStoreCopyIssues deliberately requests the full source snapshot rather
+// than a user-facing list, which would apply listing exclusions to copied data.
+func searchStoreCopyIssues(ctx context.Context, source storeCopySearcher) ([]*types.Issue, error) {
+	return source.SearchIssues(ctx, "", types.IssueFilter{
+		Limit:      0,
+		MaxRows:    0,
+		Ephemeral:  nil, // include persistent issues and wisps
+		IsTemplate: nil, // include templates
+		SkipWisps:  false,
+	})
+}
+
 // getHierarchicalChildren handles the --tree --parent combination logic.
 // baseFilter carries CLI filters (--type, --status, etc.) through the recursive walk.
 func getHierarchicalChildren(ctx context.Context, store storage.DoltStorage, dbPath string, parentID string, baseFilter types.IssueFilter) ([]*types.Issue, error) {

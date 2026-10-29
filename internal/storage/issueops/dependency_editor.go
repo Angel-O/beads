@@ -409,7 +409,7 @@ func ValidateEpicContextRemovalInTx(ctx context.Context, tx DBTX, request public
 	_, _, _, depTable := WispTableRouting(sourceIsWisp)
 	var depType string
 	//nolint:gosec // depTable is selected by WispTableRouting.
-	err := tx.QueryRowContext(ctx, fmt.Sprintf("SELECT type FROM %s WHERE issue_id = ? AND %s", depTable, depTargetEquals("")), request.IssueID, request.DependsOnID).Scan(&depType)
+	err := tx.QueryRowContext(ctx, fmt.Sprintf("SELECT type FROM %s WHERE issue_id = ? AND %s", depTable, depTargetEquals()), request.IssueID, request.DependsOnID).Scan(&depType)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("validate epic context removal: %w", err)
 	}

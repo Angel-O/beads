@@ -45,8 +45,8 @@ func depTargetExpr(alias string) string {
 	return fmt.Sprintf("COALESCE(%s.depends_on_issue_id, %s.depends_on_wisp_id, %s.depends_on_external)", alias, alias, alias)
 }
 
-func depTargetEquals(alias string) string {
-	return depTargetExpr(alias) + " = ?"
+func depTargetEquals() string {
+	return DepTargetExpr + " = ?"
 }
 
 // depTargetEqualsOr returns a SARGABLE target-equality predicate as an explicit
@@ -260,14 +260,14 @@ func addDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 	// target column cannot bypass the idempotency/conflict check.
 	var existingType string
 	//nolint:gosec // G201: writeTable from WispTableRouting; depTargetEquals has no user input.
-	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT type FROM %s WHERE issue_id = ? AND %s`, writeTable, depTargetEquals("")),
+	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT type FROM %s WHERE issue_id = ? AND %s`, writeTable, depTargetEquals()),
 		dep.IssueID, dep.DependsOnID).Scan(&existingType)
 	if err == nil {
 		if existingType == string(dep.Type) {
 			// Same type — idempotent; update metadata. No event is written, so the
 			// caller must not stage the events table for this re-add.
 			//nolint:gosec // G201: writeTable from WispTableRouting; depTargetEquals has no user input.
-			if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET metadata = ? WHERE issue_id = ? AND %s`, writeTable, depTargetEquals("")),
+			if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET metadata = ? WHERE issue_id = ? AND %s`, writeTable, depTargetEquals()),
 				metadata, dep.IssueID, dep.DependsOnID); err != nil {
 				return false, fmt.Errorf("failed to update dependency metadata: %w", err)
 			}

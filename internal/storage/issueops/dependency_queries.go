@@ -779,7 +779,7 @@ func GetNewlyUnblockedByCloseInTx(ctx context.Context, tx DBTX, closedIssueID st
 		rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 			SELECT issue_id FROM %s
 			WHERE %s AND type = 'blocks'
-		`, depTable, depTargetEquals("")), closedIssueID)
+		`, depTable, depTargetEquals()), closedIssueID)
 		if err != nil {
 			if optionalBlockedTable(depTable) && isTableNotExistError(err) {
 				continue

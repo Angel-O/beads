@@ -130,7 +130,7 @@ func runStoreCopy(cmd *cobra.Command, args []string) error {
 }
 
 type storeCopySource interface {
-	SearchIssues(context.Context, string, types.IssueFilter) ([]*types.Issue, error)
+	storeCopySearcher
 	GetLabelsForIssues(context.Context, []string) (map[string][]string, error)
 	GetDependencyRecordsForIssues(context.Context, []string) (map[string][]*types.Dependency, error)
 	GetCommentsForIssues(context.Context, []string) (map[string][]*types.Comment, error)
@@ -140,17 +140,7 @@ type storeCopySource interface {
 }
 
 func readStoreCopyIssues(ctx context.Context, source storeCopySource) ([]*types.Issue, error) {
-	issues, err := source.SearchIssues(ctx, "", types.IssueFilter{
-		Limit:      0,
-		MaxRows:    0,
-		Ephemeral:  nil, // include persistent issues and wisps
-		IsTemplate: nil, // include templates
-		SkipWisps:  false,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return issues, nil
+	return searchStoreCopyIssues(ctx, source)
 }
 
 func readStoreCopySnapshot(ctx context.Context, source storeCopySource, sourceDir, prefix, namespace string, extraLabels []string, issues []*types.Issue, ids beads.SnapshotIDMap) (beads.SnapshotImportBundle, error) {
@@ -308,8 +298,7 @@ func appendUniqueStoreCopyLabels(labels, extra []string) []string {
 }
 
 func readStoreCopyInteractions(sourceDir, prefix, namespace string, ids beads.SnapshotIDMap) ([]byte, error) {
-	path := filepath.Join(sourceDir, "interactions.jsonl")
-	raw, err := os.ReadFile(path)
+	raw, err := readStoreCopyFile(sourceDir, "interactions.jsonl")
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -370,7 +359,7 @@ func installStoreCopyInteractions(destinationDir string, staged []byte) error {
 		return nil
 	}
 	path := filepath.Join(destinationDir, "interactions.jsonl")
-	existing, err := os.ReadFile(path)
+	existing, err := readStoreCopyFile(destinationDir, "interactions.jsonl")
 	if os.IsNotExist(err) {
 		existing = nil
 	} else if err != nil {
@@ -412,6 +401,19 @@ func installStoreCopyInteractions(destinationDir string, staged []byte) error {
 		known[id] = canonical
 	}
 	return atomicfile.WriteFile(path, merged, 0o600)
+}
+
+func readStoreCopyFile(dir, name string) ([]byte, error) {
+	path, err := filepath.EvalSymlinks(filepath.Join(dir, name))
+	if err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+	return root.ReadFile(filepath.Base(path))
 }
 
 func canonicalStoreCopyInteraction(raw []byte) (string, []byte, error) {
