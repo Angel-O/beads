@@ -158,6 +158,35 @@ func TestFixBeadsDirPermissions(t *testing.T) {
 	}
 }
 
+func TestFixBeadsDirPermissionsRepairsReadableNonSearchableDirectory(t *testing.T) {
+	for _, mode := range []os.FileMode{0o644, 0o444} {
+		t.Run(mode.String(), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), ".beads")
+			if err := os.Mkdir(path, mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatal(err)
+			}
+
+			fixed, err := FixBeadsDirPermissions(path)
+			if err != nil {
+				t.Fatalf("FixBeadsDirPermissions: %v", err)
+			}
+			if !fixed {
+				t.Fatal("expected permissions to be repaired")
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode().Perm(); got != BeadsDirPerm {
+				t.Fatalf("permissions = %04o, want %04o", got, BeadsDirPerm)
+			}
+		})
+	}
+}
+
 func TestFixBeadsDirPermissions_Nonexistent(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "no-such-dir")
 	fixed, err := FixBeadsDirPermissions(dir)

@@ -1646,7 +1646,7 @@ func cloneSnapshotIssues(issues []*types.Issue) []*types.Issue {
 	out := make([]*types.Issue, len(issues))
 	for i, issue := range issues {
 		if issue != nil {
-			out[i] = clonePublicIssue((*publicops.Issue)(issue))
+			out[i] = clonePublicIssue(issue)
 		}
 	}
 	return out

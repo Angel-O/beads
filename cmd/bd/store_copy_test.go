@@ -152,6 +152,41 @@ func TestInstallStoreCopyInteractionsIsIdempotentAndDetectsCollision(t *testing.
 	}
 }
 
+func TestReadStoreCopyFileFollowsInteractionSymlinksOutsideStore(t *testing.T) {
+	storeDir := t.TempDir()
+	targetDir := t.TempDir()
+	target := filepath.Join(targetDir, "interactions.jsonl")
+	want := []byte(`{"id":"external"}`)
+	if err := os.WriteFile(target, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	relativeTarget, err := filepath.Rel(storeDir, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, target string }{
+		{name: "absolute", target: target},
+		{name: "relative", target: relativeTarget},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			link := filepath.Join(storeDir, "interactions.jsonl")
+			if err := os.Symlink(tc.target, link); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Remove(link) })
+
+			got, err := readStoreCopyFile(storeDir, "interactions.jsonl")
+			if err != nil {
+				t.Fatalf("readStoreCopyFile: %v", err)
+			}
+			if string(got) != string(want) {
+				t.Fatalf("readStoreCopyFile = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func storeCopyStringPtr(value string) *string { return &value }
 
 func TestStoreCopyContextAndInteractionIDsAreNamespaceScoped(t *testing.T) {
