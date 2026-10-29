@@ -23,3 +23,12 @@ func runBulkHistoryProxiedServer(ctx context.Context, issueIDs []string, limit i
 
 	return runBulkHistory(ctx, uw.IssueUseCase(), issueIDs, limit)
 }
+
+func runCompactBulkHistoryProxiedServer(ctx context.Context, issueIDs []string, limit int) error {
+	uw, err := openProxiedListUOW(ctx)
+	if err != nil {
+		return HandleErrorRespectJSON("%v", err)
+	}
+	defer uw.Close(ctx)
+	return runCompactBulkHistory(ctx, uw.IssueUseCase(), issueIDs, limit)
+}

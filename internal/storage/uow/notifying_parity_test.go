@@ -138,6 +138,7 @@ func TestRecordingIssueUseCaseCoversItsSurface(t *testing.T) {
 		reflect.TypeOf((*recordingIssueUC)(nil)), map[string]string{
 			"AsOf":                         reads,
 			"BulkHistory":                  reads,
+			"CompactBulkHistory":           reads,
 			"CountIssues":                  reads,
 			"CountIssuesByGroup":           reads,
 			"CountOpenChildren":            reads,

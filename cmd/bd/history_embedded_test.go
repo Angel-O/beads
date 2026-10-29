@@ -330,6 +330,76 @@ func TestEmbeddedHistory(t *testing.T) {
 	})
 }
 
+func TestEmbeddedCompactHistoryJSONContract(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
+	}
+	bd := buildEmbeddedBD(t)
+	dir, _, _ := bdInit(t, bd, "--prefix", "hc")
+	issue := bdCreate(t, bd, dir, "Compact history", "--type", "task")
+	bdUpdate(t, bd, dir, issue.ID, "--title", "Compact history changed")
+
+	v1 := bdHistory(t, bd, dir, "--json", issue.ID)
+	var legacy struct {
+		SchemaVersion int `json:"schema_version"`
+		Issues        []struct {
+			Snapshots []json.RawMessage `json:"snapshots"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal([]byte(v1), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.SchemaVersion != 1 || len(legacy.Issues) != 1 || len(legacy.Issues[0].Snapshots) < 2 {
+		t.Fatalf("legacy response changed: %s", v1)
+	}
+
+	compactJSON := bdHistory(t, bd, dir, "--json", "--compact", issue.ID, "missing-id", issue.ID)
+	var compact struct {
+		SchemaVersion int `json:"schema_version"`
+		Issues        []struct {
+			IssueID string `json:"issue_id"`
+			States  []struct {
+				Issue       json.RawMessage   `json:"Issue"`
+				Occurrences []json.RawMessage `json:"occurrences"`
+			} `json:"states"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal([]byte(compactJSON), &compact); err != nil {
+		t.Fatalf("parse compact response: %v\n%s", err, compactJSON)
+	}
+	if compact.SchemaVersion != 2 || len(compact.Issues) != 2 || compact.Issues[0].IssueID != issue.ID || compact.Issues[1].IssueID != "missing-id" || compact.Issues[1].States == nil || len(compact.Issues[1].States) != 0 {
+		t.Fatalf("unexpected compact envelope: %s", compactJSON)
+	}
+	if len(compact.Issues[0].States) == 0 {
+		t.Fatalf("compact states missing: %s", compactJSON)
+	}
+	for _, state := range compact.Issues[0].States {
+		if len(state.Issue) == 0 || len(state.Occurrences) == 0 {
+			t.Fatalf("invalid compact state: %+v", state)
+		}
+	}
+	singleJSON := bdHistory(t, bd, dir, "--json", "--compact", issue.ID)
+	var single struct {
+		SchemaVersion int `json:"schema_version"`
+		Issues        []struct {
+			IssueID string            `json:"issue_id"`
+			States  []json.RawMessage `json:"states"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal([]byte(singleJSON), &single); err != nil {
+		t.Fatalf("parse single compact response: %v\n%s", err, singleJSON)
+	}
+	if single.SchemaVersion != 2 || len(single.Issues) != 1 || single.Issues[0].IssueID != issue.ID || len(single.Issues[0].States) == 0 {
+		t.Fatalf("unexpected single compact response: %s", singleJSON)
+	}
+	if out := bdHistoryFail(t, bd, dir, "--compact", issue.ID); !strings.Contains(out, "requires --json") {
+		t.Fatalf("compact without json: %s", out)
+	}
+	if out := bdHistoryFail(t, bd, dir, "--json", "--compact", "--events", issue.ID); !strings.Contains(out, "cannot be used with --events") {
+		t.Fatalf("compact with events: %s", out)
+	}
+}
+
 // TestEmbeddedHistoryConcurrent exercises history operations concurrently.
 func TestEmbeddedHistoryConcurrent(t *testing.T) {
 	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {

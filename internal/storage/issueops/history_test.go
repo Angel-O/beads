@@ -263,6 +263,79 @@ func TestBulkHistoryInTxPropagatesQueryAndRowsErrors(t *testing.T) {
 	})
 }
 
+func TestCompactBulkHistoryInTxPropagatesCancellationAndClosesFailedRows(t *testing.T) {
+	queryPattern := `(?s)WITH selected AS \(\s*SELECT h\.\*\s+FROM \(SELECT \* FROM dolt_history_issues\).*JSON_ARRAYAGG.*GROUP BY`
+	t.Run("query cancellation", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		mock.ExpectQuery(queryPattern).WithArgs("a").WillReturnError(context.Canceled)
+		_, err = CompactBulkHistoryInTx(t.Context(), db, []string{"a"}, 0, time.UTC)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error=%v, want context.Canceled", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("row iteration error closes rows", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		rowsErr := errors.New("compact rows failed")
+		rows := sqlmock.NewRows([]string{
+			"id", "title", "description", "design", "acceptance_criteria", "notes", "status", "priority", "issue_type",
+			"assignee", "owner", "created_by", "estimated_minutes", "created_at", "updated_at", "closed_at", "close_reason",
+			"pinned", "mol_type", "occurrences",
+		}).AddRow("a", "title", "", "", "", "", "open", 2, "task", nil, nil, nil, nil,
+			"2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", nil, nil, 0, nil,
+			[]byte(`[["hash","author","2026-01-01 00:00:00"]]`)).RowError(0, rowsErr)
+		mock.ExpectQuery(queryPattern).WithArgs("a").WillReturnRows(rows).RowsWillBeClosed()
+		_, err = CompactBulkHistoryInTx(t.Context(), db, []string{"a"}, 0, time.UTC)
+		if !errors.Is(err, rowsErr) {
+			t.Fatalf("error=%v, want rows error", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestParseCompactCommitDateUsesDriverLocationForDateTime(t *testing.T) {
+	local := time.FixedZone("UTC+1", 60*60)
+	date := "2026-01-02 03:04:05"
+	for _, test := range []struct {
+		name     string
+		location *time.Location
+		want     time.Time
+	}{
+		{name: "embedded local", location: local, want: time.Date(2026, 1, 2, 3, 4, 5, 0, local)},
+		{name: "server default UTC", location: time.UTC, want: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseCompactCommitDate(date, test.location)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !got.Equal(test.want) || got.Location() != test.location {
+				t.Fatalf("parsed %s = %s (%s), want %s (%s)", date, got, got.Location(), test.want, test.location)
+			}
+		})
+	}
+
+	got, err := parseCompactCommitDate("2026-01-02T03:04:05+02:00", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, offset := got.Zone(); offset != 2*60*60 {
+		t.Fatalf("explicit RFC3339 offset = %d seconds, want +02:00", offset)
+	}
+}
+
 // TestBulkHistoryInTxOneQueryFor100IDs is the repeatable performance boundary:
 // approximately 100 requested IDs and snapshots are served by one SQL query.
 func TestBulkHistoryInTxOneQueryFor100IDs(t *testing.T) {

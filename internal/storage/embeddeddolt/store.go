@@ -926,6 +926,23 @@ func (s *EmbeddedDoltStore) BulkHistory(ctx context.Context, issueIDs []string) 
 	return result, err
 }
 
+func (s *EmbeddedDoltStore) CompactBulkHistory(ctx context.Context, issueIDs []string, limit int) ([]storage.CompactIssueHistory, error) {
+	issueIDs, err := issueops.NormalizeBulkHistoryIDs(issueIDs)
+	if err != nil {
+		return nil, err
+	}
+	if len(issueIDs) == 0 {
+		return []storage.CompactIssueHistory{}, nil
+	}
+	var result []storage.CompactIssueHistory
+	err = s.withConn(ctx, false, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.CompactBulkHistoryInTx(ctx, tx, issueIDs, limit, time.Local)
+		return err
+	})
+	return result, err
+}
+
 func (s *EmbeddedDoltStore) AsOf(ctx context.Context, issueID string, ref string) (*types.Issue, error) {
 	var result *types.Issue
 	err := s.withConn(ctx, false, func(tx *sql.Tx) error {

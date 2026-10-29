@@ -32,6 +32,31 @@ type BulkHistoryViewer interface {
 	BulkHistory(ctx context.Context, issueIDs []string) ([]IssueHistory, error)
 }
 
+// CompactBulkHistoryViewer returns distinct normalized issue states with all
+// commit occurrences, without repeating issue bodies across the storage boundary.
+type CompactBulkHistoryViewer interface {
+	CompactBulkHistory(ctx context.Context, issueIDs []string, limit int) ([]CompactIssueHistory, error)
+}
+
+// CompactIssueHistory is one normalized requested ID and its distinct states.
+type CompactIssueHistory struct {
+	IssueID string                `json:"issue_id"`
+	States  []CompactHistoryState `json:"states"`
+}
+
+// CompactHistoryState stores an issue body once alongside every occurrence.
+type CompactHistoryState struct {
+	Issue       *types.Issue        `json:"Issue"`
+	Occurrences []HistoryOccurrence `json:"occurrences"`
+}
+
+// HistoryOccurrence retains the producer metadata for one historical snapshot.
+type HistoryOccurrence struct {
+	CommitHash string    `json:"CommitHash"`
+	Committer  string    `json:"Committer"`
+	CommitDate time.Time `json:"CommitDate"`
+}
+
 // ExternalRefHistoryQuerier is implemented by history-capable Dolt storage
 // backends that can resolve what a given issue's external_ref was as of a
 // point in time, by querying Dolt's dolt_history_issues system table.
