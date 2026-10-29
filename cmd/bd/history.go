@@ -14,8 +14,9 @@ import (
 )
 
 var (
-	historyLimit  int
-	historyEvents bool
+	historyLimit   int
+	historyEvents  bool
+	historyCompact bool
 )
 
 var historyCmd = &cobra.Command{
@@ -48,13 +49,25 @@ Examples:
 		if len(args) == 0 {
 			return HandleErrorRespectJSON("at least one issue ID is required")
 		}
+		if historyCompact && !jsonOutput {
+			return HandleErrorRespectJSON("--compact requires --json")
+		}
+		if historyCompact && historyEvents {
+			return HandleErrorRespectJSON("--compact cannot be used with --events")
+		}
 		if jsonOutput && !historyEvents {
 			if usesProxiedServer() {
+				if historyCompact {
+					return runCompactBulkHistoryProxiedServer(rootCtx, args, historyLimit)
+				}
 				return runBulkHistoryProxiedServer(rootCtx, args, historyLimit)
 			}
 			bulkBackend, ok := storage.UnwrapStore(store).(bulkHistoryBackend)
 			if !ok {
 				return HandleErrorRespectJSON("the active storage backend does not support bulk history")
+			}
+			if historyCompact {
+				return runCompactBulkHistory(rootCtx, bulkBackend, args, historyLimit)
 			}
 			return runBulkHistory(rootCtx, bulkBackend, args, historyLimit)
 		}
@@ -96,6 +109,10 @@ type bulkHistoryBackend interface {
 	BulkHistory(ctx context.Context, ids []string) ([]storage.IssueHistory, error)
 }
 
+type compactBulkHistoryBackend interface {
+	CompactBulkHistory(ctx context.Context, ids []string, limit int) ([]storage.CompactIssueHistory, error)
+}
+
 type bulkHistoryEnvelope struct {
 	SchemaVersion int                    `json:"schema_version"`
 	Issues        []storage.IssueHistory `json:"issues"`
@@ -114,6 +131,21 @@ func runBulkHistory(ctx context.Context, backend bulkHistoryBackend, issueIDs []
 		}
 	}
 	return outputJSONRaw(bulkHistoryEnvelope{SchemaVersion: 1, Issues: groups})
+}
+
+func runCompactBulkHistory(ctx context.Context, backend any, issueIDs []string, limit int) error {
+	compactBackend, ok := backend.(compactBulkHistoryBackend)
+	if !ok {
+		return HandleErrorRespectJSON("the active storage backend does not support compact history; upgrade the backend")
+	}
+	groups, err := compactBackend.CompactBulkHistory(ctx, issueIDs, limit)
+	if err != nil {
+		return HandleErrorRespectJSON("failed to get compact history: %v", err)
+	}
+	return outputJSONRaw(struct {
+		SchemaVersion int                           `json:"schema_version"`
+		Issues        []storage.CompactIssueHistory `json:"issues"`
+	}{SchemaVersion: 2, Issues: groups})
 }
 
 func runHistory(ctx context.Context, backend historyBackend, issueID string, limit int, showEvents bool) error {
@@ -173,6 +205,7 @@ func runHistory(ctx context.Context, backend historyBackend, issueID string, lim
 func init() {
 	historyCmd.Flags().IntVar(&historyLimit, "limit", 0, "Limit number of history entries (0 = all)")
 	historyCmd.Flags().BoolVar(&historyEvents, "events", false, "Show database audit events instead of commit snapshots")
+	historyCmd.Flags().BoolVar(&historyCompact, "compact", false, "Use compact schema-v2 JSON snapshot history")
 	historyCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(historyCmd)
 }

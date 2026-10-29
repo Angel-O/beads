@@ -5,8 +5,10 @@ package main
 import (
 	"encoding/json"
 	"os/exec"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -22,6 +24,118 @@ func TestProxiedServerHistory(t *testing.T) {
 	bdProxiedUpdate(t, bd, p.dir, issue.ID, "--status", "in_progress")
 	bdProxiedUpdate(t, bd, p.dir, issue.ID, "--priority", "1")
 	bdProxiedUpdate(t, bd, p.dir, issue.ID, "--title", "History test issue updated")
+
+	t.Run("compact_history_v2", func(t *testing.T) {
+		// The proxied MySQL DSN leaves Loc unset (ParseTime defaults to UTC),
+		// while this non-UTC child timezone catches accidental Local parsing.
+		const testTZ = "Etc/GMT-1"
+		baselineOutput, baselineStderr, err := bdProxiedRunBuffersWithEnv(t, bd, p.dir, []string{"TZ=" + testTZ}, "history", "--json", issue.ID)
+		if err != nil {
+			t.Fatalf("baseline history: %v\n%s\n%s", err, baselineOutput, baselineStderr)
+		}
+		baselineJSON := []byte(baselineOutput)
+		type occurrence struct {
+			CommitHash string          `json:"CommitHash"`
+			Committer  string          `json:"Committer"`
+			CommitDate json.RawMessage `json:"CommitDate"`
+		}
+		type reconstructedEntry struct {
+			Issue      json.RawMessage
+			occurrence occurrence
+		}
+		var baseline struct {
+			SchemaVersion int `json:"schema_version"`
+			Issues        []struct {
+				IssueID   string `json:"issue_id"`
+				Snapshots []struct {
+					Issue      json.RawMessage `json:"Issue"`
+					CommitHash string          `json:"CommitHash"`
+					Committer  string          `json:"Committer"`
+					CommitDate json.RawMessage `json:"CommitDate"`
+				} `json:"snapshots"`
+			} `json:"issues"`
+		}
+		if err := json.Unmarshal(baselineJSON, &baseline); err != nil {
+			t.Fatalf("parse baseline history: %v\n%s", err, baselineJSON)
+		}
+		if baseline.SchemaVersion != 1 || len(baseline.Issues) != 1 || baseline.Issues[0].IssueID != issue.ID {
+			t.Fatalf("unexpected baseline envelope: %s", baselineJSON)
+		}
+		want := make([]reconstructedEntry, 0, len(baseline.Issues[0].Snapshots))
+		for _, entry := range baseline.Issues[0].Snapshots {
+			want = append(want, reconstructedEntry{Issue: entry.Issue, occurrence: occurrence{CommitHash: entry.CommitHash, Committer: entry.Committer, CommitDate: entry.CommitDate}})
+		}
+
+		compactOutput, compactStderr, err := bdProxiedRunBuffersWithEnv(t, bd, p.dir, []string{"TZ=" + testTZ}, "history", "--json", "--compact", issue.ID, "hst-missing")
+		if err != nil {
+			t.Fatalf("compact history: %v\n%s\n%s", err, compactOutput, compactStderr)
+		}
+		out := []byte(compactOutput)
+		type compactGroup struct {
+			IssueID string `json:"issue_id"`
+			States  []struct {
+				Issue       json.RawMessage `json:"Issue"`
+				Occurrences []occurrence    `json:"occurrences"`
+			} `json:"states"`
+		}
+		var envelope struct {
+			SchemaVersion int            `json:"schema_version"`
+			Issues        []compactGroup `json:"issues"`
+		}
+		if err := json.Unmarshal(out, &envelope); err != nil {
+			t.Fatalf("parse compact history: %v\n%s", err, out)
+		}
+		wantIDs := []string{issue.ID, "hst-missing"}
+		sort.Strings(wantIDs)
+		gotIDs := make([]string, len(envelope.Issues))
+		var issueGroup, missingGroup *compactGroup
+		for i := range envelope.Issues {
+			group := &envelope.Issues[i]
+			gotIDs[i] = group.IssueID
+			switch group.IssueID {
+			case issue.ID:
+				issueGroup = group
+			case "hst-missing":
+				missingGroup = group
+			}
+		}
+		if envelope.SchemaVersion != 2 || len(envelope.Issues) != 2 || strings.Join(gotIDs, "\x00") != strings.Join(wantIDs, "\x00") || issueGroup == nil || missingGroup == nil || missingGroup.States == nil || len(missingGroup.States) != 0 {
+			t.Fatalf("unexpected compact envelope: %s", out)
+		}
+		var got []reconstructedEntry
+		for _, state := range issueGroup.States {
+			if len(state.Issue) == 0 || len(state.Occurrences) == 0 {
+				t.Fatalf("invalid compact state: %+v", state)
+			}
+			for _, occurrence := range state.Occurrences {
+				got = append(got, reconstructedEntry{Issue: state.Issue, occurrence: occurrence})
+			}
+		}
+		if len(got) != len(want) {
+			t.Fatalf("compact occurrences=%d, baseline=%d", len(got), len(want))
+		}
+		dateOf := func(entry reconstructedEntry) time.Time {
+			t.Helper()
+			var date time.Time
+			if err := json.Unmarshal(entry.occurrence.CommitDate, &date); err != nil {
+				t.Fatalf("decode CommitDate %s: %v", entry.occurrence.CommitDate, err)
+			}
+			return date
+		}
+		sort.Slice(got, func(i, j int) bool {
+			a, b := dateOf(got[i]), dateOf(got[j])
+			if !a.Equal(b) {
+				return a.After(b)
+			}
+			return got[i].occurrence.CommitHash > got[j].occurrence.CommitHash
+		})
+		for i := range want {
+			g, w := got[i], want[i]
+			if string(g.Issue) != string(w.Issue) || g.occurrence.CommitHash != w.occurrence.CommitHash || g.occurrence.Committer != w.occurrence.Committer || string(g.occurrence.CommitDate) != string(w.occurrence.CommitDate) {
+				t.Fatalf("reconstructed occurrence %d differs from baseline:\ngot=%+v\nwant=%+v", i, g, w)
+			}
+		}
+	})
 
 	const missingID = "hst-nonexistent999"
 

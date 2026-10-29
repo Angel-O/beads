@@ -54,6 +54,26 @@ func (s *DoltStore) BulkHistory(ctx context.Context, issueIDs []string) ([]stora
 	return result, err
 }
 
+func (s *DoltStore) CompactBulkHistory(ctx context.Context, issueIDs []string, limit int) ([]storage.CompactIssueHistory, error) {
+	issueIDs, err := issueops.NormalizeBulkHistoryIDs(issueIDs)
+	if err != nil {
+		return nil, err
+	}
+	if len(issueIDs) == 0 {
+		return []storage.CompactIssueHistory{}, nil
+	}
+	var result []storage.CompactIssueHistory
+	err = s.withReadTxLongTimeout(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.CompactBulkHistoryInTx(ctx, tx, issueIDs, limit, time.UTC)
+		if err != nil {
+			return wrapQueryError("get compact bulk issue history", err)
+		}
+		return nil
+	})
+	return result, err
+}
+
 // AsOf returns the state of an issue at a specific commit hash or branch ref.
 // Implements storage.VersionedStorage.
 func (s *DoltStore) AsOf(ctx context.Context, issueID string, ref string) (*types.Issue, error) {

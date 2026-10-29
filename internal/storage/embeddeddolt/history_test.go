@@ -3,9 +3,14 @@
 package embeddeddolt_test
 
 import (
+	"encoding/json"
 	"reflect"
+	"sort"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -48,6 +53,188 @@ func TestBulkHistoryMatchesRepeatedHistory(t *testing.T) {
 			t.Fatalf("BulkHistory(%s) differs from History", group.IssueID)
 		}
 	}
+}
+
+func TestCompactBulkHistoryMatchesRealEngineBaseline(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	previousLocal := time.Local
+	time.Local = time.FixedZone("compact-history UTC+1", 60*60)
+	t.Cleanup(func() { time.Local = previousLocal })
+	te := newTestEnv(t, "ch")
+	ctx := t.Context()
+	issue := &types.Issue{ID: "ch-issue", Title: "Alpha", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+	if err := te.store.CreateIssue(ctx, issue, "tester"); err != nil {
+		t.Fatal(err)
+	}
+	graphDates := []time.Time{commitAt(t, te, "compact history initial", "2030-01-03T12:00:05")}
+	for i, title := range []string{"Beta", "Alpha", "alpha"} {
+		if err := te.store.UpdateIssue(ctx, issue.ID, map[string]any{"title": title}, "tester"); err != nil {
+			t.Fatal(err)
+		}
+		// Deliberately tie the first two edits and make the third commit
+		// date earlier than its parent to test producer ordering independently
+		// from graph chronology.
+		updateDates := []string{"2030-01-03T12:00:10.123456", "2030-01-03T12:00:10.123456", "2030-01-03T12:00:07.654321"}
+		graphDates = append(graphDates, commitAt(t, te, "compact history update", updateDates[i]))
+		// Add a commit without touching the target, exercising unchanged historical
+		// rows as returned by the pinned engine's real history table.
+		other := &types.Issue{ID: "ch-other", Title: title, Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+		if err := te.store.CreateIssue(ctx, other, "tester"); err != nil {
+			t.Fatal(err)
+		}
+		unrelatedDates := []string{"2030-01-03T12:00:03.333333", "2030-01-03T12:00:02.222222", "2030-01-03T12:00:01.111111"}
+		graphDates = append(graphDates, commitAt(t, te, "unrelated commit", unrelatedDates[i]))
+	}
+	if !graphDates[1].Equal(graphDates[3]) {
+		t.Fatalf("fixture did not create a timestamp tie: %v != %v", graphDates[1], graphDates[3])
+	}
+	if !graphDates[2].Before(graphDates[1]) {
+		t.Fatalf("fixture did not create a nonmonotonic commit date: child=%v parent=%v", graphDates[2], graphDates[1])
+	}
+	mainBranch, err := te.store.CurrentBranch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := te.store.Branch(ctx, "compact-side"); err != nil {
+		t.Fatal(err)
+	}
+	if err := te.store.Checkout(ctx, "compact-side"); err != nil {
+		t.Fatal(err)
+	}
+	if err := te.store.UpdateIssue(ctx, issue.ID, map[string]any{"title": "Side branch"}, "tester"); err != nil {
+		t.Fatal(err)
+	}
+	commitAt(t, te, "compact side branch edit", "2030-01-03T12:00:12")
+	if err := te.store.Checkout(ctx, mainBranch); err != nil {
+		t.Fatal(err)
+	}
+	mainOnly := &types.Issue{ID: "ch-mainline", Title: "Mainline", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+	if err := te.store.CreateIssue(ctx, mainOnly, "tester"); err != nil {
+		t.Fatal(err)
+	}
+	commitAt(t, te, "compact mainline edit", "2030-01-03T12:00:11")
+	conflicts, err := te.store.Merge(ctx, "compact-side")
+	if err != nil || len(conflicts) != 0 {
+		t.Fatalf("merge compact-side conflicts=%v err=%v", conflicts, err)
+	}
+	if err := te.store.Commit(ctx, "compact merge follow-up"); err != nil {
+		t.Fatal(err)
+	}
+	if err := te.store.DeleteIssue(ctx, issue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := te.store.Commit(ctx, "delete compact history issue"); err != nil {
+		t.Fatal(err)
+	}
+	if err := te.store.CreateIssue(ctx, &types.Issue{ID: issue.ID, Title: "Recreated", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}, "tester"); err != nil {
+		t.Fatal(err)
+	}
+	if err := te.store.Commit(ctx, "recreate compact history issue"); err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := te.store.BulkHistory(ctx, []string{"ch-issue"})
+	if err != nil {
+		t.Fatalf("baseline BulkHistory: %v", err)
+	}
+	compact, err := te.store.CompactBulkHistory(ctx, []string{" ch-issue ", "ch-missing", "ch-issue"}, 0)
+	if err != nil {
+		t.Fatalf("CompactBulkHistory: %v", err)
+	}
+	if len(compact) != 2 || compact[0].IssueID != "ch-issue" || compact[1].IssueID != "ch-missing" || compact[1].States == nil || len(compact[1].States) != 0 {
+		t.Fatalf("groups/miss = %#v", compact)
+	}
+	want := make(map[string][]storage.HistoryOccurrence)
+	for _, entry := range baseline[0].Entries {
+		key, _ := json.Marshal(entry.Issue)
+		want[string(key)] = append(want[string(key)], storage.HistoryOccurrence{CommitHash: entry.CommitHash, Committer: entry.Committer, CommitDate: entry.CommitDate})
+	}
+	got := make(map[string][]storage.HistoryOccurrence)
+	for _, state := range compact[0].States {
+		key, _ := json.Marshal(state.Issue)
+		if _, exists := got[string(key)]; exists {
+			t.Fatalf("duplicate equal normalized state: %s", key)
+		}
+		got[string(key)] = state.Occurrences
+	}
+	if len(got) != len(want) {
+		t.Fatalf("compact state count=%d, baseline=%d", len(got), len(want))
+	}
+	sawFractionalDate := false
+	for key, wantOccurrences := range want {
+		gotOccurrences, ok := got[key]
+		if !ok || len(gotOccurrences) != len(wantOccurrences) {
+			t.Fatalf("occurrences for %s: got=%#v want=%#v", key, gotOccurrences, wantOccurrences)
+		}
+		for i := range wantOccurrences {
+			g, w := gotOccurrences[i], wantOccurrences[i]
+			wantDateJSON, err := json.Marshal(w.CommitDate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotDateJSON, err := json.Marshal(g.CommitDate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sawFractionalDate = sawFractionalDate || strings.Contains(string(wantDateJSON), ".")
+			if g.CommitHash != w.CommitHash || g.Committer != w.Committer || string(gotDateJSON) != string(wantDateJSON) {
+				t.Fatalf("occurrence mismatch for %s at %d: got=%+v want=%+v", key, i, g, w)
+			}
+		}
+	}
+	if !sawFractionalDate {
+		t.Fatal("real-engine history fixture did not preserve any fractional CommitDate precision")
+	}
+
+	limited, err := te.store.CompactBulkHistory(ctx, []string{issue.ID}, 2)
+	if err != nil {
+		t.Fatalf("limited CompactBulkHistory: %v", err)
+	}
+	var occurrences []storage.HistoryOccurrence
+	for _, state := range limited[0].States {
+		occurrences = append(occurrences, state.Occurrences...)
+	}
+	sort.Slice(occurrences, func(i, j int) bool {
+		if !occurrences[i].CommitDate.Equal(occurrences[j].CommitDate) {
+			return occurrences[i].CommitDate.After(occurrences[j].CommitDate)
+		}
+		return occurrences[i].CommitHash > occurrences[j].CommitHash
+	})
+	if len(occurrences) != 2 {
+		t.Fatalf("limited occurrences=%d, want 2", len(occurrences))
+	}
+	for i := range occurrences {
+		entry := baseline[0].Entries[i]
+		if occurrences[i].CommitHash != entry.CommitHash || !occurrences[i].CommitDate.Equal(entry.CommitDate) || occurrences[i].Committer != entry.Committer {
+			t.Fatalf("limited occurrence %d=%+v, baseline=%+v", i, occurrences[i], entry)
+		}
+	}
+	unlimited, err := te.store.CompactBulkHistory(ctx, []string{issue.ID}, -1)
+	if err != nil {
+		t.Fatalf("nonpositive CompactBulkHistory: %v", err)
+	}
+	var unlimitedCount int
+	for _, state := range unlimited[0].States {
+		unlimitedCount += len(state.Occurrences)
+	}
+	if unlimitedCount != len(baseline[0].Entries) {
+		t.Fatalf("nonpositive limit retained %d occurrences, baseline has %d", unlimitedCount, len(baseline[0].Entries))
+	}
+}
+
+func commitAt(t *testing.T, te *testEnv, message, date string) time.Time {
+	t.Helper()
+	te.exec(t, t.Context(), "CALL DOLT_COMMIT('-Am', ?, '--date', ?)", message, date)
+	commits, err := te.store.Log(t.Context(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, commit := range commits {
+		if commit.Message == message {
+			return commit.Date
+		}
+	}
+	t.Fatalf("commit %q not found in real Dolt log", message)
+	return time.Time{}
 }
 
 // migration0049DDL replays migration 0049's exact column widening: the four
@@ -148,5 +335,28 @@ func TestHistory_NullTextColumns(t *testing.T) {
 	}
 	if older.Notes != "" {
 		t.Errorf("expected pre-migration notes to coalesce to \"\", got %q", older.Notes)
+	}
+	compact, err := te.store.CompactBulkHistory(ctx, []string{issue.ID}, 0)
+	if err != nil {
+		t.Fatalf("CompactBulkHistory across TEXT -> LONGTEXT schema: %v", err)
+	}
+	var compactEntries int
+	for _, state := range compact[0].States {
+		for _, occurrence := range state.Occurrences {
+			compactEntries++
+			found := false
+			for _, entry := range history {
+				if entry.CommitHash == occurrence.CommitHash && entry.Committer == occurrence.Committer && entry.CommitDate.Equal(occurrence.CommitDate) && reflect.DeepEqual(entry.Issue, state.Issue) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("compact historical occurrence %+v has no baseline match", occurrence)
+			}
+		}
+	}
+	if compactEntries != len(history) {
+		t.Fatalf("compact occurrences=%d, baseline history=%d", compactEntries, len(history))
 	}
 }

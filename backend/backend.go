@@ -83,23 +83,24 @@ type DoltStorage = storage.DoltStorage
 // capability sub-interfaces; each is aliased so an implementation can be
 // organized (and documented) per capability.
 type (
-	Storage              = storage.Storage
-	ScopeStore           = storage.ScopeStore
-	IssueLifecycleStore  = storage.IssueLifecycleStore
-	VersionControl       = storage.VersionControl
-	HistoryViewer        = storage.HistoryViewer
-	BulkHistoryViewer    = storage.BulkHistoryViewer
-	RemoteStore          = storage.RemoteStore
-	SyncStore            = storage.SyncStore
-	FederationStore      = storage.FederationStore
-	BulkIssueStore       = storage.BulkIssueStore
-	DependencyQueryStore = storage.DependencyQueryStore
-	EventQueryStore      = storage.EventQueryStore
-	AnnotationStore      = storage.AnnotationStore
-	ConfigMetadataStore  = storage.ConfigMetadataStore
-	CompactionStore      = storage.CompactionStore
-	AdvancedQueryStore   = storage.AdvancedQueryStore
-	FastStatisticsStore  = storage.FastStatisticsStore
+	Storage                  = storage.Storage
+	ScopeStore               = storage.ScopeStore
+	IssueLifecycleStore      = storage.IssueLifecycleStore
+	VersionControl           = storage.VersionControl
+	HistoryViewer            = storage.HistoryViewer
+	BulkHistoryViewer        = storage.BulkHistoryViewer
+	CompactBulkHistoryViewer = storage.CompactBulkHistoryViewer
+	RemoteStore              = storage.RemoteStore
+	SyncStore                = storage.SyncStore
+	FederationStore          = storage.FederationStore
+	BulkIssueStore           = storage.BulkIssueStore
+	DependencyQueryStore     = storage.DependencyQueryStore
+	EventQueryStore          = storage.EventQueryStore
+	AnnotationStore          = storage.AnnotationStore
+	ConfigMetadataStore      = storage.ConfigMetadataStore
+	CompactionStore          = storage.CompactionStore
+	AdvancedQueryStore       = storage.AdvancedQueryStore
+	FastStatisticsStore      = storage.FastStatisticsStore
 )
 
 // Transaction types: Storage.RunInTransaction yields a Transaction;
