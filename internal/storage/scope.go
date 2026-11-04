@@ -23,7 +23,7 @@ const (
 
 // ScopeStore is the storage-level scope capability. Scope membership is
 // durable state, not a list-filter concern: every mutation is atomic and the
-// membership methods enforce the one-scope-per-issue and 100-member rules.
+// membership methods enforce the one-scope-per-issue and 125-member rules.
 type ScopeStore interface {
 	CreateScope(ctx context.Context, scope *types.Scope, activate bool) error
 	// RenameScope changes only a scope's display name and normalized name.
@@ -44,7 +44,7 @@ type ScopeStore interface {
 	MoveScopeMembers(ctx context.Context, sourceID, targetID string, issueIDs []string) error
 }
 
-const MaxScopeMembers = 100
+const MaxScopeMembers = 125
 
 var (
 	ErrScopeInvalid            = newStorageError("invalid scope")

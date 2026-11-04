@@ -152,7 +152,8 @@ func TestEmbeddedScopesCapacityAndTransactionRollback(t *testing.T) {
 	te := newTestEnv(t, "scope_capacity")
 	ctx := t.Context()
 	createScope(t, te, "scope-cap", "Capacity")
-	ids := make([]string, 101)
+	createScope(t, te, "scope-source", "Source")
+	ids := make([]string, storage.MaxScopeMembers+1)
 	issues := make([]*types.Issue, len(ids))
 	for i := range ids {
 		ids[i] = "scope_capacity-" + threeDigits(i)
@@ -161,16 +162,23 @@ func TestEmbeddedScopesCapacityAndTransactionRollback(t *testing.T) {
 	if err := te.store.CreateIssues(ctx, issues, "tester"); err != nil {
 		t.Fatalf("CreateIssues: %v", err)
 	}
-	if err := te.store.AddScopeMembers(ctx, "scope-cap", ids[:99]); err != nil {
-		t.Fatalf("add 99: %v", err)
+	if err := te.store.AddScopeMembers(ctx, "scope-cap", ids[:storage.MaxScopeMembers]); err != nil {
+		t.Fatalf("add %d: %v", storage.MaxScopeMembers, err)
 	}
-	if err := te.store.AddScopeMembers(ctx, "scope-cap", ids[99:100]); err != nil {
-		t.Fatalf("add 100: %v", err)
+	if err := te.store.AddScopeMembers(ctx, "scope-cap", ids[storage.MaxScopeMembers:]); !errors.Is(err, storage.ErrScopeCapacityExceeded) {
+		t.Fatalf("add member %d error = %v, want ErrScopeCapacityExceeded", storage.MaxScopeMembers+1, err)
 	}
-	if err := te.store.AddScopeMembers(ctx, "scope-cap", ids[100:]); !errors.Is(err, storage.ErrScopeCapacityExceeded) {
-		t.Fatalf("add 101st error = %v, want ErrScopeCapacityExceeded", err)
+	assertScopeMembers(t, te, "scope-cap", ids[:storage.MaxScopeMembers])
+	if scope, err := te.store.GetScope(ctx, "scope-cap"); err != nil || scope.MemberLimit != storage.MaxScopeMembers {
+		t.Fatalf("scope member limit = %v, %v; want %d", scope, err, storage.MaxScopeMembers)
 	}
-	assertScopeMembers(t, te, "scope-cap", ids[:100])
+	if err := te.store.AddScopeMembers(ctx, "scope-source", ids[storage.MaxScopeMembers:]); err != nil {
+		t.Fatalf("add move source member: %v", err)
+	}
+	if err := te.store.MoveScopeMembers(ctx, "scope-source", "scope-cap", ids[storage.MaxScopeMembers:]); !errors.Is(err, storage.ErrScopeCapacityExceeded) {
+		t.Fatalf("move member %d error = %v, want ErrScopeCapacityExceeded", storage.MaxScopeMembers+1, err)
+	}
+	assertScopeMembers(t, te, "scope-source", ids[storage.MaxScopeMembers:])
 
 	rollbackID := "scope-rollback"
 	err := te.store.RunInTransaction(ctx, "bd: rollback scope", func(tx storage.Transaction) error {
