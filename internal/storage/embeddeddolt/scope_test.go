@@ -153,6 +153,9 @@ func TestEmbeddedScopesCapacityAndTransactionRollback(t *testing.T) {
 	ctx := t.Context()
 	createScope(t, te, "scope-cap", "Capacity")
 	createScope(t, te, "scope-source", "Source")
+	if storage.MaxScopeMembers != 200 {
+		t.Fatalf("scope member limit = %d, want 200", storage.MaxScopeMembers)
+	}
 	ids := make([]string, storage.MaxScopeMembers+1)
 	issues := make([]*types.Issue, len(ids))
 	for i := range ids {
